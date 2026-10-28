@@ -50,12 +50,22 @@ export const DEFAULT_SETTINGS: AppSettings = {
   updatedAtIso: new Date().toISOString(),
 };
 
+export const DEFAULT_PRODUCT_CATEGORIES = [
+  'Bebidas',
+  'Mercearia',
+  'Padaria',
+  'Cafetaria',
+  'Serviços',
+  'Geral',
+] as const;
+
 export interface Product {
   id: string;
   code: string;
   name: string;
+  category: string;
   unit: string;
-  price: number; // PVP Unitário (IVA incluído quando ivaRate === 14)
+  price: number; // Preço Unitário em Kwanzas (Kz)
   ivaRate: TaxRate;
   exemptionReason: string;
   active: boolean;

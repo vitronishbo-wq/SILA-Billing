@@ -37,13 +37,14 @@ service cloud.firestore {
           'ivaRate', 'exemptionReason', 'active', 'createdAt', 'updatedAt'
         ])
         && data.keys().hasOnly([
-          'id', 'ownerId', 'code', 'name', 'unit', 'price',
+          'id', 'ownerId', 'code', 'name', 'category', 'unit', 'price',
           'ivaRate', 'exemptionReason', 'active', 'createdAt', 'updatedAt'
         ])
         && data.id is string && data.id == productId && isValidId(data.id)
         && data.ownerId is string && data.ownerId == request.auth.uid && isValidId(data.ownerId)
         && data.code is string && data.code.size() >= 1 && data.code.size() <= 32
         && data.name is string && data.name.size() >= 1 && data.name.size() <= 160
+        && (!('category' in data) || (data.category is string && data.category.size() >= 1 && data.category.size() <= 48))
         && data.unit is string && data.unit.size() >= 1 && data.unit.size() <= 16
         && data.price is number && data.price >= 0 && data.price <= 999999999
         && data.ivaRate is number && (data.ivaRate == 0 || data.ivaRate == 14)
@@ -186,7 +187,7 @@ service cloud.firestore {
         && (
           // Action: Edit catalog product details
           incoming().diff(existing()).affectedKeys().hasOnly([
-            'code', 'name', 'unit', 'price', 'ivaRate', 'exemptionReason', 'active', 'updatedAt'
+            'code', 'name', 'category', 'unit', 'price', 'ivaRate', 'exemptionReason', 'active', 'updatedAt'
           ])
         );
 

@@ -34,6 +34,7 @@ export async function upsertProductCloud(product: Product, isNew: boolean): Prom
         ownerId: user.uid,
         code: product.code.slice(0, 32),
         name: product.name.slice(0, 160),
+        category: (product.category || 'Geral').trim().slice(0, 48) || 'Geral',
         unit: (product.unit || 'un').slice(0, 16),
         price: Number(product.price) || 0,
         ivaRate: product.ivaRate === 14 ? 14 : 0,
@@ -46,6 +47,7 @@ export async function upsertProductCloud(product: Product, isNew: boolean): Prom
       await updateDoc(ref, {
         code: product.code.slice(0, 32),
         name: product.name.slice(0, 160),
+        category: (product.category || 'Geral').trim().slice(0, 48) || 'Geral',
         unit: (product.unit || 'un').slice(0, 16),
         price: Number(product.price) || 0,
         ivaRate: product.ivaRate === 14 ? 14 : 0,
@@ -315,6 +317,7 @@ export async function pullAllFromCloud(): Promise<{
         id: data.id,
         code: data.code,
         name: data.name,
+        category: data.category || 'Geral',
         unit: data.unit,
         price: data.price,
         ivaRate: data.ivaRate === 14 ? 14 : 0,

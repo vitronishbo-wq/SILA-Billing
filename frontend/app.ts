@@ -10,6 +10,7 @@ import {
   AppSettings,
   CartDraftItem,
   Customer,
+  DEFAULT_PRODUCT_CATEGORIES,
   DEFAULT_SETTINGS,
   DocumentFormat,
   DocumentType,
@@ -86,9 +87,13 @@ export class SilaBillingApp {
 
   // Estado POS / Emissão Unificada
   private posSearch = '';
+  private posCategoryFilter = 'ALL';
   private posTaxFilter: 'ALL' | 14 | 0 = 'ALL';
   private cart: CartDraftItem[] = [];
   private selectedCustomerId = 'cust_direct';
+  private showCustomerPicker = false;
+  private posCustomerSearch = '';
+  private showQuickCustomerForm = false;
   private docType: DocumentType = 'FR';
   private paymentMethod: PaymentMethod = 'Dinheiro';
   private amountReceivedInput = '';
@@ -284,7 +289,46 @@ export class SilaBillingApp {
     this.root.addEventListener('click', (e) => this.handleClick(e));
     this.root.addEventListener('input', (e) => this.handleInput(e));
     this.root.addEventListener('change', (e) => this.handleChange(e));
+    this.root.addEventListener('keydown', (e) => this.handleKeyDown(e));
     this.root.addEventListener('submit', (e) => this.handleSubmit(e));
+  }
+
+  private getFilteredPosProducts(): Product[] {
+    const q = this.posSearch.trim().toLowerCase();
+    return this.products.filter((p) => {
+      if (!p.active) return false;
+      if (this.posCategoryFilter !== 'ALL' && (p.category || 'Geral') !== this.posCategoryFilter) {
+        return false;
+      }
+      if (this.posTaxFilter !== 'ALL' && p.ivaRate !== this.posTaxFilter) return false;
+      if (!q) return true;
+      return (
+        p.name.toLowerCase().includes(q) ||
+        p.code.toLowerCase().includes(q) ||
+        (p.category || '').toLowerCase().includes(q)
+      );
+    });
+  }
+
+  private addProductToCart(prod: Product): void {
+    this.lastEmitted = null;
+    this.lastAuditHash = '';
+    const existing = this.cart.find((c) => c.productId === prod.id);
+    if (existing) {
+      existing.qty = roundKz(existing.qty + 1);
+    } else {
+      this.cart.push({
+        productId: prod.id,
+        code: prod.code,
+        description: prod.name,
+        unit: prod.unit,
+        qty: 1,
+        unitPrice: prod.price,
+        discountPct: 0,
+        ivaRate: prod.ivaRate,
+      });
+    }
+    this.scheduleDraftSave();
   }
 
   private async refreshBackendHealth(): Promise<void> {
@@ -423,27 +467,20 @@ export class SilaBillingApp {
         this.render();
         break;
       }
+      case 'pos-category': {
+        this.posCategoryFilter = value || 'ALL';
+        this.render();
+        break;
+      }
+      case 'clear-pos-search': {
+        this.posSearch = '';
+        this.renderPreservingFocus('pos-search-input', 0);
+        break;
+      }
       case 'add-to-cart': {
         const prod = this.products.find((p) => p.id === id);
         if (!prod) return;
-        this.lastEmitted = null;
-        this.lastAuditHash = '';
-        const existing = this.cart.find((c) => c.productId === prod.id);
-        if (existing) {
-          existing.qty = roundKz(existing.qty + 1);
-        } else {
-          this.cart.push({
-            productId: prod.id,
-            code: prod.code,
-            description: prod.name,
-            unit: prod.unit,
-            qty: 1,
-            unitPrice: prod.price,
-            discountPct: 0,
-            ivaRate: prod.ivaRate,
-          });
-        }
-        this.scheduleDraftSave();
+        this.addProductToCart(prod);
         this.render();
         break;
       }
@@ -460,10 +497,54 @@ export class SilaBillingApp {
         this.render();
         break;
       }
+      case 'set-cart-iva': {
+        const nextIva: TaxRate = Number(value) === 0 ? 0 : 14;
+        this.cart = this.cart.map((item) =>
+          item.productId === id ? { ...item, ivaRate: nextIva } : item
+        );
+        this.scheduleDraftSave();
+        this.render();
+        break;
+      }
       case 'remove-cart-item': {
         this.cart = this.cart.filter((c) => c.productId !== id);
         this.scheduleDraftSave();
         this.render();
+        break;
+      }
+      case 'toggle-customer-picker': {
+        this.showCustomerPicker = !this.showCustomerPicker;
+        if (this.showCustomerPicker) {
+          this.showQuickCustomerForm = false;
+          this.posCustomerSearch = '';
+        }
+        this.render();
+        if (this.showCustomerPicker) {
+          const searchInput = document.getElementById('pos-customer-search-input') as HTMLInputElement | null;
+          searchInput?.focus();
+        }
+        break;
+      }
+      case 'select-pos-customer': {
+        if (id && this.customers.some((c) => c.id === id)) {
+          this.selectedCustomerId = id;
+          this.showCustomerPicker = false;
+          this.posCustomerSearch = '';
+          this.scheduleDraftSave();
+          this.render();
+        }
+        break;
+      }
+      case 'toggle-quick-customer': {
+        this.showQuickCustomerForm = !this.showQuickCustomerForm;
+        if (this.showQuickCustomerForm) {
+          this.showCustomerPicker = false;
+        }
+        this.render();
+        if (this.showQuickCustomerForm) {
+          const nameInput = document.getElementById('quick-customer-name-input') as HTMLInputElement | null;
+          nameInput?.focus();
+        }
         break;
       }
       case 'clear-pos': {
@@ -519,6 +600,7 @@ export class SilaBillingApp {
           id: `prod_${Date.now()}`,
           code: nextCode,
           name: '',
+          category: 'Mercearia',
           unit: 'un',
           price: 0,
           ivaRate: 14,
@@ -711,46 +793,128 @@ export class SilaBillingApp {
     }
   }
 
+  private handleKeyDown(e: KeyboardEvent): void {
+    const el = e.target as HTMLInputElement;
+    if (!el || !el.dataset) return;
+
+    if (el.dataset.field === 'pos-search' && e.key === 'Enter') {
+      e.preventDefault();
+      const matches = this.getFilteredPosProducts();
+      if (matches.length > 0) {
+        this.addProductToCart(matches[0]!);
+        this.posSearch = '';
+        this.renderPreservingFocus('pos-search-input', 0);
+      }
+      return;
+    }
+
+    if (el.dataset.field === 'pos-customer-search' && e.key === 'Enter') {
+      e.preventDefault();
+      const cq = this.posCustomerSearch.trim().toLowerCase();
+      const match = this.customers.find(
+        (c) =>
+          !cq ||
+          c.name.toLowerCase().includes(cq) ||
+          c.nif.toLowerCase().includes(cq) ||
+          c.locality.toLowerCase().includes(cq)
+      );
+      if (match) {
+        this.selectedCustomerId = match.id;
+        this.showCustomerPicker = false;
+        this.posCustomerSearch = '';
+        this.scheduleDraftSave();
+        this.render();
+      }
+      return;
+    }
+
+    if (e.key === 'Escape' && (this.showCustomerPicker || this.showQuickCustomerForm)) {
+      this.showCustomerPicker = false;
+      this.showQuickCustomerForm = false;
+      this.render();
+    }
+  }
+
   private handleInput(e: Event): void {
     const el = e.target as HTMLInputElement;
     const field = el.dataset.field;
+    const id = el.dataset.id || '';
     if (!field) return;
 
     const activeId = el.id;
     const selStart = el.selectionStart;
+    const rawVal = el.value;
 
     switch (field) {
       case 'pos-search':
-        this.posSearch = el.value;
+        this.posSearch = rawVal;
         this.renderPreservingFocus(activeId, selStart);
         break;
-      case 'amount-received':
-        this.amountReceivedInput = el.value;
-        this.scheduleDraftSave();
+      case 'pos-customer-search':
+        this.posCustomerSearch = rawVal;
         this.renderPreservingFocus(activeId, selStart);
+        break;
+      case 'cart-qty-live': {
+        const parsed = parseFloat(rawVal.replace(',', '.'));
+        if (!Number.isNaN(parsed) && parsed > 0) {
+          this.cart = this.cart.map((c) =>
+            c.productId === id ? { ...c, qty: roundKz(parsed) } : c
+          );
+          this.scheduleDraftSave();
+          this.renderPreservingInputValue(activeId, rawVal, selStart);
+        }
+        break;
+      }
+      case 'cart-price-live': {
+        const parsed = parseFloat(rawVal.replace(',', '.'));
+        if (!Number.isNaN(parsed) && parsed >= 0) {
+          this.cart = this.cart.map((c) =>
+            c.productId === id ? { ...c, unitPrice: roundKz(parsed) } : c
+          );
+          this.scheduleDraftSave();
+          this.renderPreservingInputValue(activeId, rawVal, selStart);
+        }
+        break;
+      }
+      case 'cart-discount-live': {
+        const parsed = rawVal.trim() === '' ? 0 : parseFloat(rawVal.replace(',', '.'));
+        if (!Number.isNaN(parsed)) {
+          const disc = Math.min(100, Math.max(0, parsed));
+          this.cart = this.cart.map((c) =>
+            c.productId === id ? { ...c, discountPct: roundKz(disc) } : c
+          );
+          this.scheduleDraftSave();
+          this.renderPreservingInputValue(activeId, rawVal, selStart);
+        }
+        break;
+      }
+      case 'amount-received':
+        this.amountReceivedInput = rawVal;
+        this.scheduleDraftSave();
+        this.renderPreservingInputValue(activeId, rawVal, selStart);
         break;
       case 'pos-cashier':
-        this.cashier = el.value;
+        this.cashier = rawVal;
         this.scheduleDraftSave();
         break;
       case 'pos-operator':
-        this.operator = el.value;
+        this.operator = rawVal;
         this.scheduleDraftSave();
         break;
       case 'pos-notes':
-        this.notes = el.value;
+        this.notes = rawVal;
         this.scheduleDraftSave();
         break;
       case 'product-search':
-        this.productSearch = el.value;
+        this.productSearch = rawVal;
         this.renderPreservingFocus(activeId, selStart);
         break;
       case 'customer-search':
-        this.customerSearch = el.value;
+        this.customerSearch = rawVal;
         this.renderPreservingFocus(activeId, selStart);
         break;
       case 'history-search':
-        this.historySearch = el.value;
+        this.historySearch = rawVal;
         this.renderPreservingFocus(activeId, selStart);
         break;
     }
@@ -773,19 +937,30 @@ export class SilaBillingApp {
         this.scheduleDraftSave();
         this.render();
         break;
-      case 'cart-qty': {
+      case 'cart-qty-live': {
         const val = parseFloat(el.value.replace(',', '.'));
         if (!Number.isNaN(val) && val > 0) {
           this.cart = this.cart.map((c) =>
             c.productId === id ? { ...c, qty: roundKz(val) } : c
           );
           this.scheduleDraftSave();
-          this.render();
         }
+        this.render();
         break;
       }
-      case 'cart-discount': {
-        const disc = Math.min(100, Math.max(0, parseFloat(el.value) || 0));
+      case 'cart-price-live': {
+        const val = parseFloat(el.value.replace(',', '.'));
+        if (!Number.isNaN(val) && val >= 0) {
+          this.cart = this.cart.map((c) =>
+            c.productId === id ? { ...c, unitPrice: roundKz(val) } : c
+          );
+          this.scheduleDraftSave();
+        }
+        this.render();
+        break;
+      }
+      case 'cart-discount-live': {
+        const disc = Math.min(100, Math.max(0, parseFloat(el.value.replace(',', '.')) || 0));
         this.cart = this.cart.map((c) =>
           c.productId === id ? { ...c, discountPct: roundKz(disc) } : c
         );
@@ -804,9 +979,55 @@ export class SilaBillingApp {
 
     const fd = new FormData(form);
 
+    if (formName === 'pos-quick-customer-form') {
+      const name = String(fd.get('name') || '').trim();
+      const nif = String(fd.get('nif') || '').trim() || 'Consumidor Final';
+      const phone = String(fd.get('phone') || '').trim();
+      const locality = String(fd.get('locality') || '').trim() || 'Saurimo - Angola';
+
+      if (!name) return;
+
+      const now = new Date().toISOString();
+      const created: Customer = {
+        id: `cust_${Date.now()}`,
+        name,
+        nif,
+        phone,
+        locality,
+        address: locality,
+        synced: false,
+        createdAtIso: now,
+        updatedAtIso: now,
+      };
+
+      await localDb.saveCustomer(created);
+      this.customers = [created, ...this.customers].sort((a, b) =>
+        a.id === 'cust_direct' ? -1 : b.id === 'cust_direct' ? 1 : a.name.localeCompare(b.name)
+      );
+      this.selectedCustomerId = created.id;
+      this.showQuickCustomerForm = false;
+      this.showCustomerPicker = false;
+      this.scheduleDraftSave();
+      this.render();
+
+      if (this.user && this.isOnline) {
+        try {
+          await upsertCustomerCloud(created);
+          const synced = { ...created, synced: true };
+          await localDb.saveCustomer(synced);
+          this.customers = this.customers.map((c) => (c.id === synced.id ? synced : c));
+          this.render();
+        } catch {
+          // Mantém pendente localmente
+        }
+      }
+      return;
+    }
+
     if (formName === 'product-form' && this.editingProduct) {
       const code = String(fd.get('code') || '').trim();
       const name = String(fd.get('name') || '').trim();
+      const category = String(fd.get('category') || 'Mercearia').trim() || 'Mercearia';
       const unit = String(fd.get('unit') || 'un').trim() || 'un';
       const price = Math.max(0, parseFloat(String(fd.get('price') || '0')) || 0);
       const ivaRate: TaxRate = Number(fd.get('ivaRate')) === 0 ? 0 : 14;
@@ -817,6 +1038,7 @@ export class SilaBillingApp {
         ...this.editingProduct,
         code,
         name,
+        category,
         unit,
         price,
         ivaRate,
@@ -1120,6 +1342,27 @@ export class SilaBillingApp {
     }
   }
 
+  private renderPreservingInputValue(
+    elementId: string,
+    rawValue: string,
+    selectionStart: number | null
+  ): void {
+    this.render();
+    if (!elementId) return;
+    const nextEl = document.getElementById(elementId) as HTMLInputElement | null;
+    if (nextEl) {
+      nextEl.value = rawValue;
+      nextEl.focus();
+      if (selectionStart !== null) {
+        try {
+          nextEl.setSelectionRange(selectionStart, selectionStart);
+        } catch {
+          // Ignore selection range on unsupported inputs
+        }
+      }
+    }
+  }
+
   // ==================== RENDERIZAÇÃO MODULAR VANILLA JS ====================
 
   private render(): void {
@@ -1343,20 +1586,44 @@ export class SilaBillingApp {
     }
   }
 
-  // ==================== 1 & 2. TERMINAL UNIFICADO POS & A4 ====================
+  // ==================== 1, 2 & 3. ÁREA DE FATURAÇÃO UNIFICADA POS & A4 ====================
 
   private renderPosWorkspace(): string {
-    const q = this.posSearch.trim().toLowerCase();
-    const visibleProducts = this.products.filter((p) => {
-      if (!p.active) return false;
-      if (this.posTaxFilter !== 'ALL' && p.ivaRate !== this.posTaxFilter) return false;
-      if (!q) return true;
-      return p.name.toLowerCase().includes(q) || p.code.toLowerCase().includes(q);
-    });
+    const activeProducts = this.products.filter((p) => p.active);
+
+    // Contagem por categoria para os seletores compactos
+    const categoryCounts = new Map<string, number>();
+    for (const p of activeProducts) {
+      const cat = (p.category || 'Geral').trim() || 'Geral';
+      categoryCounts.set(cat, (categoryCounts.get(cat) || 0) + 1);
+    }
+    const orderedCategories = Array.from(categoryCounts.keys()).sort((a, b) =>
+      a.localeCompare(b, 'pt')
+    );
+
+    const visibleProducts = this.getFilteredPosProducts();
 
     const totals = calculateInvoiceTotals(this.cart);
     const liveInvoice = this.buildLivePreviewInvoice();
-    const cartCount = this.cart.reduce((acc, c) => acc + c.qty, 0);
+    const cartCount = roundKz(this.cart.reduce((acc, c) => acc + c.qty, 0));
+
+    const selectedCustomer =
+      this.customers.find((c) => c.id === this.selectedCustomerId) ||
+      this.customers[0] || {
+        id: 'cust_direct',
+        name: 'Cliente de Venda Directa',
+        nif: 'Consumidor Final',
+        locality: 'Saurimo - Angola',
+      };
+
+    const cq = this.posCustomerSearch.trim().toLowerCase();
+    const matchingCustomers = this.customers.filter(
+      (c) =>
+        !cq ||
+        c.name.toLowerCase().includes(cq) ||
+        c.nif.toLowerCase().includes(cq) ||
+        c.locality.toLowerCase().includes(cq)
+    );
 
     const cacheKey = `${liveInvoice.number}|${liveInvoice.grandTotal.toFixed(2)}|${this.settings.company.nif}`;
     const cachedQr = this.qrCache.get(cacheKey) || '';
@@ -1388,7 +1655,7 @@ export class SilaBillingApp {
               this.mobilePane === 'CART' ? 'bg-slate-900 text-white' : 'text-slate-600 hover:bg-slate-100'
             }"
           >
-            Caixa (${cartCount})
+            Fatura (${this.cart.length})
           </button>
           <button
             type="button"
@@ -1403,36 +1670,82 @@ export class SilaBillingApp {
         </div>
 
         <div class="flex-1 grid grid-cols-1 lg:grid-cols-12 overflow-hidden">
-          <!-- COLUNA 1: Catálogo Rápido -->
+          <!-- COLUNA 1: Pesquisa Rápida & Categorias Compactas -->
           <section class="${isA4 ? 'lg:col-span-4' : 'lg:col-span-5'} flex flex-col border-r border-slate-200 bg-slate-50/60 overflow-hidden ${
             this.mobilePane === 'CATALOG' ? 'flex' : 'hidden lg:flex'
           }">
-            <div class="p-3 border-b border-slate-200 bg-white flex items-center gap-2 shrink-0">
-              <div class="relative flex-1">
-                <span class="text-slate-400 absolute left-3 top-1/2 -translate-y-1/2 pointer-events-none">${ICONS.search}</span>
-                <input
-                  id="pos-search-input"
-                  type="text"
-                  data-field="pos-search"
-                  value="${escapeHtml(this.posSearch)}"
-                  placeholder="Pesquisar código ou artigo..."
-                  class="w-full h-10 pl-9 pr-3 text-xs bg-slate-50 border border-slate-200 rounded-lg focus:outline-none focus:border-blue-600"
-                />
+            <div class="p-3 border-b border-slate-200 bg-white space-y-2 shrink-0">
+              <!-- Pesquisa rápida + filtro de regime fiscal -->
+              <div class="flex items-center gap-2">
+                <div class="relative flex-1 min-w-0">
+                  <span class="text-slate-400 absolute left-3 top-1/2 -translate-y-1/2 pointer-events-none">${ICONS.search}</span>
+                  <input
+                    id="pos-search-input"
+                    type="text"
+                    autocomplete="off"
+                    data-field="pos-search"
+                    value="${escapeHtml(this.posSearch)}"
+                    placeholder="Pesquisar código, artigo ou Enter p/ adicionar..."
+                    class="w-full h-10 pl-9 ${this.posSearch ? 'pr-8' : 'pr-3'} text-xs bg-slate-50 border border-slate-200 rounded-lg focus:outline-none focus:border-blue-600"
+                  />
+                  ${
+                    this.posSearch
+                      ? `<button
+                          type="button"
+                          data-action="clear-pos-search"
+                          title="Limpar pesquisa"
+                          class="h-7 w-7 absolute right-1.5 top-1/2 -translate-y-1/2 flex items-center justify-center rounded text-slate-400 hover:text-slate-700 hover:bg-slate-200/60"
+                        >${ICONS.close}</button>`
+                      : ''
+                  }
+                </div>
+                <div class="flex items-center bg-slate-100 p-0.5 rounded-lg shrink-0">
+                  ${(['ALL', '14', '0'] as const)
+                    .map((f) => {
+                      const active = String(this.posTaxFilter) === f;
+                      const label = f === 'ALL' ? 'Todos' : f === '14' ? '14%' : 'Isento';
+                      return `
+                        <button
+                          type="button"
+                          data-action="tax-filter"
+                          data-value="${f}"
+                          class="h-9 px-2.5 text-[11px] font-medium rounded-md transition-colors whitespace-nowrap ${
+                            active ? 'bg-white text-slate-900 shadow-xs' : 'text-slate-600 hover:text-slate-900'
+                          }"
+                        >${label}</button>
+                      `;
+                    })
+                    .join('')}
+                </div>
               </div>
-              <div class="flex items-center bg-slate-100 p-0.5 rounded-lg shrink-0">
-                ${(['ALL', '14', '0'] as const)
-                  .map((f) => {
-                    const active = String(this.posTaxFilter) === f;
-                    const label = f === 'ALL' ? 'Todos' : f === '14' ? 'IVA 14%' : 'Isento';
+
+              <!-- Categorias de produtos em seletores compactos -->
+              <div class="flex items-center gap-1 overflow-x-auto pb-0.5 no-scrollbar">
+                <button
+                  type="button"
+                  data-action="pos-category"
+                  data-value="ALL"
+                  class="h-7 px-2.5 rounded-md text-[11px] font-medium transition-colors whitespace-nowrap shrink-0 tabular-nums ${
+                    this.posCategoryFilter === 'ALL'
+                      ? 'bg-slate-900 text-white'
+                      : 'bg-slate-100 text-slate-600 hover:bg-slate-200/70 hover:text-slate-900'
+                  }"
+                >Todas · ${activeProducts.length}</button>
+                ${orderedCategories
+                  .map((cat) => {
+                    const active = this.posCategoryFilter === cat;
+                    const count = categoryCounts.get(cat) || 0;
                     return `
                       <button
                         type="button"
-                        data-action="tax-filter"
-                        data-value="${f}"
-                        class="h-9 px-2.5 text-[11px] font-medium rounded-md transition-colors whitespace-nowrap ${
-                          active ? 'bg-white text-slate-900 shadow-xs' : 'text-slate-600 hover:text-slate-900'
+                        data-action="pos-category"
+                        data-value="${escapeHtml(cat)}"
+                        class="h-7 px-2.5 rounded-md text-[11px] font-medium transition-colors whitespace-nowrap shrink-0 tabular-nums ${
+                          active
+                            ? 'bg-slate-900 text-white'
+                            : 'bg-slate-100 text-slate-600 hover:bg-slate-200/70 hover:text-slate-900'
                         }"
-                      >${label}</button>
+                      >${escapeHtml(cat)} · ${count}</button>
                     `;
                   })
                   .join('')}
@@ -1442,7 +1755,19 @@ export class SilaBillingApp {
             <div class="flex-1 overflow-y-auto p-3">
               ${
                 visibleProducts.length === 0
-                  ? `<div class="h-40 flex items-center justify-center text-xs text-slate-500">Nenhum artigo encontrado.</div>`
+                  ? `<div class="h-40 flex flex-col items-center justify-center gap-2 text-xs text-slate-500">
+                      <span>Nenhum artigo encontrado para o filtro atual.</span>
+                      ${
+                        this.posSearch || this.posCategoryFilter !== 'ALL' || this.posTaxFilter !== 'ALL'
+                          ? `<button
+                              type="button"
+                              data-action="pos-category"
+                              data-value="ALL"
+                              class="text-blue-600 hover:underline font-medium"
+                            >Mostrar todas as categorias</button>`
+                          : ''
+                      }
+                    </div>`
                   : `<div class="grid grid-cols-2 sm:grid-cols-3 lg:grid-cols-2 xl:grid-cols-3 gap-2">
                       ${visibleProducts
                         .map((prod) => {
@@ -1452,13 +1777,13 @@ export class SilaBillingApp {
                               type="button"
                               data-action="add-to-cart"
                               data-id="${escapeHtml(prod.id)}"
-                              class="text-left p-3 rounded-lg border transition-colors min-h-[84px] flex flex-col justify-between bg-white hover:border-blue-600 active:bg-slate-50 ${
+                              class="text-left p-2.5 rounded-lg border transition-colors min-h-[88px] flex flex-col justify-between bg-white hover:border-blue-600 active:bg-slate-50 ${
                                 inCart ? 'border-blue-600 ring-1 ring-blue-600/20' : 'border-slate-200'
                               }"
                             >
-                              <div class="flex items-start justify-between gap-1.5 w-full">
-                                <span class="text-[10px] font-mono text-slate-400 truncate">${escapeHtml(prod.code)}</span>
-                                <span class="text-[10px] text-slate-500 tabular-nums shrink-0">${prod.ivaRate}%</span>
+                              <div class="flex items-center justify-between gap-1.5 w-full text-[10px] text-slate-400">
+                                <span class="font-mono truncate">${escapeHtml(prod.code)} · ${escapeHtml(prod.category || 'Geral')}</span>
+                                <span class="tabular-nums shrink-0 text-slate-500">${prod.ivaRate === 14 ? '14%' : 'Isento'}</span>
                               </div>
                               <div class="text-xs font-semibold text-slate-900 line-clamp-2 leading-snug my-1">${escapeHtml(prod.name)}</div>
                               <div class="flex items-center justify-between gap-1 w-full pt-1 border-t border-slate-100">
@@ -1478,47 +1803,187 @@ export class SilaBillingApp {
             </div>
           </section>
 
-          <!-- COLUNA 2: Operação de Caixa -->
+          <!-- COLUNA 2: Área de Faturação (Cliente, Artigos Adicionados, Edição Direta & Totais) -->
           <section class="lg:col-span-4 flex flex-col border-r border-slate-200 bg-white overflow-hidden ${
             this.mobilePane === 'CART' ? 'flex' : 'hidden lg:flex'
           }">
+            <!-- Barra de Seleção Rápida e Cadastro Rápido de Cliente -->
             <div class="p-3 border-b border-slate-200 space-y-2 shrink-0">
-              <div class="flex items-center gap-2">
-                <select
-                  aria-label="Selecionar Cliente"
-                  data-field="pos-customer"
-                  class="flex-1 h-10 px-2.5 text-xs font-medium bg-slate-50 border border-slate-200 rounded-lg focus:outline-none focus:border-blue-600 truncate"
+              <div class="flex items-center gap-1.5">
+                <div class="flex-1 min-w-0 flex items-center bg-slate-50 border border-slate-200 rounded-lg h-10 focus-within:border-blue-600">
+                  <button
+                    type="button"
+                    data-action="toggle-customer-picker"
+                    title="Pesquisar e selecionar cliente rapidamente"
+                    class="flex-1 h-full px-2.5 text-left flex items-center justify-between gap-2 min-w-0"
+                  >
+                    <div class="min-w-0">
+                      <div class="text-xs font-semibold text-slate-900 truncate">${escapeHtml(selectedCustomer.name)}</div>
+                      <div class="text-[10px] text-slate-500 font-mono truncate tabular-nums">
+                        ${escapeHtml(selectedCustomer.nif || 'Consumidor Final')} · ${escapeHtml(selectedCustomer.locality || 'Saurimo')}
+                      </div>
+                    </div>
+                    <span class="text-slate-400 shrink-0">${this.showCustomerPicker ? ICONS.chevronUp : ICONS.chevronDown}</span>
+                  </button>
+                  ${
+                    this.selectedCustomerId !== 'cust_direct'
+                      ? `<button
+                          type="button"
+                          data-action="select-pos-customer"
+                          data-id="cust_direct"
+                          title="Repor Cliente de Venda Directa"
+                          class="h-8 w-8 mr-1 flex items-center justify-center rounded text-slate-400 hover:text-slate-700 hover:bg-slate-200/60 shrink-0"
+                        >${ICONS.close}</button>`
+                      : ''
+                  }
+                </div>
+
+                <button
+                  type="button"
+                  data-action="toggle-quick-customer"
+                  title="Cadastro rápido de cliente sem sair da fatura"
+                  class="h-10 px-2.5 flex items-center justify-center gap-1 rounded-lg border text-xs font-medium transition-colors whitespace-nowrap shrink-0 ${
+                    this.showQuickCustomerForm
+                      ? 'bg-slate-900 text-white border-slate-900'
+                      : 'border-slate-200 text-slate-700 hover:bg-slate-50'
+                  }"
                 >
-                  ${this.customers
-                    .map(
-                      (c) => `
-                      <option value="${escapeHtml(c.id)}" ${c.id === this.selectedCustomerId ? 'selected' : ''}>
-                        ${escapeHtml(c.name)}${c.nif && c.nif !== 'Consumidor Final' ? ` · NIF ${escapeHtml(c.nif)}` : ''}
-                      </option>
-                    `
-                    )
-                    .join('')}
-                </select>
+                  ${ICONS.userPlus}
+                  <span class="hidden xl:inline">Novo</span>
+                </button>
 
                 <button
                   type="button"
                   data-action="toggle-pos-options"
-                  title="Opções do documento"
-                  class="h-10 w-10 flex items-center justify-center rounded-lg border border-slate-200 text-slate-600 hover:bg-slate-50 shrink-0"
+                  title="Opções do documento (Tipo, Caixa, Operador, Notas)"
+                  class="h-10 w-10 flex items-center justify-center rounded-lg border transition-colors shrink-0 ${
+                    this.showOptionsDrawer
+                      ? 'bg-slate-100 border-slate-300 text-slate-900'
+                      : 'border-slate-200 text-slate-600 hover:bg-slate-50'
+                  }"
                 >
-                  ${this.showOptionsDrawer ? ICONS.chevronUp : ICONS.chevronDown}
-                </button>
-
-                <button
-                  type="button"
-                  data-action="clear-pos"
-                  title="Limpar caixa"
-                  ${this.cart.length === 0 && !this.lastEmitted ? 'disabled' : ''}
-                  class="h-10 w-10 flex items-center justify-center rounded-lg border border-slate-200 text-slate-600 hover:text-red-600 hover:bg-red-50 disabled:opacity-40 shrink-0"
-                >
-                  ${ICONS.reset}
+                  ${ICONS.settings}
                 </button>
               </div>
+
+              <!-- Painel de Seleção Rápida de Cliente com Pesquisa Instantânea -->
+              ${
+                this.showCustomerPicker
+                  ? `
+                  <div class="border border-slate-200 rounded-lg bg-slate-50 p-2 space-y-1.5">
+                    <div class="relative">
+                      <span class="text-slate-400 absolute left-2.5 top-1/2 -translate-y-1/2 pointer-events-none">${ICONS.search}</span>
+                      <input
+                        id="pos-customer-search-input"
+                        type="text"
+                        autocomplete="off"
+                        data-field="pos-customer-search"
+                        value="${escapeHtml(this.posCustomerSearch)}"
+                        placeholder="Filtrar cliente por nome ou NIF..."
+                        class="w-full h-8 pl-8 pr-2.5 text-xs bg-white border border-slate-200 rounded-md focus:outline-none focus:border-blue-600"
+                      />
+                    </div>
+                    <div class="max-h-40 overflow-y-auto divide-y divide-slate-100 bg-white border border-slate-200 rounded-md">
+                      ${
+                        matchingCustomers.length === 0
+                          ? `<div class="p-2.5 text-[11px] text-slate-500 flex items-center justify-between gap-2">
+                              <span>Nenhum cliente encontrado.</span>
+                              <button
+                                type="button"
+                                data-action="toggle-quick-customer"
+                                class="text-blue-600 font-semibold hover:underline whitespace-nowrap"
+                              >+ Cadastrar agora</button>
+                            </div>`
+                          : matchingCustomers
+                              .map((c) => {
+                                const isSel = c.id === this.selectedCustomerId;
+                                return `
+                                  <button
+                                    type="button"
+                                    data-action="select-pos-customer"
+                                    data-id="${escapeHtml(c.id)}"
+                                    class="w-full px-2.5 py-2 text-left flex items-center justify-between gap-2 text-xs transition-colors ${
+                                      isSel ? 'bg-blue-50/80 text-blue-900 font-semibold' : 'hover:bg-slate-50 text-slate-800'
+                                    }"
+                                  >
+                                    <span class="truncate">${escapeHtml(c.name)}</span>
+                                    <span class="text-[10px] font-mono text-slate-500 shrink-0 tabular-nums">${escapeHtml(c.nif || 'Consumidor Final')}</span>
+                                  </button>
+                                `;
+                              })
+                              .join('')
+                      }
+                    </div>
+                  </div>
+                `
+                  : ''
+              }
+
+              <!-- Cadastro Rápido de Cliente Sem Sair da Fatura -->
+              ${
+                this.showQuickCustomerForm
+                  ? `
+                  <form
+                    data-form="pos-quick-customer-form"
+                    class="border border-slate-200 rounded-lg bg-slate-50 p-2.5 space-y-2"
+                  >
+                    <div class="flex items-center justify-between">
+                      <span class="text-[11px] font-semibold text-slate-800">Novo cliente na fatura</span>
+                      <button
+                        type="button"
+                        data-action="toggle-quick-customer"
+                        class="h-6 w-6 flex items-center justify-center rounded text-slate-400 hover:text-slate-700"
+                      >${ICONS.close}</button>
+                    </div>
+                    <div class="grid grid-cols-2 gap-1.5">
+                      <div class="col-span-2">
+                        <input
+                          id="quick-customer-name-input"
+                          name="name"
+                          type="text"
+                          required
+                          maxlength="160"
+                          placeholder="Nome completo ou empresa *"
+                          class="w-full h-8 px-2.5 text-xs bg-white border border-slate-200 rounded-md focus:outline-none focus:border-blue-600"
+                        />
+                      </div>
+                      <div>
+                        <input
+                          name="nif"
+                          type="text"
+                          maxlength="32"
+                          placeholder="NIF (ou Consumidor Final)"
+                          class="w-full h-8 px-2.5 text-xs font-mono bg-white border border-slate-200 rounded-md focus:outline-none focus:border-blue-600"
+                        />
+                      </div>
+                      <div>
+                        <input
+                          name="phone"
+                          type="text"
+                          maxlength="40"
+                          placeholder="Telefone (+244...)"
+                          class="w-full h-8 px-2.5 text-xs font-mono bg-white border border-slate-200 rounded-md focus:outline-none focus:border-blue-600"
+                        />
+                      </div>
+                      <div class="col-span-2 flex items-center gap-1.5">
+                        <input
+                          name="locality"
+                          type="text"
+                          maxlength="160"
+                          value="Saurimo - Angola"
+                          placeholder="Localidade"
+                          class="flex-1 h-8 px-2.5 text-xs bg-white border border-slate-200 rounded-md focus:outline-none focus:border-blue-600"
+                        />
+                        <button
+                          type="submit"
+                          class="h-8 px-3 rounded-md bg-blue-600 text-white text-xs font-semibold hover:bg-blue-700 whitespace-nowrap shrink-0"
+                        >Guardar e usar</button>
+                      </div>
+                    </div>
+                  </form>
+                `
+                  : ''
+              }
 
               ${
                 this.showOptionsDrawer
@@ -1528,7 +1993,7 @@ export class SilaBillingApp {
                       <label class="block text-[10px] text-slate-500 mb-0.5">Documento</label>
                       <select
                         data-field="pos-doctype"
-                        class="w-full h-9 px-2 bg-slate-50 border border-slate-200 rounded-md text-xs"
+                        class="w-full h-8 px-2 bg-slate-50 border border-slate-200 rounded-md text-xs"
                       >
                         <option value="FR" ${this.docType === 'FR' ? 'selected' : ''}>Factura/Recibo</option>
                         <option value="FP" ${this.docType === 'FP' ? 'selected' : ''}>Proforma</option>
@@ -1541,7 +2006,7 @@ export class SilaBillingApp {
                         maxlength="8"
                         data-field="pos-cashier"
                         value="${escapeHtml(this.cashier)}"
-                        class="w-full h-9 px-2 bg-slate-50 border border-slate-200 rounded-md text-xs font-mono"
+                        class="w-full h-8 px-2 bg-slate-50 border border-slate-200 rounded-md text-xs font-mono"
                       />
                     </div>
                     <div>
@@ -1551,7 +2016,7 @@ export class SilaBillingApp {
                         maxlength="12"
                         data-field="pos-operator"
                         value="${escapeHtml(this.operator)}"
-                        class="w-full h-9 px-2 bg-slate-50 border border-slate-200 rounded-md text-xs font-mono"
+                        class="w-full h-8 px-2 bg-slate-50 border border-slate-200 rounded-md text-xs font-mono"
                       />
                     </div>
                     <div class="col-span-3">
@@ -1561,7 +2026,7 @@ export class SilaBillingApp {
                         data-field="pos-notes"
                         value="${escapeHtml(this.notes)}"
                         placeholder="Observações na fatura..."
-                        class="w-full h-9 px-2.5 bg-slate-50 border border-slate-200 rounded-md text-xs"
+                        class="w-full h-8 px-2.5 bg-slate-50 border border-slate-200 rounded-md text-xs"
                       />
                     </div>
                   </div>
@@ -1570,13 +2035,27 @@ export class SilaBillingApp {
               }
             </div>
 
-            <!-- Linhas do Carrinho -->
+            <!-- Cabeçalho compacto da lista de artigos adicionados -->
+            ${
+              this.cart.length > 0
+                ? `<div class="px-3 py-1.5 bg-slate-50 border-b border-slate-200 flex items-center justify-between text-[11px] text-slate-500 shrink-0 tabular-nums">
+                    <span>${this.cart.length} ${this.cart.length === 1 ? 'artigo' : 'artigos'} · ${cartCount} un</span>
+                    <button
+                      type="button"
+                      data-action="clear-pos"
+                      class="text-slate-500 hover:text-red-600 font-medium transition-colors"
+                    >Limpar tudo</button>
+                  </div>`
+                : ''
+            }
+
+            <!-- Lista de Artigos Adicionados com Edição Direta de Qtd, Preço e IVA 14% / Isento -->
             <div class="flex-1 overflow-y-auto divide-y divide-slate-100">
               ${
                 this.cart.length === 0
                   ? `
                   <div class="h-full flex flex-col items-center justify-center p-6 text-center">
-                    <p class="text-xs text-slate-500">Selecione artigos para iniciar a emissão.</p>
+                    <p class="text-xs text-slate-500">Adicione artigos do catálogo para iniciar a fatura.</p>
                     ${
                       this.lastEmitted
                         ? `<div class="mt-3 text-xs text-emerald-700 font-medium flex flex-col items-center gap-1">
@@ -1592,94 +2071,146 @@ export class SilaBillingApp {
                   </div>
                 `
                   : totals.lines
-                      .map(
-                        (line) => `
-                        <div class="p-2.5 hover:bg-slate-50/70 transition-colors">
+                      .map((line) => {
+                        const domKey = line.productId.replace(/[^a-zA-Z0-9_-]/g, '_');
+                        return `
+                        <div class="p-2.5 hover:bg-slate-50/60 transition-colors space-y-2">
                           <div class="flex items-start justify-between gap-2">
-                            <div class="min-w-0">
+                            <div class="min-w-0 flex-1">
                               <div class="text-xs font-semibold text-slate-900 truncate">${escapeHtml(line.description)}</div>
-                              <div class="text-[11px] text-slate-500 font-mono tabular-nums">
-                                ${formatKzNumber(line.unitPrice)} Kz · IVA ${line.ivaRate}%
+                              <div class="text-[10.5px] text-slate-400 font-mono tabular-nums">
+                                ${escapeHtml(line.code)} · ${escapeHtml(line.unit)} ${
+                                  line.ivaRate === 14
+                                    ? `· IVA ${formatKzNumber(line.lineTax)} Kz`
+                                    : '· Isento 0%'
+                                }
                               </div>
                             </div>
-                            <div class="text-right shrink-0">
-                              <div class="text-xs font-bold text-slate-900 font-mono tabular-nums">${formatKzNumber(line.lineTotal)} Kz</div>
-                              ${
-                                line.ivaRate === 14
-                                  ? `<div class="text-[10px] text-slate-400 font-mono tabular-nums">IVA ${formatKzNumber(line.lineTax)}</div>`
-                                  : ''
-                              }
+                            <div class="flex items-center gap-1.5 shrink-0">
+                              <div class="text-right">
+                                <div class="text-xs font-bold text-slate-900 font-mono tabular-nums">${formatKzNumber(line.lineTotal)} Kz</div>
+                              </div>
+                              <button
+                                type="button"
+                                data-action="remove-cart-item"
+                                data-id="${escapeHtml(line.productId)}"
+                                title="Remover artigo"
+                                class="h-7 w-7 flex items-center justify-center text-slate-400 hover:text-red-600 rounded-md hover:bg-red-50 transition-colors"
+                              >${ICONS.trash}</button>
                             </div>
                           </div>
 
-                          <div class="mt-2 flex items-center justify-between gap-2">
-                            <div class="flex items-center border border-slate-200 rounded-md bg-white">
+                          <!-- Controlos diretos: Quantidade | Preço Unit. | IVA 14% / Isento -->
+                          <div class="flex items-center justify-between gap-1.5 flex-wrap sm:flex-nowrap">
+                            <!-- Quantidade -->
+                            <div class="flex items-center border border-slate-200 rounded-md bg-white h-8 shrink-0">
                               <button
                                 type="button"
                                 data-action="qty-delta"
                                 data-id="${escapeHtml(line.productId)}"
                                 data-value="-1"
-                                class="h-8 w-8 flex items-center justify-center text-slate-600 hover:bg-slate-100"
+                                title="Diminuir quantidade"
+                                class="h-full w-7 flex items-center justify-center text-slate-600 hover:bg-slate-100 rounded-l-md"
                               >${ICONS.minus}</button>
                               <input
-                                type="number"
-                                min="0.1"
-                                step="1"
-                                data-field="cart-qty"
+                                id="cart-qty-${domKey}"
+                                type="text"
+                                inputmode="decimal"
+                                aria-label="Quantidade"
+                                data-field="cart-qty-live"
                                 data-id="${escapeHtml(line.productId)}"
                                 value="${line.qty}"
-                                class="w-11 h-8 text-center text-xs font-mono font-semibold tabular-nums focus:outline-none"
+                                class="w-10 h-full text-center text-xs font-mono font-semibold tabular-nums focus:outline-none focus:bg-blue-50/40"
                               />
                               <button
                                 type="button"
                                 data-action="qty-delta"
                                 data-id="${escapeHtml(line.productId)}"
                                 data-value="1"
-                                class="h-8 w-8 flex items-center justify-center text-slate-600 hover:bg-slate-100"
+                                title="Aumentar quantidade"
+                                class="h-full w-7 flex items-center justify-center text-slate-600 hover:bg-slate-100 rounded-r-md"
                               >${ICONS.plus}</button>
                             </div>
 
-                            <div class="flex items-center gap-1 text-[11px] text-slate-500">
-                              <span>Desc%</span>
+                            <!-- Edição direta de Preço Unitário (Kz) -->
+                            <div class="flex items-center gap-1 flex-1 min-w-[108px] h-8 px-2 border border-slate-200 rounded-md bg-white focus-within:border-blue-600">
+                              <span class="text-[10px] text-slate-400 shrink-0">Preço</span>
                               <input
-                                type="number"
-                                min="0"
-                                max="100"
-                                data-field="cart-discount"
+                                id="cart-price-${domKey}"
+                                type="text"
+                                inputmode="decimal"
+                                aria-label="Preço unitário em Kwanzas"
+                                data-field="cart-price-live"
                                 data-id="${escapeHtml(line.productId)}"
-                                value="${line.discountPct || ''}"
-                                placeholder="0"
-                                class="w-12 h-8 px-1.5 text-right font-mono text-xs border border-slate-200 rounded-md focus:outline-none focus:border-blue-600"
+                                value="${line.unitPrice}"
+                                class="w-full h-full text-right text-xs font-mono font-semibold text-slate-900 tabular-nums focus:outline-none bg-transparent"
                               />
                             </div>
 
-                            <button
-                              type="button"
-                              data-action="remove-cart-item"
-                              data-id="${escapeHtml(line.productId)}"
-                              class="h-8 w-8 flex items-center justify-center text-slate-400 hover:text-red-600 rounded-md hover:bg-red-50"
-                            >${ICONS.trash}</button>
+                            <!-- Seletor compacto de IVA 14% ou Isenção por artigo -->
+                            <div class="flex items-center bg-slate-100 p-0.5 rounded-md h-8 shrink-0">
+                              <button
+                                type="button"
+                                data-action="set-cart-iva"
+                                data-id="${escapeHtml(line.productId)}"
+                                data-value="14"
+                                title="Aplicar IVA de 14% neste artigo"
+                                class="h-7 px-2 rounded text-[10.5px] font-medium transition-colors whitespace-nowrap tabular-nums ${
+                                  line.ivaRate === 14
+                                    ? 'bg-white text-slate-900 shadow-xs font-semibold'
+                                    : 'text-slate-500 hover:text-slate-900'
+                                }"
+                              >14%</button>
+                              <button
+                                type="button"
+                                data-action="set-cart-iva"
+                                data-id="${escapeHtml(line.productId)}"
+                                data-value="0"
+                                title="Isentar este artigo de IVA (0%)"
+                                class="h-7 px-2 rounded text-[10.5px] font-medium transition-colors whitespace-nowrap ${
+                                  line.ivaRate === 0
+                                    ? 'bg-white text-slate-900 shadow-xs font-semibold'
+                                    : 'text-slate-500 hover:text-slate-900'
+                                }"
+                              >Isento</button>
+                            </div>
                           </div>
                         </div>
-                      `
-                      )
+                      `;
+                      })
                       .join('')
               }
             </div>
 
-            <!-- Rodapé Caixa: Impostos, Troco e Botões Emitir -->
+            <!-- Rodapé Faturação: Subtotal, Impostos (IVA 14% / Isento) e Total Automático -->
             <div class="border-t border-slate-200 bg-slate-50 p-3 space-y-2.5 shrink-0">
               <div class="space-y-1 text-xs tabular-nums">
                 <div class="flex justify-between text-slate-600">
-                  <span>Mercadorias</span>
+                  <span>Subtotal</span>
                   <span class="font-mono">${formatKzNumber(totals.merchandiseTotal)} Kz</span>
                 </div>
+                ${
+                  totals.discountTotal > 0
+                    ? `<div class="flex justify-between text-slate-500 text-[11px]">
+                        <span>Desconto comercial</span>
+                        <span class="font-mono">-${formatKzNumber(totals.discountTotal)} Kz</span>
+                      </div>`
+                    : ''
+                }
                 <div class="flex justify-between text-slate-600">
-                  <span>IVA (14%)</span>
+                  <span>Impostos (IVA 14%)</span>
                   <span class="font-mono">${formatKzNumber(totals.taxTotal)} Kz</span>
                 </div>
-                <div class="flex justify-between items-baseline pt-1 border-t border-slate-200">
-                  <span class="font-bold text-slate-900">TOTAL</span>
+                ${
+                  totals.taxBase0 > 0
+                    ? `<div class="flex justify-between text-[10.5px] text-slate-400">
+                        <span>Incidência isenta (0%)</span>
+                        <span class="font-mono">${formatKzNumber(totals.taxBase0)} Kz</span>
+                      </div>`
+                    : ''
+                }
+                <div class="flex justify-between items-baseline pt-1.5 border-t border-slate-200">
+                  <span class="font-bold text-slate-900">Total a pagar</span>
                   <span class="text-lg font-bold text-slate-900 font-mono">${formatKzNumber(totals.grandTotal)} Kz</span>
                 </div>
               </div>
@@ -1710,9 +2241,8 @@ export class SilaBillingApp {
                         <label class="block text-[10px] text-slate-500 mb-0.5">Valor recebido (Kz)</label>
                         <input
                           id="amount-received-input"
-                          type="number"
-                          min="0"
-                          step="50"
+                          type="text"
+                          inputmode="decimal"
                           data-field="amount-received"
                           value="${escapeHtml(this.amountReceivedInput)}"
                           placeholder="${formatKzNumber(totals.grandTotal)}"
@@ -1984,8 +2514,19 @@ export class SilaBillingApp {
   private renderProductsWorkspace(): string {
     const q = this.productSearch.trim().toLowerCase();
     const filtered = this.products.filter(
-      (p) => !q || p.name.toLowerCase().includes(q) || p.code.toLowerCase().includes(q)
+      (p) =>
+        !q ||
+        p.name.toLowerCase().includes(q) ||
+        p.code.toLowerCase().includes(q) ||
+        (p.category || '').toLowerCase().includes(q)
     );
+
+    const allCategories = Array.from(
+      new Set([
+        ...DEFAULT_PRODUCT_CATEGORIES,
+        ...this.products.map((p) => (p.category || '').trim()).filter(Boolean),
+      ])
+    ).sort((a, b) => a.localeCompare(b, 'pt'));
 
     return `
       <div class="h-full flex flex-col bg-white overflow-hidden">
@@ -1997,7 +2538,7 @@ export class SilaBillingApp {
               type="text"
               data-field="product-search"
               value="${escapeHtml(this.productSearch)}"
-              placeholder="Filtrar artigos por código ou descrição..."
+              placeholder="Filtrar artigos por código, descrição ou categoria..."
               class="w-full h-10 pl-9 pr-3 text-xs bg-slate-50 border border-slate-200 rounded-lg focus:outline-none focus:border-blue-600"
             />
           </div>
@@ -2029,7 +2570,7 @@ export class SilaBillingApp {
                   class="w-full h-9 px-2.5 text-xs font-mono bg-white border border-slate-200 rounded-md focus:outline-none focus:border-blue-600"
                 />
               </div>
-              <div class="col-span-2 sm:col-span-4">
+              <div class="col-span-2 sm:col-span-3">
                 <label class="block text-[10px] font-medium text-slate-600 mb-1">Descrição</label>
                 <input
                   name="name"
@@ -2040,6 +2581,21 @@ export class SilaBillingApp {
                   placeholder="Ex: Água Mineral 1,5L"
                   class="w-full h-9 px-2.5 text-xs bg-white border border-slate-200 rounded-md focus:outline-none focus:border-blue-600"
                 />
+              </div>
+              <div class="col-span-1 sm:col-span-2">
+                <label class="block text-[10px] font-medium text-slate-600 mb-1">Categoria</label>
+                <input
+                  name="category"
+                  type="text"
+                  list="product-categories-datalist"
+                  maxlength="48"
+                  value="${escapeHtml(this.editingProduct.category || 'Mercearia')}"
+                  placeholder="Ex: Bebidas"
+                  class="w-full h-9 px-2.5 text-xs bg-white border border-slate-200 rounded-md focus:outline-none focus:border-blue-600"
+                />
+                <datalist id="product-categories-datalist">
+                  ${allCategories.map((cat) => `<option value="${escapeHtml(cat)}"></option>`).join('')}
+                </datalist>
               </div>
               <div class="col-span-1 sm:col-span-2">
                 <label class="block text-[10px] font-medium text-slate-600 mb-1">Preço Unit. (Kz)</label>
@@ -2073,10 +2629,10 @@ export class SilaBillingApp {
                   <option value="0" ${this.editingProduct.ivaRate === 0 ? 'selected' : ''}>Isento</option>
                 </select>
               </div>
-              <div class="col-span-2 sm:col-span-2 flex items-center gap-1.5">
+              <div class="col-span-2 sm:col-span-1 flex items-center gap-1.5">
                 <button
                   type="submit"
-                  class="flex-1 h-9 px-3 rounded-md bg-blue-600 text-white text-xs font-semibold hover:bg-blue-700 whitespace-nowrap"
+                  class="flex-1 h-9 px-2.5 rounded-md bg-blue-600 text-white text-xs font-semibold hover:bg-blue-700 whitespace-nowrap"
                 >Guardar</button>
                 <button
                   type="button"
@@ -2095,6 +2651,7 @@ export class SilaBillingApp {
               <tr>
                 <th class="py-2.5 px-3 font-medium">Código</th>
                 <th class="py-2.5 px-3 font-medium">Descrição</th>
+                <th class="py-2.5 px-3 font-medium hidden sm:table-cell">Categoria</th>
                 <th class="py-2.5 px-3 font-medium">Unid.</th>
                 <th class="py-2.5 px-3 font-medium text-right">IVA</th>
                 <th class="py-2.5 px-3 font-medium text-right">Preço Unit.</th>
@@ -2108,6 +2665,7 @@ export class SilaBillingApp {
                   <tr class="hover:bg-slate-50/80">
                     <td class="py-2.5 px-3 font-mono text-slate-600">${escapeHtml(p.code)}</td>
                     <td class="py-2.5 px-3 font-medium text-slate-900">${escapeHtml(p.name)}</td>
+                    <td class="py-2.5 px-3 text-slate-500 hidden sm:table-cell">${escapeHtml(p.category || 'Geral')}</td>
                     <td class="py-2.5 px-3 text-slate-500">${escapeHtml(p.unit)}</td>
                     <td class="py-2.5 px-3 text-right font-mono tabular-nums text-slate-600">${p.ivaRate}%</td>
                     <td class="py-2.5 px-3 text-right font-mono font-semibold tabular-nums text-slate-900">${formatKzNumber(p.price)} Kz</td>

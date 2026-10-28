@@ -118,13 +118,37 @@ export async function bootstrapLocalStore(): Promise<{
     await putInStore('meta', { key: 'seeded', value: true });
   }
 
-  const [products, customers, invoices, settingsMeta, draftMeta] = await Promise.all([
+  const [rawProducts, customers, invoices, settingsMeta, draftMeta] = await Promise.all([
     getAllFromStore<Product>('products'),
     getAllFromStore<Customer>('customers'),
     getAllFromStore<InvoiceRecord>('invoices'),
     getFromStore<{ key: string; value: AppSettings }>('meta', 'app_settings'),
     getFromStore<{ key: string; value: PosWorkspaceDraft }>('meta', 'pos_draft'),
   ]);
+
+  const products: Product[] = [];
+  for (const p of rawProducts) {
+    if (p.category && p.category.trim()) {
+      products.push(p);
+    } else {
+      const seedMatch = INITIAL_PRODUCTS.find((sp) => sp.id === p.id || sp.code === p.code);
+      const lower = p.name.toLowerCase();
+      const inferred =
+        seedMatch?.category ||
+        (/água|agua|sumo|refrigerante|bebida|cerveja|vinho/.test(lower)
+          ? 'Bebidas'
+          : /pão|pao|bolo|pastel|padaria/.test(lower)
+            ? 'Padaria'
+            : /café|cafe|chá|cha/.test(lower)
+              ? 'Cafetaria'
+              : /serviço|servico|entrega|transporte|taxa/.test(lower)
+                ? 'Serviços'
+                : 'Mercearia');
+      const upgraded: Product = { ...p, category: inferred };
+      await putInStore('products', upgraded);
+      products.push(upgraded);
+    }
+  }
 
   products.sort((a, b) => a.code.localeCompare(b.code));
   customers.sort((a, b) =>
