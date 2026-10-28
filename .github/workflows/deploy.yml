@@ -97,6 +97,87 @@ jobs:
         run: |
           npx --yes firebase-tools@15.34.0 hosting:sites:create silabilling --project gen-lang-client-0982515821 --non-interactive || echo "Site já provisionado ou existente."
 
+      - name: Autorizar Dominio silabilling.web.app no Firebase Authentication
+        shell: bash
+        run: |
+          node -e '
+          const fs = require("node:fs");
+          const crypto = require("node:crypto");
+
+          (async () => {
+            try {
+              const credPath = process.env.GOOGLE_APPLICATION_CREDENTIALS;
+              const sa = JSON.parse(fs.readFileSync(credPath, "utf-8"));
+              const projectId = sa.project_id || "gen-lang-client-0982515821";
+              const b64url = (v) => Buffer.from(v).toString("base64").replace(/\+/g, "-").replace(/\//g, "_").replace(/=+$/g, "");
+              const now = Math.floor(Date.now() / 1000);
+              const unsigned = `${b64url(JSON.stringify({ alg: "RS256", typ: "JWT" }))}.${b64url(JSON.stringify({
+                iss: sa.client_email,
+                sub: sa.client_email,
+                aud: "https://oauth2.googleapis.com/token",
+                iat: now,
+                exp: now + 3300,
+                scope: "https://www.googleapis.com/auth/cloud-platform https://www.googleapis.com/auth/firebase"
+              }))}`;
+              const signer = crypto.createSign("RSA-SHA256");
+              signer.update(unsigned);
+              signer.end();
+              const assertion = `${unsigned}.${b64url(signer.sign(sa.private_key))}`;
+
+              const tokRes = await fetch("https://oauth2.googleapis.com/token", {
+                method: "POST",
+                headers: { "Content-Type": "application/x-www-form-urlencoded" },
+                body: new URLSearchParams({
+                  grant_type: "urn:ietf:params:oauth:grant-type:jwt-bearer",
+                  assertion
+                }).toString()
+              });
+              const tokJson = await tokRes.json();
+              if (!tokJson.access_token) {
+                console.warn("::warning::Nao foi possivel obter access_token para Identity Toolkit.");
+                return;
+              }
+
+              const endpoint = `https://identitytoolkit.googleapis.com/admin/v2/projects/${projectId}/config`;
+              const headers = {
+                Authorization: `Bearer ${tokJson.access_token}`,
+                "X-Goog-User-Project": projectId,
+                "Content-Type": "application/json"
+              };
+
+              const getRes = await fetch(endpoint, { method: "GET", headers });
+              if (!getRes.ok) {
+                console.warn(`::warning::Identity Toolkit GET retornou ${getRes.status}. Verifique permissao Firebase Auth Admin da Service Account.`);
+                return;
+              }
+
+              const cfg = await getRes.json();
+              if (!Array.isArray(cfg.authorizedDomains) || cfg.authorizedDomains.length === 0) return;
+
+              const required = ["silabilling.web.app", "silabilling.firebaseapp.com"];
+              const missing = required.filter((d) => !cfg.authorizedDomains.includes(d));
+              if (missing.length === 0) {
+                console.log("Dominios OAuth silabilling.web.app ja autorizados no Firebase Auth.");
+                return;
+              }
+
+              const merged = Array.from(new Set([...cfg.authorizedDomains, ...missing]));
+              const patchRes = await fetch(`${endpoint}?updateMask=authorizedDomains`, {
+                method: "PATCH",
+                headers,
+                body: JSON.stringify({ authorizedDomains: merged })
+              });
+              if (patchRes.ok) {
+                console.log(`Dominios OAuth adicionados automaticamente no Firebase Auth: ${missing.join(", ")}`);
+              } else {
+                console.warn(`::warning::Identity Toolkit PATCH retornou ${patchRes.status}. Adicione silabilling.web.app manualmente em Authentication -> Settings -> Authorized domains.`);
+              }
+            } catch (err) {
+              console.warn(`::warning::Aviso ao verificar authorizedDomains: ${err.message}`);
+            }
+          })();
+          '
+
       - name: Deploy para o Firebase Hosting e Regras do Firestore
         run: |
           npx --yes firebase-tools@15.34.0 deploy --only hosting:silabilling,firestore:rules --project gen-lang-client-0982515821 --non-interactive

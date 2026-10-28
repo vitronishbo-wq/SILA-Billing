@@ -113,6 +113,32 @@ export async function fetchBackendHealth(): Promise<BackendHealthStatus | null> 
   }
 }
 
+export async function requestEnsureAuthDomains(): Promise<{
+  ok: boolean;
+  added: string[];
+  alreadyPresent: boolean;
+}> {
+  try {
+    const res = await fetch(`${API_BASE}/api/health/ensure-auth-domains`, {
+      method: 'POST',
+      headers: { Accept: 'application/json' },
+    });
+    if (!res.ok) return { ok: false, added: [], alreadyPresent: false };
+    const data = (await res.json()) as {
+      ok?: boolean;
+      added?: string[];
+      alreadyPresent?: boolean;
+    };
+    return {
+      ok: Boolean(data.ok),
+      added: Array.isArray(data.added) ? data.added : [],
+      alreadyPresent: Boolean(data.alreadyPresent),
+    };
+  } catch {
+    return { ok: false, added: [], alreadyPresent: false };
+  }
+}
+
 export async function submitInvoiceAudit(
   invoice: InvoiceRecord,
   companyId = JAIMONA_COMPANY_ID

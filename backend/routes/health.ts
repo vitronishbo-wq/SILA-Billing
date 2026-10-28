@@ -1,5 +1,5 @@
 import { Router } from 'express';
-import { getFirebaseAdminContext } from '../firebaseAdmin.ts';
+import { ensureFirebaseAuthorizedDomains, getFirebaseAdminContext } from '../firebaseAdmin.ts';
 
 export const healthRouter = Router();
 
@@ -35,4 +35,9 @@ healthRouter.get('/', async (_req, res) => {
     message: firestoreMessage,
     timestamp: new Date().toISOString(),
   });
+});
+
+healthRouter.post('/ensure-auth-domains', async (_req, res) => {
+  const result = await ensureFirebaseAuthorizedDomains();
+  res.status(result.ok ? 200 : 202).json(result);
 });

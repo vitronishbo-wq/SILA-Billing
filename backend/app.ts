@@ -1,5 +1,6 @@
 import cors from 'cors';
 import express, { type Express } from 'express';
+import { ensureFirebaseAuthorizedDomains, getFirebaseAdminContext } from './firebaseAdmin.ts';
 import { adminRouter } from './routes/admin.ts';
 import { auditRouter } from './routes/audit.ts';
 import { backupRouter } from './routes/backup.ts';
@@ -8,6 +9,11 @@ import { healthRouter } from './routes/health.ts';
 
 export function createApiApp(): Express {
   const app = express();
+
+  const ctx = getFirebaseAdminContext();
+  if (ctx.hasExplicitCredentials) {
+    void ensureFirebaseAuthorizedDomains();
+  }
 
   const allowedOrigins = (process.env.CORS_ORIGINS || '')
     .split(',')

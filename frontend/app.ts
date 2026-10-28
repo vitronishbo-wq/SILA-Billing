@@ -43,6 +43,8 @@ import {
 } from '../src/services/cloudSync';
 import {
   auth,
+  formatFirebaseAuthErrorPt,
+  isUnauthorizedDomainError,
   signInWithGoogle,
   signOutFirebase,
   validateFirestoreConnection,
@@ -65,6 +67,7 @@ import {
   fetchPlatformAdminOverview,
   logPlatformSupportAccess,
   registerCompanyBackend,
+  requestEnsureAuthDomains,
   submitInvoiceAudit,
   updatePlatformCompanyAdmin,
 } from './services/backendApi';
@@ -170,6 +173,7 @@ export class SilaBillingApp {
   private memberFormError: string | null = null;
 
   private showMasterAdminModal = false;
+  private isAuthenticatingAdmin = false;
   private masterAdminLoading = false;
   private masterAdminDenied = false;
   private masterAdminError: string | null = null;
@@ -722,13 +726,27 @@ export class SilaBillingApp {
         break;
       }
       case 'master-admin-signin': {
-        if (!this.isOnline) return;
+        if (!this.isOnline) {
+          this.masterAdminError =
+            'Terminal offline. Ligue à internet para autenticar o Administrador Google.';
+          this.render();
+          return;
+        }
+        if (this.isAuthenticatingAdmin) return;
+        this.isAuthenticatingAdmin = true;
+        this.masterAdminError = null;
         try {
           await signInWithGoogle();
+          this.isAuthenticatingAdmin = false;
           await this.refreshMasterAdminData();
         } catch (err) {
-          this.masterAdminError =
-            err instanceof Error ? err.message : 'Autenticação cancelada.';
+          this.isAuthenticatingAdmin = false;
+          let autoAuthorized = false;
+          if (isUnauthorizedDomainError(err)) {
+            const healRes = await requestEnsureAuthDomains();
+            autoAuthorized = healRes.ok && (healRes.added.length > 0 || healRes.alreadyPresent);
+          }
+          this.masterAdminError = formatFirebaseAuthErrorPt(err, autoAuthorized);
           this.render();
         }
         break;
@@ -1124,10 +1142,15 @@ export class SilaBillingApp {
       case 'signin-google': {
         if (!this.isOnline) return;
         try {
+          this.syncMessage = null;
           await signInWithGoogle();
         } catch (err) {
-          this.syncMessage =
-            err instanceof Error ? err.message : 'Autenticação cancelada.';
+          let autoAuthorized = false;
+          if (isUnauthorizedDomainError(err)) {
+            const healRes = await requestEnsureAuthDomains();
+            autoAuthorized = healRes.ok && (healRes.added.length > 0 || healRes.alreadyPresent);
+          }
+          this.syncMessage = formatFirebaseAuthErrorPt(err, autoAuthorized);
           this.render();
         }
         break;
@@ -1158,11 +1181,12 @@ export class SilaBillingApp {
       }
       case 'install-pwa': {
         if (this.deferredPrompt) {
-          await this.deferredPrompt.prompt();
-          const choice = await this.deferredPrompt.userChoice;
+          const promptEvent = this.deferredPrompt;
+          this.deferredPrompt = null;
+          await promptEvent.prompt();
+          const choice = await promptEvent.userChoice;
           if (choice.outcome === 'accepted') {
             this.isInstalled = true;
-            this.deferredPrompt = null;
           }
           this.render();
         } else if (this.isIOS) {
@@ -2292,6 +2316,7 @@ export class SilaBillingApp {
           this.showMasterAdminModal
             ? renderMasterAdminModal({
                 isSignedIn: Boolean(this.user),
+                isAuthenticating: this.isAuthenticatingAdmin,
                 userEmail: this.user?.email || '',
                 isLoading: this.masterAdminLoading,
                 accessDenied: this.masterAdminDenied,

@@ -299,6 +299,7 @@ export function renderCancelInvoiceModal(params: {
 
 export function renderMasterAdminModal(params: {
   isSignedIn: boolean;
+  isAuthenticating?: boolean;
   userEmail: string;
   isLoading: boolean;
   accessDenied: boolean;
@@ -310,6 +311,7 @@ export function renderMasterAdminModal(params: {
 }): string {
   const {
     isSignedIn,
+    isAuthenticating = false,
     userEmail,
     isLoading,
     accessDenied,
@@ -360,16 +362,22 @@ export function renderMasterAdminModal(params: {
           ${
             !isSignedIn
               ? `
-              <div class="py-12 max-w-sm mx-auto text-center space-y-4">
+              <div class="py-10 max-w-md mx-auto text-center space-y-4">
                 <div class="text-sm font-bold text-slate-900">Autenticação Administrativa Verificada</div>
                 <p class="text-xs text-slate-600 leading-relaxed">
                   O Painel Master utiliza autenticação real com validação no servidor e nas regras do Firestore, sem chaves fixas expostas no navegador.
                 </p>
+                ${
+                  errorMessage
+                    ? `<div class="p-3 rounded-lg border border-amber-300 bg-amber-50 text-left text-xs text-amber-900 leading-relaxed">${escapeHtml(errorMessage)}</div>`
+                    : ''
+                }
                 <button
                   type="button"
                   data-action="master-admin-signin"
-                  class="h-10 px-5 rounded-lg bg-slate-900 text-white text-xs font-semibold hover:bg-slate-800 whitespace-nowrap"
-                >Autenticar Administrador Google</button>
+                  ${isAuthenticating ? 'disabled' : ''}
+                  class="h-10 px-5 rounded-lg bg-slate-900 text-white text-xs font-semibold hover:bg-slate-800 disabled:opacity-50 whitespace-nowrap"
+                >${isAuthenticating ? 'A abrir autenticação Google...' : 'Autenticar Administrador Google'}</button>
               </div>
             `
               : isLoading
