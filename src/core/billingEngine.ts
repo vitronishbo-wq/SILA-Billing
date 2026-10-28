@@ -1,5 +1,5 @@
-import { kwanzaToWords } from './extenso';
-import { CalculatedLineItem, CartDraftItem, InvoiceTotals } from './types';
+import { kwanzaToWords } from './extenso.ts';
+import type { CalculatedLineItem, CartDraftItem, InvoiceTotals } from './types.ts';
 
 export function roundKz(val: number): number {
   return Math.round((val + Number.EPSILON) * 100) / 100;

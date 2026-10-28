@@ -143,6 +143,28 @@
         "phone", "email", "tagline", "defaultCashier", "defaultOperator",
         "defaultFormat", "defaultDocType", "defaultNotes", "autoPrintOnEmit", "updatedAt"
       ]
+    },
+    "AuditLog": {
+      "title": "AuditLog",
+      "description": "Registo de auditoria criptográfica SHA-256 gerado exclusivamente pelo backend administrativo.",
+      "type": "object",
+      "properties": {
+        "invoiceId": { "type": "string", "maxLength": 128, "pattern": "^[a-zA-Z0-9_\\-]+$" },
+        "invoiceNumber": { "type": "string", "maxLength": 40 },
+        "ownerId": { "type": "string", "maxLength": 128, "pattern": "^[a-zA-Z0-9_\\-]+$" },
+        "ownerEmail": { "type": "string", "maxLength": 120 },
+        "grandTotal": { "type": "number" },
+        "taxBase14": { "type": "number" },
+        "taxAmount14": { "type": "number" },
+        "taxBase0": { "type": "number" },
+        "auditHash": { "type": "string", "maxLength": 64, "minLength": 64 },
+        "verifiedAt": { "type": "string", "format": "date-time" }
+      },
+      "required": [
+        "invoiceId", "invoiceNumber", "ownerId", "ownerEmail",
+        "grandTotal", "taxBase14", "taxAmount14", "taxBase0",
+        "auditHash", "verifiedAt"
+      ]
     }
   },
   "firestore": {
@@ -169,6 +191,10 @@
     "/users/{userId}/settings/{settingId}": {
       "schema": { "$ref": "#/entities/AppSettings" },
       "description": "Configurações da empresa e predefinições de caixa/impressão."
+    },
+    "/users/{userId}/audit_logs/{invoiceId}": {
+      "schema": { "$ref": "#/entities/AuditLog" },
+      "description": "Registo imutável de auditoria fiscal (escrita exclusiva via Admin SDK no backend)."
     }
   }
 }

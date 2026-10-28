@@ -394,5 +394,19 @@ service cloud.firestore {
 
       allow delete: if false;
     }
+
+    // Collection (System-Only Writes): /users/{userId}/audit_logs/{invoiceId}
+    match /users/{userId}/audit_logs/{invoiceId} {
+      allow get: if isVerifiedOwner(userId)
+        && isValidId(userId)
+        && isValidId(invoiceId)
+        && existing().ownerId == request.auth.uid;
+
+      allow list: if isVerifiedOwner(userId)
+        && existing().ownerId == request.auth.uid;
+
+      // Escrita exclusiva pelo servidor administrativo (Firebase Admin SDK via /api/audit/invoices)
+      allow create, update, delete: if false;
+    }
   }
 }
