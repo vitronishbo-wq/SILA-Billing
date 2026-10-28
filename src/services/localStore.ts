@@ -78,77 +78,339 @@ export interface RegisterCompanyInput {
 }
 
 const DB_NAME = 'sila_billing_idb_v1';
-const DB_VERSION = 2;
 
-function ensureStoreIndex(
-  tx: IDBTransaction,
-  storeName: string,
-  indexName: string,
-  keyPath: string,
-  unique = false
-): void {
-  const store = tx.objectStore(storeName);
-  if (!store.indexNames.contains(indexName)) {
-    store.createIndex(indexName, keyPath, { unique });
+interface StoreSchemaSpec {
+  name: string;
+  keyPath: 'id' | 'key';
+  indexes: Array<{ name: string; keyPath: string; unique: boolean }>;
+}
+
+const REQUIRED_SCHEMA: StoreSchemaSpec[] = [
+  {
+    name: 'products',
+    keyPath: 'id',
+    indexes: [{ name: 'by_company', keyPath: 'companyId', unique: false }],
+  },
+  {
+    name: 'customers',
+    keyPath: 'id',
+    indexes: [{ name: 'by_company', keyPath: 'companyId', unique: false }],
+  },
+  {
+    name: 'invoices',
+    keyPath: 'id',
+    indexes: [{ name: 'by_company', keyPath: 'companyId', unique: false }],
+  },
+  {
+    name: 'meta',
+    keyPath: 'key',
+    indexes: [],
+  },
+  {
+    name: 'companies',
+    keyPath: 'id',
+    // unique: false evita ConstraintError que abortaria toda a transação onupgradeneeded
+    // caso existam registos legados parciais; a unicidade de NIF é garantida na aplicação + Cloud.
+    indexes: [{ name: 'by_normalized_nif', keyPath: 'normalizedNif', unique: false }],
+  },
+  {
+    name: 'company_members',
+    keyPath: 'id',
+    indexes: [{ name: 'by_company', keyPath: 'companyId', unique: false }],
+  },
+  {
+    name: 'sync_queue',
+    keyPath: 'id',
+    indexes: [{ name: 'by_company', keyPath: 'companyId', unique: false }],
+  },
+];
+
+let activeDb: IDBDatabase | null = null;
+let openingPromise: Promise<IDBDatabase> | null = null;
+let orphanRecordsChecked = false;
+
+function attachDbLifecycle(db: IDBDatabase): IDBDatabase {
+  db.onversionchange = () => {
+    try {
+      db.close();
+    } catch {
+      // Ignora erro ao fechar conexão obsoleta
+    }
+    if (activeDb === db) {
+      activeDb = null;
+      openingPromise = null;
+    }
+  };
+  db.onclose = () => {
+    if (activeDb === db) {
+      activeDb = null;
+      openingPromise = null;
+    }
+  };
+  return db;
+}
+
+function applyRequiredSchema(db: IDBDatabase, tx: IDBTransaction): void {
+  for (const spec of REQUIRED_SCHEMA) {
+    let store: IDBObjectStore;
+    if (!db.objectStoreNames.contains(spec.name)) {
+      store = db.createObjectStore(spec.name, { keyPath: spec.keyPath });
+    } else {
+      store = tx.objectStore(spec.name);
+    }
+
+    for (const idx of spec.indexes) {
+      if (!store.indexNames.contains(idx.name)) {
+        try {
+          store.createIndex(idx.name, idx.keyPath, { unique: idx.unique });
+        } catch (err) {
+          console.warn(`[SILA-IDB] Aviso ao criar índice ${spec.name}.${idx.name}:`, err);
+        }
+      }
+    }
   }
 }
 
-function openDb(): Promise<IDBDatabase> {
+function hasCompleteSchema(db: IDBDatabase): boolean {
+  for (const spec of REQUIRED_SCHEMA) {
+    if (!db.objectStoreNames.contains(spec.name)) {
+      return false;
+    }
+  }
+  try {
+    const storeNames = REQUIRED_SCHEMA.map((s) => s.name);
+    const tx = db.transaction(storeNames, 'readonly');
+    for (const spec of REQUIRED_SCHEMA) {
+      const store = tx.objectStore(spec.name);
+      for (const idx of spec.indexes) {
+        if (!store.indexNames.contains(idx.name)) {
+          return false;
+        }
+      }
+    }
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+function openWithoutVersion(): Promise<IDBDatabase> {
   return new Promise((resolve, reject) => {
-    const req = indexedDB.open(DB_NAME, DB_VERSION);
+    const req = indexedDB.open(DB_NAME);
+    req.onupgradeneeded = () => {
+      const db = req.result;
+      const tx = req.transaction;
+      if (tx) {
+        applyRequiredSchema(db, tx);
+      }
+    };
+    req.onsuccess = () => resolve(req.result);
+    req.onerror = () => reject(req.error || new Error('Falha ao abrir base local IndexedDB.'));
+  });
+}
+
+function openWithUpgrade(targetVersion: number): Promise<IDBDatabase> {
+  return new Promise((resolve, reject) => {
+    let settled = false;
+    const blockTimer = setTimeout(() => {
+      if (settled) return;
+      settled = true;
+      // Outra aba antiga bloqueou o upgrade: reabre na versão atual para manter gravações operacionais
+      openWithoutVersion().then(resolve).catch(reject);
+    }, 1800);
+
+    const req = indexedDB.open(DB_NAME, targetVersion);
 
     req.onupgradeneeded = () => {
       const db = req.result;
-      const tx = req.transaction!;
-
-      if (!db.objectStoreNames.contains('products')) {
-        db.createObjectStore('products', { keyPath: 'id' });
+      const tx = req.transaction;
+      if (tx) {
+        applyRequiredSchema(db, tx);
       }
-      ensureStoreIndex(tx, 'products', 'by_company', 'companyId', false);
-
-      if (!db.objectStoreNames.contains('customers')) {
-        db.createObjectStore('customers', { keyPath: 'id' });
-      }
-      ensureStoreIndex(tx, 'customers', 'by_company', 'companyId', false);
-
-      if (!db.objectStoreNames.contains('invoices')) {
-        db.createObjectStore('invoices', { keyPath: 'id' });
-      }
-      ensureStoreIndex(tx, 'invoices', 'by_company', 'companyId', false);
-
-      if (!db.objectStoreNames.contains('meta')) {
-        db.createObjectStore('meta', { keyPath: 'key' });
-      }
-
-      if (!db.objectStoreNames.contains('companies')) {
-        db.createObjectStore('companies', { keyPath: 'id' });
-      }
-      ensureStoreIndex(tx, 'companies', 'by_normalized_nif', 'normalizedNif', true);
-
-      if (!db.objectStoreNames.contains('company_members')) {
-        db.createObjectStore('company_members', { keyPath: 'id' });
-      }
-      ensureStoreIndex(tx, 'company_members', 'by_company', 'companyId', false);
-
-      if (!db.objectStoreNames.contains('sync_queue')) {
-        db.createObjectStore('sync_queue', { keyPath: 'id' });
-      }
-      ensureStoreIndex(tx, 'sync_queue', 'by_company', 'companyId', false);
     };
 
-    req.onsuccess = () => resolve(req.result);
+    req.onblocked = () => {
+      console.warn(
+        '[SILA-IDB] Atualização de schema aguarda fecho de outra aba; fallback seguro ativo.'
+      );
+    };
+
+    req.onsuccess = () => {
+      clearTimeout(blockTimer);
+      if (settled) {
+        try {
+          req.result.close();
+        } catch {
+          // ignore
+        }
+        return;
+      }
+      settled = true;
+      resolve(req.result);
+    };
+
+    req.onerror = () => {
+      clearTimeout(blockTimer);
+      if (settled) return;
+      settled = true;
+      // Se outra aba subiu a versão em paralelo (VersionError), reabre dinamicamente sem versão fixa
+      openWithoutVersion().then(resolve).catch(reject);
+    };
+  });
+}
+
+async function flushFallbackStoresIfReady(db: IDBDatabase): Promise<void> {
+  if (!db.objectStoreNames.contains('meta')) return;
+  const fallbackStoreNames = ['companies', 'company_members', 'sync_queue'];
+
+  for (const storeName of fallbackStoreNames) {
+    if (!db.objectStoreNames.contains(storeName)) continue;
+    const fallbackKey = `__fallback_store_${storeName}`;
+
+    const existingFallback = await new Promise<{ key: string; value: Array<Record<string, unknown>> } | undefined>(
+      (resolve) => {
+        try {
+          const tx = db.transaction('meta', 'readonly');
+          const req = tx.objectStore('meta').get(fallbackKey);
+          req.onsuccess = () => resolve(req.result);
+          req.onerror = () => resolve(undefined);
+        } catch {
+          resolve(undefined);
+        }
+      }
+    );
+
+    if (existingFallback?.value && Array.isArray(existingFallback.value) && existingFallback.value.length > 0) {
+      await new Promise<void>((resolve) => {
+        try {
+          const tx = db.transaction([storeName, 'meta'], 'readwrite');
+          const targetStore = tx.objectStore(storeName);
+          for (const item of existingFallback.value) {
+            if (item && typeof item === 'object' && 'id' in item) {
+              targetStore.put(item);
+            }
+          }
+          tx.objectStore('meta').delete(fallbackKey);
+          tx.oncomplete = () => resolve();
+          tx.onerror = () => resolve();
+        } catch {
+          resolve();
+        }
+      });
+    }
+  }
+}
+
+async function openDbInternal(): Promise<IDBDatabase> {
+  const probedDb = await openWithoutVersion();
+
+  if (hasCompleteSchema(probedDb)) {
+    attachDbLifecycle(probedDb);
+    activeDb = probedDb;
+    await flushFallbackStoresIfReady(probedDb);
+    return probedDb;
+  }
+
+  const nextVersion = Math.max(1, probedDb.version) + 1;
+  try {
+    probedDb.close();
+  } catch {
+    // ignore
+  }
+
+  const upgradedDb = await openWithUpgrade(nextVersion);
+  attachDbLifecycle(upgradedDb);
+  activeDb = upgradedDb;
+  await flushFallbackStoresIfReady(upgradedDb);
+  return upgradedDb;
+}
+
+function openDb(): Promise<IDBDatabase> {
+  if (activeDb) {
+    return Promise.resolve(activeDb);
+  }
+  if (!openingPromise) {
+    openingPromise = openDbInternal().catch((err) => {
+      activeDb = null;
+      openingPromise = null;
+      throw err;
+    });
+  }
+  return openingPromise;
+}
+
+function resetCachedDb(): void {
+  if (activeDb) {
+    try {
+      activeDb.close();
+    } catch {
+      // ignore
+    }
+  }
+  activeDb = null;
+  openingPromise = null;
+}
+
+async function withDbRetry<T>(operation: (db: IDBDatabase) => Promise<T>): Promise<T> {
+  try {
+    const db = await openDb();
+    return await operation(db);
+  } catch (err) {
+    const errName = err instanceof DOMException ? err.name : (err as { name?: string })?.name || '';
+    if (
+      errName === 'InvalidStateError' ||
+      errName === 'VersionError' ||
+      errName === 'TransactionInactiveError'
+    ) {
+      resetCachedDb();
+      const freshDb = await openDb();
+      return await operation(freshDb);
+    }
+    throw err;
+  }
+}
+
+function readFallbackListFromMeta<T>(db: IDBDatabase, storeName: string): Promise<T[]> {
+  if (!db.objectStoreNames.contains('meta')) return Promise.resolve([]);
+  const fallbackKey = `__fallback_store_${storeName}`;
+  return new Promise((resolve, reject) => {
+    const tx = db.transaction('meta', 'readonly');
+    const req = tx.objectStore('meta').get(fallbackKey);
+    req.onsuccess = () => {
+      const entry = req.result as { key: string; value?: T[] } | undefined;
+      resolve(Array.isArray(entry?.value) ? entry!.value : []);
+    };
     req.onerror = () => reject(req.error);
   });
 }
 
-async function getAllFromStore<T>(storeName: string): Promise<T[]> {
-  const db = await openDb();
+async function writeFallbackListToMeta<T>(
+  db: IDBDatabase,
+  storeName: string,
+  items: T[]
+): Promise<void> {
+  if (!db.objectStoreNames.contains('meta')) return;
+  const fallbackKey = `__fallback_store_${storeName}`;
   return new Promise((resolve, reject) => {
-    const tx = db.transaction(storeName, 'readonly');
-    const store = tx.objectStore(storeName);
-    const req = store.getAll();
-    req.onsuccess = () => resolve(req.result as T[]);
-    req.onerror = () => reject(req.error);
+    const tx = db.transaction('meta', 'readwrite');
+    tx.objectStore('meta').put({ key: fallbackKey, value: items });
+    tx.oncomplete = () => resolve();
+    tx.onerror = () => reject(tx.error);
+  });
+}
+
+async function getAllFromStore<T>(storeName: string): Promise<T[]> {
+  return withDbRetry(async (db) => {
+    if (!db.objectStoreNames.contains(storeName)) {
+      return readFallbackListFromMeta<T>(db, storeName);
+    }
+    return new Promise<T[]>((resolve, reject) => {
+      const tx = db.transaction(storeName, 'readonly');
+      const store = tx.objectStore(storeName);
+      const req = store.getAll();
+      req.onsuccess = () => resolve((req.result as T[]) || []);
+      req.onerror = () => reject(req.error);
+    });
   });
 }
 
@@ -156,58 +418,91 @@ async function getAllByCompanyIndex<T extends { companyId?: string }>(
   storeName: string,
   companyId: string
 ): Promise<T[]> {
-  const db = await openDb();
-  return new Promise((resolve, reject) => {
-    const tx = db.transaction(storeName, 'readonly');
-    const store = tx.objectStore(storeName);
-    if (store.indexNames.contains('by_company')) {
-      const idx = store.index('by_company');
-      const req = idx.getAll(IDBKeyRange.only(companyId));
-      req.onsuccess = () => resolve(req.result as T[]);
-      req.onerror = () => reject(req.error);
-      return;
+  return withDbRetry(async (db) => {
+    if (!db.objectStoreNames.contains(storeName)) {
+      const fallbackRows = await readFallbackListFromMeta<T>(db, storeName);
+      return fallbackRows.filter((r) => (r.companyId || JAIMONA_COMPANY_ID) === companyId);
     }
-    const fallbackReq = store.getAll();
-    fallbackReq.onsuccess = () => {
-      const rows = (fallbackReq.result as T[]).filter(
-        (r) => (r.companyId || JAIMONA_COMPANY_ID) === companyId
-      );
-      resolve(rows);
-    };
-    fallbackReq.onerror = () => reject(fallbackReq.error);
+    return new Promise<T[]>((resolve, reject) => {
+      const tx = db.transaction(storeName, 'readonly');
+      const store = tx.objectStore(storeName);
+      if (store.indexNames.contains('by_company') && companyId !== JAIMONA_COMPANY_ID) {
+        const idx = store.index('by_company');
+        const req = idx.getAll(IDBKeyRange.only(companyId));
+        req.onsuccess = () => resolve((req.result as T[]) || []);
+        req.onerror = () => reject(req.error);
+        return;
+      }
+      // Para JAIMONA ou caso o índice ainda não exista, lê todos e inclui registos legados sem companyId
+      const fallbackReq = store.getAll();
+      fallbackReq.onsuccess = () => {
+        const rows = ((fallbackReq.result as T[]) || []).filter(
+          (r) => (r.companyId || JAIMONA_COMPANY_ID) === companyId
+        );
+        resolve(rows);
+      };
+      fallbackReq.onerror = () => reject(fallbackReq.error);
+    });
   });
 }
 
 async function getFromStore<T>(storeName: string, key: string): Promise<T | undefined> {
-  const db = await openDb();
-  return new Promise((resolve, reject) => {
-    const tx = db.transaction(storeName, 'readonly');
-    const store = tx.objectStore(storeName);
-    const req = store.get(key);
-    req.onsuccess = () => resolve(req.result as T | undefined);
-    req.onerror = () => reject(req.error);
+  return withDbRetry(async (db) => {
+    if (!db.objectStoreNames.contains(storeName)) {
+      const list = await readFallbackListFromMeta<Record<string, unknown>>(db, storeName);
+      const keyProp = storeName === 'meta' ? 'key' : 'id';
+      return (list.find((item) => item[keyProp] === key) as T | undefined) || undefined;
+    }
+    return new Promise<T | undefined>((resolve, reject) => {
+      const tx = db.transaction(storeName, 'readonly');
+      const store = tx.objectStore(storeName);
+      const req = store.get(key);
+      req.onsuccess = () => resolve(req.result as T | undefined);
+      req.onerror = () => reject(req.error);
+    });
   });
 }
 
 async function putInStore<T>(storeName: string, record: T): Promise<void> {
-  const db = await openDb();
-  return new Promise((resolve, reject) => {
-    const tx = db.transaction(storeName, 'readwrite');
-    const store = tx.objectStore(storeName);
-    store.put(record);
-    tx.oncomplete = () => resolve();
-    tx.onerror = () => reject(tx.error);
+  return withDbRetry(async (db) => {
+    if (!db.objectStoreNames.contains(storeName)) {
+      const keyProp = storeName === 'meta' ? 'key' : 'id';
+      const recObj = record as unknown as Record<string, unknown>;
+      const recKey = recObj[keyProp];
+      const list = await readFallbackListFromMeta<Record<string, unknown>>(db, storeName);
+      const filtered = list.filter((item) => item[keyProp] !== recKey);
+      filtered.push(recObj);
+      await writeFallbackListToMeta(db, storeName, filtered);
+      return;
+    }
+    return new Promise<void>((resolve, reject) => {
+      const tx = db.transaction(storeName, 'readwrite');
+      const store = tx.objectStore(storeName);
+      store.put(record);
+      tx.oncomplete = () => resolve();
+      tx.onerror = () => reject(tx.error || new Error(`Erro ao gravar em ${storeName}.`));
+      tx.onabort = () => reject(tx.error || new Error(`Transação abortada em ${storeName}.`));
+    });
   });
 }
 
 async function deleteFromStore(storeName: string, id: string): Promise<void> {
-  const db = await openDb();
-  return new Promise((resolve, reject) => {
-    const tx = db.transaction(storeName, 'readwrite');
-    const store = tx.objectStore(storeName);
-    store.delete(id);
-    tx.oncomplete = () => resolve();
-    tx.onerror = () => reject(tx.error);
+  return withDbRetry(async (db) => {
+    if (!db.objectStoreNames.contains(storeName)) {
+      const keyProp = storeName === 'meta' ? 'key' : 'id';
+      const list = await readFallbackListFromMeta<Record<string, unknown>>(db, storeName);
+      const filtered = list.filter((item) => item[keyProp] !== id);
+      await writeFallbackListToMeta(db, storeName, filtered);
+      return;
+    }
+    return new Promise<void>((resolve, reject) => {
+      const tx = db.transaction(storeName, 'readwrite');
+      const store = tx.objectStore(storeName);
+      store.delete(id);
+      tx.oncomplete = () => resolve();
+      tx.onerror = () => reject(tx.error || new Error(`Erro ao remover de ${storeName}.`));
+      tx.onabort = () => reject(tx.error || new Error(`Remoção abortada em ${storeName}.`));
+    });
   });
 }
 
@@ -227,57 +522,117 @@ export async function findCompanyByNif(rawNif: string): Promise<CompanyRecord | 
   const normalized = normalizeCompanyNif(rawNif);
   if (!normalized) return null;
 
-  const db = await openDb();
-  return new Promise((resolve, reject) => {
-    const tx = db.transaction('companies', 'readonly');
-    const store = tx.objectStore('companies');
-    if (store.indexNames.contains('by_normalized_nif')) {
-      const idx = store.index('by_normalized_nif');
-      const req = idx.get(normalized);
-      req.onsuccess = () => resolve((req.result as CompanyRecord | undefined) || null);
-      req.onerror = () => reject(req.error);
-      return;
+  return withDbRetry(async (db) => {
+    if (!db.objectStoreNames.contains('companies')) {
+      const list = await readFallbackListFromMeta<CompanyRecord>(db, 'companies');
+      return (
+        list.find((c) => normalizeCompanyNif(c.normalizedNif || c.profile.nif) === normalized) ||
+        null
+      );
     }
-    const allReq = store.getAll();
-    allReq.onsuccess = () => {
-      const found =
-        (allReq.result as CompanyRecord[]).find(
-          (c) => normalizeCompanyNif(c.normalizedNif || c.profile.nif) === normalized
-        ) || null;
-      resolve(found);
-    };
-    allReq.onerror = () => reject(allReq.error);
+    return new Promise<CompanyRecord | null>((resolve, reject) => {
+      const tx = db.transaction('companies', 'readonly');
+      const store = tx.objectStore('companies');
+      if (store.indexNames.contains('by_normalized_nif')) {
+        const idx = store.index('by_normalized_nif');
+        const req = idx.get(normalized);
+        req.onsuccess = () => resolve((req.result as CompanyRecord | undefined) || null);
+        req.onerror = () => reject(req.error);
+        return;
+      }
+      const allReq = store.getAll();
+      allReq.onsuccess = () => {
+        const found =
+          ((allReq.result as CompanyRecord[]) || []).find(
+            (c) => normalizeCompanyNif(c.normalizedNif || c.profile.nif) === normalized
+          ) || null;
+        resolve(found);
+      };
+      allReq.onerror = () => reject(allReq.error);
+    });
   });
+}
+
+async function healOrphanCompanyRecordsOnce(): Promise<void> {
+  if (orphanRecordsChecked) return;
+  orphanRecordsChecked = true;
+
+  const [rawProducts, rawCustomers, rawInvoices] = await Promise.all([
+    getAllFromStore<Product>('products'),
+    getAllFromStore<Customer>('customers'),
+    getAllFromStore<InvoiceRecord>('invoices'),
+  ]);
+
+  for (const p of rawProducts) {
+    if (!p.companyId) {
+      await putInStore('products', {
+        ...p,
+        companyId: JAIMONA_COMPANY_ID,
+        category: inferProductCategory(p),
+      });
+    }
+  }
+  for (const c of rawCustomers) {
+    if (!c.companyId) {
+      await putInStore('customers', {
+        ...c,
+        companyId: JAIMONA_COMPANY_ID,
+      });
+    }
+  }
+  for (const inv of rawInvoices) {
+    if (!inv.companyId) {
+      await putInStore('invoices', {
+        ...inv,
+        companyId: JAIMONA_COMPANY_ID,
+      });
+    }
+  }
 }
 
 async function ensureMulticompanyInitialized(): Promise<void> {
   const seededMeta = await getFromStore<{ key: string; value: boolean }>('meta', 'seeded');
 
   if (!seededMeta?.value) {
-    // Instalação limpa: cria JAIMONA como 1.ª empresa de referência mantendo todos os IDs clássicos
-    await putInStore('companies', JAIMONA_INITIAL_COMPANY);
-    for (const p of INITIAL_PRODUCTS) {
-      await putInStore('products', { ...p, companyId: JAIMONA_COMPANY_ID });
+    // Verifica se já existem dados reais gravados antes de semear (proteção extra contra perda de dados)
+    const [existingProds, existingCusts, existingInvs] = await Promise.all([
+      getAllFromStore<Product>('products'),
+      getAllFromStore<Customer>('customers'),
+      getAllFromStore<InvoiceRecord>('invoices'),
+    ]);
+    const hasExistingRealData =
+      existingProds.length > 0 || existingCusts.length > 0 || existingInvs.length > 0;
+
+    if (!hasExistingRealData) {
+      // Instalação limpa: cria JAIMONA como 1.ª empresa de referência mantendo todos os IDs clássicos
+      await putInStore('companies', JAIMONA_INITIAL_COMPANY);
+      for (const p of INITIAL_PRODUCTS) {
+        await putInStore('products', { ...p, companyId: JAIMONA_COMPANY_ID });
+      }
+      for (const c of INITIAL_CUSTOMERS) {
+        await putInStore('customers', { ...c, companyId: JAIMONA_COMPANY_ID });
+      }
+      await putInStore('invoices', { ...createSeedInvoice(), companyId: JAIMONA_COMPANY_ID });
+      await putInStore('meta', { key: 'app_settings', value: DEFAULT_SETTINGS });
+      await putInStore('meta', {
+        key: `app_settings:${JAIMONA_COMPANY_ID}`,
+        value: DEFAULT_SETTINGS,
+      });
+      await putInStore('meta', { key: 'active_company_id', value: JAIMONA_COMPANY_ID });
+      await putInStore('meta', {
+        key: 'migration_multicompany_v2',
+        value: { completedAtIso: new Date().toISOString(), mode: 'fresh_install' },
+      });
+      await putInStore('meta', { key: 'seeded', value: true });
+      orphanRecordsChecked = true;
+      return;
     }
-    for (const c of INITIAL_CUSTOMERS) {
-      await putInStore('customers', { ...c, companyId: JAIMONA_COMPANY_ID });
-    }
-    await putInStore('invoices', { ...createSeedInvoice(), companyId: JAIMONA_COMPANY_ID });
-    await putInStore('meta', { key: 'app_settings', value: DEFAULT_SETTINGS });
-    await putInStore('meta', {
-      key: `app_settings:${JAIMONA_COMPANY_ID}`,
-      value: DEFAULT_SETTINGS,
-    });
-    await putInStore('meta', { key: 'active_company_id', value: JAIMONA_COMPANY_ID });
-    await putInStore('meta', {
-      key: 'migration_multicompany_v2',
-      value: { completedAtIso: new Date().toISOString(), mode: 'fresh_install' },
-    });
+
+    // Se já havia registos mas faltava a flag 'seeded', marca seeded=true sem sobrescrever nada!
     await putInStore('meta', { key: 'seeded', value: true });
-    return;
   }
 
-  // Migração idempotente e repetível de instalações existentes (v1 -> v2)
+  // Migração idempotente e repetível de instalações existentes (v1 -> v2+)
   const migrationDone = await getFromStore<{
     key: string;
     value: { completedAtIso: string; mode: string };
@@ -285,6 +640,7 @@ async function ensureMulticompanyInitialized(): Promise<void> {
 
   const existingJaimona = await getFromStore<CompanyRecord>('companies', JAIMONA_COMPANY_ID);
   if (migrationDone?.value && existingJaimona) {
+    await healOrphanCompanyRecordsOnce();
     return;
   }
 
@@ -714,14 +1070,23 @@ export const localDb = {
   deleteMember: (id: string) => deleteFromStore('company_members', id),
   enqueueSync: (entry: SyncQueueEntry) => putInStore('sync_queue', entry),
   deleteSyncEntry: (id: string) => deleteFromStore('sync_queue', id),
-  saveProduct: (p: Product, companyId = JAIMONA_COMPANY_ID) =>
-    putInStore('products', { ...p, companyId: p.companyId || companyId }),
+  saveProduct: (p: Product, companyId = JAIMONA_COMPANY_ID) => {
+    const resolvedId = String(p.id || '').trim() || `prod_${Date.now()}_${Math.random().toString(36).slice(2, 6)}`;
+    const resolvedCompanyId = String(p.companyId || companyId || JAIMONA_COMPANY_ID).trim() || JAIMONA_COMPANY_ID;
+    return putInStore('products', { ...p, id: resolvedId, companyId: resolvedCompanyId });
+  },
   deleteProduct: (id: string) => deleteFromStore('products', id),
-  saveCustomer: (c: Customer, companyId = JAIMONA_COMPANY_ID) =>
-    putInStore('customers', { ...c, companyId: c.companyId || companyId }),
+  saveCustomer: (c: Customer, companyId = JAIMONA_COMPANY_ID) => {
+    const resolvedId = String(c.id || '').trim() || `cust_${Date.now()}_${Math.random().toString(36).slice(2, 6)}`;
+    const resolvedCompanyId = String(c.companyId || companyId || JAIMONA_COMPANY_ID).trim() || JAIMONA_COMPANY_ID;
+    return putInStore('customers', { ...c, id: resolvedId, companyId: resolvedCompanyId });
+  },
   deleteCustomer: (id: string) => deleteFromStore('customers', id),
-  saveInvoice: (inv: InvoiceRecord, companyId = JAIMONA_COMPANY_ID) =>
-    putInStore('invoices', { ...inv, companyId: inv.companyId || companyId }),
+  saveInvoice: (inv: InvoiceRecord, companyId = JAIMONA_COMPANY_ID) => {
+    const resolvedId = String(inv.id || '').trim() || `inv_${Date.now()}_${Math.random().toString(36).slice(2, 6)}`;
+    const resolvedCompanyId = String(inv.companyId || companyId || JAIMONA_COMPANY_ID).trim() || JAIMONA_COMPANY_ID;
+    return putInStore('invoices', { ...inv, id: resolvedId, companyId: resolvedCompanyId });
+  },
   saveSettings: (settings: AppSettings, companyId = JAIMONA_COMPANY_ID) =>
     saveCompanySettingsScoped(companyId, settings),
   savePosDraft: (draft: PosWorkspaceDraft, companyId = JAIMONA_COMPANY_ID) =>

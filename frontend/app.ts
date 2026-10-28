@@ -107,6 +107,41 @@ function escapeHtml(raw: string): string {
     .replace(/'/g, '&#39;');
 }
 
+function parseDecimalInput(raw: string): number {
+  const cleaned = String(raw || '')
+    .replace(/kz/gi, '')
+    .replace(/\s+/g, '')
+    .trim();
+  if (!cleaned) return 0;
+
+  const lastComma = cleaned.lastIndexOf(',');
+  const lastDot = cleaned.lastIndexOf('.');
+  let normalized = cleaned;
+
+  if (lastComma !== -1 && lastDot !== -1) {
+    if (lastComma > lastDot) {
+      normalized = cleaned.replace(/\./g, '').replace(',', '.');
+    } else {
+      normalized = cleaned.replace(/,/g, '');
+    }
+  } else if (lastComma !== -1) {
+    normalized = cleaned.replace(',', '.');
+  }
+
+  const parsed = Number(normalized);
+  return Number.isFinite(parsed) ? roundKz(parsed) : Number.NaN;
+}
+
+function formatStorageErrorPt(err: unknown, entityLabel: string): string {
+  const detail = err instanceof Error ? err.message : String(err || '');
+  if (/quota/i.test(detail)) {
+    return `Espaço de armazenamento cheio no dispositivo ao guardar ${entityLabel}.`;
+  }
+  return detail
+    ? `Não foi possível guardar ${entityLabel}: ${detail}`
+    : `Não foi possível guardar ${entityLabel} na base de dados local.`;
+}
+
 export class SilaBillingApp {
   private root: HTMLElement;
 
@@ -153,10 +188,19 @@ export class SilaBillingApp {
   // Estado Produtos / Clientes / Histórico
   private productSearch = '';
   private editingProduct: Product | null = null;
+  private editingProductPriceInput = '';
   private isNewProduct = false;
+  private productFormError: string | null = null;
+  private productSavedNotice: string | null = null;
 
   private customerSearch = '';
   private editingCustomer: Customer | null = null;
+  private isNewCustomer = false;
+  private customerFormError: string | null = null;
+  private customerSavedNotice: string | null = null;
+  private quickCustomerDraft = { name: '', nif: '', phone: '', locality: '' };
+  private quickCustomerError: string | null = null;
+  private dbBootError: string | null = null;
 
   private historySearch = '';
   private selectedHistoryId = '';
@@ -213,6 +257,9 @@ export class SilaBillingApp {
     try {
       const data = await bootstrapLocalStore();
       this.applyWorkspaceBundle(data);
+      this.dbBootError = null;
+    } catch (err) {
+      this.dbBootError = formatStorageErrorPt(err, 'os dados iniciais do terminal');
     } finally {
       this.isBooting = false;
       this.render();
@@ -260,7 +307,14 @@ export class SilaBillingApp {
     this.lastEmitted = null;
     this.lastAuditHash = '';
     this.editingProduct = null;
+    this.editingProductPriceInput = '';
+    this.productFormError = null;
+    this.productSavedNotice = null;
     this.editingCustomer = null;
+    this.isNewCustomer = false;
+    this.customerFormError = null;
+    this.customerSavedNotice = null;
+    this.quickCustomerError = null;
     this.cancellingInvoiceId = null;
     this.cancelInvoiceError = null;
     this.settingsErrorMessage = null;
@@ -433,7 +487,15 @@ export class SilaBillingApp {
   }
 
   public isBusyWithCriticalTask(): boolean {
-    return this.isEmitting || this.isPrinting;
+    return (
+      this.isEmitting ||
+      this.isPrinting ||
+      this.editingProduct !== null ||
+      this.editingCustomer !== null ||
+      this.showQuickCustomerForm ||
+      this.showNewCompanyModal ||
+      this.cart.length > 0
+    );
   }
 
   public async flushDraftNow(): Promise<void> {
@@ -442,23 +504,27 @@ export class SilaBillingApp {
       this.draftSaveTimer = null;
     }
     if (this.isBooting) return;
-    await localDb.savePosDraft(
-      {
-        companyId: this.activeCompany.id,
-        activeModule: this.activeModule,
-        previewFormat: this.previewFormat,
-        cart: this.cart,
-        selectedCustomerId: this.selectedCustomerId,
-        docType: this.docType,
-        paymentMethod: this.paymentMethod,
-        amountReceivedInput: this.amountReceivedInput,
-        notes: this.notes,
-        cashier: this.cashier,
-        operator: this.operator,
-        updatedAtIso: new Date().toISOString(),
-      },
-      this.activeCompany.id
-    );
+    try {
+      await localDb.savePosDraft(
+        {
+          companyId: this.activeCompany.id,
+          activeModule: this.activeModule,
+          previewFormat: this.previewFormat,
+          cart: this.cart,
+          selectedCustomerId: this.selectedCustomerId,
+          docType: this.docType,
+          paymentMethod: this.paymentMethod,
+          amountReceivedInput: this.amountReceivedInput,
+          notes: this.notes,
+          cashier: this.cashier,
+          operator: this.operator,
+          updatedAtIso: new Date().toISOString(),
+        },
+        this.activeCompany.id
+      );
+    } catch {
+      // Ignora erro transitório de gravação de rascunho para não bloquear a interface
+    }
   }
 
   private scheduleDraftSave(): void {
@@ -906,13 +972,35 @@ export class SilaBillingApp {
       case 'toggle-quick-customer': {
         if (this.isCompanySuspended()) return;
         this.showQuickCustomerForm = !this.showQuickCustomerForm;
+        this.quickCustomerError = null;
         if (this.showQuickCustomerForm) {
           this.showCustomerPicker = false;
+          this.quickCustomerDraft = {
+            name: '',
+            nif: '',
+            phone: '',
+            locality: this.activeCompany.profile.cityCountry || 'Angola',
+          };
         }
         this.render();
         if (this.showQuickCustomerForm) {
           const nameInput = document.getElementById('quick-customer-name-input') as HTMLInputElement | null;
           nameInput?.focus();
+        }
+        break;
+      }
+      case 'retry-db-boot': {
+        this.dbBootError = null;
+        this.isBooting = true;
+        this.render();
+        try {
+          const data = await bootstrapLocalStore(this.activeCompany.id);
+          this.applyWorkspaceBundle(data);
+        } catch (err) {
+          this.dbBootError = formatStorageErrorPt(err, 'os dados locais');
+        } finally {
+          this.isBooting = false;
+          this.render();
         }
         break;
       }
@@ -964,11 +1052,19 @@ export class SilaBillingApp {
       }
       case 'new-product': {
         if (!this.canManageCatalog()) return;
-        const nextCode = String(this.products.length + 1).padStart(5, '0');
+        const maxNumericCode = this.products.reduce((max, p) => {
+          const n = parseInt(p.code.replace(/\D/g, ''), 10);
+          return Number.isFinite(n) && n > max ? n : max;
+        }, this.products.length);
+        const nextCode = String(maxNumericCode + 1).padStart(5, '0');
         const now = new Date().toISOString();
+        const rand = Math.random().toString(36).slice(2, 6);
         this.isNewProduct = true;
+        this.productFormError = null;
+        this.productSavedNotice = null;
+        this.editingProductPriceInput = '';
         this.editingProduct = {
-          id: `prod_${Date.now()}`,
+          id: `prod_${Date.now()}_${rand}`,
           companyId: this.activeCompany.id,
           code: nextCode,
           name: '',
@@ -984,6 +1080,8 @@ export class SilaBillingApp {
           updatedAtIso: now,
         };
         this.render();
+        const prodNameInput = document.getElementById('product-form-name-input') as HTMLInputElement | null;
+        prodNameInput?.focus();
         break;
       }
       case 'edit-product': {
@@ -991,36 +1089,56 @@ export class SilaBillingApp {
         const targetProd = this.products.find((p) => p.id === id);
         if (targetProd) {
           this.isNewProduct = false;
+          this.productFormError = null;
+          this.productSavedNotice = null;
           this.editingProduct = { ...targetProd };
+          this.editingProductPriceInput = String(targetProd.price);
           this.render();
+          const prodNameInput = document.getElementById('product-form-name-input') as HTMLInputElement | null;
+          prodNameInput?.focus();
         }
         break;
       }
       case 'cancel-edit-product': {
         this.editingProduct = null;
+        this.editingProductPriceInput = '';
+        this.productFormError = null;
         this.render();
         break;
       }
       case 'delete-product': {
         if (!this.canManageCatalog()) return;
-        await localDb.deleteProduct(id);
-        this.products = this.products.filter((p) => p.id !== id);
-        this.render();
-        if (this.user && this.isOnline) {
-          try {
-            await ensureCompanyRegisteredCloud(this.activeCompany);
-            await removeProductCloud(id, this.activeCompany.id);
-          } catch {
-            // Mantém estado local
+        try {
+          await localDb.deleteProduct(id);
+          this.products = this.products.filter((p) => p.id !== id);
+          if (this.editingProduct?.id === id) {
+            this.editingProduct = null;
+            this.editingProductPriceInput = '';
           }
+          this.render();
+          if (this.user && this.isOnline) {
+            try {
+              await ensureCompanyRegisteredCloud(this.activeCompany);
+              await removeProductCloud(id, this.activeCompany.id);
+            } catch {
+              // Mantém estado local
+            }
+          }
+        } catch (err) {
+          this.productFormError = formatStorageErrorPt(err, 'a remoção do artigo');
+          this.render();
         }
         break;
       }
       case 'new-customer': {
         if (this.isCompanySuspended()) return;
         const now = new Date().toISOString();
+        const rand = Math.random().toString(36).slice(2, 6);
+        this.isNewCustomer = true;
+        this.customerFormError = null;
+        this.customerSavedNotice = null;
         this.editingCustomer = {
-          id: `cust_${Date.now()}`,
+          id: `cust_${Date.now()}_${rand}`,
           companyId: this.activeCompany.id,
           name: '',
           nif: '',
@@ -1033,19 +1151,28 @@ export class SilaBillingApp {
           updatedAtIso: now,
         };
         this.render();
+        const custNameInput = document.getElementById('customer-form-name-input') as HTMLInputElement | null;
+        custNameInput?.focus();
         break;
       }
       case 'edit-customer': {
         if (!this.canEditExistingCustomers()) return;
         const cust = this.customers.find((c) => c.id === id);
         if (cust) {
+          this.isNewCustomer = false;
+          this.customerFormError = null;
+          this.customerSavedNotice = null;
           this.editingCustomer = { ...cust };
           this.render();
+          const custNameInput = document.getElementById('customer-form-name-input') as HTMLInputElement | null;
+          custNameInput?.focus();
         }
         break;
       }
       case 'cancel-edit-customer': {
         this.editingCustomer = null;
+        this.isNewCustomer = false;
+        this.customerFormError = null;
         this.render();
         break;
       }
@@ -1252,6 +1379,39 @@ export class SilaBillingApp {
 
   private handleInput(e: Event): void {
     const el = e.target as HTMLInputElement;
+    if (!el) return;
+
+    // Preserva em memória os campos em edição (sem re-renderizar o DOM a cada tecla)
+    // para que eventos assíncronos de rede/auth nunca limpem o formulário do utilizador.
+    const parentForm = el.closest<HTMLFormElement>('form[data-form]');
+    if (parentForm) {
+      const fName = parentForm.dataset.form;
+      const inputName = el.name;
+      if (fName === 'product-form' && this.editingProduct) {
+        if (inputName === 'code') this.editingProduct.code = el.value;
+        else if (inputName === 'name') this.editingProduct.name = el.value;
+        else if (inputName === 'category') this.editingProduct.category = el.value;
+        else if (inputName === 'unit') this.editingProduct.unit = el.value;
+        else if (inputName === 'price') {
+          this.editingProductPriceInput = el.value;
+          const p = parseDecimalInput(el.value);
+          if (!Number.isNaN(p) && p >= 0) {
+            this.editingProduct.price = p;
+          }
+        }
+      } else if (fName === 'customer-form' && this.editingCustomer) {
+        if (inputName === 'name') this.editingCustomer.name = el.value;
+        else if (inputName === 'nif') this.editingCustomer.nif = el.value;
+        else if (inputName === 'phone') this.editingCustomer.phone = el.value;
+        else if (inputName === 'locality') this.editingCustomer.locality = el.value;
+      } else if (fName === 'pos-quick-customer-form') {
+        if (inputName === 'name') this.quickCustomerDraft.name = el.value;
+        else if (inputName === 'nif') this.quickCustomerDraft.nif = el.value;
+        else if (inputName === 'phone') this.quickCustomerDraft.phone = el.value;
+        else if (inputName === 'locality') this.quickCustomerDraft.locality = el.value;
+      }
+    }
+
     const field = el.dataset.field;
     const id = el.dataset.id || '';
     if (!field) return;
@@ -1341,6 +1501,9 @@ export class SilaBillingApp {
 
   private async handleChange(e: Event): Promise<void> {
     const el = e.target as HTMLInputElement | HTMLSelectElement;
+    if (el && el.name === 'ivaRate' && this.editingProduct && el.closest('form[data-form="product-form"]')) {
+      this.editingProduct.ivaRate = Number(el.value) === 0 ? 0 : 14;
+    }
     const field = el.dataset.field;
     const id = el.dataset.id || '';
     if (!field) return;
@@ -1658,19 +1821,30 @@ export class SilaBillingApp {
     }
 
     if (formName === 'pos-quick-customer-form') {
-      if (this.isCompanySuspended()) return;
-      const name = String(fd.get('name') || '').trim();
-      const nif = String(fd.get('nif') || '').trim() || 'Consumidor Final';
-      const phone = String(fd.get('phone') || '').trim();
+      if (this.isCompanySuspended()) {
+        this.quickCustomerError = 'A empresa encontra-se suspensa.';
+        this.render();
+        return;
+      }
+      this.quickCustomerError = null;
+      const name = String(fd.get('name') || this.quickCustomerDraft.name || '').trim();
+      const nif = String(fd.get('nif') || this.quickCustomerDraft.nif || '').trim() || 'Consumidor Final';
+      const phone = String(fd.get('phone') || this.quickCustomerDraft.phone || '').trim();
       const defaultLoc = this.activeCompany.profile.cityCountry || 'Angola';
-      const locality = String(fd.get('locality') || '').trim() || defaultLoc;
+      const locality =
+        String(fd.get('locality') || this.quickCustomerDraft.locality || '').trim() || defaultLoc;
 
-      if (!name) return;
+      if (!name) {
+        this.quickCustomerError = 'Indique o nome completo ou designação da empresa.';
+        this.render();
+        return;
+      }
 
       const now = new Date().toISOString();
+      const rand = Math.random().toString(36).slice(2, 6);
       const directCustId = getDirectCustomerIdForCompany(this.activeCompany.id);
       const created: Customer = {
-        id: `cust_${Date.now()}`,
+        id: `cust_${Date.now()}_${rand}`,
         companyId: this.activeCompany.id,
         name,
         nif,
@@ -1683,11 +1857,20 @@ export class SilaBillingApp {
         updatedAtIso: now,
       };
 
-      await localDb.saveCustomer(created, this.activeCompany.id);
-      this.customers = [created, ...this.customers].sort((a, b) =>
-        a.id === directCustId ? -1 : b.id === directCustId ? 1 : a.name.localeCompare(b.name)
+      try {
+        await localDb.saveCustomer(created, this.activeCompany.id);
+      } catch (err) {
+        this.quickCustomerError = formatStorageErrorPt(err, 'o cliente');
+        this.render();
+        return;
+      }
+
+      this.customers = [created, ...this.customers.filter((c) => c.id !== created.id)].sort(
+        (a, b) =>
+          a.id === directCustId ? -1 : b.id === directCustId ? 1 : a.name.localeCompare(b.name, 'pt')
       );
       this.selectedCustomerId = created.id;
+      this.quickCustomerDraft = { name: '', nif: '', phone: '', locality: defaultLoc };
       this.showQuickCustomerForm = false;
       this.showCustomerPicker = false;
       this.scheduleDraftSave();
@@ -1709,15 +1892,35 @@ export class SilaBillingApp {
     }
 
     if (formName === 'product-form' && this.editingProduct) {
-      if (!this.canManageCatalog()) return;
-      const code = String(fd.get('code') || '').trim();
-      const name = String(fd.get('name') || '').trim();
-      const category = String(fd.get('category') || 'Mercearia').trim() || 'Mercearia';
-      const unit = String(fd.get('unit') || 'un').trim() || 'un';
-      const price = Math.max(0, parseFloat(String(fd.get('price') || '0')) || 0);
+      if (!this.canManageCatalog()) {
+        this.productFormError =
+          'O seu perfil atual está em modo de consulta e não permite alterar o catálogo.';
+        this.render();
+        return;
+      }
+      this.productFormError = null;
+
+      const code = String(fd.get('code') || this.editingProduct.code || '').trim();
+      const name = String(fd.get('name') || this.editingProduct.name || '').trim();
+      const category =
+        String(fd.get('category') || this.editingProduct.category || 'Mercearia').trim() ||
+        'Mercearia';
+      const unit = String(fd.get('unit') || this.editingProduct.unit || 'un').trim() || 'un';
+      const rawPrice = String(fd.get('price') ?? this.editingProductPriceInput ?? '0');
+      const parsedPrice = parseDecimalInput(rawPrice);
       const ivaRate: TaxRate = Number(fd.get('ivaRate')) === 0 ? 0 : 14;
 
-      if (!code || !name) return;
+      if (!code || !name) {
+        this.productFormError = 'Preencha o código e a descrição do artigo antes de guardar.';
+        this.render();
+        return;
+      }
+
+      if (Number.isNaN(parsedPrice) || parsedPrice < 0) {
+        this.productFormError = 'Indique um preço unitário válido em Kwanzas (ex: 1500 ou 1500,50).';
+        this.render();
+        return;
+      }
 
       const updated: Product = {
         ...this.editingProduct,
@@ -1726,23 +1929,41 @@ export class SilaBillingApp {
         name,
         category,
         unit,
-        price,
+        price: parsedPrice,
         ivaRate,
         exemptionReason:
           ivaRate === 0 ? 'Isento nos termos da Lei do IVA (Cesta Básica)' : '',
+        active: this.editingProduct.active !== false,
         syncState: 'pending',
         synced: false,
         updatedAtIso: new Date().toISOString(),
       };
 
       const wasNew = this.isNewProduct;
-      await localDb.saveProduct(updated, this.activeCompany.id);
+      try {
+        await localDb.saveProduct(updated, this.activeCompany.id);
+      } catch (err) {
+        this.productFormError = formatStorageErrorPt(err, 'o artigo');
+        this.render();
+        return;
+      }
+
       this.products = [
         ...this.products.filter((p) => p.id !== updated.id),
         updated,
       ].sort((a, b) => a.code.localeCompare(b.code));
       this.editingProduct = null;
+      this.editingProductPriceInput = '';
+      this.productFormError = null;
+      this.productSavedNotice = `Artigo "${updated.name}" guardado com sucesso.`;
       this.render();
+
+      setTimeout(() => {
+        if (this.productSavedNotice) {
+          this.productSavedNotice = null;
+          if (this.activeModule === 'PRODUCTS') this.render();
+        }
+      }, 2500);
 
       if (this.user && this.isOnline) {
         try {
@@ -1760,17 +1981,34 @@ export class SilaBillingApp {
     }
 
     if (formName === 'customer-form' && this.editingCustomer) {
-      const isEditingExisting = this.customers.some((c) => c.id === this.editingCustomer!.id);
-      if (isEditingExisting && !this.canEditExistingCustomers()) return;
-      if (this.isCompanySuspended()) return;
+      const isEditingExisting =
+        !this.isNewCustomer && this.customers.some((c) => c.id === this.editingCustomer!.id);
+      if (isEditingExisting && !this.canEditExistingCustomers()) {
+        this.customerFormError =
+          'O seu perfil atual não tem permissão para editar clientes existentes.';
+        this.render();
+        return;
+      }
+      if (this.isCompanySuspended()) {
+        this.customerFormError = 'A empresa encontra-se suspensa.';
+        this.render();
+        return;
+      }
+      this.customerFormError = null;
 
-      const name = String(fd.get('name') || '').trim();
-      const nif = String(fd.get('nif') || '').trim() || 'Consumidor Final';
-      const phone = String(fd.get('phone') || '').trim();
+      const name = String(fd.get('name') || this.editingCustomer.name || '').trim();
+      const nif =
+        String(fd.get('nif') || this.editingCustomer.nif || '').trim() || 'Consumidor Final';
+      const phone = String(fd.get('phone') || this.editingCustomer.phone || '').trim();
       const defaultLoc = this.activeCompany.profile.cityCountry || 'Angola';
-      const locality = String(fd.get('locality') || '').trim() || defaultLoc;
+      const locality =
+        String(fd.get('locality') || this.editingCustomer.locality || '').trim() || defaultLoc;
 
-      if (!name) return;
+      if (!name) {
+        this.customerFormError = 'Indique o nome completo ou entidade do cliente.';
+        this.render();
+        return;
+      }
 
       const directCustId = getDirectCustomerIdForCompany(this.activeCompany.id);
       const updated: Customer = {
@@ -1780,20 +2018,38 @@ export class SilaBillingApp {
         nif,
         phone,
         locality,
+        address: this.editingCustomer.address || locality,
         syncState: 'pending',
         synced: false,
         updatedAtIso: new Date().toISOString(),
       };
 
-      await localDb.saveCustomer(updated, this.activeCompany.id);
+      try {
+        await localDb.saveCustomer(updated, this.activeCompany.id);
+      } catch (err) {
+        this.customerFormError = formatStorageErrorPt(err, 'o cliente');
+        this.render();
+        return;
+      }
+
       this.customers = [
         ...this.customers.filter((c) => c.id !== updated.id),
         updated,
       ].sort((a, b) =>
-        a.id === directCustId ? -1 : b.id === directCustId ? 1 : a.name.localeCompare(b.name)
+        a.id === directCustId ? -1 : b.id === directCustId ? 1 : a.name.localeCompare(b.name, 'pt')
       );
       this.editingCustomer = null;
+      this.isNewCustomer = false;
+      this.customerFormError = null;
+      this.customerSavedNotice = `Cliente "${updated.name}" guardado com sucesso.`;
       this.render();
+
+      setTimeout(() => {
+        if (this.customerSavedNotice) {
+          this.customerSavedNotice = null;
+          if (this.activeModule === 'CUSTOMERS') this.render();
+        }
+      }, 2500);
 
       if (this.user && this.isOnline) {
         try {
@@ -2071,16 +2327,34 @@ export class SilaBillingApp {
 
       const cloudData = await pullCompanyFromCloud(this.activeCompany.id);
       if (cloudData) {
+        // Proteção estrita: nunca sobrescrever registos locais ainda pendentes de sincronização
+        const preMergeLocal = await loadCompanyWorkspace(this.activeCompany.id);
+        const pendingProdIds = new Set(
+          preMergeLocal.products.filter((p) => !p.synced).map((p) => p.id)
+        );
+        const pendingCustIds = new Set(
+          preMergeLocal.customers.filter((c) => !c.synced).map((c) => c.id)
+        );
+        const pendingInvIds = new Set(
+          preMergeLocal.invoices.filter((i) => !i.synced).map((i) => i.id)
+        );
+
         for (const cp of cloudData.products) {
-          await localDb.saveProduct(cp, this.activeCompany.id);
+          if (!pendingProdIds.has(cp.id)) {
+            await localDb.saveProduct(cp, this.activeCompany.id);
+          }
         }
         for (const cc of cloudData.customers) {
-          await localDb.saveCustomer(cc, this.activeCompany.id);
+          if (!pendingCustIds.has(cc.id)) {
+            await localDb.saveCustomer(cc, this.activeCompany.id);
+          }
         }
         for (const ci of cloudData.invoices) {
-          await localDb.saveInvoice(ci, this.activeCompany.id);
+          if (!pendingInvIds.has(ci.id)) {
+            await localDb.saveInvoice(ci, this.activeCompany.id);
+          }
         }
-        if (cloudData.settings) {
+        if (cloudData.settings && preMergeLocal.settings.synced !== false) {
           await localDb.saveSettings(cloudData.settings, this.activeCompany.id).catch(() => null);
         }
       }
@@ -2289,8 +2563,22 @@ export class SilaBillingApp {
         <div class="flex-1 flex overflow-hidden">
           ${this.renderSidebar(pendingCount)}
 
-          <main class="flex-1 overflow-hidden">
-            ${this.isBooting ? this.renderBooting() : this.renderActiveWorkspace()}
+          <main class="flex-1 overflow-hidden flex flex-col">
+            ${
+              this.dbBootError
+                ? `<div class="px-3 py-2 bg-red-50 border-b border-red-200 text-xs text-red-700 flex items-center justify-between gap-2 shrink-0">
+                    <span>${escapeHtml(this.dbBootError)}</span>
+                    <button
+                      type="button"
+                      data-action="retry-db-boot"
+                      class="h-7 px-2.5 rounded bg-red-600 text-white font-semibold hover:bg-red-700 whitespace-nowrap shrink-0"
+                    >Tentar novamente</button>
+                  </div>`
+                : ''
+            }
+            <div class="flex-1 overflow-hidden">
+              ${this.isBooting ? this.renderBooting() : this.renderActiveWorkspace()}
+            </div>
           </main>
         </div>
 
@@ -2850,6 +3138,13 @@ export class SilaBillingApp {
                         class="h-6 w-6 flex items-center justify-center rounded text-slate-400 hover:text-slate-700"
                       >${ICONS.close}</button>
                     </div>
+                    ${
+                      this.quickCustomerError
+                        ? `<div class="p-2 rounded bg-red-50 border border-red-200 text-[11px] text-red-700">${escapeHtml(
+                            this.quickCustomerError
+                          )}</div>`
+                        : ''
+                    }
                     <div class="grid grid-cols-2 gap-1.5">
                       <div class="col-span-2">
                         <input
@@ -2858,6 +3153,7 @@ export class SilaBillingApp {
                           type="text"
                           required
                           maxlength="160"
+                          value="${escapeHtml(this.quickCustomerDraft.name)}"
                           placeholder="Nome completo ou empresa *"
                           class="w-full h-8 px-2.5 text-xs bg-white border border-slate-200 rounded-md focus:outline-none focus:border-blue-600"
                         />
@@ -2867,6 +3163,7 @@ export class SilaBillingApp {
                           name="nif"
                           type="text"
                           maxlength="32"
+                          value="${escapeHtml(this.quickCustomerDraft.nif)}"
                           placeholder="NIF (ou Consumidor Final)"
                           class="w-full h-8 px-2.5 text-xs font-mono bg-white border border-slate-200 rounded-md focus:outline-none focus:border-blue-600"
                         />
@@ -2876,6 +3173,7 @@ export class SilaBillingApp {
                           name="phone"
                           type="text"
                           maxlength="40"
+                          value="${escapeHtml(this.quickCustomerDraft.phone)}"
                           placeholder="Telefone (+244...)"
                           class="w-full h-8 px-2.5 text-xs font-mono bg-white border border-slate-200 rounded-md focus:outline-none focus:border-blue-600"
                         />
@@ -2885,7 +3183,7 @@ export class SilaBillingApp {
                           name="locality"
                           type="text"
                           maxlength="160"
-                          value="${escapeHtml(defaultLocality)}"
+                          value="${escapeHtml(this.quickCustomerDraft.locality || defaultLocality)}"
                           placeholder="Localidade"
                           class="flex-1 h-8 px-2.5 text-xs bg-white border border-slate-200 rounded-md focus:outline-none focus:border-blue-600"
                         />
@@ -3320,15 +3618,31 @@ export class SilaBillingApp {
         </div>
 
         ${
+          this.customerSavedNotice
+            ? `<div class="px-3.5 py-2 bg-emerald-50 border-b border-emerald-200 text-xs text-emerald-800 flex items-center gap-1.5 shrink-0">${ICONS.check}<span>${escapeHtml(
+                this.customerSavedNotice
+              )}</span></div>`
+            : ''
+        }
+
+        ${
           this.editingCustomer
             ? `
             <form
               data-form="customer-form"
               class="p-3.5 border-b border-slate-200 bg-slate-50 grid grid-cols-1 sm:grid-cols-12 gap-2.5 items-end shrink-0"
             >
+              ${
+                this.customerFormError
+                  ? `<div class="sm:col-span-12 p-2 rounded-md bg-red-50 border border-red-200 text-xs text-red-700">${escapeHtml(
+                      this.customerFormError
+                    )}</div>`
+                  : ''
+              }
               <div class="sm:col-span-4">
                 <label class="block text-[10px] font-medium text-slate-600 mb-1">Nome / Entidade</label>
                 <input
+                  id="customer-form-name-input"
                   name="name"
                   type="text"
                   required
@@ -3497,12 +3811,27 @@ export class SilaBillingApp {
         </div>
 
         ${
+          this.productSavedNotice
+            ? `<div class="px-3.5 py-2 bg-emerald-50 border-b border-emerald-200 text-xs text-emerald-800 flex items-center gap-1.5 shrink-0">${ICONS.check}<span>${escapeHtml(
+                this.productSavedNotice
+              )}</span></div>`
+            : ''
+        }
+
+        ${
           this.editingProduct && canManageCat
             ? `
             <form
               data-form="product-form"
               class="p-3.5 border-b border-slate-200 bg-slate-50 grid grid-cols-2 sm:grid-cols-12 gap-2.5 items-end shrink-0"
             >
+              ${
+                this.productFormError
+                  ? `<div class="col-span-2 sm:col-span-12 p-2 rounded-md bg-red-50 border border-red-200 text-xs text-red-700">${escapeHtml(
+                      this.productFormError
+                    )}</div>`
+                  : ''
+              }
               <div class="col-span-1 sm:col-span-2">
                 <label class="block text-[10px] font-medium text-slate-600 mb-1">Código</label>
                 <input
@@ -3517,6 +3846,7 @@ export class SilaBillingApp {
               <div class="col-span-2 sm:col-span-3">
                 <label class="block text-[10px] font-medium text-slate-600 mb-1">Descrição</label>
                 <input
+                  id="product-form-name-input"
                   name="name"
                   type="text"
                   required
@@ -3545,11 +3875,11 @@ export class SilaBillingApp {
                 <label class="block text-[10px] font-medium text-slate-600 mb-1">Preço Unit. (Kz)</label>
                 <input
                   name="price"
-                  type="number"
-                  required
-                  min="0"
-                  step="0.01"
-                  value="${this.editingProduct.price}"
+                  type="text"
+                  inputmode="decimal"
+                  autocomplete="off"
+                  placeholder="0,00"
+                  value="${escapeHtml(this.editingProductPriceInput)}"
                   class="w-full h-9 px-2.5 text-xs font-mono bg-white border border-slate-200 rounded-md focus:outline-none focus:border-blue-600"
                 />
               </div>

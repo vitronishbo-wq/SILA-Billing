@@ -205,7 +205,7 @@ export async function upsertProductCloud(
 
   try {
     const snap = await getDoc(compProdRef);
-    if (!snap.exists() || isNew) {
+    if (!snap.exists()) {
       await setDoc(compProdRef, {
         id: productId,
         companyId,
@@ -310,7 +310,10 @@ export async function upsertCustomerCloud(
   const privRef = doc(db, 'companies', companyId, 'customers', customerId, 'private', 'contact');
 
   try {
-    const snap = await getDoc(custRef);
+    const [snap, privSnap] = await Promise.all([
+      getDoc(custRef),
+      getDoc(privRef).catch(() => null),
+    ]);
     const batch = writeBatch(db);
     if (!snap.exists()) {
       batch.set(custRef, {
@@ -324,6 +327,17 @@ export async function upsertCustomerCloud(
         createdAt: serverTimestamp(),
         updatedAt: serverTimestamp(),
       });
+    } else {
+      batch.update(custRef, {
+        updatedByUid: user.uid,
+        name: customer.name.slice(0, 160),
+        nif: (customer.nif || '').slice(0, 32),
+        locality: (customer.locality || '').slice(0, 160),
+        updatedAt: serverTimestamp(),
+      });
+    }
+
+    if (!privSnap || !privSnap.exists()) {
       batch.set(privRef, {
         companyId,
         companyOwnerUid: ownerUid,
@@ -333,13 +347,6 @@ export async function upsertCustomerCloud(
         updatedAt: serverTimestamp(),
       });
     } else {
-      batch.update(custRef, {
-        updatedByUid: user.uid,
-        name: customer.name.slice(0, 160),
-        nif: (customer.nif || '').slice(0, 32),
-        locality: (customer.locality || '').slice(0, 160),
-        updatedAt: serverTimestamp(),
-      });
       batch.update(privRef, {
         updatedByUid: user.uid,
         phone: (customer.phone || '').slice(0, 40),
@@ -352,7 +359,10 @@ export async function upsertCustomerCloud(
     if (companyId === JAIMONA_COMPANY_ID && ownerUid === user.uid) {
       const legCustRef = doc(db, 'users', user.uid, 'customers', customerId);
       const legPrivRef = doc(db, 'users', user.uid, 'customers', customerId, 'private', 'contact');
-      const legSnap = await getDoc(legCustRef);
+      const [legSnap, legPrivSnap] = await Promise.all([
+        getDoc(legCustRef),
+        getDoc(legPrivRef).catch(() => null),
+      ]);
       const legBatch = writeBatch(db);
       if (!legSnap.exists()) {
         legBatch.set(legCustRef, {
@@ -364,12 +374,6 @@ export async function upsertCustomerCloud(
           createdAt: serverTimestamp(),
           updatedAt: serverTimestamp(),
         });
-        legBatch.set(legPrivRef, {
-          ownerId: user.uid,
-          phone: (customer.phone || '').slice(0, 40),
-          address: (customer.address || '').slice(0, 200),
-          updatedAt: serverTimestamp(),
-        });
       } else {
         legBatch.update(legCustRef, {
           name: customer.name.slice(0, 160),
@@ -377,6 +381,16 @@ export async function upsertCustomerCloud(
           locality: (customer.locality || '').slice(0, 160),
           updatedAt: serverTimestamp(),
         });
+      }
+
+      if (!legPrivSnap || !legPrivSnap.exists()) {
+        legBatch.set(legPrivRef, {
+          ownerId: user.uid,
+          phone: (customer.phone || '').slice(0, 40),
+          address: (customer.address || '').slice(0, 200),
+          updatedAt: serverTimestamp(),
+        });
+      } else {
         legBatch.update(legPrivRef, {
           phone: (customer.phone || '').slice(0, 40),
           address: (customer.address || '').slice(0, 200),
