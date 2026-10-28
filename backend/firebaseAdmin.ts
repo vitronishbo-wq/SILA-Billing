@@ -59,9 +59,13 @@ function parseJsonResilient(rawInput: string): RawServiceAccount {
     }
     return parsed as RawServiceAccount;
   } catch {
-    // Suporta JSON colado com aspas escapadas (ex: {\"type\": \"service_account\", ...})
-    const unescapedQuotes = candidate.replace(/\\"/g, '"');
-    return JSON.parse(unescapedQuotes) as RawServiceAccount;
+    // Suporta JSON colado com aspas escapadas ou quebras de linha literais dentro de strings
+    const sanitized = candidate
+      .replace(/\\"/g, '"')
+      .replace(/"((?:\\.|[^"\\])*)"/gs, (match) =>
+        match.replace(/\r/g, '').replace(/\n/g, '\\n').replace(/\t/g, '\\t')
+      );
+    return JSON.parse(sanitized) as RawServiceAccount;
   }
 }
 

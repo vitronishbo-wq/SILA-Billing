@@ -30,36 +30,22 @@ jobs:
           bun run build
 
       - name: Descodificar Chave Privada do Firebase (Segurança Node 24)
-        env:
-          RAW_SECRET: ${{ secrets.FIREBASE_SERVICE_ACCOUNT_ID || secrets.FIREBASE_SERVICE_ACCOUNT || secrets.FIREBASE_SERVICE_ACCOUNT_JSON || secrets.FIREBASE_SERVICE_ACCOUNT_GEN_LANG_CLIENT_0982515821 }}
+        shell: bash
         run: |
-          node -e '
-            const fs = require("fs");
-            const raw = (process.env.RAW_SECRET || "").trim();
-            if (!raw) {
-              console.error("::error::Secret FIREBASE_SERVICE_ACCOUNT_ID não configurado no GitHub (Settings > Secrets and variables > Actions).");
-              process.exit(1);
-            }
-            let jsonText = raw;
-            if (!raw.startsWith("{")) {
-              const cleanedBase64 = raw.replace(/\s+/g, "");
-              jsonText = Buffer.from(cleanedBase64, "base64").toString("utf8");
-            }
-            let parsed;
-            try {
-              parsed = JSON.parse(jsonText);
-            } catch (e) {
-              console.error("::error::A chave FIREBASE_SERVICE_ACCOUNT está corrompida ou não é um JSON/Base64 válido:", e.message);
-              process.exit(1);
-            }
-            if (!parsed.client_email || !parsed.private_key || !parsed.private_key.includes("BEGIN PRIVATE KEY")) {
-              console.error("::error::A Service Account descodificada não contém client_email ou private_key PEM válida.");
-              process.exit(1);
-            }
-            parsed.private_key = parsed.private_key.replace(/\\n/g, "\n");
-            fs.writeFileSync("gcp_key.json", JSON.stringify(parsed, null, 2), { mode: 0o600 });
-            console.log("Service Account validada com sucesso para:", parsed.client_email);
-          '
+          # Remove espaços ou quebras de linha ocultas e cria o arquivo local limpo
+          cat << 'EOF' > b64_temp.txt
+          ${{ secrets.FIREBASE_SERVICE_ACCOUNT_ID }}
+          EOF
+
+          # Remove qualquer quebra de linha interna da string antes de decodificar
+          tr -d '\r\n ' < b64_temp.txt > b64_clean.txt
+
+          # Decodifica para o arquivo final esperado pela CLI do Firebase
+          base64 -d b64_clean.txt > gcp_key.json
+
+          # Garante a permissão correta de leitura do arquivo
+          chmod 600 gcp_key.json
+          rm -f b64_temp.txt b64_clean.txt
 
       - name: Deploy para o Firebase Hosting e Regras do Firestore
         env:
