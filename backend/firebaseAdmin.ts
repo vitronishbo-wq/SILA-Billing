@@ -42,6 +42,16 @@ function parseJsonResilient(rawInput: string): RawServiceAccount {
     candidate = candidate.slice(1, -1).trim();
   }
 
+  // Se o valor não começar por '{', tenta descodificar automaticamente como Base64
+  // (permite colar Base64 diretamente em FIREBASE_SERVICE_ACCOUNT_JSON ou FIREBASE_CREDENTIALS_BASE64)
+  if (candidate && !candidate.startsWith('{') && !candidate.startsWith('{\\"')) {
+    const cleanB64 = candidate.replace(/\s+/g, '');
+    const decoded = Buffer.from(cleanB64, 'base64').toString('utf-8').trim();
+    if (decoded.startsWith('{')) {
+      candidate = decoded;
+    }
+  }
+
   try {
     const parsed = JSON.parse(candidate);
     if (typeof parsed === 'string') {
@@ -81,10 +91,10 @@ function parseCredentialFromEnv(): {
   source: AdminCredentialSource;
   warning: string | null;
 } {
-  const jsonEnv = process.env.FIREBASE_SERVICE_ACCOUNT_JSON?.trim();
-  if (jsonEnv && !jsonEnv.includes('...')) {
+  const jsonOrBase64Env = process.env.FIREBASE_SERVICE_ACCOUNT_JSON?.trim();
+  if (jsonOrBase64Env && !jsonOrBase64Env.includes('...')) {
     try {
-      const parsed = parseJsonResilient(jsonEnv);
+      const parsed = parseJsonResilient(jsonOrBase64Env);
       return {
         serviceAccount: normalizeServiceAccount(parsed),
         source: 'FIREBASE_SERVICE_ACCOUNT_JSON',
@@ -103,10 +113,9 @@ function parseCredentialFromEnv(): {
   }
 
   const base64Env = process.env.FIREBASE_CREDENTIALS_BASE64?.trim();
-  if (base64Env) {
+  if (base64Env && !base64Env.includes('...')) {
     try {
-      const decoded = Buffer.from(base64Env, 'base64').toString('utf-8');
-      const parsed = parseJsonResilient(decoded);
+      const parsed = parseJsonResilient(base64Env);
       return {
         serviceAccount: normalizeServiceAccount(parsed),
         source: 'FIREBASE_CREDENTIALS_BASE64',
