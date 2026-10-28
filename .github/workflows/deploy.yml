@@ -29,25 +29,97 @@ jobs:
           bun install
           bun run build
 
-      - name: Gravar Credenciais do Firebase Service Account
+      - name: Gravar e Validar Credenciais do Firebase Service Account
         shell: bash
         env:
-          FIREBASE_SA_JSON: ${{ secrets.FIREBASE_SERVICE_ACCOUNT_ID || secrets.FIREBASE_SERVICE_ACCOUNT }}
+          SA_1: ${{ secrets.FIREBASE_SERVICE_ACCOUNT_ID }}
+          SA_2: ${{ secrets.FIREBASE_SERVICE_ACCOUNT }}
+          SA_3: ${{ secrets.FIREBASE_SERVICE_ACCOUNT_JSON }}
+          SA_4: ${{ secrets.GCP_SA_KEY }}
+          KEY_OUT: ${{ runner.temp }}/gcp_key.json
         run: |
-          # Grava o JSON diretamente no ficheiro esperado pela CLI do Firebase preservando \n
-          printf '%s\n' "$FIREBASE_SA_JSON" > gcp_key.json
-          chmod 600 gcp_key.json
-          echo "Credenciais gravadas com sucesso."
+          node -e '
+            const fs = require("fs");
+            const crypto = require("crypto");
+
+            const raw = (
+              process.env.SA_1 ||
+              process.env.SA_2 ||
+              process.env.SA_3 ||
+              process.env.SA_4 ||
+              ""
+            ).trim();
+
+            if (!raw) {
+              console.error("::error::Nenhuma credencial recebida! Confirme que criou FIREBASE_SERVICE_ACCOUNT_ID em Settings > Secrets and variables > Actions > Repository secrets (e NÃO apenas dentro de Environments).");
+              process.exit(1);
+            }
+
+            let candidate = raw;
+            if (
+              (candidate.startsWith("\"") && candidate.endsWith("\"")) ||
+              (candidate.startsWith("\x27") && candidate.endsWith("\x27"))
+            ) {
+              candidate = candidate.slice(1, -1).trim();
+            }
+
+            const looksLikeJson = candidate.startsWith("{") || candidate.startsWith("{\\");
+            console.log("Formato detetado no Secret:", looksLikeJson ? "JSON texto plano" : "Base64", "| Tamanho:", candidate.length, "caracteres");
+
+            if (!looksLikeJson) {
+              const noWs = candidate.replace(/\s+/g, "");
+              const badMatch = noWs.match(/[^A-Za-z0-9+/=_-]/);
+              if (badMatch) {
+                console.error(`::error::O Secret contém Base64 CORROMPIDO (caractere inválido "${badMatch[0]}" na posição ${badMatch.index}). Abra o ficheiro .json original descarregado do Firebase num editor de texto e cole o JSON original diretamente no Secret FIREBASE_SERVICE_ACCOUNT_ID.`);
+                process.exit(1);
+              }
+              const normalizedB64 = noWs.replace(/-/g, "+").replace(/_/g, "/");
+              candidate = Buffer.from(normalizedB64, "base64").toString("utf8").trim();
+            }
+
+            let parsed;
+            try {
+              parsed = JSON.parse(candidate);
+            } catch {
+              const sanitized = candidate
+                .replace(/\\"/g, "\"")
+                .replace(/"((?:\\.|[^"\\])*)"/gs, (m) =>
+                  m.replace(/\r/g, "").replace(/\n/g, "\\n").replace(/\t/g, "\\t")
+                );
+              try {
+                parsed = JSON.parse(sanitized);
+              } catch (err2) {
+                console.error("::error::O conteúdo do Secret não é um JSON válido de Service Account:", err2.message);
+                process.exit(1);
+              }
+            }
+
+            if (parsed.type !== "service_account" || !parsed.client_email || !parsed.private_key) {
+              console.error("::error::JSON incompleto: faltam os campos type=service_account, client_email ou private_key.");
+              process.exit(1);
+            }
+
+            parsed.private_key = String(parsed.private_key).replace(/\\n/g, "\n");
+
+            try {
+              crypto.createPrivateKey(parsed.private_key);
+            } catch (pemErr) {
+              console.error("::error::A chave privada RSA (private_key) está truncada ou corrompida:", pemErr.message, "— Gere uma nova chave privada .json na Consola do Firebase > Definições do Projeto > Contas de serviço.");
+              process.exit(1);
+            }
+
+            fs.writeFileSync(process.env.KEY_OUT, JSON.stringify(parsed, null, 2), { mode: 0o600 });
+            fs.appendFileSync(process.env.GITHUB_ENV, `GOOGLE_APPLICATION_CREDENTIALS=${process.env.KEY_OUT}\n`);
+            console.log("Service Account validada criptograficamente com sucesso:", parsed.client_email, "| Projeto:", parsed.project_id);
+          '
 
       - name: Deploy para o Firebase Hosting e Regras do Firestore
-        env:
-          GOOGLE_APPLICATION_CREDENTIALS: ${{ github.workspace }}/gcp_key.json
         run: |
-          npx --yes firebase-tools@latest deploy --only hosting,firestore:rules --project gen-lang-client-0982515821
+          npx --yes firebase-tools@latest deploy --only hosting,firestore:rules --project gen-lang-client-0982515821 --non-interactive
 
       - name: Limpar Chave Temporária
         if: always()
-        run: rm -f gcp_key.json
+        run: rm -f "${{ runner.temp }}/gcp_key.json"
 
       - name: Disparar Atualização Automática no Render
         env:
