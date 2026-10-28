@@ -1,8 +1,8 @@
 @import "tailwindcss";
 
 @theme {
-  --font-sans: "Plus Jakarta Sans", ui-sans-serif, system-ui, sans-serif;
-  --font-mono: "JetBrains Mono", ui-monospace, SFMono-Regular, monospace;
+  --font-sans: "Plus Jakarta Sans", "Segoe UI", ui-sans-serif, system-ui, -apple-system, Arial, sans-serif;
+  --font-mono: "JetBrains Mono", Consolas, "Liberation Mono", ui-monospace, SFMono-Regular, "Courier New", monospace;
 }
 
 @layer base {
@@ -22,6 +22,22 @@
   .no-scrollbar {
     -ms-overflow-style: none;
     scrollbar-width: none;
+  }
+}
+
+/* Fallbacks à prova de minificação para browsers Windows 7 (Chrome 79–107 / Firefox ESR) */
+@supports not (height: 100dvh) {
+  .h-dvh {
+    height: 100vh;
+  }
+}
+
+@supports not (translate: 0) {
+  .-translate-y-1\/2 {
+    transform: translateY(-50%);
+  }
+  .-translate-x-1\/2 {
+    transform: translateX(-50%);
   }
 }
 

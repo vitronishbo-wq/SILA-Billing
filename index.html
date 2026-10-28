@@ -2,6 +2,7 @@
 <html lang="pt">
   <head>
     <meta charset="UTF-8" />
+    <meta http-equiv="X-UA-Compatible" content="IE=edge" />
     <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no" />
     <title>SILA-Billing — JAIMONA</title>
     <meta name="description" content="Sistema de faturação POS térmico e A4 offline-first para JAIMONA-COMÉRCIO E SERVIÇOS, (SU) LDA." />
@@ -19,9 +20,259 @@
     <link rel="preconnect" href="https://fonts.googleapis.com" />
     <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
     <link href="https://fonts.googleapis.com/css2?family=JetBrains+Mono:wght@400;600;700&family=Plus+Jakarta+Sans:wght@400;500;600;700&display=swap" rel="stylesheet" />
+    <style>
+      .sila-compat-hidden { display: none; }
+      .sila-compat-wrap {
+        min-height: 100vh;
+        padding: 24px 16px;
+        background-color: #f8fafc;
+        color: #0f172a;
+        font-family: "Segoe UI", Arial, sans-serif;
+      }
+      .sila-compat-box {
+        max-width: 480px;
+        margin: 48px auto;
+        padding: 24px;
+        background-color: #ffffff;
+        border: 1px solid #cbd5e1;
+        border-radius: 8px;
+      }
+      .sila-compat-kicker {
+        font-size: 12px;
+        font-weight: 700;
+        color: #2563eb;
+        margin: 0 0 6px 0;
+      }
+      .sila-compat-title {
+        font-size: 18px;
+        font-weight: 700;
+        color: #0f172a;
+        margin: 0 0 10px 0;
+      }
+      .sila-compat-text {
+        font-size: 13px;
+        line-height: 1.55;
+        color: #334155;
+        margin: 0 0 12px 0;
+      }
+      .sila-compat-detail {
+        font-family: Consolas, "Courier New", monospace;
+        font-size: 11px;
+        color: #64748b;
+        background-color: #f1f5f9;
+        padding: 8px 10px;
+        border-radius: 4px;
+        margin: 0 0 16px 0;
+        word-break: break-word;
+      }
+      .sila-compat-btn {
+        display: inline-block;
+        padding: 9px 16px;
+        font-size: 12px;
+        font-weight: 600;
+        color: #ffffff;
+        background-color: #0f172a;
+        border: 0;
+        border-radius: 6px;
+        cursor: pointer;
+      }
+    </style>
+    <script>
+      /* Micro-shim 100% local e offline para motores antigos (Windows 7 / Chrome legado) — 0 pedidos externos */
+      (function () {
+        window.__SILA_BOOTED__ = false;
+
+        if (typeof Object.assign !== 'function') {
+          Object.assign = function (target) {
+            if (target == null) throw new TypeError('Cannot convert undefined or null to object');
+            var to = Object(target);
+            for (var i = 1; i < arguments.length; i++) {
+              var next = arguments[i];
+              if (next != null) {
+                for (var key in next) {
+                  if (Object.prototype.hasOwnProperty.call(next, key)) to[key] = next[key];
+                }
+              }
+            }
+            return to;
+          };
+        }
+
+        if (typeof Object.fromEntries !== 'function') {
+          Object.fromEntries = function (entries) {
+            var obj = {};
+            if (!entries) return obj;
+            var arr = Array.from ? Array.from(entries) : entries;
+            for (var i = 0; i < arr.length; i++) {
+              var pair = arr[i];
+              if (pair && pair.length >= 2) obj[pair[0]] = pair[1];
+            }
+            return obj;
+          };
+        }
+
+        if (!Array.prototype.flat) {
+          Array.prototype.flat = function (depth) {
+            var d = depth === undefined ? 1 : Number(depth) || 0;
+            var res = [];
+            (function flatten(arr, cur) {
+              for (var i = 0; i < arr.length; i++) {
+                if (Array.isArray(arr[i]) && cur > 0) flatten(arr[i], cur - 1);
+                else res.push(arr[i]);
+              }
+            })(this, d);
+            return res;
+          };
+        }
+
+        if (!Array.prototype.at) {
+          Array.prototype.at = function (n) {
+            var idx = Math.trunc ? Math.trunc(n) || 0 : parseInt(n, 10) || 0;
+            if (idx < 0) idx += this.length;
+            if (idx < 0 || idx >= this.length) return undefined;
+            return this[idx];
+          };
+        }
+
+        if (!String.prototype.replaceAll) {
+          String.prototype.replaceAll = function (search, replacement) {
+            if (Object.prototype.toString.call(search) === '[object RegExp]') {
+              return this.replace(search, replacement);
+            }
+            return this.split(String(search)).join(String(replacement));
+          };
+        }
+
+        if (typeof Element !== 'undefined') {
+          if (!Element.prototype.matches) {
+            Element.prototype.matches =
+              Element.prototype.msMatchesSelector || Element.prototype.webkitMatchesSelector;
+          }
+          if (!Element.prototype.closest) {
+            Element.prototype.closest = function (s) {
+              var el = this;
+              do {
+                if (el.matches && el.matches(s)) return el;
+                el = el.parentElement || el.parentNode;
+              } while (el !== null && el.nodeType === 1);
+              return null;
+            };
+          }
+        }
+
+        if (!window.CSS) window.CSS = {};
+        if (typeof window.CSS.escape !== 'function') {
+          window.CSS.escape = function (value) {
+            return String(value).replace(/[^a-zA-Z0-9_\-]/g, function (ch) {
+              return '\\' + ch;
+            });
+          };
+        }
+
+        if (typeof Promise !== 'undefined' && typeof Promise.allSettled !== 'function') {
+          Promise.allSettled = function (promises) {
+            var list = Array.prototype.slice.call(promises || []);
+            return Promise.all(
+              list.map(function (p) {
+                return Promise.resolve(p).then(
+                  function (value) {
+                    return { status: 'fulfilled', value: value };
+                  },
+                  function (reason) {
+                    return { status: 'rejected', reason: reason };
+                  }
+                );
+              })
+            );
+          };
+        }
+      })();
+    </script>
   </head>
   <body class="bg-slate-50 text-slate-900 antialiased selection:bg-blue-600 selection:text-white">
-    <div id="root"></div>
+    <div id="root">
+      <noscript>
+        <div class="sila-compat-wrap">
+          <div class="sila-compat-box">
+            <p class="sila-compat-kicker">SILA-Billing</p>
+            <h1 class="sila-compat-title">JavaScript desativado</h1>
+            <p class="sila-compat-text">Ative o JavaScript nas definições do navegador para utilizar o terminal de faturação POS e A4.</p>
+          </div>
+        </div>
+      </noscript>
+      <div id="sila-compat-fallback" class="sila-compat-wrap sila-compat-hidden" role="alert">
+        <div class="sila-compat-box">
+          <p class="sila-compat-kicker">SILA-Billing · Modo de Compatibilidade</p>
+          <h1 class="sila-compat-title">Navegador desatualizado detetado</h1>
+          <p class="sila-compat-text">
+            Este terminal está a utilizar um navegador antigo (como Internet Explorer ou uma versão muito antiga do Chrome) que não suporta módulos modernos nem armazenamento local seguro.
+          </p>
+          <p class="sila-compat-text">
+            <strong>Em computadores com Windows 7:</strong> instale gratuitamente o <strong>Google Chrome 109</strong> ou o <strong>Mozilla Firefox 115 ESR</strong> para emitir faturas POS e A4 com rapidez total, inclusive offline.
+          </p>
+          <p id="sila-compat-detail" class="sila-compat-detail sila-compat-hidden"></p>
+          <button type="button" id="sila-compat-reload-btn" class="sila-compat-btn">
+            Recarregar terminal
+          </button>
+        </div>
+      </div>
+    </div>
+    <script>
+      /* Detetor inteligente de arranque (evita falsos positivos em discos HDD lentos) */
+      (function () {
+        function showCompatFallback(reason) {
+          if (window.__SILA_BOOTED__) return;
+          var root = document.getElementById('root');
+          if (root && root.getAttribute('data-sila-mounted') === '1') return;
+          var box = document.getElementById('sila-compat-fallback');
+          if (box) {
+            box.className = 'sila-compat-wrap';
+          }
+          if (reason) {
+            var detail = document.getElementById('sila-compat-detail');
+            if (detail) {
+              detail.textContent = 'Diagnóstico: ' + String(reason);
+              detail.className = 'sila-compat-detail';
+            }
+          }
+        }
+
+        var reloadBtn = document.getElementById('sila-compat-reload-btn');
+        if (reloadBtn) {
+          reloadBtn.onclick = function () {
+            if (window.navigator && navigator.serviceWorker && navigator.serviceWorker.getRegistrations) {
+              navigator.serviceWorker.getRegistrations().then(function (regs) {
+                for (var i = 0; i < regs.length; i++) regs[i].unregister();
+                window.location.reload();
+              })['catch'](function () {
+                window.location.reload();
+              });
+            } else {
+              window.location.reload();
+            }
+          };
+        }
+
+        var supportsModules = 'noModule' in document.createElement('script');
+        if (!supportsModules || typeof window.indexedDB === 'undefined') {
+          showCompatFallback('Motor sem suporte nativo a ES Modules / IndexedDB.');
+          return;
+        }
+
+        window.addEventListener('error', function (evt) {
+          if (!window.__SILA_BOOTED__) {
+            var msg = evt && evt.message ? evt.message : 'Falha ao carregar módulo principal.';
+            showCompatFallback(msg);
+          }
+        });
+
+        setTimeout(function () {
+          if (!window.__SILA_BOOTED__) {
+            showCompatFallback('Tempo limite excedido no arranque inicial do navegador.');
+          }
+        }, 9000);
+      })();
+    </script>
     <script type="module" src="/src/main.tsx"></script>
   </body>
 </html>

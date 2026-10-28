@@ -1,9 +1,9 @@
 import tailwindcss from '@tailwindcss/vite';
 import path from 'path';
-import { defineConfig } from 'vite';
+import { defineConfig, type UserConfig } from 'vite';
 import { VitePWA } from 'vite-plugin-pwa';
 
-export default defineConfig(() => {
+export default defineConfig((): UserConfig => {
   return {
     plugins: [
       tailwindcss(),
@@ -93,6 +93,9 @@ export default defineConfig(() => {
       }),
     ],
     build: {
+      target: ['es2018', 'chrome79', 'firefox78', 'safari13'],
+      cssTarget: ['chrome79', 'firefox78', 'safari13'],
+      minify: 'esbuild',
       chunkSizeWarningLimit: 1000,
     },
     resolve: {
