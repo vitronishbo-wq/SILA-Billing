@@ -1,4 +1,5 @@
-- name: Gravar Credenciais do Firebase Service Account
+
+      - name: Gravar e Validar Credenciais do Firebase Service Account
         shell: bash
         env:
           FIREBASE_SA_JSON: ${{ secrets.FIREBASE_SERVICE_ACCOUNT_ID }}
@@ -6,32 +7,96 @@
         run: |
           node -e '
             const fs = require("fs");
+            const crypto = require("crypto");
+
             let raw = (process.env.FIREBASE_SA_JSON || "").trim();
+
             if (!raw) {
-              console.error("::error::Secret FIREBASE_SERVICE_ACCOUNT_ID em falta.");
+              console.error("::error::Secret FIREBASE_SERVICE_ACCOUNT_ID não está configurado.");
               process.exit(1);
             }
 
-            // Se for Base64, converte para texto
-            if (!raw.startsWith("{")) {
-              raw = Buffer.from(raw.replace(/\s+/g, ""), "base64").toString("utf8");
+            let candidate = raw;
+
+            // Descodificar Base64 quando o conteúdo não for JSON bruto.
+            if (!candidate.startsWith("{")) {
+              try {
+                candidate = Buffer.from(
+                  candidate.replace(/\s+/g, "").replace(/-/g, "+").replace(/_/g, "/"),
+                  "base64"
+                ).toString("utf8").trim();
+
+                if (!candidate.startsWith("{")) {
+                  throw new Error("O conteúdo descodificado não começa com '{'.");
+                }
+              } catch (err) {
+                console.error("::error::Secret inválido: JSON ou Base64 malformado.");
+                process.exit(1);
+              }
             }
 
+            // Validar a estrutura JSON.
             let parsed;
+
             try {
-              parsed = JSON.parse(raw);
-            } catch (e) {
-              // Fallback seguro caso haja quebras de linha literais nas strings
-              const fixed = raw.replace(/\n/g, "\\n").replace(/\r/g, "");
-              parsed = JSON.parse(fixed);
+              parsed = JSON.parse(candidate);
+            } catch (err) {
+              console.error("::error::O Secret não contém JSON válido.");
+              process.exit(1);
             }
 
-            // Normaliza o formato PEM da chave privada
-            if (parsed.private_key) {
-              parsed.private_key = parsed.private_key.replace(/\\n/g, "\n");
+            // Validar os campos obrigatórios.
+            if (
+              !parsed ||
+              typeof parsed !== "object" ||
+              typeof parsed.project_id !== "string" ||
+              !parsed.project_id.trim() ||
+              typeof parsed.client_email !== "string" ||
+              !parsed.client_email.trim() ||
+              typeof parsed.private_key !== "string" ||
+              !parsed.private_key.trim()
+            ) {
+              console.error("::error::Credenciais incompletas ou inválidas.");
+              process.exit(1);
             }
 
-            fs.writeFileSync(process.env.KEY_OUT, JSON.stringify(parsed, null, 2), { mode: 0o600 });
-            fs.appendFileSync(process.env.GITHUB_ENV, `GOOGLE_APPLICATION_CREDENTIALS=${process.env.KEY_OUT}\n`);
-            console.log("Credenciais validadas com sucesso para:", parsed.client_email);
+            // Normalizar e validar a chave privada.
+            parsed.private_key = parsed.private_key.replace(/\\n/g, "\n");
+
+            let privateKey;
+
+            try {
+              privateKey = crypto.createPrivateKey(parsed.private_key);
+
+              if (privateKey.asymmetricKeyType !== "rsa") {
+                throw new Error("A chave não é RSA.");
+              }
+            } catch (err) {
+              console.error("::error::A chave privada PEM é inválida ou está corrompida.");
+              process.exit(1);
+            }
+
+            // Confirmar que o destino e o ambiente do GitHub estão disponíveis.
+            if (!process.env.KEY_OUT || !process.env.GITHUB_ENV) {
+              console.error("::error::Variáveis de ambiente obrigatórias em falta.");
+              process.exit(1);
+            }
+
+            try {
+              fs.writeFileSync(
+                process.env.KEY_OUT,
+                JSON.stringify(parsed, null, 2),
+                { mode: 0o600, flag: "w" }
+              );
+
+              fs.appendFileSync(
+                process.env.GITHUB_ENV,
+                `GOOGLE_APPLICATION_CREDENTIALS=${process.env.KEY_OUT}\n`
+              );
+            } catch (err) {
+              console.error("::error::Falha ao guardar as credenciais.");
+              process.exit(1);
+            }
+
+            console.log("Credenciais do Service Account validadas com sucesso.");
           '
