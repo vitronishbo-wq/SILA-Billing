@@ -1,102 +1,95 @@
+name: Automacao Total SILA-Billing
+
+on:
+  push:
+    branches:
+      - main
+
+jobs:
+  build_and_deploy:
+    runs-on: ubuntu-24.04
+    
+    steps:
+      - name: Checkout do Repositorio
+        uses: actions/checkout@v4
+
+      - name: Configurar o Bun Runtime
+        uses: oven-sh/setup-bun@v1
+        with:
+          bun-version: latest
+
+      - name: Instalar Dependencias e Gerar Build PWA
+        run: |
+          bun install
+          bun run build
 
       - name: Gravar e Validar Credenciais do Firebase Service Account
         shell: bash
         env:
           FIREBASE_SA_JSON: ${{ secrets.FIREBASE_SERVICE_ACCOUNT_ID }}
-          KEY_OUT: ${{ runner.temp }}/gcp_key.json
         run: |
           node -e '
-            const fs = require("fs");
-            const crypto = require("crypto");
-
-            let raw = (process.env.FIREBASE_SA_JSON || "").trim();
-
-            if (!raw) {
-              console.error("::error::Secret FIREBASE_SERVICE_ACCOUNT_ID não está configurado.");
-              process.exit(1);
-            }
-
-            let candidate = raw;
-
-            // Descodificar Base64 quando o conteúdo não for JSON bruto.
-            if (!candidate.startsWith("{")) {
-              try {
-                candidate = Buffer.from(
-                  candidate.replace(/\s+/g, "").replace(/-/g, "+").replace(/_/g, "/"),
-                  "base64"
-                ).toString("utf8").trim();
-
-                if (!candidate.startsWith("{")) {
-                  throw new Error("O conteúdo descodificado não começa com '{'.");
-                }
-              } catch (err) {
-                console.error("::error::Secret inválido: JSON ou Base64 malformado.");
-                process.exit(1);
-              }
-            }
-
-            // Validar a estrutura JSON.
-            let parsed;
-
+          const fs = require("fs");
+          const crypto = require("crypto");
+          const raw = (process.env.FIREBASE_SA_JSON || "").trim();
+          if (!raw) {
+            console.error("::error::Secret FIREBASE_SERVICE_ACCOUNT_ID nao esta configurado.");
+            process.exit(1);
+          }
+          let candidate = raw;
+          if (!candidate.startsWith("{")) {
             try {
-              parsed = JSON.parse(candidate);
-            } catch (err) {
-              console.error("::error::O Secret não contém JSON válido.");
-              process.exit(1);
-            }
-
-            // Validar os campos obrigatórios.
-            if (
-              !parsed ||
-              typeof parsed !== "object" ||
-              typeof parsed.project_id !== "string" ||
-              !parsed.project_id.trim() ||
-              typeof parsed.client_email !== "string" ||
-              !parsed.client_email.trim() ||
-              typeof parsed.private_key !== "string" ||
-              !parsed.private_key.trim()
-            ) {
-              console.error("::error::Credenciais incompletas ou inválidas.");
-              process.exit(1);
-            }
-
-            // Normalizar e validar a chave privada.
-            parsed.private_key = parsed.private_key.replace(/\\n/g, "\n");
-
-            let privateKey;
-
-            try {
-              privateKey = crypto.createPrivateKey(parsed.private_key);
-
-              if (privateKey.asymmetricKeyType !== "rsa") {
-                throw new Error("A chave não é RSA.");
+              candidate = Buffer.from(
+                candidate.replace(/\s+/g, "").replace(/-/g, "+").replace(/_/g, "/"),
+                "base64"
+              ).toString("utf8").trim();
+              if (!candidate.startsWith("{")) {
+                throw new Error("Conteudo descodificado invalido");
               }
             } catch (err) {
-              console.error("::error::A chave privada PEM é inválida ou está corrompida.");
+              console.error("::error::Secret invalido: JSON ou Base64 malformado.");
               process.exit(1);
             }
-
-            // Confirmar que o destino e o ambiente do GitHub estão disponíveis.
-            if (!process.env.KEY_OUT || !process.env.GITHUB_ENV) {
-              console.error("::error::Variáveis de ambiente obrigatórias em falta.");
-              process.exit(1);
+          }
+          let parsed;
+          try {
+            parsed = JSON.parse(candidate);
+          } catch (err) {
+            console.error("::error::O Secret nao contem JSON valido.");
+            process.exit(1);
+          }
+          if (!parsed || typeof parsed !== "object" || !parsed.project_id || !parsed.client_email || !parsed.private_key) {
+            console.error("::error::Credenciais incompletas ou invalidas.");
+            process.exit(1);
+          }
+          parsed.private_key = parsed.private_key.replace(/\\n/g, "\n");
+          try {
+            const privateKey = crypto.createPrivateKey(parsed.private_key);
+            if (privateKey.asymmetricKeyType !== "rsa") {
+              throw new Error("A chave nao e RSA.");
             }
-
-            try {
-              fs.writeFileSync(
-                process.env.KEY_OUT,
-                JSON.stringify(parsed, null, 2),
-                { mode: 0o600, flag: "w" }
-              );
-
-              fs.appendFileSync(
-                process.env.GITHUB_ENV,
-                `GOOGLE_APPLICATION_CREDENTIALS=${process.env.KEY_OUT}\n`
-              );
-            } catch (err) {
-              console.error("::error::Falha ao guardar as credenciais.");
-              process.exit(1);
-            }
-
-            console.log("Credenciais do Service Account validadas com sucesso.");
+          } catch (err) {
+            console.error("::error::A chave privada PEM e invalida ou esta corrompida.");
+            process.exit(1);
+          }
+          const keyPath = `${process.env.RUNNER_TEMP}/gcp_key.json`;
+          try {
+            fs.writeFileSync(keyPath, JSON.stringify(parsed, null, 2), { mode: 0o600, flag: "w" });
+            fs.appendFileSync(process.env.GITHUB_ENV, `GOOGLE_APPLICATION_CREDENTIALS=${keyPath}\n`);
+          } catch (err) {
+            console.error("::error::Falha ao guardar as credenciais.");
+            process.exit(1);
+          }
+          console.log("Credenciais do Service Account validadas com sucesso.");
           '
+
+      - name: Deploy para o Firebase Hosting e Regras do Firestore
+        uses: w9jds/firebase-action@v2.3.0
+        with:
+          args: deploy --only hosting,firestore:rules --project gen-lang-client-0982515821
+        env:
+          GCP_SA_KEY: ${{ env.GOOGLE_APPLICATION_CREDENTIALS }}
+
+      - name: Disparar Atualizacao Automatica no Render
+        run: |
+          curl -X POST "${{ secrets.RENDER_DEPLOY_HOOK_URL }}"
