@@ -29,23 +29,15 @@ jobs:
           bun install
           bun run build
 
-      - name: Descodificar Chave Privada do Firebase (Segurança Node 24)
+      - name: Gravar Credenciais do Firebase Service Account
         shell: bash
+        env:
+          FIREBASE_SA_JSON: ${{ secrets.FIREBASE_SERVICE_ACCOUNT_ID || secrets.FIREBASE_SERVICE_ACCOUNT }}
         run: |
-          # Remove espaços ou quebras de linha ocultas e cria o arquivo local limpo
-          cat << 'EOF' > b64_temp.txt
-          ${{ secrets.FIREBASE_SERVICE_ACCOUNT_ID }}
-          EOF
-
-          # Remove qualquer quebra de linha interna da string antes de decodificar
-          tr -d '\r\n ' < b64_temp.txt > b64_clean.txt
-
-          # Decodifica para o arquivo final esperado pela CLI do Firebase
-          base64 -d b64_clean.txt > gcp_key.json
-
-          # Garante a permissão correta de leitura do arquivo
+          # Grava o JSON diretamente no ficheiro esperado pela CLI do Firebase preservando \n
+          printf '%s\n' "$FIREBASE_SA_JSON" > gcp_key.json
           chmod 600 gcp_key.json
-          rm -f b64_temp.txt b64_clean.txt
+          echo "Credenciais gravadas com sucesso."
 
       - name: Deploy para o Firebase Hosting e Regras do Firestore
         env:
