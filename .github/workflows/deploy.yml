@@ -1,0 +1,83 @@
+name: Automação Total SILA-Billing
+
+on:
+  push:
+    branches:
+      - main
+
+jobs:
+  build_and_deploy:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout do Repositório
+        uses: actions/checkout@v4
+
+      - name: Configurar o Bun Runtime
+        uses: oven-sh/setup-bun@v2
+        with:
+          bun-version: latest
+
+      - name: Configurar Node.js 24 (Firebase CLI)
+        uses: actions/setup-node@v4
+        with:
+          node-version: 24
+
+      - name: Instalar Dependências e Gerar Build PWA
+        env:
+          VITE_API_BASE_URL: ${{ vars.VITE_API_BASE_URL || secrets.VITE_API_BASE_URL }}
+        run: |
+          bun install
+          bun run build
+
+      - name: Descodificar Chave Privada do Firebase (Segurança Node 24)
+        env:
+          RAW_SECRET: ${{ secrets.FIREBASE_SERVICE_ACCOUNT || secrets.FIREBASE_SERVICE_ACCOUNT_JSON }}
+        run: |
+          node -e '
+            const fs = require("fs");
+            const raw = (process.env.RAW_SECRET || "").trim();
+            if (!raw) {
+              console.error("::error::Secret FIREBASE_SERVICE_ACCOUNT não configurado no GitHub (Settings > Secrets and variables > Actions).");
+              process.exit(1);
+            }
+            let jsonText = raw;
+            if (!raw.startsWith("{")) {
+              const cleanedBase64 = raw.replace(/\s+/g, "");
+              jsonText = Buffer.from(cleanedBase64, "base64").toString("utf8");
+            }
+            let parsed;
+            try {
+              parsed = JSON.parse(jsonText);
+            } catch (e) {
+              console.error("::error::A chave FIREBASE_SERVICE_ACCOUNT está corrompida ou não é um JSON/Base64 válido:", e.message);
+              process.exit(1);
+            }
+            if (!parsed.client_email || !parsed.private_key || !parsed.private_key.includes("BEGIN PRIVATE KEY")) {
+              console.error("::error::A Service Account descodificada não contém client_email ou private_key PEM válida.");
+              process.exit(1);
+            }
+            parsed.private_key = parsed.private_key.replace(/\\n/g, "\n");
+            fs.writeFileSync("gcp_key.json", JSON.stringify(parsed, null, 2), { mode: 0o600 });
+            console.log("Service Account validada com sucesso para:", parsed.client_email);
+          '
+
+      - name: Deploy para o Firebase Hosting e Regras do Firestore
+        env:
+          GOOGLE_APPLICATION_CREDENTIALS: ${{ github.workspace }}/gcp_key.json
+        run: |
+          npx --yes firebase-tools@latest deploy --only hosting,firestore:rules --project gen-lang-client-0982515821
+
+      - name: Limpar Chave Temporária
+        if: always()
+        run: rm -f gcp_key.json
+
+      - name: Disparar Atualização Automática no Render
+        env:
+          HOOK_URL: ${{ secrets.RENDER_DEPLOY_HOOK_URL }}
+        run: |
+          if [ -n "$HOOK_URL" ]; then
+            curl -fsSL -X POST "$HOOK_URL"
+            echo "Deploy Hook do Render disparado com sucesso."
+          else
+            echo "RENDER_DEPLOY_HOOK_URL não definido (o Render já atualiza automaticamente via GitHub autoDeploy)."
+          fi

@@ -1,11 +1,13 @@
 {
   "firestore": {
+    "database": "ai-studio-49352535-85f6-4187-bf2b-3e420dac8a25",
     "rules": "firestore.rules"
   },
   "hosting": {
     "public": "dist",
     "ignore": [
       "firebase.json",
+      "gcp_key.json",
       "**/.*",
       "**/node_modules/**",
       "backend/**",
