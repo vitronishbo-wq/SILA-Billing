@@ -1,133 +1,37 @@
-name: Automação Total SILA-Billing
-
-on:
-  push:
-    branches:
-      - main
-
-jobs:
-  build_and_deploy:
-    runs-on: ubuntu-latest
-    steps:
-      - name: Checkout do Repositório
-        uses: actions/checkout@v4
-
-      - name: Configurar o Bun Runtime
-        uses: oven-sh/setup-bun@v2
-        with:
-          bun-version: latest
-
-      - name: Configurar Node.js 24 (Firebase CLI)
-        uses: actions/setup-node@v4
-        with:
-          node-version: 24
-
-      - name: Instalar Dependências e Gerar Build PWA
-        env:
-          VITE_API_BASE_URL: ${{ vars.VITE_API_BASE_URL || secrets.VITE_API_BASE_URL }}
-        run: |
-          bun install
-          bun run build
-
-      - name: Gravar e Validar Credenciais do Firebase Service Account
+- name: Gravar Credenciais do Firebase Service Account
         shell: bash
         env:
-          SA_1: ${{ secrets.FIREBASE_SERVICE_ACCOUNT_ID }}
-          SA_2: ${{ secrets.FIREBASE_SERVICE_ACCOUNT }}
-          SA_3: ${{ secrets.FIREBASE_SERVICE_ACCOUNT_JSON }}
-          SA_4: ${{ secrets.GCP_SA_KEY }}
+          FIREBASE_SA_JSON: ${{ secrets.FIREBASE_SERVICE_ACCOUNT_ID }}
           KEY_OUT: ${{ runner.temp }}/gcp_key.json
         run: |
           node -e '
             const fs = require("fs");
-            const crypto = require("crypto");
-
-            const raw = (
-              process.env.SA_1 ||
-              process.env.SA_2 ||
-              process.env.SA_3 ||
-              process.env.SA_4 ||
-              ""
-            ).trim();
-
+            let raw = (process.env.FIREBASE_SA_JSON || "").trim();
             if (!raw) {
-              console.error("::error::Nenhuma credencial recebida! Confirme que criou FIREBASE_SERVICE_ACCOUNT_ID em Settings > Secrets and variables > Actions > Repository secrets (e NÃO apenas dentro de Environments).");
+              console.error("::error::Secret FIREBASE_SERVICE_ACCOUNT_ID em falta.");
               process.exit(1);
             }
 
-            let candidate = raw;
-            if (
-              (candidate.startsWith("\"") && candidate.endsWith("\"")) ||
-              (candidate.startsWith("\x27") && candidate.endsWith("\x27"))
-            ) {
-              candidate = candidate.slice(1, -1).trim();
-            }
-
-            const looksLikeJson = candidate.startsWith("{") || candidate.startsWith("{\\");
-            console.log("Formato detetado no Secret:", looksLikeJson ? "JSON texto plano" : "Base64", "| Tamanho:", candidate.length, "caracteres");
-
-            if (!looksLikeJson) {
-              const noWs = candidate.replace(/\s+/g, "");
-              const badMatch = noWs.match(/[^A-Za-z0-9+/=_-]/);
-              if (badMatch) {
-                console.error(`::error::O Secret contém Base64 CORROMPIDO (caractere inválido "${badMatch[0]}" na posição ${badMatch.index}). Abra o ficheiro .json original descarregado do Firebase num editor de texto e cole o JSON original diretamente no Secret FIREBASE_SERVICE_ACCOUNT_ID.`);
-                process.exit(1);
-              }
-              const normalizedB64 = noWs.replace(/-/g, "+").replace(/_/g, "/");
-              candidate = Buffer.from(normalizedB64, "base64").toString("utf8").trim();
+            // Se for Base64, converte para texto
+            if (!raw.startsWith("{")) {
+              raw = Buffer.from(raw.replace(/\s+/g, ""), "base64").toString("utf8");
             }
 
             let parsed;
             try {
-              parsed = JSON.parse(candidate);
-            } catch {
-              const sanitized = candidate
-                .replace(/\\"/g, "\"")
-                .replace(/"((?:\\.|[^"\\])*)"/gs, (m) =>
-                  m.replace(/\r/g, "").replace(/\n/g, "\\n").replace(/\t/g, "\\t")
-                );
-              try {
-                parsed = JSON.parse(sanitized);
-              } catch (err2) {
-                console.error("::error::O conteúdo do Secret não é um JSON válido de Service Account:", err2.message);
-                process.exit(1);
-              }
+              parsed = JSON.parse(raw);
+            } catch (e) {
+              // Fallback seguro caso haja quebras de linha literais nas strings
+              const fixed = raw.replace(/\n/g, "\\n").replace(/\r/g, "");
+              parsed = JSON.parse(fixed);
             }
 
-            if (parsed.type !== "service_account" || !parsed.client_email || !parsed.private_key) {
-              console.error("::error::JSON incompleto: faltam os campos type=service_account, client_email ou private_key.");
-              process.exit(1);
-            }
-
-            parsed.private_key = String(parsed.private_key).replace(/\\n/g, "\n");
-
-            try {
-              crypto.createPrivateKey(parsed.private_key);
-            } catch (pemErr) {
-              console.error("::error::A chave privada RSA (private_key) está truncada ou corrompida:", pemErr.message, "— Gere uma nova chave privada .json na Consola do Firebase > Definições do Projeto > Contas de serviço.");
-              process.exit(1);
+            // Normaliza o formato PEM da chave privada
+            if (parsed.private_key) {
+              parsed.private_key = parsed.private_key.replace(/\\n/g, "\n");
             }
 
             fs.writeFileSync(process.env.KEY_OUT, JSON.stringify(parsed, null, 2), { mode: 0o600 });
             fs.appendFileSync(process.env.GITHUB_ENV, `GOOGLE_APPLICATION_CREDENTIALS=${process.env.KEY_OUT}\n`);
-            console.log("Service Account validada criptograficamente com sucesso:", parsed.client_email, "| Projeto:", parsed.project_id);
+            console.log("Credenciais validadas com sucesso para:", parsed.client_email);
           '
-
-      - name: Deploy para o Firebase Hosting e Regras do Firestore
-        run: |
-          npx --yes firebase-tools@latest deploy --only hosting,firestore:rules --project gen-lang-client-0982515821 --non-interactive
-
-      - name: Limpar Chave Temporária
-        if: always()
-        run: rm -f "${{ runner.temp }}/gcp_key.json"
-
-      - name: Disparar Atualização Automática no Render
-        env:
-          HOOK_URL: ${{ secrets.RENDER_DEPLOY_HOOK_URL }}
-        run: |
-          if [ -n "$HOOK_URL" ]; then
-            curl -fsSL -X POST "$HOOK_URL"
-            echo "Deploy Hook do Render disparado com sucesso."
-          else
-            echo "RENDER_DEPLOY_HOOK_URL não definido (o Render já atualiza automaticamente via GitHub autoDeploy)."
-          fi
