@@ -1,6 +1,6 @@
 services:
   - type: web
-    name: sila-billing-backend
+    name: sila-billing
     runtime: node
     region: frankfurt
     plan: free
@@ -15,9 +15,9 @@ services:
         value: gen-lang-client-0982515821
       - key: FIREBASE_DATABASE_ID
         value: ai-studio-49352535-85f6-4187-bf2b-3e420dac8a25
+      - key: CORS_ORIGINS
+        value: https://silabilling.web.app,https://silabilling.firebaseapp.com
       - key: FIREBASE_SERVICE_ACCOUNT_JSON
         sync: false
       - key: FIREBASE_CREDENTIALS_BASE64
-        sync: false
-      - key: CORS_ORIGINS
         sync: false

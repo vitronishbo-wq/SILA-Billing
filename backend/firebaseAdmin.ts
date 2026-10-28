@@ -1,3 +1,4 @@
+import crypto from 'node:crypto';
 import { applicationDefault, cert, getApps, initializeApp, type App, type ServiceAccount } from 'firebase-admin/app';
 import { getAuth, type Auth } from 'firebase-admin/auth';
 import { getFirestore, type Firestore } from 'firebase-admin/firestore';
@@ -80,8 +81,17 @@ function normalizeServiceAccount(raw: RawServiceAccount): ServiceAccount {
     );
   }
 
-  // Corrige quebras de linha escapadas (\\n -> \n) comuns em variáveis de ambiente do Render
+  // Corrige quebras de linha escapadas (\\n -> \n) comuns em variáveis de ambiente do Render/GitHub
   const privateKey = rawKey.replace(/\\n/g, '\n');
+
+  // Validação criptográfica rigorosa da chave RSA PEM antes de inicializar o Admin SDK
+  try {
+    crypto.createPrivateKey({ key: privateKey, format: 'pem' });
+  } catch (err) {
+    throw new Error(
+      `Chave privada RSA inválida na Service Account (${err instanceof Error ? err.message : String(err)}).`
+    );
+  }
 
   return {
     projectId,

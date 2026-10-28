@@ -20,47 +20,77 @@ jobs:
 
       - name: Instalar Dependencias e Gerar Build PWA
         env:
-          VITE_API_BASE_URL: ${{ vars.VITE_API_BASE_URL || secrets.VITE_API_BASE_URL }}
+          VITE_API_BASE_URL: ${{ vars.VITE_API_BASE_URL || secrets.VITE_API_BASE_URL || 'https://sila-billing.onrender.com' }}
         run: |
           bun install
           bun run build
 
-      - name: Gravar Credenciais do Firebase Service Account
+      - name: Validar Criptograficamente e Gravar Service Account do Firebase
         shell: bash
         env:
-          FIREBASE_SA_JSON: ${{ secrets.FIREBASE_SERVICE_ACCOUNT_ID }}
+          FIREBASE_SA_RAW: ${{ secrets.FIREBASE_SERVICE_ACCOUNT_ID }}
           KEY_OUT: ${{ runner.temp }}/gcp_key.json
         run: |
           node -e '
           const fs = require("node:fs");
-          let raw = (process.env.FIREBASE_SA_JSON || "").trim();
-          if (!raw) {
-            console.error("::error::Secret Firebase ausente.");
+          const crypto = require("node:crypto");
+
+          let candidate = (process.env.FIREBASE_SA_RAW || "").trim();
+          if (!candidate) {
+            console.error("::error::Secret FIREBASE_SERVICE_ACCOUNT_ID ausente.");
             process.exit(1);
           }
+
+          if (
+            (candidate.startsWith("\x27") && candidate.endsWith("\x27")) ||
+            (candidate.startsWith("\"") && candidate.endsWith("\""))
+          ) {
+            candidate = candidate.slice(1, -1).trim();
+          }
+
+          if (!candidate.startsWith("{") && !candidate.startsWith("{\\\"")) {
+            const cleanB64 = candidate.replace(/\s+/g, "");
+            const decoded = Buffer.from(cleanB64, "base64").toString("utf-8").trim();
+            if (decoded.startsWith("{")) {
+              candidate = decoded;
+            }
+          }
+
           let credentials;
           try {
-            credentials = JSON.parse(raw);
-            if (typeof credentials === "string") {
-              credentials = JSON.parse(credentials);
+            const parsed = JSON.parse(candidate);
+            credentials = typeof parsed === "string" ? JSON.parse(parsed) : parsed;
+          } catch {
+            try {
+              const sanitized = candidate
+                .replace(/\\"/g, "\"")
+                .replace(/"((?:\\.|[^"\\])*)"/gs, (m) =>
+                  m.replace(/\r/g, "").replace(/\n/g, "\\n").replace(/\t/g, "\\t")
+                );
+              credentials = JSON.parse(sanitized);
+            } catch (err) {
+              console.error(`::error::Falha no parsing JSON/Base64 da Service Account: ${err.message}`);
+              process.exit(1);
             }
-          } catch (err) {
-            console.error(`::error::Secret não contém um JSON válido: ${err.message}`);
-            process.exit(1);
           }
+
           if (credentials.type !== "service_account" || !credentials.project_id || !credentials.private_key) {
-            console.error("::error::Credenciais incompletas ou inválidas.");
+            console.error("::error::Service Account incompleta (verifique type, project_id e private_key).");
             process.exit(1);
           }
-          credentials.private_key = credentials.private_key.replace(/\\n/g, "\n");
+
+          credentials.private_key = String(credentials.private_key).replace(/\\n/g, "\n");
+
           try {
-            fs.writeFileSync(process.env.KEY_OUT, JSON.stringify(credentials), { mode: 0o600 });
-            fs.appendFileSync(process.env.GITHUB_ENV, `GOOGLE_APPLICATION_CREDENTIALS=${process.env.KEY_OUT}\n`);
-            console.log("Credenciais Firebase gravadas com sucesso.");
+            crypto.createPrivateKey({ key: credentials.private_key, format: "pem" });
           } catch (err) {
-            console.error(`::error::Falha ao guardar as credenciais: ${err.message}`);
+            console.error(`::error::Falha na validação criptográfica RSA (crypto.createPrivateKey): ${err.message}`);
             process.exit(1);
           }
+
+          fs.writeFileSync(process.env.KEY_OUT, JSON.stringify(credentials), { mode: 0o600 });
+          fs.appendFileSync(process.env.GITHUB_ENV, `GOOGLE_APPLICATION_CREDENTIALS=${process.env.KEY_OUT}\n`);
+          console.log(`Service Account validada criptograficamente para o projeto: ${credentials.project_id}`);
           '
 
       - name: Provisionar Canal Hosting (Obrigatorio para Projetos Novos)
@@ -71,10 +101,12 @@ jobs:
         run: |
           npx --yes firebase-tools@15.34.0 deploy --only hosting:silabilling,firestore:rules --project gen-lang-client-0982515821 --non-interactive
 
-      - name: Disparar Atualizacao Automatica no Render
+      - name: Sincronizar Backend no Render e Verificar Estado da API
         run: |
           if [ -n "${{ secrets.RENDER_DEPLOY_HOOK_URL }}" ]; then
             curl -fsSL -X POST "${{ secrets.RENDER_DEPLOY_HOOK_URL }}"
+            echo "Deploy Hook do Render acionado com sucesso."
           else
-            echo "RENDER_DEPLOY_HOOK_URL não definido; o Render atualizará via autoDeploy do GitHub."
+            echo "RENDER_DEPLOY_HOOK_URL opcional não definido; atualização via Git autoDeploy do Render."
           fi
+          curl -fsSL --max-time 25 "https://sila-billing.onrender.com/api/health" || echo "Backend Render em aquecimento (cold start)."

@@ -1,11 +1,28 @@
 import type { InvoiceRecord } from '../../src/core/types.ts';
 import { auth } from '../../src/services/firebaseClient.ts';
 
+const PRODUCTION_RENDER_API_URL = 'https://sila-billing.onrender.com';
+
 function resolveApiBaseUrl(): string {
-  const raw = typeof import.meta !== 'undefined' && import.meta.env
-    ? String(import.meta.env.VITE_API_BASE_URL || '')
-    : '';
-  return raw.trim().replace(/\/+$/, '').replace(/\/api$/i, '');
+  const raw =
+    typeof import.meta !== 'undefined' && import.meta.env
+      ? String(import.meta.env.VITE_API_BASE_URL || '')
+      : '';
+  const cleaned = raw.trim().replace(/\/+$/, '').replace(/\/api$/i, '');
+  if (cleaned) {
+    return cleaned;
+  }
+
+  // Em produção no Firebase Hosting (silabilling.web.app / firebaseapp.com),
+  // liga nativamente ao backend oficial no Render sem exigir configuração manual.
+  if (typeof window !== 'undefined') {
+    const host = window.location.hostname.toLowerCase();
+    if (host.endsWith('.web.app') || host.endsWith('.firebaseapp.com')) {
+      return PRODUCTION_RENDER_API_URL;
+    }
+  }
+
+  return '';
 }
 
 const API_BASE = resolveApiBaseUrl();

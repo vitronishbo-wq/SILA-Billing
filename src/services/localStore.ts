@@ -1,5 +1,29 @@
 import { createSeedInvoice, INITIAL_CUSTOMERS, INITIAL_PRODUCTS } from '../core/seedData';
-import { AppSettings, Customer, DEFAULT_SETTINGS, InvoiceRecord, Product } from '../core/types';
+import {
+  AppSettings,
+  CartDraftItem,
+  Customer,
+  DEFAULT_SETTINGS,
+  DocumentFormat,
+  DocumentType,
+  InvoiceRecord,
+  PaymentMethod,
+  Product,
+} from '../core/types';
+
+export interface PosWorkspaceDraft {
+  activeModule: 'NEW_POS' | 'NEW_A4' | 'CUSTOMERS' | 'PRODUCTS' | 'HISTORY' | 'SETTINGS' | 'SYNC';
+  previewFormat: DocumentFormat;
+  cart: CartDraftItem[];
+  selectedCustomerId: string;
+  docType: DocumentType;
+  paymentMethod: PaymentMethod;
+  amountReceivedInput: string;
+  notes: string;
+  cashier: string;
+  operator: string;
+  updatedAtIso: string;
+}
 
 const DB_NAME = 'sila_billing_idb_v1';
 const DB_VERSION = 1;
@@ -78,6 +102,7 @@ export async function bootstrapLocalStore(): Promise<{
   customers: Customer[];
   invoices: InvoiceRecord[];
   settings: AppSettings;
+  posDraft: PosWorkspaceDraft | null;
 }> {
   const seededMeta = await getFromStore<{ key: string; value: boolean }>('meta', 'seeded');
 
@@ -93,11 +118,12 @@ export async function bootstrapLocalStore(): Promise<{
     await putInStore('meta', { key: 'seeded', value: true });
   }
 
-  const [products, customers, invoices, settingsMeta] = await Promise.all([
+  const [products, customers, invoices, settingsMeta, draftMeta] = await Promise.all([
     getAllFromStore<Product>('products'),
     getAllFromStore<Customer>('customers'),
     getAllFromStore<InvoiceRecord>('invoices'),
     getFromStore<{ key: string; value: AppSettings }>('meta', 'app_settings'),
+    getFromStore<{ key: string; value: PosWorkspaceDraft }>('meta', 'pos_draft'),
   ]);
 
   products.sort((a, b) => a.code.localeCompare(b.code));
@@ -111,6 +137,7 @@ export async function bootstrapLocalStore(): Promise<{
     customers,
     invoices,
     settings: settingsMeta?.value || DEFAULT_SETTINGS,
+    posDraft: draftMeta?.value || null,
   };
 }
 
@@ -122,4 +149,6 @@ export const localDb = {
   saveInvoice: (inv: InvoiceRecord) => putInStore('invoices', inv),
   saveSettings: (settings: AppSettings) =>
     putInStore('meta', { key: 'app_settings', value: settings }),
+  savePosDraft: (draft: PosWorkspaceDraft) =>
+    putInStore('meta', { key: 'pos_draft', value: draft }),
 };

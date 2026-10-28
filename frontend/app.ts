@@ -100,7 +100,9 @@ export class SilaBillingApp {
   private previewFormat: DocumentFormat = 'POS';
   private lastEmitted: InvoiceRecord | null = null;
   private isEmitting = false;
+  private isPrinting = false;
   private lastAuditHash = '';
+  private draftSaveTimer: number | null = null;
 
   // Estado Produtos / Clientes / Histórico
   private productSearch = '';
@@ -153,6 +155,26 @@ export class SilaBillingApp {
       this.operator = data.settings.defaultOperator || '001';
       this.notes = data.settings.defaultNotes || 'Venda directa a retalho.';
       this.selectedHistoryId = data.invoices[0]?.id || '';
+
+      if (data.posDraft) {
+        this.activeModule = data.posDraft.activeModule || 'NEW_POS';
+        this.previewFormat = data.posDraft.previewFormat || 'POS';
+        this.cart = Array.isArray(data.posDraft.cart) ? data.posDraft.cart : [];
+        if (
+          data.posDraft.selectedCustomerId &&
+          this.customers.some((c) => c.id === data.posDraft!.selectedCustomerId)
+        ) {
+          this.selectedCustomerId = data.posDraft.selectedCustomerId;
+        }
+        if (data.posDraft.docType) this.docType = data.posDraft.docType;
+        if (data.posDraft.paymentMethod) this.paymentMethod = data.posDraft.paymentMethod;
+        if (typeof data.posDraft.amountReceivedInput === 'string') {
+          this.amountReceivedInput = data.posDraft.amountReceivedInput;
+        }
+        if (typeof data.posDraft.notes === 'string') this.notes = data.posDraft.notes;
+        if (data.posDraft.cashier) this.cashier = data.posDraft.cashier;
+        if (data.posDraft.operator) this.operator = data.posDraft.operator;
+      }
     } finally {
       this.isBooting = false;
       this.render();
@@ -162,7 +184,55 @@ export class SilaBillingApp {
     onAuthStateChanged(auth, (u) => {
       this.user = u;
       this.render();
+      if (u && this.isOnline && this.hasUnsyncedLocalRecords()) {
+        void this.syncAllWithCloud();
+      }
     });
+  }
+
+  public isBusyWithCriticalTask(): boolean {
+    return this.isEmitting || this.isPrinting;
+  }
+
+  public async flushDraftNow(): Promise<void> {
+    if (this.draftSaveTimer !== null) {
+      window.clearTimeout(this.draftSaveTimer);
+      this.draftSaveTimer = null;
+    }
+    if (this.isBooting) return;
+    await localDb.savePosDraft({
+      activeModule: this.activeModule,
+      previewFormat: this.previewFormat,
+      cart: this.cart,
+      selectedCustomerId: this.selectedCustomerId,
+      docType: this.docType,
+      paymentMethod: this.paymentMethod,
+      amountReceivedInput: this.amountReceivedInput,
+      notes: this.notes,
+      cashier: this.cashier,
+      operator: this.operator,
+      updatedAtIso: new Date().toISOString(),
+    });
+  }
+
+  private scheduleDraftSave(): void {
+    if (this.isBooting) return;
+    if (this.draftSaveTimer !== null) {
+      window.clearTimeout(this.draftSaveTimer);
+    }
+    this.draftSaveTimer = window.setTimeout(() => {
+      this.draftSaveTimer = null;
+      void this.flushDraftNow();
+    }, 120);
+  }
+
+  private hasUnsyncedLocalRecords(): boolean {
+    return (
+      this.invoices.some((i) => !i.synced) ||
+      this.products.some((p) => !p.synced) ||
+      this.customers.some((c) => !c.synced) ||
+      this.settings.synced === false
+    );
   }
 
   private setupGlobalListeners(): void {
@@ -188,11 +258,26 @@ export class SilaBillingApp {
       this.isOnline = true;
       this.refreshBackendHealth();
       this.render();
+      if (this.user && this.hasUnsyncedLocalRecords()) {
+        void this.syncAllWithCloud();
+      }
     });
 
     window.addEventListener('offline', () => {
       this.isOnline = false;
       this.render();
+    });
+
+    window.addEventListener('beforeprint', () => {
+      this.isPrinting = true;
+    });
+
+    window.addEventListener('afterprint', () => {
+      this.isPrinting = false;
+    });
+
+    window.addEventListener('pagehide', () => {
+      void this.flushDraftNow();
     });
 
     // Event Delegation Centralizada (Zero listeners duplicados)
@@ -324,6 +409,7 @@ export class SilaBillingApp {
         if (mod === 'NEW_POS') this.previewFormat = 'POS';
         if (mod === 'NEW_A4') this.previewFormat = 'A4';
         if (mod === 'SYNC') this.refreshBackendHealth();
+        this.scheduleDraftSave();
         this.render();
         break;
       }
@@ -357,6 +443,7 @@ export class SilaBillingApp {
             ivaRate: prod.ivaRate,
           });
         }
+        this.scheduleDraftSave();
         this.render();
         break;
       }
@@ -369,11 +456,13 @@ export class SilaBillingApp {
             return next <= 0 ? null : { ...item, qty: next };
           })
           .filter((x): x is CartDraftItem => x !== null);
+        this.scheduleDraftSave();
         this.render();
         break;
       }
       case 'remove-cart-item': {
         this.cart = this.cart.filter((c) => c.productId !== id);
+        this.scheduleDraftSave();
         this.render();
         break;
       }
@@ -382,6 +471,7 @@ export class SilaBillingApp {
         this.amountReceivedInput = '';
         this.lastEmitted = null;
         this.lastAuditHash = '';
+        void this.flushDraftNow();
         this.render();
         break;
       }
@@ -392,17 +482,20 @@ export class SilaBillingApp {
       }
       case 'set-payment': {
         this.paymentMethod = value as PaymentMethod;
+        this.scheduleDraftSave();
         this.render();
         break;
       }
       case 'quick-cash': {
         this.paymentMethod = 'Dinheiro';
         this.amountReceivedInput = value;
+        this.scheduleDraftSave();
         this.render();
         break;
       }
       case 'set-preview-format': {
         this.previewFormat = value as DocumentFormat;
+        this.scheduleDraftSave();
         this.render();
         break;
       }
@@ -633,16 +726,20 @@ export class SilaBillingApp {
         break;
       case 'amount-received':
         this.amountReceivedInput = el.value;
+        this.scheduleDraftSave();
         this.renderPreservingFocus(activeId, selStart);
         break;
       case 'pos-cashier':
         this.cashier = el.value;
+        this.scheduleDraftSave();
         break;
       case 'pos-operator':
         this.operator = el.value;
+        this.scheduleDraftSave();
         break;
       case 'pos-notes':
         this.notes = el.value;
+        this.scheduleDraftSave();
         break;
       case 'product-search':
         this.productSearch = el.value;
@@ -668,10 +765,12 @@ export class SilaBillingApp {
     switch (field) {
       case 'pos-customer':
         this.selectedCustomerId = el.value;
+        this.scheduleDraftSave();
         this.render();
         break;
       case 'pos-doctype':
         this.docType = el.value as DocumentType;
+        this.scheduleDraftSave();
         this.render();
         break;
       case 'cart-qty': {
@@ -680,6 +779,7 @@ export class SilaBillingApp {
           this.cart = this.cart.map((c) =>
             c.productId === id ? { ...c, qty: roundKz(val) } : c
           );
+          this.scheduleDraftSave();
           this.render();
         }
         break;
@@ -689,6 +789,7 @@ export class SilaBillingApp {
         this.cart = this.cart.map((c) =>
           c.productId === id ? { ...c, discountPct: roundKz(disc) } : c
         );
+        this.scheduleDraftSave();
         this.render();
         break;
       }
@@ -866,6 +967,7 @@ export class SilaBillingApp {
       this.cart = [];
       this.amountReceivedInput = '';
       this.mobilePane = 'PREVIEW';
+      await this.flushDraftNow();
       this.render();
 
       // Sincronização Cloud + Auditoria Backend (/api/audit/invoices) quando online e autenticado
@@ -986,12 +1088,19 @@ export class SilaBillingApp {
   }
 
   private async triggerPrint(invoice: InvoiceRecord, format: DocumentFormat): Promise<void> {
+    this.isPrinting = true;
     const qr = await this.ensureQrForInvoice(invoice);
     document.body.setAttribute('data-print-mode', format);
     this.printJob = { invoice, format, qr };
     this.render();
     setTimeout(() => {
-      window.print();
+      try {
+        window.print();
+      } finally {
+        setTimeout(() => {
+          this.isPrinting = false;
+        }, 1200);
+      }
     }, 100);
   }
 
