@@ -1,3 +1,27 @@
+name: Automacao Total SILA-Billing
+
+on:
+  push:
+    branches:
+      - main
+
+jobs:
+  build_and_deploy:
+    runs-on: ubuntu-24.04
+    
+    steps:
+      - name: Checkout do Repositorio
+        uses: actions/checkout@v4
+
+      - name: Configurar o Bun Runtime
+        uses: oven-sh/setup-bun@v1
+        with:
+          bun-version: latest
+
+      - name: Instalar Dependencias e Gerar Build PWA
+        run: |
+          bun install
+          bun run build
 
       - name: Gravar e Validar Credenciais do Firebase Service Account
         shell: bash
@@ -5,110 +29,78 @@
           FIREBASE_SA_JSON: ${{ secrets.FIREBASE_SERVICE_ACCOUNT_ID }}
           KEY_OUT: ${{ runner.temp }}/gcp_key.json
         run: |
-          node <<'NODE'
+          node -e '
           const fs = require("node:fs");
           const crypto = require("node:crypto");
-
           let raw = (process.env.FIREBASE_SA_JSON || "").trim();
-
           if (!raw) {
             console.error("::error::Secret Firebase ausente.");
             process.exit(1);
           }
-
           function parseCredentials(value) {
             let candidate = value.trim();
-
             for (let i = 0; i < 3; i++) {
               try {
                 const parsed = JSON.parse(candidate);
-
                 if (typeof parsed === "string") {
                   candidate = parsed.trim();
                   continue;
                 }
-
-                if (
-                  parsed &&
-                  typeof parsed === "object" &&
-                  !Array.isArray(parsed)
-                ) {
+                if (parsed && typeof parsed === "object" && !Array.isArray(parsed)) {
                   return parsed;
                 }
-
                 throw new Error("Formato JSON inesperado.");
               } catch (err) {
                 if (i === 0 && !candidate.startsWith("{")) {
                   const decoded = Buffer.from(
-                    candidate.replace(/\s+/g, "")
-                      .replace(/-/g, "+")
-                      .replace(/_/g, "/"),
+                    candidate.replace(/\s+/g, "").replace(/-/g, "+").replace(/_/g, "/"),
                     "base64"
                   ).toString("utf8").trim();
-
                   if (decoded && decoded !== candidate) {
                     candidate = decoded;
                     continue;
                   }
                 }
-
-                throw new Error("Secret não contém JSON válido.");
+                throw new Error("Secret nao contem JSON valido.");
               }
             }
-
             throw new Error("Secret demasiado aninhado.");
           }
-
           let credentials;
-
           try {
             credentials = parseCredentials(raw);
           } catch (err) {
             console.error(`::error::${err.message}`);
             process.exit(1);
           }
-
-          if (
-            credentials.type !== "service_account" ||
-            typeof credentials.project_id !== "string" ||
-            typeof credentials.client_email !== "string" ||
-            typeof credentials.private_key !== "string"
-          ) {
-            console.error("::error::Credenciais incompletas ou inválidas.");
+          if (credentials.type !== "service_account" || typeof credentials.project_id !== "string" || typeof credentials.client_email !== "string" || typeof credentials.private_key !== "string") {
+            console.error("::error::Credenciais incompletas ou invalidas.");
             process.exit(1);
           }
-
-          credentials.private_key =
-            credentials.private_key.replace(/\\n/g, "\n");
-
+          credentials.private_key = credentials.private_key.replace(/\\n/g, "\n");
           try {
-            const key = crypto.createPrivateKey(
-              credentials.private_key
-            );
-
+            const key = crypto.createPrivateKey(credentials.private_key);
             if (key.asymmetricKeyType !== "rsa") {
               throw new Error("Chave RSA esperada.");
             }
           } catch {
-            console.error("::error::Chave privada inválida.");
+            console.error("::error::Chave privada invalida.");
             process.exit(1);
           }
-
           try {
-            fs.writeFileSync(
-              process.env.KEY_OUT,
-              JSON.stringify(credentials),
-              { mode: 0o600, flag: "w" }
-            );
-
-            fs.appendFileSync(
-              process.env.GITHUB_ENV,
-              `GOOGLE_APPLICATION_CREDENTIALS=${process.env.KEY_OUT}\n`
-            );
+            fs.writeFileSync(process.env.KEY_OUT, JSON.stringify(credentials), { mode: 0o600, flag: "w" });
+            fs.appendFileSync(process.env.GITHUB_ENV, `GOOGLE_APPLICATION_CREDENTIALS=${process.env.KEY_OUT}\n`);
           } catch {
             console.error("::error::Falha ao guardar as credenciais.");
             process.exit(1);
           }
+          console.log("Credenciais Firebase validadas com sucesso.");
+          '
 
-          console.log("Credenciais Firebase validadas.");
-          NODE
+      - name: Deploy para o Firebase Hosting e Regras do Firestore
+        run: |
+          npx --yes firebase-tools@latest deploy --only hosting,firestore:rules --project gen-lang-client-0982515821
+
+      - name: Disparar Atualizacao Automatica no Render
+        run: |
+          curl -X POST "${{ secrets.RENDER_DEPLOY_HOOK_URL }}"
