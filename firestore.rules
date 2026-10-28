@@ -1,0 +1,398 @@
+rules_version = '2';
+
+service cloud.firestore {
+  match /databases/{database}/documents {
+    // Global Safety Net: Default-deny catch-all
+    match /{document=**} {
+      allow read, write: if false;
+    }
+
+    // Hardened Global Helpers
+    function isSignedIn() {
+      return request.auth != null;
+    }
+
+    function isVerifiedOwner(userId) {
+      return isSignedIn()
+        && request.auth.token.email_verified == true
+        && request.auth.uid == userId;
+    }
+
+    function isValidId(id) {
+      return id is string && id.size() >= 1 && id.size() <= 128 && id.matches('^[a-zA-Z0-9_\\-]+$');
+    }
+
+    function incoming() {
+      return request.resource.data;
+    }
+
+    function existing() {
+      return resource.data;
+    }
+
+    // Validation Blueprint: Product
+    function isValidProduct(data, productId) {
+      return data.keys().hasAll([
+          'id', 'ownerId', 'code', 'name', 'unit', 'price',
+          'ivaRate', 'exemptionReason', 'active', 'createdAt', 'updatedAt'
+        ])
+        && data.keys().hasOnly([
+          'id', 'ownerId', 'code', 'name', 'unit', 'price',
+          'ivaRate', 'exemptionReason', 'active', 'createdAt', 'updatedAt'
+        ])
+        && data.id is string && data.id == productId && isValidId(data.id)
+        && data.ownerId is string && data.ownerId == request.auth.uid && isValidId(data.ownerId)
+        && data.code is string && data.code.size() >= 1 && data.code.size() <= 32
+        && data.name is string && data.name.size() >= 1 && data.name.size() <= 160
+        && data.unit is string && data.unit.size() >= 1 && data.unit.size() <= 16
+        && data.price is number && data.price >= 0 && data.price <= 999999999
+        && data.ivaRate is number && (data.ivaRate == 0 || data.ivaRate == 14)
+        && data.exemptionReason is string && data.exemptionReason.size() <= 120
+        && data.active is bool
+        && data.createdAt is timestamp
+        && data.updatedAt is timestamp;
+    }
+
+    // Validation Blueprint: Customer (Public/Fiscal)
+    function isValidCustomer(data, customerId) {
+      return data.keys().hasAll([
+          'id', 'ownerId', 'name', 'nif', 'locality', 'createdAt', 'updatedAt'
+        ])
+        && data.keys().hasOnly([
+          'id', 'ownerId', 'name', 'nif', 'locality', 'createdAt', 'updatedAt'
+        ])
+        && data.id is string && data.id == customerId && isValidId(data.id)
+        && data.ownerId is string && data.ownerId == request.auth.uid && isValidId(data.ownerId)
+        && data.name is string && data.name.size() >= 1 && data.name.size() <= 160
+        && data.nif is string && data.nif.size() <= 32
+        && data.locality is string && data.locality.size() <= 160
+        && data.createdAt is timestamp
+        && data.updatedAt is timestamp;
+    }
+
+    // Validation Blueprint: CustomerPrivate (PII Split Collection)
+    function isValidCustomerPrivate(data) {
+      return data.keys().hasAll(['ownerId', 'phone', 'address', 'updatedAt'])
+        && data.keys().hasOnly(['ownerId', 'phone', 'address', 'updatedAt'])
+        && data.ownerId is string && data.ownerId == request.auth.uid && isValidId(data.ownerId)
+        && data.phone is string && data.phone.size() <= 40
+        && data.address is string && data.address.size() <= 200
+        && data.updatedAt is timestamp;
+    }
+
+    // Validation Blueprint: Invoice
+    function isValidInvoice(data, invoiceId) {
+      return data.keys().hasAll([
+          'id', 'ownerId', 'number', 'docType', 'issuedAtIso', 'cashier', 'operator',
+          'paymentMethod', 'customerId', 'customerName', 'customerNif', 'customerLocality',
+          'merchandiseTotal', 'discountTotal', 'taxBase14', 'taxAmount14', 'taxBase0',
+          'taxAmount0', 'taxTotal', 'grandTotal', 'amountInWords', 'amountReceived',
+          'changeAmount', 'notes', 'itemCount', 'status', 'createdAt', 'updatedAt'
+        ])
+        && data.keys().hasOnly([
+          'id', 'ownerId', 'number', 'docType', 'issuedAtIso', 'cashier', 'operator',
+          'paymentMethod', 'customerId', 'customerName', 'customerNif', 'customerLocality',
+          'merchandiseTotal', 'discountTotal', 'taxBase14', 'taxAmount14', 'taxBase0',
+          'taxAmount0', 'taxTotal', 'grandTotal', 'amountInWords', 'amountReceived',
+          'changeAmount', 'notes', 'itemCount', 'status', 'createdAt', 'updatedAt'
+        ])
+        && data.id is string && data.id == invoiceId && isValidId(data.id)
+        && data.ownerId is string && data.ownerId == request.auth.uid && isValidId(data.ownerId)
+        && data.number is string && data.number.size() >= 1 && data.number.size() <= 40
+        && data.docType is string && data.docType.size() <= 8 && (data.docType == 'FR' || data.docType == 'FP')
+        && data.issuedAtIso is string && data.issuedAtIso.size() >= 10 && data.issuedAtIso.size() <= 40
+        && data.cashier is string && data.cashier.size() >= 1 && data.cashier.size() <= 16
+        && data.operator is string && data.operator.size() >= 1 && data.operator.size() <= 32
+        && data.paymentMethod is string && data.paymentMethod.size() <= 24
+        && (data.paymentMethod == 'Dinheiro' || data.paymentMethod == 'Multicaixa' || data.paymentMethod == 'Transferência')
+        && data.customerId is string && data.customerId.size() >= 1 && data.customerId.size() <= 128
+        && data.customerName is string && data.customerName.size() >= 1 && data.customerName.size() <= 160
+        && data.customerNif is string && data.customerNif.size() <= 32
+        && data.customerLocality is string && data.customerLocality.size() <= 160
+        && data.merchandiseTotal is number && data.merchandiseTotal >= 0
+        && data.discountTotal is number && data.discountTotal >= 0
+        && data.taxBase14 is number && data.taxBase14 >= 0
+        && data.taxAmount14 is number && data.taxAmount14 >= 0
+        && data.taxBase0 is number && data.taxBase0 >= 0
+        && data.taxAmount0 is number && data.taxAmount0 == 0
+        && data.taxTotal is number && data.taxTotal >= 0
+        && data.grandTotal is number && data.grandTotal >= 0
+        && data.amountInWords is string && data.amountInWords.size() >= 1 && data.amountInWords.size() <= 300
+        && data.amountReceived is number && data.amountReceived >= 0
+        && data.changeAmount is number && data.changeAmount >= 0
+        && data.notes is string && data.notes.size() <= 300
+        && data.itemCount is number && data.itemCount >= 1 && data.itemCount <= 200
+        && data.status is string && data.status.size() <= 16 && (data.status == 'issued' || data.status == 'cancelled')
+        && data.createdAt is timestamp
+        && data.updatedAt is timestamp;
+    }
+
+    // Validation Blueprint: InvoiceLineItem
+    function isValidInvoiceLineItem(data, invoiceId, itemId) {
+      return data.keys().hasAll([
+          'id', 'invoiceId', 'ownerId', 'code', 'description', 'unit', 'qty',
+          'unitPrice', 'discountPct', 'ivaRate', 'lineGross', 'lineNet',
+          'lineBase', 'lineTax', 'lineTotal', 'createdAt'
+        ])
+        && data.keys().hasOnly([
+          'id', 'invoiceId', 'ownerId', 'code', 'description', 'unit', 'qty',
+          'unitPrice', 'discountPct', 'ivaRate', 'lineGross', 'lineNet',
+          'lineBase', 'lineTax', 'lineTotal', 'createdAt'
+        ])
+        && data.id is string && data.id == itemId && isValidId(data.id)
+        && data.invoiceId is string && data.invoiceId == invoiceId && isValidId(data.invoiceId)
+        && data.ownerId is string && data.ownerId == request.auth.uid && isValidId(data.ownerId)
+        && data.code is string && data.code.size() >= 1 && data.code.size() <= 32
+        && data.description is string && data.description.size() >= 1 && data.description.size() <= 160
+        && data.unit is string && data.unit.size() >= 1 && data.unit.size() <= 16
+        && data.qty is number && data.qty > 0 && data.qty <= 100000
+        && data.unitPrice is number && data.unitPrice >= 0 && data.unitPrice <= 999999999
+        && data.discountPct is number && data.discountPct >= 0 && data.discountPct <= 100
+        && data.ivaRate is number && (data.ivaRate == 0 || data.ivaRate == 14)
+        && data.lineGross is number && data.lineGross >= 0
+        && data.lineNet is number && data.lineNet >= 0
+        && data.lineBase is number && data.lineBase >= 0
+        && data.lineTax is number && data.lineTax >= 0
+        && data.lineTotal is number && data.lineTotal >= 0
+        && data.createdAt is timestamp;
+    }
+
+    // Collection: /users/{userId}/products/{productId}
+    match /users/{userId}/products/{productId} {
+      allow get: if isVerifiedOwner(userId)
+        && isValidId(userId)
+        && isValidId(productId)
+        && existing().ownerId == request.auth.uid;
+
+      allow list: if isVerifiedOwner(userId)
+        && existing().ownerId == request.auth.uid;
+
+      allow create: if isVerifiedOwner(userId)
+        && isValidId(userId)
+        && isValidId(productId)
+        && isValidProduct(incoming(), productId)
+        && incoming().createdAt == request.time
+        && incoming().updatedAt == request.time;
+
+      allow update: if isVerifiedOwner(userId)
+        && isValidId(userId)
+        && isValidId(productId)
+        && isValidProduct(incoming(), productId)
+        && existing().ownerId == request.auth.uid
+        && incoming().ownerId == existing().ownerId
+        && incoming().id == existing().id
+        && incoming().createdAt == existing().createdAt
+        && incoming().updatedAt == request.time
+        && (
+          // Action: Edit catalog product details
+          incoming().diff(existing()).affectedKeys().hasOnly([
+            'code', 'name', 'unit', 'price', 'ivaRate', 'exemptionReason', 'active', 'updatedAt'
+          ])
+        );
+
+      allow delete: if isVerifiedOwner(userId)
+        && isValidId(userId)
+        && isValidId(productId)
+        && existing().ownerId == request.auth.uid;
+    }
+
+    // Collection: /users/{userId}/customers/{customerId}
+    match /users/{userId}/customers/{customerId} {
+      allow get: if isVerifiedOwner(userId)
+        && isValidId(userId)
+        && isValidId(customerId)
+        && existing().ownerId == request.auth.uid;
+
+      allow list: if isVerifiedOwner(userId)
+        && existing().ownerId == request.auth.uid;
+
+      allow create: if isVerifiedOwner(userId)
+        && isValidId(userId)
+        && isValidId(customerId)
+        && isValidCustomer(incoming(), customerId)
+        && incoming().createdAt == request.time
+        && incoming().updatedAt == request.time;
+
+      allow update: if isVerifiedOwner(userId)
+        && isValidId(userId)
+        && isValidId(customerId)
+        && isValidCustomer(incoming(), customerId)
+        && existing().ownerId == request.auth.uid
+        && incoming().ownerId == existing().ownerId
+        && incoming().id == existing().id
+        && incoming().createdAt == existing().createdAt
+        && incoming().updatedAt == request.time
+        && (
+          // Action: Edit customer public/fiscal details
+          incoming().diff(existing()).affectedKeys().hasOnly([
+            'name', 'nif', 'locality', 'updatedAt'
+          ])
+        );
+
+      allow delete: if isVerifiedOwner(userId)
+        && isValidId(userId)
+        && isValidId(customerId)
+        && existing().ownerId == request.auth.uid;
+
+      // Subcollection (Split PII): /users/{userId}/customers/{customerId}/private/{docId}
+      match /private/{docId} {
+        allow get: if isVerifiedOwner(userId)
+          && isValidId(userId)
+          && isValidId(customerId)
+          && docId == 'contact'
+          && existing().ownerId == request.auth.uid
+          && get(/databases/$(database)/documents/users/$(userId)/customers/$(customerId)).data.ownerId == request.auth.uid;
+
+        allow create: if isVerifiedOwner(userId)
+          && isValidId(userId)
+          && isValidId(customerId)
+          && docId == 'contact'
+          && isValidCustomerPrivate(incoming())
+          && incoming().updatedAt == request.time
+          && existsAfter(/databases/$(database)/documents/users/$(userId)/customers/$(customerId))
+          && getAfter(/databases/$(database)/documents/users/$(userId)/customers/$(customerId)).data.ownerId == request.auth.uid;
+
+        allow update: if isVerifiedOwner(userId)
+          && isValidId(userId)
+          && isValidId(customerId)
+          && docId == 'contact'
+          && isValidCustomerPrivate(incoming())
+          && existing().ownerId == request.auth.uid
+          && incoming().ownerId == existing().ownerId
+          && incoming().updatedAt == request.time
+          && (
+            incoming().diff(existing()).affectedKeys().hasOnly(['phone', 'address', 'updatedAt'])
+          )
+          && get(/databases/$(database)/documents/users/$(userId)/customers/$(customerId)).data.ownerId == request.auth.uid;
+
+        allow delete: if isVerifiedOwner(userId)
+          && isValidId(userId)
+          && isValidId(customerId)
+          && docId == 'contact'
+          && existing().ownerId == request.auth.uid;
+      }
+    }
+
+    // Collection: /users/{userId}/invoices/{invoiceId}
+    match /users/{userId}/invoices/{invoiceId} {
+      allow get: if isVerifiedOwner(userId)
+        && isValidId(userId)
+        && isValidId(invoiceId)
+        && existing().ownerId == request.auth.uid;
+
+      allow list: if isVerifiedOwner(userId)
+        && existing().ownerId == request.auth.uid;
+
+      allow create: if isVerifiedOwner(userId)
+        && isValidId(userId)
+        && isValidId(invoiceId)
+        && isValidInvoice(incoming(), invoiceId)
+        && incoming().status == 'issued'
+        && incoming().createdAt == request.time
+        && incoming().updatedAt == request.time;
+
+      allow update: if isVerifiedOwner(userId)
+        && isValidId(userId)
+        && isValidId(invoiceId)
+        && isValidInvoice(incoming(), invoiceId)
+        && existing().ownerId == request.auth.uid
+        && incoming().ownerId == existing().ownerId
+        && incoming().id == existing().id
+        && incoming().createdAt == existing().createdAt
+        && existing().status != 'cancelled'
+        && incoming().updatedAt == request.time
+        && (
+          // Action: Cancel an issued invoice (Terminal State Transition)
+          incoming().status == 'cancelled'
+          && incoming().diff(existing()).affectedKeys().hasOnly(['status', 'updatedAt'])
+        );
+
+      allow delete: if false;
+
+      // Subcollection: /users/{userId}/invoices/{invoiceId}/items/{itemId}
+      match /items/{itemId} {
+        allow get: if isVerifiedOwner(userId)
+          && isValidId(userId)
+          && isValidId(invoiceId)
+          && isValidId(itemId)
+          && existing().ownerId == request.auth.uid
+          && get(/databases/$(database)/documents/users/$(userId)/invoices/$(invoiceId)).data.ownerId == request.auth.uid;
+
+        allow list: if isVerifiedOwner(userId)
+          && existing().ownerId == request.auth.uid;
+
+        allow create: if isVerifiedOwner(userId)
+          && isValidId(userId)
+          && isValidId(invoiceId)
+          && isValidId(itemId)
+          && isValidInvoiceLineItem(incoming(), invoiceId, itemId)
+          && incoming().createdAt == request.time
+          && existsAfter(/databases/$(database)/documents/users/$(userId)/invoices/$(invoiceId))
+          && getAfter(/databases/$(database)/documents/users/$(userId)/invoices/$(invoiceId)).data.ownerId == request.auth.uid;
+
+        allow update, delete: if false;
+      }
+    }
+
+    // Validation Blueprint: AppSettings
+    function isValidAppSettings(data) {
+      return data.keys().hasAll([
+          'ownerId', 'legalName', 'shortName', 'nif', 'address', 'cityCountry',
+          'phone', 'email', 'tagline', 'defaultCashier', 'defaultOperator',
+          'defaultFormat', 'defaultDocType', 'defaultNotes', 'autoPrintOnEmit', 'updatedAt'
+        ])
+        && data.keys().hasOnly([
+          'ownerId', 'legalName', 'shortName', 'nif', 'address', 'cityCountry',
+          'phone', 'email', 'tagline', 'defaultCashier', 'defaultOperator',
+          'defaultFormat', 'defaultDocType', 'defaultNotes', 'autoPrintOnEmit', 'updatedAt'
+        ])
+        && data.ownerId is string && data.ownerId == request.auth.uid && isValidId(data.ownerId)
+        && data.legalName is string && data.legalName.size() >= 1 && data.legalName.size() <= 160
+        && data.shortName is string && data.shortName.size() >= 1 && data.shortName.size() <= 64
+        && data.nif is string && data.nif.size() >= 1 && data.nif.size() <= 32
+        && data.address is string && data.address.size() >= 1 && data.address.size() <= 160
+        && data.cityCountry is string && data.cityCountry.size() >= 1 && data.cityCountry.size() <= 80
+        && data.phone is string && data.phone.size() <= 40
+        && data.email is string && data.email.size() <= 120
+        && data.tagline is string && data.tagline.size() <= 120
+        && data.defaultCashier is string && data.defaultCashier.size() >= 1 && data.defaultCashier.size() <= 16
+        && data.defaultOperator is string && data.defaultOperator.size() >= 1 && data.defaultOperator.size() <= 32
+        && data.defaultFormat is string && (data.defaultFormat == 'POS' || data.defaultFormat == 'A4')
+        && data.defaultDocType is string && (data.defaultDocType == 'FR' || data.defaultDocType == 'FP')
+        && data.defaultNotes is string && data.defaultNotes.size() <= 300
+        && data.autoPrintOnEmit is bool
+        && data.updatedAt is timestamp;
+    }
+
+    // Collection: /users/{userId}/settings/{settingId}
+    match /users/{userId}/settings/{settingId} {
+      allow get: if isVerifiedOwner(userId)
+        && isValidId(userId)
+        && settingId == 'general'
+        && existing().ownerId == request.auth.uid;
+
+      allow create: if isVerifiedOwner(userId)
+        && isValidId(userId)
+        && settingId == 'general'
+        && isValidAppSettings(incoming())
+        && incoming().updatedAt == request.time;
+
+      allow update: if isVerifiedOwner(userId)
+        && isValidId(userId)
+        && settingId == 'general'
+        && isValidAppSettings(incoming())
+        && existing().ownerId == request.auth.uid
+        && incoming().ownerId == existing().ownerId
+        && incoming().updatedAt == request.time
+        && (
+          incoming().diff(existing()).affectedKeys().hasOnly([
+            'legalName', 'shortName', 'nif', 'address', 'cityCountry',
+            'phone', 'email', 'tagline', 'defaultCashier', 'defaultOperator',
+            'defaultFormat', 'defaultDocType', 'defaultNotes', 'autoPrintOnEmit', 'updatedAt'
+          ])
+        );
+
+      allow delete: if false;
+    }
+  }
+}

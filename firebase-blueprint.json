@@ -1,0 +1,174 @@
+{
+  "entities": {
+    "Product": {
+      "title": "Product",
+      "description": "Artigo comercial ou serviço para faturação em Kwanzas (Kz).",
+      "type": "object",
+      "properties": {
+        "id": { "type": "string", "maxLength": 128, "pattern": "^[a-zA-Z0-9_\\-]+$" },
+        "ownerId": { "type": "string", "maxLength": 128, "pattern": "^[a-zA-Z0-9_\\-]+$" },
+        "code": { "type": "string", "maxLength": 32 },
+        "name": { "type": "string", "maxLength": 160 },
+        "unit": { "type": "string", "maxLength": 16 },
+        "price": { "type": "number" },
+        "ivaRate": { "type": "number", "enum": [0, 14] },
+        "exemptionReason": { "type": "string", "maxLength": 120 },
+        "active": { "type": "boolean" },
+        "createdAt": { "type": "string", "format": "date-time" },
+        "updatedAt": { "type": "string", "format": "date-time" }
+      },
+      "required": ["id", "ownerId", "code", "name", "unit", "price", "ivaRate", "exemptionReason", "active", "createdAt", "updatedAt"]
+    },
+    "Customer": {
+      "title": "Customer",
+      "description": "Dados públicos/fiscais do cliente para faturação.",
+      "type": "object",
+      "properties": {
+        "id": { "type": "string", "maxLength": 128, "pattern": "^[a-zA-Z0-9_\\-]+$" },
+        "ownerId": { "type": "string", "maxLength": 128, "pattern": "^[a-zA-Z0-9_\\-]+$" },
+        "name": { "type": "string", "maxLength": 160 },
+        "nif": { "type": "string", "maxLength": 32 },
+        "locality": { "type": "string", "maxLength": 160 },
+        "createdAt": { "type": "string", "format": "date-time" },
+        "updatedAt": { "type": "string", "format": "date-time" }
+      },
+      "required": ["id", "ownerId", "name", "nif", "locality", "createdAt", "updatedAt"]
+    },
+    "CustomerPrivate": {
+      "title": "CustomerPrivate",
+      "description": "Contacto privado (PII isolada) do cliente.",
+      "type": "object",
+      "properties": {
+        "ownerId": { "type": "string", "maxLength": 128, "pattern": "^[a-zA-Z0-9_\\-]+$" },
+        "phone": { "type": "string", "maxLength": 40 },
+        "address": { "type": "string", "maxLength": 200 },
+        "updatedAt": { "type": "string", "format": "date-time" }
+      },
+      "required": ["ownerId", "phone", "address", "updatedAt"]
+    },
+    "Invoice": {
+      "title": "Invoice",
+      "description": "Cabeçalho da fatura/recibo emitida no SILA-Billing.",
+      "type": "object",
+      "properties": {
+        "id": { "type": "string", "maxLength": 128, "pattern": "^[a-zA-Z0-9_\\-]+$" },
+        "ownerId": { "type": "string", "maxLength": 128, "pattern": "^[a-zA-Z0-9_\\-]+$" },
+        "number": { "type": "string", "maxLength": 40 },
+        "docType": { "type": "string", "enum": ["FR", "FP"], "maxLength": 8 },
+        "issuedAtIso": { "type": "string", "maxLength": 40 },
+        "cashier": { "type": "string", "maxLength": 16 },
+        "operator": { "type": "string", "maxLength": 32 },
+        "paymentMethod": { "type": "string", "enum": ["Dinheiro", "Multicaixa", "Transferência"], "maxLength": 24 },
+        "customerId": { "type": "string", "maxLength": 128 },
+        "customerName": { "type": "string", "maxLength": 160 },
+        "customerNif": { "type": "string", "maxLength": 32 },
+        "customerLocality": { "type": "string", "maxLength": 160 },
+        "merchandiseTotal": { "type": "number" },
+        "discountTotal": { "type": "number" },
+        "taxBase14": { "type": "number" },
+        "taxAmount14": { "type": "number" },
+        "taxBase0": { "type": "number" },
+        "taxAmount0": { "type": "number" },
+        "taxTotal": { "type": "number" },
+        "grandTotal": { "type": "number" },
+        "amountInWords": { "type": "string", "maxLength": 300 },
+        "amountReceived": { "type": "number" },
+        "changeAmount": { "type": "number" },
+        "notes": { "type": "string", "maxLength": 300 },
+        "itemCount": { "type": "number" },
+        "status": { "type": "string", "enum": ["issued", "cancelled"], "maxLength": 16 },
+        "createdAt": { "type": "string", "format": "date-time" },
+        "updatedAt": { "type": "string", "format": "date-time" }
+      },
+      "required": [
+        "id", "ownerId", "number", "docType", "issuedAtIso", "cashier", "operator",
+        "paymentMethod", "customerId", "customerName", "customerNif", "customerLocality",
+        "merchandiseTotal", "discountTotal", "taxBase14", "taxAmount14", "taxBase0",
+        "taxAmount0", "taxTotal", "grandTotal", "amountInWords", "amountReceived",
+        "changeAmount", "notes", "itemCount", "status", "createdAt", "updatedAt"
+      ]
+    },
+    "InvoiceLineItem": {
+      "title": "InvoiceLineItem",
+      "description": "Linha de artigo pertencente a uma fatura.",
+      "type": "object",
+      "properties": {
+        "id": { "type": "string", "maxLength": 128, "pattern": "^[a-zA-Z0-9_\\-]+$" },
+        "invoiceId": { "type": "string", "maxLength": 128, "pattern": "^[a-zA-Z0-9_\\-]+$" },
+        "ownerId": { "type": "string", "maxLength": 128, "pattern": "^[a-zA-Z0-9_\\-]+$" },
+        "code": { "type": "string", "maxLength": 32 },
+        "description": { "type": "string", "maxLength": 160 },
+        "unit": { "type": "string", "maxLength": 16 },
+        "qty": { "type": "number" },
+        "unitPrice": { "type": "number" },
+        "discountPct": { "type": "number" },
+        "ivaRate": { "type": "number", "enum": [0, 14] },
+        "lineGross": { "type": "number" },
+        "lineNet": { "type": "number" },
+        "lineBase": { "type": "number" },
+        "lineTax": { "type": "number" },
+        "lineTotal": { "type": "number" },
+        "createdAt": { "type": "string", "format": "date-time" }
+      },
+      "required": [
+        "id", "invoiceId", "ownerId", "code", "description", "unit", "qty",
+        "unitPrice", "discountPct", "ivaRate", "lineGross", "lineNet",
+        "lineBase", "lineTax", "lineTotal", "createdAt"
+      ]
+    },
+    "AppSettings": {
+      "title": "AppSettings",
+      "description": "Configurações operacionais e identidade fiscal da empresa no SILA-Billing.",
+      "type": "object",
+      "properties": {
+        "ownerId": { "type": "string", "maxLength": 128, "pattern": "^[a-zA-Z0-9_\\-]+$" },
+        "legalName": { "type": "string", "maxLength": 160 },
+        "shortName": { "type": "string", "maxLength": 64 },
+        "nif": { "type": "string", "maxLength": 32 },
+        "address": { "type": "string", "maxLength": 160 },
+        "cityCountry": { "type": "string", "maxLength": 80 },
+        "phone": { "type": "string", "maxLength": 40 },
+        "email": { "type": "string", "maxLength": 120 },
+        "tagline": { "type": "string", "maxLength": 120 },
+        "defaultCashier": { "type": "string", "maxLength": 16 },
+        "defaultOperator": { "type": "string", "maxLength": 32 },
+        "defaultFormat": { "type": "string", "enum": ["POS", "A4"], "maxLength": 8 },
+        "defaultDocType": { "type": "string", "enum": ["FR", "FP"], "maxLength": 8 },
+        "defaultNotes": { "type": "string", "maxLength": 300 },
+        "autoPrintOnEmit": { "type": "boolean" },
+        "updatedAt": { "type": "string", "format": "date-time" }
+      },
+      "required": [
+        "ownerId", "legalName", "shortName", "nif", "address", "cityCountry",
+        "phone", "email", "tagline", "defaultCashier", "defaultOperator",
+        "defaultFormat", "defaultDocType", "defaultNotes", "autoPrintOnEmit", "updatedAt"
+      ]
+    }
+  },
+  "firestore": {
+    "/users/{userId}/products/{productId}": {
+      "schema": { "$ref": "#/entities/Product" },
+      "description": "Catálogo de artigos e serviços do operador autenticado."
+    },
+    "/users/{userId}/customers/{customerId}": {
+      "schema": { "$ref": "#/entities/Customer" },
+      "description": "Registo fiscal de clientes do operador autenticado."
+    },
+    "/users/{userId}/customers/{customerId}/private/{docId}": {
+      "schema": { "$ref": "#/entities/CustomerPrivate" },
+      "description": "Contactos privados (telefone e morada) isolados por PII."
+    },
+    "/users/{userId}/invoices/{invoiceId}": {
+      "schema": { "$ref": "#/entities/Invoice" },
+      "description": "Cabeçalhos de faturas emitidas."
+    },
+    "/users/{userId}/invoices/{invoiceId}/items/{itemId}": {
+      "schema": { "$ref": "#/entities/InvoiceLineItem" },
+      "description": "Linhas de artigos de cada fatura (subcoleção escalável)."
+    },
+    "/users/{userId}/settings/{settingId}": {
+      "schema": { "$ref": "#/entities/AppSettings" },
+      "description": "Configurações da empresa e predefinições de caixa/impressão."
+    }
+  }
+}
