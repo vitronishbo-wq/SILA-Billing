@@ -2,14 +2,16 @@ import { createHash } from 'crypto';
 import { Router } from 'express';
 import { FieldValue } from 'firebase-admin/firestore';
 import { calculateInvoiceTotals, roundKz } from '../../src/core/billingEngine.ts';
-import type { CartDraftItem, TaxRate } from '../../src/core/types.ts';
+import { JAIMONA_COMPANY_ID, type CartDraftItem, type TaxRate } from '../../src/core/types.ts';
 import { getFirebaseAdminContext } from '../firebaseAdmin.ts';
 import { requireFirebaseAuth, type AuthenticatedRequest } from '../middleware/requireFirebaseAuth.ts';
+import { verifyCompanyMembershipServer } from '../middleware/requirePlatformAdmin.ts';
 
 export const auditRouter = Router();
 
 interface AuditInvoicePayload {
   id: string;
+  companyId?: string;
   number: string;
   docType: 'FR' | 'FP';
   issuedAtIso: string;
@@ -46,6 +48,10 @@ auditRouter.post('/invoices', requireFirebaseAuth, async (req: AuthenticatedRequ
     });
     return;
   }
+
+  const safeCompanyId = String(body.companyId || JAIMONA_COMPANY_ID)
+    .replace(/[^a-zA-Z0-9_-]/g, '_')
+    .slice(0, 128);
 
   // Normaliza e valida cada linha segundo o regime de IVA angolano (14% ou Isento 0%)
   const draftItems: CartDraftItem[] = [];
@@ -96,8 +102,9 @@ auditRouter.post('/invoices', requireFirebaseAuth, async (req: AuthenticatedRequ
     return;
   }
 
-  // Gera assinatura SHA-256 de integridade documental
+  // Gera assinatura SHA-256 de integridade documental vinculada à empresa
   const canonicalDigest = [
+    safeCompanyId,
     user.uid,
     body.number,
     body.issuedAtIso || '',
@@ -115,96 +122,174 @@ auditRouter.post('/invoices', requireFirebaseAuth, async (req: AuthenticatedRequ
 
   if (ctx.db && ctx.hasExplicitCredentials) {
     try {
+      const membership = await verifyCompanyMembershipServer(ctx.db, safeCompanyId, user);
+      if (!membership) {
+        res.status(403).json({
+          ok: false,
+          error: 'Sem permissão operacional para emitir documentos nesta empresa.',
+        });
+        return;
+      }
+
+      if (membership.companyStatus === 'suspended') {
+        res.status(403).json({
+          ok: false,
+          error: 'Esta empresa encontra-se suspensa e não pode emitir novas faturas.',
+        });
+        return;
+      }
+
       const safeInvoiceId = String(body.id).replace(/[^a-zA-Z0-9_-]/g, '_').slice(0, 128);
       const batch = ctx.db.batch();
 
-      const invRef = ctx.db
-        .collection('users')
-        .doc(user.uid)
-        .collection('invoices')
-        .doc(safeInvoiceId);
-
-      const auditRef = ctx.db
-        .collection('users')
-        .doc(user.uid)
-        .collection('audit_logs')
-        .doc(safeInvoiceId);
-
-      batch.set(
-        invRef,
-        {
-          id: safeInvoiceId,
-          ownerId: user.uid,
-          number: String(body.number).slice(0, 40),
-          docType: body.docType === 'FP' ? 'FP' : 'FR',
-          issuedAtIso: String(body.issuedAtIso || new Date().toISOString()).slice(0, 40),
-          cashier: String(body.cashier || '01').slice(0, 16),
-          operator: String(body.operator || '001').slice(0, 32),
-          paymentMethod:
-            body.paymentMethod === 'Multicaixa' || body.paymentMethod === 'Transferência'
-              ? body.paymentMethod
-              : 'Dinheiro',
-          customerId: String(body.customerId || 'cust_direct')
-            .replace(/[^a-zA-Z0-9_-]/g, '_')
-            .slice(0, 128),
-          customerName: String(body.customerName || 'Cliente de Venda Directa').slice(0, 160),
-          customerNif: String(body.customerNif || 'Consumidor Final').slice(0, 32),
-          customerLocality: String(body.customerLocality || 'Saurimo - Angola').slice(0, 160),
-          merchandiseTotal: serverCalc.merchandiseTotal,
-          discountTotal: serverCalc.discountTotal,
-          taxBase14: serverCalc.taxBase14,
-          taxAmount14: serverCalc.taxAmount14,
-          taxBase0: serverCalc.taxBase0,
-          taxAmount0: 0,
-          taxTotal: serverCalc.taxTotal,
-          grandTotal: serverCalc.grandTotal,
-          amountInWords: serverCalc.amountInWords.slice(0, 300),
-          amountReceived,
-          changeAmount,
-          notes: String(body.notes || '').slice(0, 300),
-          itemCount: serverCalc.lines.length,
-          status: 'issued',
-          createdAt: FieldValue.serverTimestamp(),
-          updatedAt: FieldValue.serverTimestamp(),
-        },
-        { merge: true }
-      );
-
-      for (const line of serverCalc.lines) {
-        const safeItemId = line.id.replace(/[^a-zA-Z0-9_-]/g, '_').slice(0, 128);
-        const itemRef = invRef.collection('items').doc(safeItemId);
-        batch.set(itemRef, {
-          id: safeItemId,
-          invoiceId: safeInvoiceId,
-          ownerId: user.uid,
-          code: line.code,
-          description: line.description,
-          unit: line.unit,
-          qty: line.qty,
-          unitPrice: line.unitPrice,
-          discountPct: line.discountPct,
-          ivaRate: line.ivaRate,
-          lineGross: line.lineGross,
-          lineNet: line.lineNet,
-          lineBase: line.lineBase,
-          lineTax: line.lineTax,
-          lineTotal: line.lineTotal,
-          createdAt: FieldValue.serverTimestamp(),
-        });
-      }
-
-      batch.set(auditRef, {
-        invoiceId: safeInvoiceId,
-        invoiceNumber: String(body.number).slice(0, 40),
-        ownerId: user.uid,
-        ownerEmail: user.email || '',
-        grandTotal: serverCalc.grandTotal,
+      const invoicePayloadBase = {
+        id: safeInvoiceId,
+        number: String(body.number).slice(0, 40),
+        docType: body.docType === 'FP' ? 'FP' : 'FR',
+        issuedAtIso: String(body.issuedAtIso || new Date().toISOString()).slice(0, 40),
+        cashier: String(body.cashier || '01').slice(0, 16),
+        operator: String(body.operator || '001').slice(0, 32),
+        paymentMethod:
+          body.paymentMethod === 'Multicaixa' || body.paymentMethod === 'Transferência'
+            ? body.paymentMethod
+            : 'Dinheiro',
+        customerId: String(body.customerId || 'cust_direct')
+          .replace(/[^a-zA-Z0-9_-]/g, '_')
+          .slice(0, 128),
+        customerName: String(body.customerName || 'Cliente de Venda Directa').slice(0, 160),
+        customerNif: String(body.customerNif || 'Consumidor Final').slice(0, 32),
+        customerLocality: String(body.customerLocality || 'Angola').slice(0, 160),
+        merchandiseTotal: serverCalc.merchandiseTotal,
+        discountTotal: serverCalc.discountTotal,
         taxBase14: serverCalc.taxBase14,
         taxAmount14: serverCalc.taxAmount14,
         taxBase0: serverCalc.taxBase0,
-        auditHash,
-        verifiedAt: FieldValue.serverTimestamp(),
-      });
+        taxAmount0: 0,
+        taxTotal: serverCalc.taxTotal,
+        grandTotal: serverCalc.grandTotal,
+        amountInWords: serverCalc.amountInWords.slice(0, 300),
+        amountReceived,
+        changeAmount,
+        notes: String(body.notes || '').slice(0, 300),
+        itemCount: serverCalc.lines.length,
+        status: 'issued',
+        createdAt: FieldValue.serverTimestamp(),
+        updatedAt: FieldValue.serverTimestamp(),
+      };
+
+      if (membership.existsInCloud) {
+        const companyOwnerUid = String(membership.companyData?.ownerUid || user.uid);
+        const compInvRef = ctx.db
+          .collection('companies')
+          .doc(safeCompanyId)
+          .collection('invoices')
+          .doc(safeInvoiceId);
+        const compAuditRef = ctx.db
+          .collection('companies')
+          .doc(safeCompanyId)
+          .collection('audit_logs')
+          .doc(safeInvoiceId);
+
+        batch.set(
+          compInvRef,
+          {
+            ...invoicePayloadBase,
+            companyId: safeCompanyId,
+            companyOwnerUid,
+            emittedByUid: user.uid,
+          },
+          { merge: true }
+        );
+
+        for (const line of serverCalc.lines) {
+          const safeItemId = line.id.replace(/[^a-zA-Z0-9_-]/g, '_').slice(0, 128);
+          batch.set(compInvRef.collection('items').doc(safeItemId), {
+            id: safeItemId,
+            invoiceId: safeInvoiceId,
+            companyId: safeCompanyId,
+            companyOwnerUid,
+            code: line.code,
+            description: line.description,
+            unit: line.unit,
+            qty: line.qty,
+            unitPrice: line.unitPrice,
+            discountPct: line.discountPct,
+            ivaRate: line.ivaRate,
+            lineGross: line.lineGross,
+            lineNet: line.lineNet,
+            lineBase: line.lineBase,
+            lineTax: line.lineTax,
+            lineTotal: line.lineTotal,
+            createdAt: FieldValue.serverTimestamp(),
+          });
+        }
+
+        batch.set(compAuditRef, {
+          invoiceId: safeInvoiceId,
+          companyId: safeCompanyId,
+          invoiceNumber: String(body.number).slice(0, 40),
+          actorUid: user.uid,
+          actorEmail: user.email || '',
+          actorRole: membership.role,
+          grandTotal: serverCalc.grandTotal,
+          taxBase14: serverCalc.taxBase14,
+          taxAmount14: serverCalc.taxAmount14,
+          taxBase0: serverCalc.taxBase0,
+          auditHash,
+          verifiedAt: FieldValue.serverTimestamp(),
+        });
+      }
+
+      // Mantém continuidade na coleção clássica para a empresa inicial JAIMONA
+      if (safeCompanyId === JAIMONA_COMPANY_ID) {
+        const invRef = ctx.db
+          .collection('users')
+          .doc(user.uid)
+          .collection('invoices')
+          .doc(safeInvoiceId);
+        const auditRef = ctx.db
+          .collection('users')
+          .doc(user.uid)
+          .collection('audit_logs')
+          .doc(safeInvoiceId);
+
+        batch.set(invRef, { ...invoicePayloadBase, ownerId: user.uid }, { merge: true });
+
+        for (const line of serverCalc.lines) {
+          const safeItemId = line.id.replace(/[^a-zA-Z0-9_-]/g, '_').slice(0, 128);
+          batch.set(invRef.collection('items').doc(safeItemId), {
+            id: safeItemId,
+            invoiceId: safeInvoiceId,
+            ownerId: user.uid,
+            code: line.code,
+            description: line.description,
+            unit: line.unit,
+            qty: line.qty,
+            unitPrice: line.unitPrice,
+            discountPct: line.discountPct,
+            ivaRate: line.ivaRate,
+            lineGross: line.lineGross,
+            lineNet: line.lineNet,
+            lineBase: line.lineBase,
+            lineTax: line.lineTax,
+            lineTotal: line.lineTotal,
+            createdAt: FieldValue.serverTimestamp(),
+          });
+        }
+
+        batch.set(auditRef, {
+          invoiceId: safeInvoiceId,
+          invoiceNumber: String(body.number).slice(0, 40),
+          ownerId: user.uid,
+          ownerEmail: user.email || '',
+          grandTotal: serverCalc.grandTotal,
+          taxBase14: serverCalc.taxBase14,
+          taxAmount14: serverCalc.taxAmount14,
+          taxBase0: serverCalc.taxBase0,
+          auditHash,
+          verifiedAt: FieldValue.serverTimestamp(),
+        });
+      }
 
       await batch.commit();
       persistedInFirestore = true;

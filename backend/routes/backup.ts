@@ -1,7 +1,8 @@
 import { Router } from 'express';
-import { JAIMONA_COMPANY } from '../../src/core/types.ts';
+import { JAIMONA_COMPANY, JAIMONA_COMPANY_ID } from '../../src/core/types.ts';
 import { getFirebaseAdminContext } from '../firebaseAdmin.ts';
 import { requireFirebaseAuth, type AuthenticatedRequest } from '../middleware/requireFirebaseAuth.ts';
+import { verifyCompanyMembershipServer } from '../middleware/requirePlatformAdmin.ts';
 
 export const backupRouter = Router();
 
@@ -18,16 +19,31 @@ backupRouter.get('/', requireFirebaseAuth, async (req: AuthenticatedRequest, res
     return;
   }
 
+  const rawCompanyId = String(req.query.companyId || JAIMONA_COMPANY_ID)
+    .replace(/[^a-zA-Z0-9_-]/g, '_')
+    .slice(0, 128);
+
   try {
-    const userRoot = ctx.db.collection('users').doc(user.uid);
+    const membership = await verifyCompanyMembershipServer(ctx.db, rawCompanyId, user);
+    if (!membership || membership.role !== 'owner') {
+      res.status(403).json({
+        ok: false,
+        error: 'Apenas o proprietário da empresa pode exportar o backup administrativo da cloud.',
+      });
+      return;
+    }
+
+    const rootRef = membership.existsInCloud
+      ? ctx.db.collection('companies').doc(rawCompanyId)
+      : ctx.db.collection('users').doc(user.uid);
 
     const [productsSnap, customersSnap, invoicesSnap, settingsDoc, auditSnap] =
       await Promise.all([
-        userRoot.collection('products').get(),
-        userRoot.collection('customers').get(),
-        userRoot.collection('invoices').get(),
-        userRoot.collection('settings').doc('general').get(),
-        userRoot.collection('audit_logs').get(),
+        rootRef.collection('products').get(),
+        rootRef.collection('customers').get(),
+        rootRef.collection('invoices').get(),
+        rootRef.collection('settings').doc('general').get(),
+        rootRef.collection('audit_logs').get(),
       ]);
 
     const products = productsSnap.docs.map((d) => ({ id: d.id, ...d.data() }));
@@ -56,12 +72,24 @@ backupRouter.get('/', requireFirebaseAuth, async (req: AuthenticatedRequest, res
 
     const auditLogs = auditSnap.docs.map((d) => ({ id: d.id, ...d.data() }));
 
+    const companySummary = membership.companyData
+      ? {
+          id: rawCompanyId,
+          legalName: membership.companyData.legalName,
+          shortName: membership.companyData.shortName,
+          nif: membership.companyData.nif,
+          address: membership.companyData.address,
+          cityCountry: membership.companyData.cityCountry,
+        }
+      : { id: JAIMONA_COMPANY_ID, ...JAIMONA_COMPANY };
+
     const exportBundle = {
-      schemaVersion: '1.0.0',
+      schemaVersion: '2.0.0',
       exportedAtIso: new Date().toISOString(),
       projectId: ctx.projectId,
       firestoreDatabaseId: ctx.databaseId,
-      company: JAIMONA_COMPANY,
+      companyId: rawCompanyId,
+      company: companySummary,
       owner: {
         uid: user.uid,
         email: user.email || '',
@@ -81,7 +109,7 @@ backupRouter.get('/', requireFirebaseAuth, async (req: AuthenticatedRequest, res
       },
     };
 
-    const filename = `sila-billing-backup-${new Date().toISOString().slice(0, 10)}.json`;
+    const filename = `sila-billing-backup-${rawCompanyId}-${new Date().toISOString().slice(0, 10)}.json`;
     res.setHeader('Content-Type', 'application/json; charset=utf-8');
     res.setHeader('Content-Disposition', `attachment; filename="${filename}"`);
     res.status(200).send(JSON.stringify(exportBundle, null, 2));

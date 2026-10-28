@@ -1,4 +1,10 @@
-import type { InvoiceRecord } from '../../src/core/types.ts';
+import type {
+  CompanyOperationalStatus,
+  CompanyRecord,
+  InvoiceRecord,
+  PlanTier,
+} from '../../src/core/types.ts';
+import { JAIMONA_COMPANY_ID } from '../../src/core/types.ts';
 import { auth } from '../../src/services/firebaseClient.ts';
 
 const PRODUCTION_RENDER_API_URL = 'https://sila-billing.onrender.com';
@@ -47,10 +53,45 @@ export interface AuditInvoiceResponse {
   error?: string;
 }
 
+export interface AdminCompanySummary {
+  id: string;
+  shortName: string;
+  legalName: string;
+  nif: string;
+  normalizedNif: string;
+  cityCountry: string;
+  ownerEmail: string;
+  status: CompanyOperationalStatus;
+  planTier: PlanTier;
+  commercialActive: boolean;
+  invoiceCount: number;
+  createdAtIso: string;
+}
+
+export interface AdminAuditEntry {
+  id: string;
+  action: string;
+  companyId: string;
+  companyName: string;
+  adminEmail: string;
+  details: string;
+  createdAtIso: string;
+}
+
+export interface AdminOverviewResponse {
+  ok: boolean;
+  statusCode?: number;
+  adminEmail?: string;
+  cloudPersisted?: boolean;
+  companies?: AdminCompanySummary[];
+  recentLogs?: AdminAuditEntry[];
+  error?: string;
+}
+
 async function getBearerHeaders(): Promise<Record<string, string>> {
   const currentUser = auth.currentUser;
   if (!currentUser) {
-    throw new Error('Autentique-se na conta Cloud para usar endpoints administrativos.');
+    throw new Error('Autentique-se na conta Google para aceder a serviços verificados.');
   }
   const token = await currentUser.getIdToken();
   return {
@@ -72,10 +113,14 @@ export async function fetchBackendHealth(): Promise<BackendHealthStatus | null> 
   }
 }
 
-export async function submitInvoiceAudit(invoice: InvoiceRecord): Promise<AuditInvoiceResponse> {
+export async function submitInvoiceAudit(
+  invoice: InvoiceRecord,
+  companyId = JAIMONA_COMPANY_ID
+): Promise<AuditInvoiceResponse> {
   const headers = await getBearerHeaders();
   const payload = {
     id: invoice.id,
+    companyId: invoice.companyId || companyId,
     number: invoice.number,
     docType: invoice.docType,
     issuedAtIso: invoice.issuedAtIso,
@@ -110,12 +155,57 @@ export async function submitInvoiceAudit(invoice: InvoiceRecord): Promise<AuditI
   return (await res.json()) as AuditInvoiceResponse;
 }
 
-export async function downloadCloudBackupJson(): Promise<void> {
+export async function registerCompanyBackend(
+  company: CompanyRecord
+): Promise<{ ok: boolean; statusCode: number; error?: string }> {
   const headers = await getBearerHeaders();
-  const res = await fetch(`${API_BASE}/api/backup`, {
-    method: 'GET',
+  const res = await fetch(`${API_BASE}/api/companies/register`, {
+    method: 'POST',
     headers,
+    body: JSON.stringify({
+      id: company.id,
+      legalName: company.profile.legalName,
+      shortName: company.profile.shortName,
+      nif: company.profile.nif,
+      address: company.profile.address,
+      cityCountry: company.profile.cityCountry,
+      phone: company.profile.phone,
+      email: company.profile.email,
+      tagline: company.profile.tagline,
+      baseSequence: company.baseSequence,
+    }),
   });
+
+  const data = (await res.json().catch(() => ({ ok: false }))) as {
+    ok: boolean;
+    error?: string;
+  };
+  return { ok: Boolean(data.ok), statusCode: res.status, error: data.error };
+}
+
+export async function cancelInvoiceBackend(
+  companyId: string,
+  invoiceId: string,
+  cancelReason: string
+): Promise<{ ok: boolean; error?: string }> {
+  const headers = await getBearerHeaders();
+  const res = await fetch(`${API_BASE}/api/companies/${encodeURIComponent(companyId)}/cancel-invoice`, {
+    method: 'POST',
+    headers,
+    body: JSON.stringify({ invoiceId, cancelReason }),
+  });
+  return (await res.json().catch(() => ({ ok: false }))) as { ok: boolean; error?: string };
+}
+
+export async function downloadCloudBackupJson(companyId = JAIMONA_COMPANY_ID): Promise<void> {
+  const headers = await getBearerHeaders();
+  const res = await fetch(
+    `${API_BASE}/api/backup?companyId=${encodeURIComponent(companyId)}`,
+    {
+      method: 'GET',
+      headers,
+    }
+  );
 
   if (!res.ok) {
     let errMsg = `Erro HTTP ${res.status}`;
@@ -132,9 +222,56 @@ export async function downloadCloudBackupJson(): Promise<void> {
   const url = URL.createObjectURL(blob);
   const a = document.createElement('a');
   a.href = url;
-  a.download = `sila-billing-backup-${new Date().toISOString().slice(0, 10)}.json`;
+  a.download = `sila-billing-backup-${companyId}-${new Date().toISOString().slice(0, 10)}.json`;
   document.body.appendChild(a);
   a.click();
   a.remove();
   URL.revokeObjectURL(url);
+}
+
+export async function fetchPlatformAdminOverview(): Promise<AdminOverviewResponse> {
+  try {
+    const headers = await getBearerHeaders();
+    const res = await fetch(`${API_BASE}/api/admin/overview`, {
+      method: 'GET',
+      headers,
+    });
+    const json = (await res.json().catch(() => ({ ok: false }))) as AdminOverviewResponse;
+    return { ...json, statusCode: res.status };
+  } catch (err) {
+    return {
+      ok: false,
+      statusCode: 0,
+      error: err instanceof Error ? err.message : 'Falha de comunicação com o servidor.',
+    };
+  }
+}
+
+export async function updatePlatformCompanyAdmin(
+  companyId: string,
+  patch: { status?: CompanyOperationalStatus; planTier?: PlanTier; reason?: string }
+): Promise<{ ok: boolean; error?: string }> {
+  const headers = await getBearerHeaders();
+  const res = await fetch(`${API_BASE}/api/admin/companies/${encodeURIComponent(companyId)}`, {
+    method: 'PATCH',
+    headers,
+    body: JSON.stringify(patch),
+  });
+  return (await res.json().catch(() => ({ ok: false }))) as { ok: boolean; error?: string };
+}
+
+export async function logPlatformSupportAccess(
+  companyId: string,
+  companyName: string
+): Promise<void> {
+  try {
+    const headers = await getBearerHeaders();
+    await fetch(`${API_BASE}/api/admin/support-access`, {
+      method: 'POST',
+      headers,
+      body: JSON.stringify({ companyId, companyName }),
+    });
+  } catch {
+    // Registo assíncrono não bloqueante
+  }
 }

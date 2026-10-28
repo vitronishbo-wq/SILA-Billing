@@ -1,11 +1,76 @@
 import { calculateInvoiceTotals } from './billingEngine';
-import { Customer, InvoiceRecord, Product } from './types';
+import {
+  AppSettings,
+  CompanyRecord,
+  Customer,
+  getDirectCustomerIdForCompany,
+  InvoiceRecord,
+  JAIMONA_COMPANY,
+  JAIMONA_COMPANY_ID,
+  normalizeCompanyNif,
+  Product,
+} from './types';
 
 const nowIso = new Date().toISOString();
+
+export const JAIMONA_INITIAL_COMPANY: CompanyRecord = {
+  id: JAIMONA_COMPANY_ID,
+  normalizedNif: normalizeCompanyNif(JAIMONA_COMPANY.nif),
+  profile: { ...JAIMONA_COMPANY },
+  status: 'active',
+  plan: {
+    planTier: 'FREE',
+    commercialActive: false,
+    maxUsers: null,
+    maxInvoicesPerMonth: null,
+    updatedAtIso: nowIso,
+  },
+  baseSequence: 15678,
+  allowManagerCancel: true,
+  syncState: 'pending',
+  synced: false,
+  createdAtIso: nowIso,
+  updatedAtIso: nowIso,
+};
+
+export function createDirectCustomerForCompany(company: CompanyRecord): Customer {
+  const ts = new Date().toISOString();
+  const locality = company.profile.cityCountry || 'Angola';
+  return {
+    id: getDirectCustomerIdForCompany(company.id),
+    companyId: company.id,
+    name: 'Cliente de Venda Directa',
+    nif: 'Consumidor Final',
+    locality,
+    phone: '',
+    address: `Venda a Balcão — ${locality}`,
+    syncState: 'pending',
+    synced: false,
+    createdAtIso: ts,
+    updatedAtIso: ts,
+  };
+}
+
+export function createDefaultSettingsForCompany(company: CompanyRecord): AppSettings {
+  return {
+    companyId: company.id,
+    company: { ...company.profile },
+    defaultCashier: '01',
+    defaultOperator: '001',
+    defaultFormat: 'POS',
+    defaultDocType: 'FR',
+    defaultNotes: 'Venda directa a retalho.',
+    autoPrintOnEmit: false,
+    syncState: 'pending',
+    synced: false,
+    updatedAtIso: new Date().toISOString(),
+  };
+}
 
 export const INITIAL_PRODUCTS: Product[] = [
   {
     id: 'prod_00123',
+    companyId: JAIMONA_COMPANY_ID,
     code: '00123',
     name: 'Água Mineral 1,5L',
     category: 'Bebidas',
@@ -14,12 +79,14 @@ export const INITIAL_PRODUCTS: Product[] = [
     ivaRate: 14,
     exemptionReason: '',
     active: true,
+    syncState: 'pending',
     synced: false,
     createdAtIso: nowIso,
     updatedAtIso: nowIso,
   },
   {
     id: 'prod_00234',
+    companyId: JAIMONA_COMPANY_ID,
     code: '00234',
     name: 'Sumo Natural 1L',
     category: 'Bebidas',
@@ -28,12 +95,14 @@ export const INITIAL_PRODUCTS: Product[] = [
     ivaRate: 14,
     exemptionReason: '',
     active: true,
+    syncState: 'pending',
     synced: false,
     createdAtIso: nowIso,
     updatedAtIso: nowIso,
   },
   {
     id: 'prod_00345',
+    companyId: JAIMONA_COMPANY_ID,
     code: '00345',
     name: 'Biscoito Maria 200g',
     category: 'Mercearia',
@@ -42,12 +111,14 @@ export const INITIAL_PRODUCTS: Product[] = [
     ivaRate: 14,
     exemptionReason: '',
     active: true,
+    syncState: 'pending',
     synced: false,
     createdAtIso: nowIso,
     updatedAtIso: nowIso,
   },
   {
     id: 'prod_00456',
+    companyId: JAIMONA_COMPANY_ID,
     code: '00456',
     name: 'Refrigerante 350ml',
     category: 'Bebidas',
@@ -56,12 +127,14 @@ export const INITIAL_PRODUCTS: Product[] = [
     ivaRate: 14,
     exemptionReason: '',
     active: true,
+    syncState: 'pending',
     synced: false,
     createdAtIso: nowIso,
     updatedAtIso: nowIso,
   },
   {
     id: 'prod_00567',
+    companyId: JAIMONA_COMPANY_ID,
     code: '00567',
     name: 'Pão Francês (un)',
     category: 'Padaria',
@@ -70,12 +143,14 @@ export const INITIAL_PRODUCTS: Product[] = [
     ivaRate: 0,
     exemptionReason: 'Isento nos termos da Lei do IVA (Cesta Básica)',
     active: true,
+    syncState: 'pending',
     synced: false,
     createdAtIso: nowIso,
     updatedAtIso: nowIso,
   },
   {
     id: 'prod_00678',
+    companyId: JAIMONA_COMPANY_ID,
     code: '00678',
     name: 'Arroz Agulha 5kg',
     category: 'Mercearia',
@@ -84,12 +159,14 @@ export const INITIAL_PRODUCTS: Product[] = [
     ivaRate: 0,
     exemptionReason: 'Isento nos termos da Lei do IVA (Cesta Básica)',
     active: true,
+    syncState: 'pending',
     synced: false,
     createdAtIso: nowIso,
     updatedAtIso: nowIso,
   },
   {
     id: 'prod_00789',
+    companyId: JAIMONA_COMPANY_ID,
     code: '00789',
     name: 'Óleo Alimentar 1L',
     category: 'Mercearia',
@@ -98,12 +175,14 @@ export const INITIAL_PRODUCTS: Product[] = [
     ivaRate: 0,
     exemptionReason: 'Isento nos termos da Lei do IVA (Cesta Básica)',
     active: true,
+    syncState: 'pending',
     synced: false,
     createdAtIso: nowIso,
     updatedAtIso: nowIso,
   },
   {
     id: 'prod_00890',
+    companyId: JAIMONA_COMPANY_ID,
     code: '00890',
     name: 'Café Torrado Moído 250g',
     category: 'Cafetaria',
@@ -112,6 +191,7 @@ export const INITIAL_PRODUCTS: Product[] = [
     ivaRate: 14,
     exemptionReason: '',
     active: true,
+    syncState: 'pending',
     synced: false,
     createdAtIso: nowIso,
     updatedAtIso: nowIso,
@@ -121,33 +201,39 @@ export const INITIAL_PRODUCTS: Product[] = [
 export const INITIAL_CUSTOMERS: Customer[] = [
   {
     id: 'cust_direct',
+    companyId: JAIMONA_COMPANY_ID,
     name: 'Cliente de Venda Directa',
     nif: 'Consumidor Final',
     locality: 'Saurimo - Angola',
     phone: '',
     address: 'Venda a Balcão — Saurimo',
+    syncState: 'pending',
     synced: false,
     createdAtIso: nowIso,
     updatedAtIso: nowIso,
   },
   {
     id: 'cust_lunda_sul',
+    companyId: JAIMONA_COMPANY_ID,
     name: 'Cooperativa Agrícola de Saurimo, Lda',
     nif: '5401129834',
     locality: 'Bairro Txizainga, Saurimo - Angola',
     phone: '(+244) 923410988',
     address: 'Estrada Nacional 230, Saurimo',
+    syncState: 'pending',
     synced: false,
     createdAtIso: nowIso,
     updatedAtIso: nowIso,
   },
   {
     id: 'cust_clinica',
+    companyId: JAIMONA_COMPANY_ID,
     name: 'Clínica Médica Paz & Vida',
     nif: '5000874129',
     locality: 'Centro da Cidade, Saurimo - Angola',
     phone: '(+244) 931802211',
     address: 'Av. 4 de Fevereiro, Saurimo',
+    syncState: 'pending',
     synced: false,
     createdAtIso: nowIso,
     updatedAtIso: nowIso,
@@ -169,6 +255,7 @@ export function createSeedInvoice(): InvoiceRecord {
 
   return {
     id: 'inv_2026_015678',
+    companyId: JAIMONA_COMPANY_ID,
     number: 'FV 2026/015678',
     docType: 'FR',
     issuedAtIso: '2026-10-14T15:32:00.000Z',
@@ -193,6 +280,7 @@ export function createSeedInvoice(): InvoiceRecord {
     notes: 'Venda directa a retalho.',
     status: 'issued',
     lines: calc.lines,
+    syncState: 'pending',
     synced: false,
     createdAtIso: '2026-10-14T15:32:00.000Z',
     updatedAtIso: '2026-10-14T15:32:00.000Z',

@@ -9,22 +9,34 @@ import {
 import {
   AppSettings,
   CartDraftItem,
+  CompanyMember,
+  CompanyOperationalStatus,
+  CompanyRecord,
+  CompanyRole,
   Customer,
   DEFAULT_PRODUCT_CATEGORIES,
   DEFAULT_SETTINGS,
   DocumentFormat,
   DocumentType,
+  getDirectCustomerIdForCompany,
   InvoiceRecord,
+  JAIMONA_COMPANY,
+  JAIMONA_COMPANY_ID,
   PaymentMethod,
+  PlanTier,
   Product,
   TaxRate,
 } from '../src/core/types';
+import { JAIMONA_INITIAL_COMPANY } from '../src/core/seedData';
 import {
   cancelInvoiceCloud,
   createInvoiceCloud,
-  pullAllFromCloud,
+  ensureCompanyRegisteredCloud,
+  pullCompanyFromCloud,
+  pullOwnedCompaniesFromCloud,
   removeCustomerCloud,
   removeProductCloud,
+  upsertCompanyMemberCloud,
   upsertCustomerCloud,
   upsertProductCloud,
   upsertSettingsCloud,
@@ -35,15 +47,37 @@ import {
   signOutFirebase,
   validateFirestoreConnection,
 } from '../src/services/firebaseClient';
-import { bootstrapLocalStore, localDb } from '../src/services/localStore';
 import {
+  bootstrapLocalStore,
+  CompanyWorkspaceBundle,
+  loadCompanyWorkspace,
+  localDb,
+  registerNewCompanyLocal,
+  restorePreMulticompanySnapshot,
+} from '../src/services/localStore';
+import {
+  AdminAuditEntry,
+  AdminCompanySummary,
   BackendHealthStatus,
+  cancelInvoiceBackend,
   downloadCloudBackupJson,
   fetchBackendHealth,
+  fetchPlatformAdminOverview,
+  logPlatformSupportAccess,
+  registerCompanyBackend,
   submitInvoiceAudit,
+  updatePlatformCompanyAdmin,
 } from './services/backendApi';
 import { generateInvoiceQrDataUrl, renderDocumentHtml } from './ui/documentRenderer';
 import { ICONS } from './ui/icons';
+import {
+  formatPlanLabelPt,
+  formatRoleLabelPt,
+  renderCancelInvoiceModal,
+  renderCompanySwitcherDropdown,
+  renderMasterAdminModal,
+  renderNewCompanyModal,
+} from './ui/multicompanyModals';
 
 type ActiveModule =
   | 'NEW_POS'
@@ -78,7 +112,11 @@ export class SilaBillingApp {
   private sidebarState: SidebarState =
     typeof window !== 'undefined' && window.innerWidth >= 1024 ? 'EXPANDED' : 'ICONS';
 
-  // Dados Persistentes (IndexedDB + Firestore)
+  // Contexto Multiempresa e Dados Persistentes (IndexedDB v2 + Firestore)
+  private activeCompany: CompanyRecord = JAIMONA_INITIAL_COMPANY;
+  private companies: CompanyRecord[] = [JAIMONA_INITIAL_COMPANY];
+  private members: CompanyMember[] = [];
+  private hasPreMigrationBackup = false;
   private products: Product[] = [];
   private customers: Customer[] = [];
   private invoices: InvoiceRecord[] = [];
@@ -121,8 +159,27 @@ export class SilaBillingApp {
   private selectedHistoryId = '';
   private historyViewFormat: DocumentFormat = 'POS';
 
+  // Estado Multiempresa, Permissões (RBAC) e Painel Master SILA-Billing
+  private showCompanyDropdown = false;
+  private showNewCompanyModal = false;
+  private newCompanyError: string | null = null;
+  private isCreatingCompany = false;
+  private cancellingInvoiceId: string | null = null;
+  private cancelInvoiceError: string | null = null;
+  private selectedTerminalRole: CompanyRole = 'owner';
+  private memberFormError: string | null = null;
+
+  private showMasterAdminModal = false;
+  private masterAdminLoading = false;
+  private masterAdminDenied = false;
+  private masterAdminError: string | null = null;
+  private masterAdminSearch = '';
+  private adminCloudCompanies: AdminCompanySummary[] = [];
+  private adminAuditLogs: AdminAuditEntry[] = [];
+
   // Estado Configurações / Cloud / PWA
   private settingsSavedNotice = false;
+  private settingsErrorMessage: string | null = null;
   private isOnline: boolean = typeof navigator !== 'undefined' ? navigator.onLine : true;
   private user: User | null = null;
   private isSyncing = false;
@@ -151,35 +208,7 @@ export class SilaBillingApp {
 
     try {
       const data = await bootstrapLocalStore();
-      this.products = data.products;
-      this.customers = data.customers;
-      this.invoices = data.invoices;
-      this.settings = data.settings;
-      this.docType = data.settings.defaultDocType || 'FR';
-      this.cashier = data.settings.defaultCashier || '01';
-      this.operator = data.settings.defaultOperator || '001';
-      this.notes = data.settings.defaultNotes || 'Venda directa a retalho.';
-      this.selectedHistoryId = data.invoices[0]?.id || '';
-
-      if (data.posDraft) {
-        this.activeModule = data.posDraft.activeModule || 'NEW_POS';
-        this.previewFormat = data.posDraft.previewFormat || 'POS';
-        this.cart = Array.isArray(data.posDraft.cart) ? data.posDraft.cart : [];
-        if (
-          data.posDraft.selectedCustomerId &&
-          this.customers.some((c) => c.id === data.posDraft!.selectedCustomerId)
-        ) {
-          this.selectedCustomerId = data.posDraft.selectedCustomerId;
-        }
-        if (data.posDraft.docType) this.docType = data.posDraft.docType;
-        if (data.posDraft.paymentMethod) this.paymentMethod = data.posDraft.paymentMethod;
-        if (typeof data.posDraft.amountReceivedInput === 'string') {
-          this.amountReceivedInput = data.posDraft.amountReceivedInput;
-        }
-        if (typeof data.posDraft.notes === 'string') this.notes = data.posDraft.notes;
-        if (data.posDraft.cashier) this.cashier = data.posDraft.cashier;
-        if (data.posDraft.operator) this.operator = data.posDraft.operator;
-      }
+      this.applyWorkspaceBundle(data);
     } finally {
       this.isBooting = false;
       this.render();
@@ -188,11 +217,215 @@ export class SilaBillingApp {
 
     onAuthStateChanged(auth, (u) => {
       this.user = u;
+      if (!u) {
+        this.masterAdminDenied = false;
+        this.adminCloudCompanies = [];
+        this.adminAuditLogs = [];
+      }
       this.render();
-      if (u && this.isOnline && this.hasUnsyncedLocalRecords()) {
-        void this.syncAllWithCloud();
+      if (u && this.isOnline) {
+        if (this.showMasterAdminModal) {
+          void this.refreshMasterAdminData();
+        }
+        if (this.hasUnsyncedLocalRecords()) {
+          void this.syncAllWithCloud();
+        }
       }
     });
+  }
+
+  private applyWorkspaceBundle(data: CompanyWorkspaceBundle): void {
+    this.activeCompany = data.activeCompany;
+    this.companies = data.companies;
+    this.members = data.members;
+    this.hasPreMigrationBackup = data.hasPreMigrationBackup;
+    this.products = data.products;
+    this.customers = data.customers;
+    this.invoices = data.invoices;
+    this.settings = data.settings;
+
+    const directCustId = getDirectCustomerIdForCompany(data.activeCompany.id);
+    this.selectedCustomerId = directCustId;
+    this.cart = [];
+    this.amountReceivedInput = '';
+    this.docType = data.settings.defaultDocType || 'FR';
+    this.cashier = data.settings.defaultCashier || '01';
+    this.operator = data.settings.defaultOperator || '001';
+    this.notes = data.settings.defaultNotes || 'Venda directa a retalho.';
+    this.selectedHistoryId = data.invoices[0]?.id || '';
+    this.lastEmitted = null;
+    this.lastAuditHash = '';
+    this.editingProduct = null;
+    this.editingCustomer = null;
+    this.cancellingInvoiceId = null;
+    this.cancelInvoiceError = null;
+    this.settingsErrorMessage = null;
+    this.memberFormError = null;
+
+    if (data.posDraft) {
+      this.activeModule = data.posDraft.activeModule || 'NEW_POS';
+      this.previewFormat = data.posDraft.previewFormat || 'POS';
+      this.cart = Array.isArray(data.posDraft.cart) ? data.posDraft.cart : [];
+      if (
+        data.posDraft.selectedCustomerId &&
+        this.customers.some((c) => c.id === data.posDraft!.selectedCustomerId)
+      ) {
+        this.selectedCustomerId = data.posDraft.selectedCustomerId;
+      }
+      if (data.posDraft.docType) this.docType = data.posDraft.docType;
+      if (data.posDraft.paymentMethod) this.paymentMethod = data.posDraft.paymentMethod;
+      if (typeof data.posDraft.amountReceivedInput === 'string') {
+        this.amountReceivedInput = data.posDraft.amountReceivedInput;
+      }
+      if (typeof data.posDraft.notes === 'string') this.notes = data.posDraft.notes;
+      if (data.posDraft.cashier) this.cashier = data.posDraft.cashier;
+      if (data.posDraft.operator) this.operator = data.posDraft.operator;
+    }
+
+    if (typeof document !== 'undefined') {
+      document.title = `SILA-Billing — ${this.settings.company.shortName}`;
+    }
+  }
+
+  private getVerifiedMaxRole(): CompanyRole {
+    if (!this.user) {
+      return 'owner';
+    }
+    if (!this.activeCompany.ownerUid || this.activeCompany.ownerUid === this.user.uid) {
+      return 'owner';
+    }
+    const emailLower = (this.user.email || '').trim().toLowerCase();
+    const matched = this.members.find(
+      (m) =>
+        m.active &&
+        (m.uid === this.user!.uid || (emailLower && m.email.trim().toLowerCase() === emailLower))
+    );
+    if (matched) {
+      return matched.role;
+    }
+    return this.members.length === 0 ? 'owner' : 'cashier';
+  }
+
+  private getEffectiveRole(): CompanyRole {
+    const rank: Record<CompanyRole, number> = { owner: 3, manager: 2, cashier: 1 };
+    const maxRole = this.getVerifiedMaxRole();
+    return rank[this.selectedTerminalRole] <= rank[maxRole] ? this.selectedTerminalRole : maxRole;
+  }
+
+  private isCompanySuspended(): boolean {
+    return this.activeCompany.status === 'suspended';
+  }
+
+  private canManageCatalog(): boolean {
+    const role = this.getEffectiveRole();
+    return !this.isCompanySuspended() && (role === 'owner' || role === 'manager');
+  }
+
+  private canEditExistingCustomers(): boolean {
+    const role = this.getEffectiveRole();
+    return !this.isCompanySuspended() && (role === 'owner' || role === 'manager');
+  }
+
+  private canManageCompanySettings(): boolean {
+    return !this.isCompanySuspended() && this.getEffectiveRole() === 'owner';
+  }
+
+  private canCancelInvoices(): boolean {
+    if (this.isCompanySuspended()) return false;
+    const role = this.getEffectiveRole();
+    if (role === 'owner') return true;
+    if (role === 'manager') {
+      if (this.activeCompany.allowManagerCancel) return true;
+      if (this.user) {
+        const emailLower = (this.user.email || '').trim().toLowerCase();
+        const m = this.members.find(
+          (x) =>
+            x.active &&
+            (x.uid === this.user!.uid || (emailLower && x.email.trim().toLowerCase() === emailLower))
+        );
+        if (m?.allowInvoiceCancel) return true;
+      }
+    }
+    return false;
+  }
+
+  private async switchActiveCompany(companyId: string): Promise<void> {
+    if (!companyId) return;
+    await this.flushDraftNow();
+    const bundle = await loadCompanyWorkspace(companyId);
+    this.applyWorkspaceBundle(bundle);
+    this.showCompanyDropdown = false;
+    this.render();
+
+    if (this.user && this.isOnline && this.hasUnsyncedLocalRecords()) {
+      void this.syncAllWithCloud();
+    }
+  }
+
+  private getMergedAdminCompanies(): AdminCompanySummary[] {
+    const byId = new Map<string, AdminCompanySummary>();
+    for (const cc of this.adminCloudCompanies) {
+      byId.set(cc.id, cc);
+    }
+    for (const lc of this.companies) {
+      const existing = byId.get(lc.id);
+      const localInvCount = lc.id === this.activeCompany.id ? this.invoices.length : 0;
+      if (!existing) {
+        byId.set(lc.id, {
+          id: lc.id,
+          shortName: lc.profile.shortName,
+          legalName: lc.profile.legalName,
+          nif: lc.profile.nif,
+          normalizedNif: lc.normalizedNif,
+          cityCountry: lc.profile.cityCountry,
+          ownerEmail: lc.ownerEmail || this.user?.email || 'Local',
+          status: lc.status,
+          planTier: lc.plan.planTier,
+          commercialActive: lc.plan.commercialActive,
+          invoiceCount: localInvCount,
+          createdAtIso: lc.createdAtIso,
+        });
+      } else {
+        byId.set(lc.id, {
+          ...existing,
+          invoiceCount: Math.max(existing.invoiceCount, localInvCount),
+        });
+      }
+    }
+
+    return Array.from(byId.values()).sort((a, b) =>
+      a.id === JAIMONA_COMPANY_ID
+        ? -1
+        : b.id === JAIMONA_COMPANY_ID
+          ? 1
+          : b.createdAtIso.localeCompare(a.createdAtIso)
+    );
+  }
+
+  private async refreshMasterAdminData(): Promise<void> {
+    if (!this.user) return;
+    this.masterAdminLoading = true;
+    this.masterAdminDenied = false;
+    this.masterAdminError = null;
+    this.render();
+
+    const res = await fetchPlatformAdminOverview();
+    this.masterAdminLoading = false;
+
+    if (res.statusCode === 403) {
+      this.masterAdminDenied = true;
+      this.render();
+      return;
+    }
+
+    if (!res.ok) {
+      this.masterAdminError =
+        res.error || 'Vista administrativa local apresentada (API em atualização).';
+    } else {
+      this.adminCloudCompanies = res.companies || [];
+      this.adminAuditLogs = res.recentLogs || [];
+    }
+    this.render();
   }
 
   public isBusyWithCriticalTask(): boolean {
@@ -205,19 +438,23 @@ export class SilaBillingApp {
       this.draftSaveTimer = null;
     }
     if (this.isBooting) return;
-    await localDb.savePosDraft({
-      activeModule: this.activeModule,
-      previewFormat: this.previewFormat,
-      cart: this.cart,
-      selectedCustomerId: this.selectedCustomerId,
-      docType: this.docType,
-      paymentMethod: this.paymentMethod,
-      amountReceivedInput: this.amountReceivedInput,
-      notes: this.notes,
-      cashier: this.cashier,
-      operator: this.operator,
-      updatedAtIso: new Date().toISOString(),
-    });
+    await localDb.savePosDraft(
+      {
+        companyId: this.activeCompany.id,
+        activeModule: this.activeModule,
+        previewFormat: this.previewFormat,
+        cart: this.cart,
+        selectedCustomerId: this.selectedCustomerId,
+        docType: this.docType,
+        paymentMethod: this.paymentMethod,
+        amountReceivedInput: this.amountReceivedInput,
+        notes: this.notes,
+        cashier: this.cashier,
+        operator: this.operator,
+        updatedAtIso: new Date().toISOString(),
+      },
+      this.activeCompany.id
+    );
   }
 
   private scheduleDraftSave(): void {
@@ -233,6 +470,7 @@ export class SilaBillingApp {
 
   private hasUnsyncedLocalRecords(): boolean {
     return (
+      !this.activeCompany.synced ||
       this.invoices.some((i) => !i.synced) ||
       this.products.some((p) => !p.synced) ||
       this.customers.some((c) => !c.synced) ||
@@ -366,15 +604,17 @@ export class SilaBillingApp {
     const totals = calculateInvoiceTotals(this.cart);
     const nextNumber = generateNextInvoiceNumber(
       this.invoices.map((i) => i.number),
-      this.docType
+      this.docType,
+      this.activeCompany.baseSequence
     );
+    const directCustId = getDirectCustomerIdForCompany(this.activeCompany.id);
     const customer =
       this.customers.find((c) => c.id === this.selectedCustomerId) ||
       this.customers[0] || {
-        id: 'cust_direct',
+        id: directCustId,
         name: 'Cliente de Venda Directa',
         nif: 'Consumidor Final',
-        locality: 'Saurimo - Angola',
+        locality: this.activeCompany.profile.cityCountry || 'Angola',
       };
 
     const parsedRec = parseFloat(this.amountReceivedInput.replace(',', '.'));
@@ -390,6 +630,7 @@ export class SilaBillingApp {
 
     return {
       id: 'preview_draft',
+      companyId: this.activeCompany.id,
       number: nextNumber,
       docType: this.docType,
       issuedAtIso: now,
@@ -422,14 +663,121 @@ export class SilaBillingApp {
   // ==================== HANDLERS DE INTERAÇÃO ====================
 
   private async handleClick(e: MouseEvent): Promise<void> {
-    const target = (e.target as HTMLElement).closest<HTMLElement>('[data-action]');
-    if (!target) return;
+    const rawEl = e.target as HTMLElement;
+    const target = rawEl.closest<HTMLElement>('[data-action]');
+
+    if (!target) {
+      if (this.showCompanyDropdown && !rawEl.closest('[data-company-switcher-zone]')) {
+        this.showCompanyDropdown = false;
+        this.render();
+      }
+      return;
+    }
 
     const action = target.dataset.action;
     const id = target.dataset.id || '';
     const value = target.dataset.value || '';
 
     switch (action) {
+      case 'toggle-company-dropdown': {
+        this.showCompanyDropdown = !this.showCompanyDropdown;
+        this.render();
+        break;
+      }
+      case 'switch-company': {
+        if (id && id !== this.activeCompany.id) {
+          await this.switchActiveCompany(id);
+        } else {
+          this.showCompanyDropdown = false;
+          this.render();
+        }
+        break;
+      }
+      case 'open-new-company-modal': {
+        this.showCompanyDropdown = false;
+        this.newCompanyError = null;
+        this.showNewCompanyModal = true;
+        this.render();
+        break;
+      }
+      case 'close-new-company-modal': {
+        this.showNewCompanyModal = false;
+        this.newCompanyError = null;
+        this.render();
+        break;
+      }
+      case 'open-master-admin': {
+        this.showCompanyDropdown = false;
+        this.showMasterAdminModal = true;
+        this.masterAdminError = null;
+        this.render();
+        if (this.user && this.isOnline) {
+          await this.refreshMasterAdminData();
+        }
+        break;
+      }
+      case 'close-master-admin': {
+        this.showMasterAdminModal = false;
+        this.render();
+        break;
+      }
+      case 'master-admin-signin': {
+        if (!this.isOnline) return;
+        try {
+          await signInWithGoogle();
+          await this.refreshMasterAdminData();
+        } catch (err) {
+          this.masterAdminError =
+            err instanceof Error ? err.message : 'Autenticação cancelada.';
+          this.render();
+        }
+        break;
+      }
+      case 'refresh-master-admin': {
+        await this.refreshMasterAdminData();
+        break;
+      }
+      case 'admin-toggle-company-status': {
+        const nextStatus = (value === 'suspended' ? 'suspended' : 'active') as CompanyOperationalStatus;
+        if (this.user && this.isOnline) {
+          const res = await updatePlatformCompanyAdmin(id, { status: nextStatus });
+          if (!res.ok) {
+            this.masterAdminError = res.error || 'Não foi possível alterar o estado da empresa.';
+            this.render();
+            return;
+          }
+        }
+        const localComp = this.companies.find((c) => c.id === id);
+        if (localComp) {
+          const updatedComp: CompanyRecord = {
+            ...localComp,
+            status: nextStatus,
+            updatedAtIso: new Date().toISOString(),
+          };
+          await localDb.saveCompany(updatedComp);
+          this.companies = this.companies.map((c) => (c.id === id ? updatedComp : c));
+          if (this.activeCompany.id === id) {
+            this.activeCompany = updatedComp;
+          }
+        }
+        await this.refreshMasterAdminData();
+        break;
+      }
+      case 'admin-support-switch': {
+        const targetSummary = this.getMergedAdminCompanies().find((c) => c.id === id);
+        if (this.user && this.isOnline && targetSummary) {
+          void logPlatformSupportAccess(id, targetSummary.shortName);
+        }
+        if (this.companies.some((c) => c.id === id)) {
+          this.showMasterAdminModal = false;
+          await this.switchActiveCompany(id);
+        } else {
+          this.masterAdminError =
+            'Acesso de suporte registado em auditoria. Esta empresa pertence a outro terminal na Cloud.';
+          this.render();
+        }
+        break;
+      }
       case 'toggle-sidebar': {
         if (this.sidebarState === 'EXPANDED') this.sidebarState = 'ICONS';
         else if (this.sidebarState === 'ICONS') this.sidebarState = 'HIDDEN';
@@ -450,6 +798,7 @@ export class SilaBillingApp {
       case 'nav': {
         const mod = value as ActiveModule;
         this.activeModule = mod;
+        this.showCompanyDropdown = false;
         if (mod === 'NEW_POS') this.previewFormat = 'POS';
         if (mod === 'NEW_A4') this.previewFormat = 'A4';
         if (mod === 'SYNC') this.refreshBackendHealth();
@@ -478,6 +827,7 @@ export class SilaBillingApp {
         break;
       }
       case 'add-to-cart': {
+        if (this.isCompanySuspended()) return;
         const prod = this.products.find((p) => p.id === id);
         if (!prod) return;
         this.addProductToCart(prod);
@@ -536,6 +886,7 @@ export class SilaBillingApp {
         break;
       }
       case 'toggle-quick-customer': {
+        if (this.isCompanySuspended()) return;
         this.showQuickCustomerForm = !this.showQuickCustomerForm;
         if (this.showQuickCustomerForm) {
           this.showCustomerPicker = false;
@@ -581,6 +932,7 @@ export class SilaBillingApp {
         break;
       }
       case 'emit-invoice': {
+        if (this.isCompanySuspended()) return;
         const autoPrint = value === 'print' || this.settings.autoPrintOnEmit;
         await this.emitCurrentInvoice(autoPrint);
         break;
@@ -593,11 +945,13 @@ export class SilaBillingApp {
         break;
       }
       case 'new-product': {
+        if (!this.canManageCatalog()) return;
         const nextCode = String(this.products.length + 1).padStart(5, '0');
         const now = new Date().toISOString();
         this.isNewProduct = true;
         this.editingProduct = {
           id: `prod_${Date.now()}`,
+          companyId: this.activeCompany.id,
           code: nextCode,
           name: '',
           category: 'Mercearia',
@@ -606,6 +960,7 @@ export class SilaBillingApp {
           ivaRate: 14,
           exemptionReason: '',
           active: true,
+          syncState: 'pending',
           synced: false,
           createdAtIso: now,
           updatedAtIso: now,
@@ -614,6 +969,7 @@ export class SilaBillingApp {
         break;
       }
       case 'edit-product': {
+        if (!this.canManageCatalog()) return;
         const targetProd = this.products.find((p) => p.id === id);
         if (targetProd) {
           this.isNewProduct = false;
@@ -628,12 +984,14 @@ export class SilaBillingApp {
         break;
       }
       case 'delete-product': {
+        if (!this.canManageCatalog()) return;
         await localDb.deleteProduct(id);
         this.products = this.products.filter((p) => p.id !== id);
         this.render();
         if (this.user && this.isOnline) {
           try {
-            await removeProductCloud(id);
+            await ensureCompanyRegisteredCloud(this.activeCompany);
+            await removeProductCloud(id, this.activeCompany.id);
           } catch {
             // Mantém estado local
           }
@@ -641,14 +999,17 @@ export class SilaBillingApp {
         break;
       }
       case 'new-customer': {
+        if (this.isCompanySuspended()) return;
         const now = new Date().toISOString();
         this.editingCustomer = {
           id: `cust_${Date.now()}`,
+          companyId: this.activeCompany.id,
           name: '',
           nif: '',
-          locality: 'Saurimo - Angola',
+          locality: this.activeCompany.profile.cityCountry || 'Angola',
           phone: '',
           address: '',
+          syncState: 'pending',
           synced: false,
           createdAtIso: now,
           updatedAtIso: now,
@@ -657,6 +1018,7 @@ export class SilaBillingApp {
         break;
       }
       case 'edit-customer': {
+        if (!this.canEditExistingCustomers()) return;
         const cust = this.customers.find((c) => c.id === id);
         if (cust) {
           this.editingCustomer = { ...cust };
@@ -670,13 +1032,16 @@ export class SilaBillingApp {
         break;
       }
       case 'delete-customer': {
-        if (id === 'cust_direct') return;
+        if (!this.canEditExistingCustomers()) return;
+        const directCustId = getDirectCustomerIdForCompany(this.activeCompany.id);
+        if (id === directCustId) return;
         await localDb.deleteCustomer(id);
         this.customers = this.customers.filter((c) => c.id !== id);
         this.render();
         if (this.user && this.isOnline) {
           try {
-            await removeCustomerCloud(id);
+            await ensureCompanyRegisteredCloud(this.activeCompany);
+            await removeCustomerCloud(id, this.activeCompany.id);
           } catch {
             // Removido localmente
           }
@@ -701,38 +1066,59 @@ export class SilaBillingApp {
         break;
       }
       case 'cancel-invoice': {
+        if (!this.canCancelInvoices()) return;
         const inv = this.invoices.find((i) => i.id === id);
         if (!inv || inv.status === 'cancelled') return;
-        const cancelled: InvoiceRecord = {
-          ...inv,
-          status: 'cancelled',
-          synced: false,
-          updatedAtIso: new Date().toISOString(),
-        };
-        await localDb.saveInvoice(cancelled);
-        this.invoices = this.invoices.map((x) => (x.id === id ? cancelled : x));
+        this.cancellingInvoiceId = id;
+        this.cancelInvoiceError = null;
         this.render();
-
-        if (this.user && this.isOnline) {
-          try {
-            await cancelInvoiceCloud(id);
-            const synced = { ...cancelled, synced: true };
-            await localDb.saveInvoice(synced);
-            this.invoices = this.invoices.map((x) => (x.id === id ? synced : x));
-            this.render();
-          } catch {
-            // Pendente de sync
-          }
-        }
+        break;
+      }
+      case 'close-cancel-invoice-modal': {
+        this.cancellingInvoiceId = null;
+        this.cancelInvoiceError = null;
+        this.render();
+        break;
+      }
+      case 'remove-company-member': {
+        if (!this.canManageCompanySettings()) return;
+        const targetMember = this.members.find((m) => m.id === id);
+        if (!targetMember || targetMember.role === 'owner') return;
+        await localDb.deleteMember(id);
+        this.members = this.members.filter((m) => m.id !== id);
+        this.render();
         break;
       }
       case 'reset-settings': {
+        if (!this.canManageCompanySettings()) return;
+        const defaultProfile =
+          this.activeCompany.id === JAIMONA_COMPANY_ID
+            ? JAIMONA_COMPANY
+            : this.activeCompany.profile;
         const resetVal: AppSettings = {
-          ...DEFAULT_SETTINGS,
+          companyId: this.activeCompany.id,
+          company: { ...defaultProfile },
+          defaultCashier: '01',
+          defaultOperator: '001',
+          defaultFormat: 'POS',
+          defaultDocType: 'FR',
+          defaultNotes: 'Venda directa a retalho.',
+          autoPrintOnEmit: false,
+          syncState: 'pending',
           synced: false,
           updatedAtIso: new Date().toISOString(),
         };
         await this.persistSettings(resetVal);
+        break;
+      }
+      case 'restore-v1-snapshot': {
+        const restored = await restorePreMulticompanySnapshot();
+        if (restored) {
+          const refreshed = await bootstrapLocalStore(JAIMONA_COMPANY_ID);
+          this.applyWorkspaceBundle(refreshed);
+          this.syncMessage = 'Snapshot v1 pré-migração restaurado com sucesso na empresa JAIMONA.';
+          this.render();
+        }
         break;
       }
       case 'signin-google': {
@@ -762,7 +1148,7 @@ export class SilaBillingApp {
       case 'export-backup-cloud': {
         try {
           this.syncMessage = null;
-          await downloadCloudBackupJson();
+          await downloadCloudBackupJson(this.activeCompany.id);
         } catch (err) {
           this.syncMessage =
             err instanceof Error ? err.message : 'Erro ao exportar backup da cloud.';
@@ -799,6 +1185,7 @@ export class SilaBillingApp {
 
     if (el.dataset.field === 'pos-search' && e.key === 'Enter') {
       e.preventDefault();
+      if (this.isCompanySuspended()) return;
       const matches = this.getFilteredPosProducts();
       if (matches.length > 0) {
         this.addProductToCart(matches[0]!);
@@ -828,10 +1215,14 @@ export class SilaBillingApp {
       return;
     }
 
-    if (e.key === 'Escape' && (this.showCustomerPicker || this.showQuickCustomerForm)) {
-      this.showCustomerPicker = false;
-      this.showQuickCustomerForm = false;
-      this.render();
+    if (e.key === 'Escape') {
+      if (this.showCompanyDropdown || this.showCustomerPicker || this.showQuickCustomerForm || this.cancellingInvoiceId) {
+        this.showCompanyDropdown = false;
+        this.showCustomerPicker = false;
+        this.showQuickCustomerForm = false;
+        this.cancellingInvoiceId = null;
+        this.render();
+      }
     }
   }
 
@@ -852,6 +1243,10 @@ export class SilaBillingApp {
         break;
       case 'pos-customer-search':
         this.posCustomerSearch = rawVal;
+        this.renderPreservingFocus(activeId, selStart);
+        break;
+      case 'master-admin-search':
+        this.masterAdminSearch = rawVal;
         this.renderPreservingFocus(activeId, selStart);
         break;
       case 'cart-qty-live': {
@@ -920,13 +1315,83 @@ export class SilaBillingApp {
     }
   }
 
-  private handleChange(e: Event): void {
+  private async handleChange(e: Event): Promise<void> {
     const el = e.target as HTMLInputElement | HTMLSelectElement;
     const field = el.dataset.field;
     const id = el.dataset.id || '';
     if (!field) return;
 
     switch (field) {
+      case 'terminal-role-select': {
+        const nextRole = el.value as CompanyRole;
+        if (nextRole === 'owner' || nextRole === 'manager' || nextRole === 'cashier') {
+          this.selectedTerminalRole = nextRole;
+          this.editingProduct = null;
+          this.editingCustomer = null;
+          this.render();
+        }
+        break;
+      }
+      case 'company-allow-manager-cancel': {
+        if (!this.canManageCompanySettings()) return;
+        const checked = (el as HTMLInputElement).checked;
+        const updatedComp: CompanyRecord = {
+          ...this.activeCompany,
+          allowManagerCancel: checked,
+          syncState: 'pending',
+          synced: false,
+          updatedAtIso: new Date().toISOString(),
+        };
+        await localDb.saveCompany(updatedComp);
+        this.activeCompany = updatedComp;
+        this.companies = this.companies.map((c) => (c.id === updatedComp.id ? updatedComp : c));
+        this.render();
+        if (this.user && this.isOnline) {
+          try {
+            await ensureCompanyRegisteredCloud(updatedComp, true);
+            const syncedComp: CompanyRecord = { ...updatedComp, syncState: 'synced', synced: true };
+            await localDb.saveCompany(syncedComp);
+            this.activeCompany = syncedComp;
+            this.companies = this.companies.map((c) => (c.id === syncedComp.id ? syncedComp : c));
+            this.render();
+          } catch {
+            // Mantém pendente localmente
+          }
+        }
+        break;
+      }
+      case 'admin-company-plan': {
+        const planTier = el.value as PlanTier;
+        if (this.user && this.isOnline) {
+          const res = await updatePlatformCompanyAdmin(id, { planTier });
+          if (!res.ok) {
+            this.masterAdminError = res.error || 'Erro ao preparar plano comercial.';
+            this.render();
+            return;
+          }
+        }
+        const localComp = this.companies.find((c) => c.id === id);
+        if (localComp) {
+          const now = new Date().toISOString();
+          const updatedComp: CompanyRecord = {
+            ...localComp,
+            plan: {
+              ...localComp.plan,
+              planTier,
+              commercialActive: false,
+              updatedAtIso: now,
+            },
+            updatedAtIso: now,
+          };
+          await localDb.saveCompany(updatedComp);
+          this.companies = this.companies.map((c) => (c.id === id ? updatedComp : c));
+          if (this.activeCompany.id === id) {
+            this.activeCompany = updatedComp;
+          }
+        }
+        await this.refreshMasterAdminData();
+        break;
+      }
       case 'pos-customer':
         this.selectedCustomerId = el.value;
         this.scheduleDraftSave();
@@ -979,30 +1444,224 @@ export class SilaBillingApp {
 
     const fd = new FormData(form);
 
+    if (formName === 'new-company-form') {
+      if (this.isCreatingCompany) return;
+      this.newCompanyError = null;
+      this.isCreatingCompany = true;
+      this.render();
+
+      try {
+        const legalName = String(fd.get('legalName') || '').trim();
+        const shortName = String(fd.get('shortName') || '').trim();
+        const nif = String(fd.get('nif') || '').trim();
+        const cityCountry = String(fd.get('cityCountry') || 'Luanda - Angola').trim();
+        const phone = String(fd.get('phone') || '').trim();
+        const address = String(fd.get('address') || '').trim();
+        const copyStarterCatalog = fd.get('copyStarterCatalog') === 'on';
+
+        const createdCompany = await registerNewCompanyLocal({
+          legalName,
+          shortName,
+          nif,
+          cityCountry,
+          phone,
+          address,
+          copyStarterCatalog,
+          ownerUid: this.user?.uid,
+          ownerEmail: this.user?.email || undefined,
+          ownerDisplayName: this.user?.displayName || undefined,
+        });
+
+        if (this.user && this.isOnline) {
+          const backendRes = await registerCompanyBackend(createdCompany);
+          if (
+            !backendRes.ok &&
+            (backendRes.statusCode === 409 ||
+              backendRes.statusCode === 429 ||
+              backendRes.statusCode === 400)
+          ) {
+            await localDb.deleteCompanyRollback(createdCompany.id);
+            throw new Error(
+              backendRes.error || 'Este NIF já se encontra registado noutra empresa no sistema.'
+            );
+          }
+
+          try {
+            await ensureCompanyRegisteredCloud(createdCompany, true);
+            const syncedComp: CompanyRecord = {
+              ...createdCompany,
+              syncState: 'synced',
+              synced: true,
+            };
+            await localDb.saveCompany(syncedComp);
+          } catch {
+            // Se o backend Admin SDK já reservou o NIF, mantém operacional e sincroniza subcoleções
+          }
+        }
+
+        await this.flushDraftNow();
+        const bundle = await loadCompanyWorkspace(createdCompany.id);
+        this.applyWorkspaceBundle(bundle);
+        this.showNewCompanyModal = false;
+        this.activeModule = 'NEW_POS';
+        this.previewFormat = 'POS';
+        this.render();
+
+        if (this.user && this.isOnline) {
+          void this.syncAllWithCloud();
+        }
+      } catch (err) {
+        this.newCompanyError =
+          err instanceof Error
+            ? err.message
+            : 'Não foi possível cadastrar a empresa. Verifique se o NIF é único.';
+        this.render();
+      } finally {
+        this.isCreatingCompany = false;
+        this.render();
+      }
+      return;
+    }
+
+    if (formName === 'cancel-invoice-form') {
+      if (!this.canCancelInvoices()) {
+        this.cancelInvoiceError = 'O seu perfil atual não tem permissão para anular faturas.';
+        this.render();
+        return;
+      }
+      const invoiceId = String(fd.get('invoiceId') || '').trim();
+      const cancelReason = String(fd.get('cancelReason') || '').trim();
+      if (cancelReason.length < 4) {
+        this.cancelInvoiceError =
+          'Indique o motivo de anulação (mínimo de 4 caracteres) para registo de auditoria.';
+        this.render();
+        return;
+      }
+
+      const inv = this.invoices.find((i) => i.id === invoiceId);
+      if (!inv || inv.status === 'cancelled') {
+        this.cancellingInvoiceId = null;
+        this.render();
+        return;
+      }
+
+      const actorLabel = this.user?.email || formatRoleLabelPt(this.getEffectiveRole());
+      const cancelled: InvoiceRecord = {
+        ...inv,
+        companyId: this.activeCompany.id,
+        status: 'cancelled',
+        cancelReason,
+        cancelledBy: actorLabel,
+        syncState: 'pending',
+        synced: false,
+        updatedAtIso: new Date().toISOString(),
+      };
+
+      await localDb.saveInvoice(cancelled, this.activeCompany.id);
+      this.invoices = this.invoices.map((x) => (x.id === invoiceId ? cancelled : x));
+      this.cancellingInvoiceId = null;
+      this.cancelInvoiceError = null;
+      this.render();
+
+      if (this.user && this.isOnline) {
+        try {
+          await ensureCompanyRegisteredCloud(this.activeCompany);
+          await cancelInvoiceCloud(invoiceId, cancelReason, this.activeCompany.id);
+          await cancelInvoiceBackend(this.activeCompany.id, invoiceId, cancelReason).catch(
+            () => null
+          );
+          const synced: InvoiceRecord = { ...cancelled, syncState: 'synced', synced: true };
+          await localDb.saveInvoice(synced, this.activeCompany.id);
+          this.invoices = this.invoices.map((x) => (x.id === invoiceId ? synced : x));
+          this.render();
+        } catch {
+          // Mantém pendente localmente para reenvio
+        }
+      }
+      return;
+    }
+
+    if (formName === 'add-member-form') {
+      if (!this.canManageCompanySettings()) return;
+      this.memberFormError = null;
+
+      const displayName = String(fd.get('displayName') || '').trim();
+      const email = String(fd.get('email') || '').trim().toLowerCase();
+      const role = (fd.get('role') === 'manager' ? 'manager' : 'cashier') as CompanyRole;
+      const allowInvoiceCancel = role === 'manager' && fd.get('allowInvoiceCancel') === 'on';
+
+      if (!displayName || !email || !email.includes('@')) {
+        this.memberFormError = 'Indique o nome e email válido do colaborador.';
+        this.render();
+        return;
+      }
+
+      if (this.members.some((m) => m.email.trim().toLowerCase() === email)) {
+        this.memberFormError = 'Este email já faz parte da equipa desta empresa.';
+        this.render();
+        return;
+      }
+
+      const now = new Date().toISOString();
+      const sanitizedEmailId = email.replace(/[^a-zA-Z0-9_-]/g, '_').slice(0, 64);
+      const member: CompanyMember = {
+        id: `mem_${this.activeCompany.id}_${sanitizedEmailId}`,
+        companyId: this.activeCompany.id,
+        uid: `mem_${sanitizedEmailId}`,
+        email,
+        displayName,
+        role,
+        allowInvoiceCancel,
+        active: true,
+        createdAtIso: now,
+        updatedAtIso: now,
+      };
+
+      await localDb.saveMember(member);
+      this.members = [...this.members, member];
+      form.reset();
+      this.render();
+
+      if (this.user && this.isOnline) {
+        try {
+          await ensureCompanyRegisteredCloud(this.activeCompany);
+          await upsertCompanyMemberCloud(this.activeCompany, member);
+        } catch {
+          // Mantém registado localmente
+        }
+      }
+      return;
+    }
+
     if (formName === 'pos-quick-customer-form') {
+      if (this.isCompanySuspended()) return;
       const name = String(fd.get('name') || '').trim();
       const nif = String(fd.get('nif') || '').trim() || 'Consumidor Final';
       const phone = String(fd.get('phone') || '').trim();
-      const locality = String(fd.get('locality') || '').trim() || 'Saurimo - Angola';
+      const defaultLoc = this.activeCompany.profile.cityCountry || 'Angola';
+      const locality = String(fd.get('locality') || '').trim() || defaultLoc;
 
       if (!name) return;
 
       const now = new Date().toISOString();
+      const directCustId = getDirectCustomerIdForCompany(this.activeCompany.id);
       const created: Customer = {
         id: `cust_${Date.now()}`,
+        companyId: this.activeCompany.id,
         name,
         nif,
         phone,
         locality,
         address: locality,
+        syncState: 'pending',
         synced: false,
         createdAtIso: now,
         updatedAtIso: now,
       };
 
-      await localDb.saveCustomer(created);
+      await localDb.saveCustomer(created, this.activeCompany.id);
       this.customers = [created, ...this.customers].sort((a, b) =>
-        a.id === 'cust_direct' ? -1 : b.id === 'cust_direct' ? 1 : a.name.localeCompare(b.name)
+        a.id === directCustId ? -1 : b.id === directCustId ? 1 : a.name.localeCompare(b.name)
       );
       this.selectedCustomerId = created.id;
       this.showQuickCustomerForm = false;
@@ -1012,9 +1671,10 @@ export class SilaBillingApp {
 
       if (this.user && this.isOnline) {
         try {
-          await upsertCustomerCloud(created);
-          const synced = { ...created, synced: true };
-          await localDb.saveCustomer(synced);
+          await ensureCompanyRegisteredCloud(this.activeCompany);
+          await upsertCustomerCloud(created, this.activeCompany);
+          const synced: Customer = { ...created, syncState: 'synced', synced: true };
+          await localDb.saveCustomer(synced, this.activeCompany.id);
           this.customers = this.customers.map((c) => (c.id === synced.id ? synced : c));
           this.render();
         } catch {
@@ -1025,6 +1685,7 @@ export class SilaBillingApp {
     }
 
     if (formName === 'product-form' && this.editingProduct) {
+      if (!this.canManageCatalog()) return;
       const code = String(fd.get('code') || '').trim();
       const name = String(fd.get('name') || '').trim();
       const category = String(fd.get('category') || 'Mercearia').trim() || 'Mercearia';
@@ -1036,6 +1697,7 @@ export class SilaBillingApp {
 
       const updated: Product = {
         ...this.editingProduct,
+        companyId: this.activeCompany.id,
         code,
         name,
         category,
@@ -1044,12 +1706,13 @@ export class SilaBillingApp {
         ivaRate,
         exemptionReason:
           ivaRate === 0 ? 'Isento nos termos da Lei do IVA (Cesta Básica)' : '',
+        syncState: 'pending',
         synced: false,
         updatedAtIso: new Date().toISOString(),
       };
 
       const wasNew = this.isNewProduct;
-      await localDb.saveProduct(updated);
+      await localDb.saveProduct(updated, this.activeCompany.id);
       this.products = [
         ...this.products.filter((p) => p.id !== updated.id),
         updated,
@@ -1059,66 +1722,83 @@ export class SilaBillingApp {
 
       if (this.user && this.isOnline) {
         try {
-          await upsertProductCloud(updated, wasNew);
-          const synced = { ...updated, synced: true };
-          await localDb.saveProduct(synced);
+          await ensureCompanyRegisteredCloud(this.activeCompany);
+          await upsertProductCloud(updated, wasNew, this.activeCompany);
+          const synced: Product = { ...updated, syncState: 'synced', synced: true };
+          await localDb.saveProduct(synced, this.activeCompany.id);
           this.products = this.products.map((p) => (p.id === synced.id ? synced : p));
           this.render();
         } catch {
           // Fica pendente para sync
         }
       }
+      return;
     }
 
     if (formName === 'customer-form' && this.editingCustomer) {
+      const isEditingExisting = this.customers.some((c) => c.id === this.editingCustomer!.id);
+      if (isEditingExisting && !this.canEditExistingCustomers()) return;
+      if (this.isCompanySuspended()) return;
+
       const name = String(fd.get('name') || '').trim();
       const nif = String(fd.get('nif') || '').trim() || 'Consumidor Final';
       const phone = String(fd.get('phone') || '').trim();
-      const locality = String(fd.get('locality') || '').trim() || 'Saurimo - Angola';
+      const defaultLoc = this.activeCompany.profile.cityCountry || 'Angola';
+      const locality = String(fd.get('locality') || '').trim() || defaultLoc;
 
       if (!name) return;
 
+      const directCustId = getDirectCustomerIdForCompany(this.activeCompany.id);
       const updated: Customer = {
         ...this.editingCustomer,
+        companyId: this.activeCompany.id,
         name,
         nif,
         phone,
         locality,
+        syncState: 'pending',
         synced: false,
         updatedAtIso: new Date().toISOString(),
       };
 
-      await localDb.saveCustomer(updated);
+      await localDb.saveCustomer(updated, this.activeCompany.id);
       this.customers = [
         ...this.customers.filter((c) => c.id !== updated.id),
         updated,
       ].sort((a, b) =>
-        a.id === 'cust_direct' ? -1 : b.id === 'cust_direct' ? 1 : a.name.localeCompare(b.name)
+        a.id === directCustId ? -1 : b.id === directCustId ? 1 : a.name.localeCompare(b.name)
       );
       this.editingCustomer = null;
       this.render();
 
       if (this.user && this.isOnline) {
         try {
-          await upsertCustomerCloud(updated);
-          const synced = { ...updated, synced: true };
-          await localDb.saveCustomer(synced);
+          await ensureCompanyRegisteredCloud(this.activeCompany);
+          await upsertCustomerCloud(updated, this.activeCompany);
+          const synced: Customer = { ...updated, syncState: 'synced', synced: true };
+          await localDb.saveCustomer(synced, this.activeCompany.id);
           this.customers = this.customers.map((c) => (c.id === synced.id ? synced : c));
           this.render();
         } catch {
           // Fica pendente localmente
         }
       }
+      return;
     }
 
     if (formName === 'settings-form') {
+      if (!this.canManageCompanySettings()) return;
       const nextSettings: AppSettings = {
+        companyId: this.activeCompany.id,
         company: {
-          legalName: String(fd.get('legalName') || '').trim() || DEFAULT_SETTINGS.company.legalName,
-          shortName: String(fd.get('shortName') || '').trim() || DEFAULT_SETTINGS.company.shortName,
-          nif: String(fd.get('nif') || '').trim() || DEFAULT_SETTINGS.company.nif,
-          address: String(fd.get('address') || '').trim() || DEFAULT_SETTINGS.company.address,
-          cityCountry: this.settings.company.cityCountry || 'Saurimo - Angola',
+          legalName: String(fd.get('legalName') || '').trim() || this.settings.company.legalName,
+          shortName: String(fd.get('shortName') || '').trim() || this.settings.company.shortName,
+          nif: String(fd.get('nif') || '').trim() || this.settings.company.nif,
+          address: String(fd.get('address') || '').trim() || this.settings.company.address,
+          cityCountry:
+            String(fd.get('cityCountry') || '').trim() ||
+            this.settings.company.cityCountry ||
+            'Angola',
           phone: String(fd.get('phone') || '').trim(),
           email: String(fd.get('email') || '').trim(),
           tagline: String(fd.get('tagline') || '').trim(),
@@ -1129,6 +1809,7 @@ export class SilaBillingApp {
         defaultFormat: fd.get('defaultFormat') === 'A4' ? 'A4' : 'POS',
         defaultNotes: String(fd.get('defaultNotes') || '').trim(),
         autoPrintOnEmit: fd.get('autoPrintOnEmit') === 'on',
+        syncState: 'pending',
         synced: false,
         updatedAtIso: new Date().toISOString(),
       };
@@ -1138,14 +1819,29 @@ export class SilaBillingApp {
   }
 
   private async persistSettings(nextSettings: AppSettings): Promise<void> {
-    await localDb.saveSettings(nextSettings);
-    this.settings = nextSettings;
-    this.cashier = nextSettings.defaultCashier;
-    this.operator = nextSettings.defaultOperator;
-    this.docType = nextSettings.defaultDocType;
-    this.notes = nextSettings.defaultNotes;
-    this.settingsSavedNotice = true;
-    this.render();
+    this.settingsErrorMessage = null;
+    try {
+      const updatedCompany = await localDb.saveSettings(nextSettings, this.activeCompany.id);
+      this.activeCompany = updatedCompany;
+      this.companies = this.companies.map((c) =>
+        c.id === updatedCompany.id ? updatedCompany : c
+      );
+      this.settings = nextSettings;
+      this.cashier = nextSettings.defaultCashier;
+      this.operator = nextSettings.defaultOperator;
+      this.docType = nextSettings.defaultDocType;
+      this.notes = nextSettings.defaultNotes;
+      this.settingsSavedNotice = true;
+      if (typeof document !== 'undefined') {
+        document.title = `SILA-Billing — ${nextSettings.company.shortName}`;
+      }
+      this.render();
+    } catch (err) {
+      this.settingsErrorMessage =
+        err instanceof Error ? err.message : 'Erro ao validar o NIF da empresa.';
+      this.render();
+      return;
+    }
 
     setTimeout(() => {
       this.settingsSavedNotice = false;
@@ -1154,9 +1850,14 @@ export class SilaBillingApp {
 
     if (this.user && this.isOnline) {
       try {
-        await upsertSettingsCloud(nextSettings);
-        const synced = { ...nextSettings, synced: true };
-        await localDb.saveSettings(synced);
+        await ensureCompanyRegisteredCloud(this.activeCompany, true);
+        await upsertSettingsCloud(nextSettings, this.activeCompany);
+        const synced: AppSettings = { ...nextSettings, syncState: 'synced', synced: true };
+        const syncedCompany = await localDb.saveSettings(synced, this.activeCompany.id);
+        this.activeCompany = syncedCompany;
+        this.companies = this.companies.map((c) =>
+          c.id === syncedCompany.id ? syncedCompany : c
+        );
         this.settings = synced;
         this.render();
       } catch {
@@ -1166,7 +1867,7 @@ export class SilaBillingApp {
   }
 
   private async emitCurrentInvoice(autoPrint: boolean): Promise<void> {
-    if (this.cart.length === 0 || this.isEmitting) return;
+    if (this.cart.length === 0 || this.isEmitting || this.isCompanySuspended()) return;
     this.isEmitting = true;
     this.render();
 
@@ -1176,13 +1877,15 @@ export class SilaBillingApp {
       const invoice: InvoiceRecord = {
         ...draft,
         id: `inv_${Date.now()}`,
+        companyId: this.activeCompany.id,
         issuedAtIso: now,
+        syncState: 'pending',
         synced: false,
         createdAtIso: now,
         updatedAtIso: now,
       };
 
-      await localDb.saveInvoice(invoice);
+      await localDb.saveInvoice(invoice, this.activeCompany.id);
       this.invoices = [invoice, ...this.invoices];
       this.selectedHistoryId = invoice.id;
       this.lastEmitted = invoice;
@@ -1195,13 +1898,14 @@ export class SilaBillingApp {
       // Sincronização Cloud + Auditoria Backend (/api/audit/invoices) quando online e autenticado
       if (this.user && this.isOnline) {
         try {
-          await createInvoiceCloud(invoice);
-          const syncedInv = { ...invoice, synced: true };
-          await localDb.saveInvoice(syncedInv);
+          await ensureCompanyRegisteredCloud(this.activeCompany);
+          await createInvoiceCloud(invoice, this.activeCompany);
+          const syncedInv: InvoiceRecord = { ...invoice, syncState: 'synced', synced: true };
+          await localDb.saveInvoice(syncedInv, this.activeCompany.id);
           this.invoices = this.invoices.map((i) => (i.id === syncedInv.id ? syncedInv : i));
           this.lastEmitted = syncedInv;
 
-          const auditRes = await submitInvoiceAudit(syncedInv);
+          const auditRes = await submitInvoiceAudit(syncedInv, this.activeCompany.id);
           if (auditRes.ok && auditRes.auditHash) {
             this.lastAuditHash = auditRes.auditHash.slice(0, 12);
           }
@@ -1227,44 +1931,144 @@ export class SilaBillingApp {
     this.render();
 
     try {
+      // 1. Regista/atualiza a empresa ativa e o respetivo NIF único no Firestore
+      await ensureCompanyRegisteredCloud(this.activeCompany, !this.activeCompany.synced);
+      if (!this.activeCompany.synced) {
+        const markedComp: CompanyRecord = {
+          ...this.activeCompany,
+          ownerUid: this.activeCompany.ownerUid || this.user.uid,
+          ownerEmail: this.activeCompany.ownerEmail || this.user.email || undefined,
+          syncState: 'synced',
+          synced: true,
+        };
+        await localDb.saveCompany(markedComp);
+        this.activeCompany = markedComp;
+      }
+
+      // 2. Envia registos pendentes da empresa ativa com controlo explícito de erro por item
       const unsyncedProducts = this.products.filter((p) => !p.synced);
       for (const prod of unsyncedProducts) {
-        await upsertProductCloud(prod, true);
-        await localDb.saveProduct({ ...prod, synced: true });
+        try {
+          await upsertProductCloud(prod, true, this.activeCompany);
+          await localDb.saveProduct(
+            { ...prod, syncState: 'synced', synced: true, syncError: undefined },
+            this.activeCompany.id
+          );
+        } catch (itemErr) {
+          await localDb.saveProduct(
+            {
+              ...prod,
+              syncState: 'error',
+              synced: false,
+              syncError: itemErr instanceof Error ? itemErr.message : 'Erro de sincronização',
+            },
+            this.activeCompany.id
+          );
+        }
       }
 
       const unsyncedCustomers = this.customers.filter((c) => !c.synced);
       for (const cust of unsyncedCustomers) {
-        await upsertCustomerCloud(cust);
-        await localDb.saveCustomer({ ...cust, synced: true });
+        try {
+          await upsertCustomerCloud(cust, this.activeCompany);
+          await localDb.saveCustomer(
+            { ...cust, syncState: 'synced', synced: true, syncError: undefined },
+            this.activeCompany.id
+          );
+        } catch (itemErr) {
+          await localDb.saveCustomer(
+            {
+              ...cust,
+              syncState: 'error',
+              synced: false,
+              syncError: itemErr instanceof Error ? itemErr.message : 'Erro de sincronização',
+            },
+            this.activeCompany.id
+          );
+        }
       }
 
       const unsyncedInvoices = this.invoices.filter((i) => !i.synced);
       for (const inv of unsyncedInvoices) {
-        await createInvoiceCloud(inv);
-        await submitInvoiceAudit(inv).catch(() => null);
-        await localDb.saveInvoice({ ...inv, synced: true });
+        try {
+          await createInvoiceCloud(inv, this.activeCompany);
+          if (inv.status === 'cancelled' && inv.cancelReason) {
+            await cancelInvoiceCloud(inv.id, inv.cancelReason, this.activeCompany.id);
+          }
+          await submitInvoiceAudit(inv, this.activeCompany.id).catch(() => null);
+          await localDb.saveInvoice(
+            { ...inv, syncState: 'synced', synced: true, syncError: undefined },
+            this.activeCompany.id
+          );
+        } catch (itemErr) {
+          await localDb.saveInvoice(
+            {
+              ...inv,
+              syncState: 'error',
+              synced: false,
+              syncError: itemErr instanceof Error ? itemErr.message : 'Erro de sincronização',
+            },
+            this.activeCompany.id
+          );
+        }
       }
 
-      if (!this.settings.synced) {
-        await upsertSettingsCloud(this.settings);
-        const syncedSettings = { ...this.settings, synced: true };
-        await localDb.saveSettings(syncedSettings);
+      if (!this.settings.synced && this.canManageCompanySettings()) {
+        await upsertSettingsCloud(this.settings, this.activeCompany);
+        const syncedSettings: AppSettings = {
+          ...this.settings,
+          syncState: 'synced',
+          synced: true,
+        };
+        await localDb.saveSettings(syncedSettings, this.activeCompany.id);
       }
 
-      const cloudData = await pullAllFromCloud();
+      // 3. Descobre outras empresas da conta autenticada e sincroniza dados da empresa ativa
+      const ownedCloudCompanies = await pullOwnedCompaniesFromCloud();
+      for (const cloudComp of ownedCloudCompanies) {
+        const localExisting = this.companies.find(
+          (c) => c.id === cloudComp.id || c.normalizedNif === cloudComp.normalizedNif
+        );
+        if (!localExisting) {
+          await localDb.saveCompany(cloudComp);
+        } else {
+          await localDb.saveCompany({
+            ...localExisting,
+            status: cloudComp.status,
+            plan: cloudComp.plan,
+            allowManagerCancel: cloudComp.allowManagerCancel,
+            ownerUid: cloudComp.ownerUid,
+            ownerEmail: cloudComp.ownerEmail,
+            syncState: 'synced',
+            synced: true,
+          });
+        }
+      }
+
+      const cloudData = await pullCompanyFromCloud(this.activeCompany.id);
       if (cloudData) {
-        for (const cp of cloudData.products) await localDb.saveProduct(cp);
-        for (const cc of cloudData.customers) await localDb.saveCustomer(cc);
-        for (const ci of cloudData.invoices) await localDb.saveInvoice(ci);
-        if (cloudData.settings) await localDb.saveSettings(cloudData.settings);
-
-        const refreshed = await bootstrapLocalStore();
-        this.products = refreshed.products;
-        this.customers = refreshed.customers;
-        this.invoices = refreshed.invoices;
-        this.settings = refreshed.settings;
+        for (const cp of cloudData.products) {
+          await localDb.saveProduct(cp, this.activeCompany.id);
+        }
+        for (const cc of cloudData.customers) {
+          await localDb.saveCustomer(cc, this.activeCompany.id);
+        }
+        for (const ci of cloudData.invoices) {
+          await localDb.saveInvoice(ci, this.activeCompany.id);
+        }
+        if (cloudData.settings) {
+          await localDb.saveSettings(cloudData.settings, this.activeCompany.id).catch(() => null);
+        }
       }
+
+      const refreshed = await loadCompanyWorkspace(this.activeCompany.id);
+      this.products = refreshed.products;
+      this.customers = refreshed.customers;
+      this.invoices = refreshed.invoices;
+      this.settings = refreshed.settings;
+      this.activeCompany = refreshed.activeCompany;
+      this.companies = refreshed.companies;
+      this.members = refreshed.members;
 
       this.lastSyncedIso = new Date().toISOString();
       await this.refreshBackendHealth();
@@ -1279,9 +2083,10 @@ export class SilaBillingApp {
 
   private exportLocalJsonBackup(): void {
     const bundle = {
-      schemaVersion: '1.0.0',
+      schemaVersion: '2.0.0-multicompany',
       source: 'indexeddb-local',
       exportedAtIso: new Date().toISOString(),
+      companyId: this.activeCompany.id,
       company: this.settings.company,
       counts: {
         products: this.products.length,
@@ -1289,6 +2094,8 @@ export class SilaBillingApp {
         invoices: this.invoices.length,
       },
       data: {
+        companyRecord: this.activeCompany,
+        members: this.members,
         settings: this.settings,
         products: this.products,
         customers: this.customers,
@@ -1302,7 +2109,7 @@ export class SilaBillingApp {
     const url = URL.createObjectURL(blob);
     const a = document.createElement('a');
     a.href = url;
-    a.download = `sila-billing-local-${new Date().toISOString().slice(0, 10)}.json`;
+    a.download = `sila-billing-${this.activeCompany.id}-${new Date().toISOString().slice(0, 10)}.json`;
     document.body.appendChild(a);
     a.click();
     a.remove();
@@ -1373,6 +2180,10 @@ export class SilaBillingApp {
       (this.settings.synced ? 0 : 1);
 
     const canInstall = !this.isInstalled && (Boolean(this.deferredPrompt) || this.isIOS);
+    const effectiveRole = this.getEffectiveRole();
+    const cancellingInvoice = this.cancellingInvoiceId
+      ? this.invoices.find((i) => i.id === this.cancellingInvoiceId) || null
+      : null;
 
     this.root.innerHTML = `
       <div class="no-print h-dvh w-screen flex flex-col overflow-hidden bg-slate-50 text-slate-900">
@@ -1388,12 +2199,40 @@ export class SilaBillingApp {
               ${this.sidebarState === 'HIDDEN' ? ICONS.panelOpen : ICONS.panelClose}
             </button>
             <span class="text-sm font-bold tracking-tight whitespace-nowrap">SILA-Billing</span>
+            <button
+              type="button"
+              data-action="open-master-admin"
+              aria-label="Administração SILA-Billing"
+              class="h-2.5 w-2.5 rounded-sm bg-emerald-600 hover:bg-emerald-500 focus-visible:outline focus-visible:outline-2 focus-visible:outline-emerald-400 transition-colors shrink-0 ml-0.5"
+            ></button>
           </div>
 
-          <div class="hidden md:flex items-center gap-2 text-xs text-slate-400 truncate">
-            <span class="truncate">${escapeHtml(this.settings.company.shortName)}</span>
-            <span aria-hidden="true">·</span>
-            <span class="font-mono tabular-nums">NIF ${escapeHtml(this.settings.company.nif)}</span>
+          <div data-company-switcher-zone class="relative flex items-center min-w-0">
+            <button
+              type="button"
+              data-action="toggle-company-dropdown"
+              class="h-8 px-2.5 rounded-md hover:bg-slate-800 text-xs text-slate-300 hover:text-white flex items-center gap-1.5 transition-colors max-w-[240px] sm:max-w-xs md:max-w-md"
+            >
+              <span class="font-medium text-white truncate">${escapeHtml(this.settings.company.shortName)}</span>
+              <span aria-hidden="true" class="text-slate-500 hidden sm:inline">·</span>
+              <span class="font-mono tabular-nums text-slate-400 hidden sm:inline shrink-0">NIF ${escapeHtml(this.settings.company.nif)}</span>
+              ${
+                this.isCompanySuspended()
+                  ? `<span class="text-[10px] text-red-400 font-medium shrink-0">· Suspensa</span>`
+                  : ''
+              }
+              <span class="text-slate-400 shrink-0">${this.showCompanyDropdown ? ICONS.chevronUp : ICONS.chevronDown}</span>
+            </button>
+
+            ${
+              this.showCompanyDropdown
+                ? renderCompanySwitcherDropdown({
+                    activeCompany: this.activeCompany,
+                    companies: this.companies,
+                    effectiveRole,
+                  })
+                : ''
+            }
           </div>
 
           <div class="flex items-center gap-2 shrink-0">
@@ -1432,6 +2271,38 @@ export class SilaBillingApp {
         </div>
 
         ${this.showIOSGuide ? this.renderIOSModal() : ''}
+        ${
+          this.showNewCompanyModal
+            ? renderNewCompanyModal({
+                errorMessage: this.newCompanyError,
+                isSubmitting: this.isCreatingCompany,
+                isSignedIn: Boolean(this.user),
+              })
+            : ''
+        }
+        ${
+          cancellingInvoice
+            ? renderCancelInvoiceModal({
+                invoice: cancellingInvoice,
+                errorMessage: this.cancelInvoiceError,
+              })
+            : ''
+        }
+        ${
+          this.showMasterAdminModal
+            ? renderMasterAdminModal({
+                isSignedIn: Boolean(this.user),
+                userEmail: this.user?.email || '',
+                isLoading: this.masterAdminLoading,
+                accessDenied: this.masterAdminDenied,
+                errorMessage: this.masterAdminError,
+                searchQuery: this.masterAdminSearch,
+                mergedCompanies: this.getMergedAdminCompanies(),
+                recentLogs: this.adminAuditLogs,
+                activeCompanyId: this.activeCompany.id,
+              })
+            : ''
+        }
       </div>
 
       ${
@@ -1607,13 +2478,17 @@ export class SilaBillingApp {
     const liveInvoice = this.buildLivePreviewInvoice();
     const cartCount = roundKz(this.cart.reduce((acc, c) => acc + c.qty, 0));
 
+    const directCustId = getDirectCustomerIdForCompany(this.activeCompany.id);
+    const defaultLocality = this.activeCompany.profile.cityCountry || 'Angola';
+    const isSuspended = this.isCompanySuspended();
+
     const selectedCustomer =
       this.customers.find((c) => c.id === this.selectedCustomerId) ||
       this.customers[0] || {
-        id: 'cust_direct',
+        id: directCustId,
         name: 'Cliente de Venda Directa',
         nif: 'Consumidor Final',
-        locality: 'Saurimo - Angola',
+        locality: defaultLocality,
       };
 
     const cq = this.posCustomerSearch.trim().toLowerCase();
@@ -1755,17 +2630,30 @@ export class SilaBillingApp {
             <div class="flex-1 overflow-y-auto p-3">
               ${
                 visibleProducts.length === 0
-                  ? `<div class="h-40 flex flex-col items-center justify-center gap-2 text-xs text-slate-500">
-                      <span>Nenhum artigo encontrado para o filtro atual.</span>
+                  ? `<div class="h-40 flex flex-col items-center justify-center gap-2 text-xs text-slate-500 text-center px-4">
+                      <span>${
+                        this.products.length === 0
+                          ? 'Catálogo vazio nesta empresa.'
+                          : 'Nenhum artigo encontrado para o filtro atual.'
+                      }</span>
                       ${
-                        this.posSearch || this.posCategoryFilter !== 'ALL' || this.posTaxFilter !== 'ALL'
+                        this.products.length === 0 && this.canManageCatalog()
                           ? `<button
                               type="button"
-                              data-action="pos-category"
-                              data-value="ALL"
+                              data-action="nav"
+                              data-value="PRODUCTS"
                               class="text-blue-600 hover:underline font-medium"
-                            >Mostrar todas as categorias</button>`
-                          : ''
+                            >Registar primeiro artigo</button>`
+                          : this.posSearch ||
+                              this.posCategoryFilter !== 'ALL' ||
+                              this.posTaxFilter !== 'ALL'
+                            ? `<button
+                                type="button"
+                                data-action="pos-category"
+                                data-value="ALL"
+                                class="text-blue-600 hover:underline font-medium"
+                              >Mostrar todas as categorias</button>`
+                            : ''
                       }
                     </div>`
                   : `<div class="grid grid-cols-2 sm:grid-cols-3 lg:grid-cols-2 xl:grid-cols-3 gap-2">
@@ -1777,7 +2665,8 @@ export class SilaBillingApp {
                               type="button"
                               data-action="add-to-cart"
                               data-id="${escapeHtml(prod.id)}"
-                              class="text-left p-2.5 rounded-lg border transition-colors min-h-[88px] flex flex-col justify-between bg-white hover:border-blue-600 active:bg-slate-50 ${
+                              ${isSuspended ? 'disabled' : ''}
+                              class="text-left p-2.5 rounded-lg border transition-colors min-h-[88px] flex flex-col justify-between bg-white hover:border-blue-600 active:bg-slate-50 disabled:opacity-50 disabled:pointer-events-none ${
                                 inCart ? 'border-blue-600 ring-1 ring-blue-600/20' : 'border-slate-200'
                               }"
                             >
@@ -1820,17 +2709,17 @@ export class SilaBillingApp {
                     <div class="min-w-0">
                       <div class="text-xs font-semibold text-slate-900 truncate">${escapeHtml(selectedCustomer.name)}</div>
                       <div class="text-[10px] text-slate-500 font-mono truncate tabular-nums">
-                        ${escapeHtml(selectedCustomer.nif || 'Consumidor Final')} · ${escapeHtml(selectedCustomer.locality || 'Saurimo')}
+                        ${escapeHtml(selectedCustomer.nif || 'Consumidor Final')} · ${escapeHtml(selectedCustomer.locality || defaultLocality)}
                       </div>
                     </div>
                     <span class="text-slate-400 shrink-0">${this.showCustomerPicker ? ICONS.chevronUp : ICONS.chevronDown}</span>
                   </button>
                   ${
-                    this.selectedCustomerId !== 'cust_direct'
+                    this.selectedCustomerId !== directCustId
                       ? `<button
                           type="button"
                           data-action="select-pos-customer"
-                          data-id="cust_direct"
+                          data-id="${escapeHtml(directCustId)}"
                           title="Repor Cliente de Venda Directa"
                           class="h-8 w-8 mr-1 flex items-center justify-center rounded text-slate-400 hover:text-slate-700 hover:bg-slate-200/60 shrink-0"
                         >${ICONS.close}</button>`
@@ -1841,8 +2730,9 @@ export class SilaBillingApp {
                 <button
                   type="button"
                   data-action="toggle-quick-customer"
+                  ${isSuspended ? 'disabled' : ''}
                   title="Cadastro rápido de cliente sem sair da fatura"
-                  class="h-10 px-2.5 flex items-center justify-center gap-1 rounded-lg border text-xs font-medium transition-colors whitespace-nowrap shrink-0 ${
+                  class="h-10 px-2.5 flex items-center justify-center gap-1 rounded-lg border text-xs font-medium transition-colors whitespace-nowrap shrink-0 disabled:opacity-40 ${
                     this.showQuickCustomerForm
                       ? 'bg-slate-900 text-white border-slate-900'
                       : 'border-slate-200 text-slate-700 hover:bg-slate-50'
@@ -1970,7 +2860,7 @@ export class SilaBillingApp {
                           name="locality"
                           type="text"
                           maxlength="160"
-                          value="Saurimo - Angola"
+                          value="${escapeHtml(defaultLocality)}"
                           placeholder="Localidade"
                           class="flex-1 h-8 px-2.5 text-xs bg-white border border-slate-200 rounded-md focus:outline-none focus:border-blue-600"
                         />
@@ -2280,12 +3170,20 @@ export class SilaBillingApp {
                   : ''
               }
 
+              ${
+                isSuspended
+                  ? `<div class="p-2 rounded-md border border-red-200 bg-red-50 text-[11px] text-red-700">
+                      Empresa suspensa — novas emissões estão bloqueadas; consulta e reimpressão continuam disponíveis.
+                    </div>`
+                  : ''
+              }
+
               <div class="flex items-center gap-2 pt-1">
                 <button
                   type="button"
                   data-action="emit-invoice"
                   data-value="save"
-                  ${this.cart.length === 0 || this.isEmitting ? 'disabled' : ''}
+                  ${this.cart.length === 0 || this.isEmitting || isSuspended ? 'disabled' : ''}
                   class="flex-1 h-11 rounded-lg bg-slate-900 text-white text-xs font-semibold hover:bg-slate-800 disabled:opacity-40 transition-colors flex items-center justify-center gap-1.5 whitespace-nowrap"
                 >
                   ${ICONS.check}
@@ -2295,7 +3193,7 @@ export class SilaBillingApp {
                   type="button"
                   data-action="emit-invoice"
                   data-value="print"
-                  ${this.cart.length === 0 || this.isEmitting ? 'disabled' : ''}
+                  ${this.cart.length === 0 || this.isEmitting || isSuspended ? 'disabled' : ''}
                   class="flex-1 h-11 rounded-lg bg-blue-600 text-white text-xs font-semibold hover:bg-blue-700 disabled:opacity-40 transition-colors flex items-center justify-center gap-1.5 whitespace-nowrap"
                 >
                   ${ICONS.printer}
@@ -2359,6 +3257,10 @@ export class SilaBillingApp {
 
   private renderCustomersWorkspace(): string {
     const q = this.customerSearch.trim().toLowerCase();
+    const directCustId = getDirectCustomerIdForCompany(this.activeCompany.id);
+    const canEditCust = this.canEditExistingCustomers();
+    const isSuspended = this.isCompanySuspended();
+
     const filtered = this.customers.filter(
       (c) =>
         !q ||
@@ -2384,7 +3286,8 @@ export class SilaBillingApp {
           <button
             type="button"
             data-action="new-customer"
-            class="h-10 px-3.5 rounded-lg bg-slate-900 text-white text-xs font-semibold hover:bg-slate-800 flex items-center gap-1.5 whitespace-nowrap shrink-0"
+            ${isSuspended ? 'disabled' : ''}
+            class="h-10 px-3.5 rounded-lg bg-slate-900 text-white text-xs font-semibold hover:bg-slate-800 disabled:opacity-40 flex items-center gap-1.5 whitespace-nowrap shrink-0"
           >
             ${ICONS.plus}
             <span>Novo Cliente</span>
@@ -2470,38 +3373,46 @@ export class SilaBillingApp {
               </tr>
             </thead>
             <tbody class="divide-y divide-slate-100 text-xs">
-              ${filtered
-                .map(
-                  (c) => `
-                  <tr class="hover:bg-slate-50/80">
-                    <td class="py-2.5 px-3 font-medium text-slate-900">${escapeHtml(c.name)}</td>
-                    <td class="py-2.5 px-3 font-mono text-slate-600 tabular-nums">${escapeHtml(c.nif)}</td>
-                    <td class="py-2.5 px-3 text-slate-600 hidden sm:table-cell">${escapeHtml(c.locality)}</td>
-                    <td class="py-2.5 px-3 font-mono text-slate-500 hidden md:table-cell">${escapeHtml(c.phone || '—')}</td>
-                    <td class="py-2 px-3 text-right">
-                      <div class="inline-flex items-center gap-1">
-                        <button
-                          type="button"
-                          data-action="edit-customer"
-                          data-id="${escapeHtml(c.id)}"
-                          class="h-8 w-8 inline-flex items-center justify-center rounded-md text-slate-500 hover:text-slate-900 hover:bg-slate-100"
-                        >${ICONS.edit}</button>
-                        ${
-                          c.id !== 'cust_direct'
-                            ? `<button
-                                type="button"
-                                data-action="delete-customer"
-                                data-id="${escapeHtml(c.id)}"
-                                class="h-8 w-8 inline-flex items-center justify-center rounded-md text-slate-400 hover:text-red-600 hover:bg-red-50"
-                              >${ICONS.trash}</button>`
-                            : ''
-                        }
-                      </div>
-                    </td>
-                  </tr>
-                `
-                )
-                .join('')}
+              ${
+                filtered.length === 0
+                  ? `<tr><td colspan="5" class="py-8 px-3 text-center text-xs text-slate-500">Nenhum cliente encontrado nesta empresa.</td></tr>`
+                  : filtered
+                      .map(
+                        (c) => `
+                        <tr class="hover:bg-slate-50/80">
+                          <td class="py-2.5 px-3 font-medium text-slate-900">${escapeHtml(c.name)}</td>
+                          <td class="py-2.5 px-3 font-mono text-slate-600 tabular-nums">${escapeHtml(c.nif)}</td>
+                          <td class="py-2.5 px-3 text-slate-600 hidden sm:table-cell">${escapeHtml(c.locality)}</td>
+                          <td class="py-2.5 px-3 font-mono text-slate-500 hidden md:table-cell">${escapeHtml(c.phone || '—')}</td>
+                          <td class="py-2 px-3 text-right">
+                            ${
+                              canEditCust
+                                ? `<div class="inline-flex items-center gap-1">
+                                    <button
+                                      type="button"
+                                      data-action="edit-customer"
+                                      data-id="${escapeHtml(c.id)}"
+                                      class="h-8 w-8 inline-flex items-center justify-center rounded-md text-slate-500 hover:text-slate-900 hover:bg-slate-100"
+                                    >${ICONS.edit}</button>
+                                    ${
+                                      c.id !== directCustId
+                                        ? `<button
+                                            type="button"
+                                            data-action="delete-customer"
+                                            data-id="${escapeHtml(c.id)}"
+                                            class="h-8 w-8 inline-flex items-center justify-center rounded-md text-slate-400 hover:text-red-600 hover:bg-red-50"
+                                          >${ICONS.trash}</button>`
+                                        : ''
+                                    }
+                                  </div>`
+                                : `<span class="text-[11px] text-slate-400">Consulta</span>`
+                            }
+                          </td>
+                        </tr>
+                      `
+                      )
+                      .join('')
+              }
             </tbody>
           </table>
         </div>
@@ -2513,6 +3424,8 @@ export class SilaBillingApp {
 
   private renderProductsWorkspace(): string {
     const q = this.productSearch.trim().toLowerCase();
+    const canManageCat = this.canManageCatalog();
+
     const filtered = this.products.filter(
       (p) =>
         !q ||
@@ -2542,18 +3455,24 @@ export class SilaBillingApp {
               class="w-full h-10 pl-9 pr-3 text-xs bg-slate-50 border border-slate-200 rounded-lg focus:outline-none focus:border-blue-600"
             />
           </div>
-          <button
-            type="button"
-            data-action="new-product"
-            class="h-10 px-3.5 rounded-lg bg-slate-900 text-white text-xs font-semibold hover:bg-slate-800 flex items-center gap-1.5 whitespace-nowrap shrink-0"
-          >
-            ${ICONS.plus}
-            <span>Novo Artigo</span>
-          </button>
+          ${
+            canManageCat
+              ? `<button
+                  type="button"
+                  data-action="new-product"
+                  class="h-10 px-3.5 rounded-lg bg-slate-900 text-white text-xs font-semibold hover:bg-slate-800 flex items-center gap-1.5 whitespace-nowrap shrink-0"
+                >
+                  ${ICONS.plus}
+                  <span>Novo Artigo</span>
+                </button>`
+              : `<span class="text-xs text-slate-500 whitespace-nowrap shrink-0">Modo consulta · ${escapeHtml(
+                  formatRoleLabelPt(this.getEffectiveRole())
+                )}</span>`
+          }
         </div>
 
         ${
-          this.editingProduct
+          this.editingProduct && canManageCat
             ? `
             <form
               data-form="product-form"
@@ -2659,36 +3578,52 @@ export class SilaBillingApp {
               </tr>
             </thead>
             <tbody class="divide-y divide-slate-100 text-xs">
-              ${filtered
-                .map(
-                  (p) => `
-                  <tr class="hover:bg-slate-50/80">
-                    <td class="py-2.5 px-3 font-mono text-slate-600">${escapeHtml(p.code)}</td>
-                    <td class="py-2.5 px-3 font-medium text-slate-900">${escapeHtml(p.name)}</td>
-                    <td class="py-2.5 px-3 text-slate-500 hidden sm:table-cell">${escapeHtml(p.category || 'Geral')}</td>
-                    <td class="py-2.5 px-3 text-slate-500">${escapeHtml(p.unit)}</td>
-                    <td class="py-2.5 px-3 text-right font-mono tabular-nums text-slate-600">${p.ivaRate}%</td>
-                    <td class="py-2.5 px-3 text-right font-mono font-semibold tabular-nums text-slate-900">${formatKzNumber(p.price)} Kz</td>
-                    <td class="py-2 px-3 text-right">
-                      <div class="inline-flex items-center gap-1">
-                        <button
-                          type="button"
-                          data-action="edit-product"
-                          data-id="${escapeHtml(p.id)}"
-                          class="h-8 w-8 inline-flex items-center justify-center rounded-md text-slate-500 hover:text-slate-900 hover:bg-slate-100"
-                        >${ICONS.edit}</button>
-                        <button
-                          type="button"
-                          data-action="delete-product"
-                          data-id="${escapeHtml(p.id)}"
-                          class="h-8 w-8 inline-flex items-center justify-center rounded-md text-slate-400 hover:text-red-600 hover:bg-red-50"
-                        >${ICONS.trash}</button>
-                      </div>
-                    </td>
-                  </tr>
-                `
-                )
-                .join('')}
+              ${
+                filtered.length === 0
+                  ? `<tr>
+                      <td colspan="7" class="py-10 px-3 text-center text-xs text-slate-500">
+                        ${
+                          this.products.length === 0
+                            ? 'Nenhum artigo registado no catálogo desta empresa.'
+                            : 'Nenhum artigo corresponde à pesquisa atual.'
+                        }
+                      </td>
+                    </tr>`
+                  : filtered
+                      .map(
+                        (p) => `
+                        <tr class="hover:bg-slate-50/80">
+                          <td class="py-2.5 px-3 font-mono text-slate-600">${escapeHtml(p.code)}</td>
+                          <td class="py-2.5 px-3 font-medium text-slate-900">${escapeHtml(p.name)}</td>
+                          <td class="py-2.5 px-3 text-slate-500 hidden sm:table-cell">${escapeHtml(p.category || 'Geral')}</td>
+                          <td class="py-2.5 px-3 text-slate-500">${escapeHtml(p.unit)}</td>
+                          <td class="py-2.5 px-3 text-right font-mono tabular-nums text-slate-600">${p.ivaRate}%</td>
+                          <td class="py-2.5 px-3 text-right font-mono font-semibold tabular-nums text-slate-900">${formatKzNumber(p.price)} Kz</td>
+                          <td class="py-2 px-3 text-right">
+                            ${
+                              canManageCat
+                                ? `<div class="inline-flex items-center gap-1">
+                                    <button
+                                      type="button"
+                                      data-action="edit-product"
+                                      data-id="${escapeHtml(p.id)}"
+                                      class="h-8 w-8 inline-flex items-center justify-center rounded-md text-slate-500 hover:text-slate-900 hover:bg-slate-100"
+                                    >${ICONS.edit}</button>
+                                    <button
+                                      type="button"
+                                      data-action="delete-product"
+                                      data-id="${escapeHtml(p.id)}"
+                                      class="h-8 w-8 inline-flex items-center justify-center rounded-md text-slate-400 hover:text-red-600 hover:bg-red-50"
+                                    >${ICONS.trash}</button>
+                                  </div>`
+                                : `<span class="text-[11px] text-slate-400">Consulta</span>`
+                            }
+                          </td>
+                        </tr>
+                      `
+                      )
+                      .join('')
+              }
             </tbody>
           </table>
         </div>
@@ -2700,6 +3635,8 @@ export class SilaBillingApp {
 
   private renderHistoryWorkspace(): string {
     const q = this.historySearch.trim().toLowerCase();
+    const canCancel = this.canCancelInvoices();
+
     const filtered = this.invoices.filter(
       (inv) =>
         !q ||
@@ -2735,7 +3672,7 @@ export class SilaBillingApp {
           <div class="flex-1 overflow-y-auto divide-y divide-slate-100">
             ${
               filtered.length === 0
-                ? `<div class="p-8 text-center text-xs text-slate-500">Nenhuma fatura encontrada.</div>`
+                ? `<div class="p-8 text-center text-xs text-slate-500">Nenhuma fatura encontrada nesta empresa.</div>`
                 : filtered
                     .map((inv) => {
                       const dt = formatDateTimePt(inv.issuedAtIso);
@@ -2763,6 +3700,11 @@ export class SilaBillingApp {
                             <div class="text-xs text-slate-600 truncate mt-0.5">
                               ${escapeHtml(inv.customerName)} · ${escapeHtml(inv.paymentMethod)}
                             </div>
+                            ${
+                              inv.status === 'cancelled' && inv.cancelReason
+                                ? `<div class="text-[11px] text-red-600/90 truncate mt-0.5">Motivo: ${escapeHtml(inv.cancelReason)}</div>`
+                                : ''
+                            }
                           </div>
                           <div class="text-right shrink-0">
                             <div class="text-xs font-bold font-mono text-slate-900 tabular-nums">${formatKzNumber(inv.grandTotal)} Kz</div>
@@ -2786,7 +3728,7 @@ export class SilaBillingApp {
                     type="button"
                     data-action="set-history-format"
                     data-value="POS"
-                    class="h-8 px-3 text-[11px] font-semibold rounded-md transition-colors ${
+                    class="h-8 px-3 text-[11px] font-semibold rounded-md transition-colors whitespace-nowrap ${
                       this.historyViewFormat === 'POS' ? 'bg-white text-slate-900 shadow-xs' : 'text-slate-600 hover:text-slate-900'
                     }"
                   >POS 80mm</button>
@@ -2794,7 +3736,7 @@ export class SilaBillingApp {
                     type="button"
                     data-action="set-history-format"
                     data-value="A4"
-                    class="h-8 px-3 text-[11px] font-semibold rounded-md transition-colors ${
+                    class="h-8 px-3 text-[11px] font-semibold rounded-md transition-colors whitespace-nowrap ${
                       this.historyViewFormat === 'A4' ? 'bg-white text-slate-900 shadow-xs' : 'text-slate-600 hover:text-slate-900'
                     }"
                   >A4</button>
@@ -2802,7 +3744,7 @@ export class SilaBillingApp {
 
                 <div class="flex items-center gap-1.5">
                   ${
-                    active.status !== 'cancelled'
+                    active.status !== 'cancelled' && canCancel
                       ? `<button
                           type="button"
                           data-action="cancel-invoice"
@@ -2831,109 +3773,305 @@ export class SilaBillingApp {
     `;
   }
 
-  // ==================== 6. CONFIGURAÇÕES ====================
+  // ==================== 6. CONFIGURAÇÕES, EQUIPA (RBAC) & PLANO COMERCIAL ====================
 
   private renderSettingsWorkspace(): string {
     const c = this.settings.company;
+    const canManage = this.canManageCompanySettings();
+    const maxRole = this.getVerifiedMaxRole();
+    const effectiveRole = this.getEffectiveRole();
+    const roleOptions: CompanyRole[] =
+      maxRole === 'owner'
+        ? ['owner', 'manager', 'cashier']
+        : maxRole === 'manager'
+          ? ['manager', 'cashier']
+          : ['cashier'];
+
     return `
       <div class="h-full overflow-y-auto bg-white p-4 sm:p-6">
-        <form data-form="settings-form" class="max-w-3xl space-y-6">
-          <div class="flex items-center justify-between gap-3 pb-3 border-b border-slate-200">
+        <div class="max-w-3xl space-y-8">
+          <form data-form="settings-form" class="space-y-6">
+            <div class="flex items-center justify-between gap-3 pb-3 border-b border-slate-200">
+              <div>
+                <h1 class="text-sm font-bold text-slate-900">Configurações da Empresa</h1>
+                <p class="text-xs text-slate-500">Identidade fiscal, série documental e predefinições POS / A4.</p>
+              </div>
+              <div class="flex items-center gap-2 shrink-0">
+                <button
+                  type="button"
+                  data-action="reset-settings"
+                  ${!canManage ? 'disabled' : ''}
+                  class="h-9 px-3 rounded-lg border border-slate-200 text-xs font-medium text-slate-600 hover:bg-slate-50 disabled:opacity-40 flex items-center gap-1.5 whitespace-nowrap"
+                >
+                  ${ICONS.reset}
+                  <span>Repor padrão</span>
+                </button>
+                <button
+                  type="submit"
+                  ${!canManage ? 'disabled' : ''}
+                  class="h-9 px-4 rounded-lg bg-slate-900 text-white text-xs font-semibold hover:bg-slate-800 disabled:opacity-40 flex items-center gap-1.5 whitespace-nowrap"
+                >
+                  ${ICONS.check}
+                  <span>${this.settingsSavedNotice ? 'Guardado' : 'Guardar'}</span>
+                </button>
+              </div>
+            </div>
+
+            ${
+              this.settingsErrorMessage
+                ? `<div class="p-3 rounded-lg border border-red-200 bg-red-50 text-xs text-red-700">${escapeHtml(
+                    this.settingsErrorMessage
+                  )}</div>`
+                : ''
+            }
+
+            ${
+              !canManage
+                ? `<div class="p-3 rounded-lg border border-slate-200 bg-slate-50 text-xs text-slate-600">
+                    Modo de leitura para o perfil <strong>${escapeHtml(
+                      formatRoleLabelPt(effectiveRole)
+                    )}</strong>. Apenas o Proprietário pode alterar os dados fiscais da empresa.
+                  </div>`
+                : ''
+            }
+
+            <section class="space-y-3">
+              <h2 class="text-xs font-semibold text-slate-900">Identidade Empresarial (1 NIF = 1 Empresa)</h2>
+              <div class="grid grid-cols-1 sm:grid-cols-12 gap-3">
+                <div class="sm:col-span-8">
+                  <label class="block text-[11px] font-medium text-slate-600 mb-1">Designação Social</label>
+                  <input name="legalName" type="text" required maxlength="160" ${!canManage ? 'disabled' : ''} value="${escapeHtml(c.legalName)}" class="w-full h-9 px-2.5 text-xs bg-slate-50 border border-slate-200 rounded-md focus:outline-none focus:border-blue-600 disabled:opacity-60" />
+                </div>
+                <div class="sm:col-span-4">
+                  <label class="block text-[11px] font-medium text-slate-600 mb-1">Nome Curto / Marca</label>
+                  <input name="shortName" type="text" required maxlength="64" ${!canManage ? 'disabled' : ''} value="${escapeHtml(c.shortName)}" class="w-full h-9 px-2.5 text-xs bg-slate-50 border border-slate-200 rounded-md focus:outline-none focus:border-blue-600 disabled:opacity-60" />
+                </div>
+                <div class="sm:col-span-4">
+                  <label class="block text-[11px] font-medium text-slate-600 mb-1">NIF (Contribuinte Único)</label>
+                  <input name="nif" type="text" required maxlength="32" ${!canManage ? 'disabled' : ''} value="${escapeHtml(c.nif)}" class="w-full h-9 px-2.5 text-xs font-mono tabular-nums bg-slate-50 border border-slate-200 rounded-md focus:outline-none focus:border-blue-600 disabled:opacity-60" />
+                </div>
+                <div class="sm:col-span-4">
+                  <label class="block text-[11px] font-medium text-slate-600 mb-1">Telefone</label>
+                  <input name="phone" type="text" maxlength="40" ${!canManage ? 'disabled' : ''} value="${escapeHtml(c.phone)}" class="w-full h-9 px-2.5 text-xs font-mono tabular-nums bg-slate-50 border border-slate-200 rounded-md focus:outline-none focus:border-blue-600 disabled:opacity-60" />
+                </div>
+                <div class="sm:col-span-4">
+                  <label class="block text-[11px] font-medium text-slate-600 mb-1">Email</label>
+                  <input name="email" type="email" maxlength="120" ${!canManage ? 'disabled' : ''} value="${escapeHtml(c.email)}" class="w-full h-9 px-2.5 text-xs bg-slate-50 border border-slate-200 rounded-md focus:outline-none focus:border-blue-600 disabled:opacity-60" />
+                </div>
+                <div class="sm:col-span-5">
+                  <label class="block text-[11px] font-medium text-slate-600 mb-1">Endereço Fiscal</label>
+                  <input name="address" type="text" required maxlength="160" ${!canManage ? 'disabled' : ''} value="${escapeHtml(c.address)}" class="w-full h-9 px-2.5 text-xs bg-slate-50 border border-slate-200 rounded-md focus:outline-none focus:border-blue-600 disabled:opacity-60" />
+                </div>
+                <div class="sm:col-span-3">
+                  <label class="block text-[11px] font-medium text-slate-600 mb-1">Localidade / País</label>
+                  <input name="cityCountry" type="text" required maxlength="80" ${!canManage ? 'disabled' : ''} value="${escapeHtml(c.cityCountry || 'Angola')}" class="w-full h-9 px-2.5 text-xs bg-slate-50 border border-slate-200 rounded-md focus:outline-none focus:border-blue-600 disabled:opacity-60" />
+                </div>
+                <div class="sm:col-span-4">
+                  <label class="block text-[11px] font-medium text-slate-600 mb-1">Assinatura / Rodapé</label>
+                  <input name="tagline" type="text" maxlength="120" ${!canManage ? 'disabled' : ''} value="${escapeHtml(c.tagline)}" class="w-full h-9 px-2.5 text-xs bg-slate-50 border border-slate-200 rounded-md focus:outline-none focus:border-blue-600 disabled:opacity-60" />
+                </div>
+              </div>
+            </section>
+
+            <section class="space-y-3 pt-4 border-t border-slate-200">
+              <h2 class="text-xs font-semibold text-slate-900">Caixa e Emissão</h2>
+              <div class="grid grid-cols-2 sm:grid-cols-12 gap-3">
+                <div class="col-span-1 sm:col-span-3">
+                  <label class="block text-[11px] font-medium text-slate-600 mb-1">Caixa Padrão</label>
+                  <input name="defaultCashier" type="text" required maxlength="16" ${!canManage ? 'disabled' : ''} value="${escapeHtml(this.settings.defaultCashier)}" class="w-full h-9 px-2.5 text-xs font-mono bg-slate-50 border border-slate-200 rounded-md focus:outline-none focus:border-blue-600 disabled:opacity-60" />
+                </div>
+                <div class="col-span-1 sm:col-span-3">
+                  <label class="block text-[11px] font-medium text-slate-600 mb-1">Operador(a) Padrão</label>
+                  <input name="defaultOperator" type="text" required maxlength="32" ${!canManage ? 'disabled' : ''} value="${escapeHtml(this.settings.defaultOperator)}" class="w-full h-9 px-2.5 text-xs font-mono bg-slate-50 border border-slate-200 rounded-md focus:outline-none focus:border-blue-600 disabled:opacity-60" />
+                </div>
+                <div class="col-span-1 sm:col-span-3">
+                  <label class="block text-[11px] font-medium text-slate-600 mb-1">Tipo de Documento</label>
+                  <select name="defaultDocType" ${!canManage ? 'disabled' : ''} class="w-full h-9 px-2.5 text-xs bg-slate-50 border border-slate-200 rounded-md focus:outline-none focus:border-blue-600 disabled:opacity-60">
+                    <option value="FR" ${this.settings.defaultDocType === 'FR' ? 'selected' : ''}>Factura / Recibo</option>
+                    <option value="FP" ${this.settings.defaultDocType === 'FP' ? 'selected' : ''}>Factura Proforma</option>
+                  </select>
+                </div>
+                <div class="col-span-1 sm:col-span-3">
+                  <label class="block text-[11px] font-medium text-slate-600 mb-1">Formato Preferencial</label>
+                  <select name="defaultFormat" ${!canManage ? 'disabled' : ''} class="w-full h-9 px-2.5 text-xs bg-slate-50 border border-slate-200 rounded-md focus:outline-none focus:border-blue-600 disabled:opacity-60">
+                    <option value="POS" ${this.settings.defaultFormat === 'POS' ? 'selected' : ''}>POS Térmico 80mm</option>
+                    <option value="A4" ${this.settings.defaultFormat === 'A4' ? 'selected' : ''}>Fatura A4</option>
+                  </select>
+                </div>
+                <div class="col-span-2 sm:col-span-8">
+                  <label class="block text-[11px] font-medium text-slate-600 mb-1">Observação Padrão</label>
+                  <input name="defaultNotes" type="text" maxlength="300" ${!canManage ? 'disabled' : ''} value="${escapeHtml(this.settings.defaultNotes)}" class="w-full h-9 px-2.5 text-xs bg-slate-50 border border-slate-200 rounded-md focus:outline-none focus:border-blue-600 disabled:opacity-60" />
+                </div>
+                <div class="col-span-2 sm:col-span-4 flex items-end">
+                  <label class="flex items-center gap-2 h-9 text-xs text-slate-700 cursor-pointer select-none">
+                    <input name="autoPrintOnEmit" type="checkbox" ${!canManage ? 'disabled' : ''} ${this.settings.autoPrintOnEmit ? 'checked' : ''} class="h-4 w-4 rounded border-slate-300 text-blue-600" />
+                    <span>Imprimir ao clicar em Emitir</span>
+                  </label>
+                </div>
+              </div>
+            </section>
+          </form>
+
+          <!-- Permissões por Empresa e Perfil Operacional no Terminal -->
+          <section class="space-y-4 pt-6 border-t border-slate-200">
+            <div class="flex flex-col sm:flex-row sm:items-center justify-between gap-3">
+              <div>
+                <h2 class="text-xs font-semibold text-slate-900">Permissões e Equipa da Empresa</h2>
+                <p class="text-xs text-slate-500">
+                  Emissão POS/A4 ativa · ${this.canManageCatalog() ? 'Gestão de catálogo autorizada' : 'Catálogo em leitura'} · ${
+                    this.canCancelInvoices() ? 'Anulação com justificação autorizada' : 'Anulação bloqueada'
+                  }
+                </p>
+              </div>
+              <div class="flex items-center gap-2 shrink-0">
+                <label class="text-[11px] text-slate-600 whitespace-nowrap" for="terminal-role-select">Modo no terminal:</label>
+                <select
+                  id="terminal-role-select"
+                  data-field="terminal-role-select"
+                  class="h-8 px-2.5 text-xs bg-slate-50 border border-slate-200 rounded-md focus:outline-none focus:border-blue-600"
+                >
+                  ${roleOptions
+                    .map(
+                      (r) =>
+                        `<option value="${r}" ${effectiveRole === r ? 'selected' : ''}>${escapeHtml(
+                          formatRoleLabelPt(r)
+                        )}</option>`
+                    )
+                    .join('')}
+                </select>
+              </div>
+            </div>
+
+            <label class="flex items-center gap-2 text-xs text-slate-700 select-none ${canManage ? 'cursor-pointer' : 'opacity-60'}">
+              <input
+                type="checkbox"
+                data-field="company-allow-manager-cancel"
+                ${!canManage ? 'disabled' : ''}
+                ${this.activeCompany.allowManagerCancel ? 'checked' : ''}
+                class="h-4 w-4 rounded border-slate-300 text-blue-600"
+              />
+              <span>Permitir que Gerentes anulem faturas emitidas mediante justificação obrigatória</span>
+            </label>
+
+            ${
+              this.memberFormError
+                ? `<div class="p-2.5 rounded-lg border border-red-200 bg-red-50 text-xs text-red-700">${escapeHtml(
+                    this.memberFormError
+                  )}</div>`
+                : ''
+            }
+
+            <div class="border border-slate-200 rounded-lg overflow-hidden">
+              <table class="w-full text-left border-collapse text-xs">
+                <thead class="bg-slate-50 border-b border-slate-200 text-[11px] text-slate-500">
+                  <tr>
+                    <th class="py-2 px-3 font-medium">Colaborador</th>
+                    <th class="py-2 px-3 font-medium">Email</th>
+                    <th class="py-2 px-3 font-medium">Perfil</th>
+                    <th class="py-2 px-3 font-medium">Anulação</th>
+                    <th class="py-2 px-3 font-medium text-right w-16">Ação</th>
+                  </tr>
+                </thead>
+                <tbody class="divide-y divide-slate-100">
+                  ${
+                    this.members.length === 0
+                      ? `<tr><td colspan="5" class="py-4 px-3 text-xs text-slate-500">Proprietário local ativo nesta empresa. Adicione gerentes ou operadores abaixo quando necessário.</td></tr>`
+                      : this.members
+                          .map(
+                            (m) => `
+                            <tr>
+                              <td class="py-2 px-3 font-medium text-slate-900">${escapeHtml(m.displayName)}</td>
+                              <td class="py-2 px-3 font-mono text-slate-600">${escapeHtml(m.email)}</td>
+                              <td class="py-2 px-3 text-slate-700">${escapeHtml(formatRoleLabelPt(m.role))}</td>
+                              <td class="py-2 px-3 text-slate-500">${
+                                m.role === 'owner' ||
+                                (m.role === 'manager' &&
+                                  (this.activeCompany.allowManagerCancel || m.allowInvoiceCancel))
+                                  ? 'Autorizada'
+                                  : 'Não'
+                              }</td>
+                              <td class="py-2 px-3 text-right">
+                                ${
+                                  canManage && m.role !== 'owner'
+                                    ? `<button
+                                        type="button"
+                                        data-action="remove-company-member"
+                                        data-id="${escapeHtml(m.id)}"
+                                        title="Remover colaborador"
+                                        class="h-7 w-7 inline-flex items-center justify-center rounded text-slate-400 hover:text-red-600 hover:bg-red-50"
+                                      >${ICONS.trash}</button>`
+                                    : `<span class="text-[11px] text-slate-400">—</span>`
+                                }
+                              </td>
+                            </tr>
+                          `
+                          )
+                          .join('')
+                  }
+                </tbody>
+              </table>
+            </div>
+
+            ${
+              canManage
+                ? `<form data-form="add-member-form" class="grid grid-cols-1 sm:grid-cols-12 gap-2 items-end">
+                    <div class="sm:col-span-4">
+                      <label class="block text-[10px] font-medium text-slate-600 mb-1">Nome do colaborador</label>
+                      <input name="displayName" type="text" required maxlength="120" placeholder="Ex: Maria Manuel" class="w-full h-9 px-2.5 text-xs bg-slate-50 border border-slate-200 rounded-md focus:outline-none focus:border-blue-600" />
+                    </div>
+                    <div class="sm:col-span-4">
+                      <label class="block text-[10px] font-medium text-slate-600 mb-1">Email autenticado</label>
+                      <input name="email" type="email" required maxlength="120" placeholder="operador@empresa.ao" class="w-full h-9 px-2.5 text-xs font-mono bg-slate-50 border border-slate-200 rounded-md focus:outline-none focus:border-blue-600" />
+                    </div>
+                    <div class="sm:col-span-2">
+                      <label class="block text-[10px] font-medium text-slate-600 mb-1">Perfil</label>
+                      <select name="role" class="w-full h-9 px-2 text-xs bg-slate-50 border border-slate-200 rounded-md focus:outline-none focus:border-blue-600">
+                        <option value="cashier">Caixa</option>
+                        <option value="manager">Gerente</option>
+                      </select>
+                    </div>
+                    <div class="sm:col-span-2">
+                      <button type="submit" class="w-full h-9 px-3 rounded-md bg-slate-900 text-white text-xs font-semibold hover:bg-slate-800 whitespace-nowrap">Adicionar</button>
+                    </div>
+                    <div class="sm:col-span-12">
+                      <label class="inline-flex items-center gap-2 text-[11px] text-slate-600 cursor-pointer select-none">
+                        <input name="allowInvoiceCancel" type="checkbox" class="h-3.5 w-3.5 rounded border-slate-300 text-blue-600" />
+                        <span>Autorizar este Gerente individualmente a anular faturas</span>
+                      </label>
+                    </div>
+                  </form>`
+                : ''
+            }
+          </section>
+
+          <!-- Estrutura Preparada para Planos Comerciais (Inativa / Fase Gratuita) -->
+          <section class="space-y-3 pt-6 border-t border-slate-200">
             <div>
-              <h1 class="text-sm font-bold text-slate-900">Configurações</h1>
-              <p class="text-xs text-slate-500">Identidade empresarial e predefinições de emissão POS / A4.</p>
+              <h2 class="text-xs font-semibold text-slate-900">Plano Comercial e Estado Operacional</h2>
+              <p class="text-xs text-slate-500">Estrutura preparada para futuros planos comerciais, sem cobrança ativa nesta fase.</p>
             </div>
-            <div class="flex items-center gap-2 shrink-0">
-              <button
-                type="button"
-                data-action="reset-settings"
-                class="h-9 px-3 rounded-lg border border-slate-200 text-xs font-medium text-slate-600 hover:bg-slate-50 flex items-center gap-1.5 whitespace-nowrap"
-              >
-                ${ICONS.reset}
-                <span>Repor padrão</span>
-              </button>
-              <button
-                type="submit"
-                class="h-9 px-4 rounded-lg bg-slate-900 text-white text-xs font-semibold hover:bg-slate-800 flex items-center gap-1.5 whitespace-nowrap"
-              >
-                ${ICONS.check}
-                <span>${this.settingsSavedNotice ? 'Guardado' : 'Guardar'}</span>
-              </button>
-            </div>
-          </div>
-
-          <section class="space-y-3">
-            <h2 class="text-xs font-semibold text-slate-900">Identidade Empresarial</h2>
-            <div class="grid grid-cols-1 sm:grid-cols-12 gap-3">
-              <div class="sm:col-span-8">
-                <label class="block text-[11px] font-medium text-slate-600 mb-1">Designação Social</label>
-                <input name="legalName" type="text" required maxlength="160" value="${escapeHtml(c.legalName)}" class="w-full h-9 px-2.5 text-xs bg-slate-50 border border-slate-200 rounded-md focus:outline-none focus:border-blue-600" />
+            <div class="grid grid-cols-1 sm:grid-cols-3 gap-4 py-3 px-4 rounded-lg border border-slate-200 bg-slate-50/70 text-xs">
+              <div>
+                <div class="text-[11px] text-slate-500">Estado operacional</div>
+                <div class="font-semibold text-slate-900 mt-0.5">
+                  ${this.isCompanySuspended() ? 'Suspensa (emissão bloqueada)' : 'Ativa'}
+                </div>
               </div>
-              <div class="sm:col-span-4">
-                <label class="block text-[11px] font-medium text-slate-600 mb-1">Nome Curto / Marca</label>
-                <input name="shortName" type="text" required maxlength="64" value="${escapeHtml(c.shortName)}" class="w-full h-9 px-2.5 text-xs bg-slate-50 border border-slate-200 rounded-md focus:outline-none focus:border-blue-600" />
+              <div>
+                <div class="text-[11px] text-slate-500">Plano associado</div>
+                <div class="font-semibold text-slate-900 mt-0.5">
+                  ${escapeHtml(formatPlanLabelPt(this.activeCompany.plan.planTier))}
+                </div>
               </div>
-              <div class="sm:col-span-4">
-                <label class="block text-[11px] font-medium text-slate-600 mb-1">NIF (Contribuinte)</label>
-                <input name="nif" type="text" required maxlength="32" value="${escapeHtml(c.nif)}" class="w-full h-9 px-2.5 text-xs font-mono tabular-nums bg-slate-50 border border-slate-200 rounded-md focus:outline-none focus:border-blue-600" />
-              </div>
-              <div class="sm:col-span-4">
-                <label class="block text-[11px] font-medium text-slate-600 mb-1">Telefone</label>
-                <input name="phone" type="text" maxlength="40" value="${escapeHtml(c.phone)}" class="w-full h-9 px-2.5 text-xs font-mono tabular-nums bg-slate-50 border border-slate-200 rounded-md focus:outline-none focus:border-blue-600" />
-              </div>
-              <div class="sm:col-span-4">
-                <label class="block text-[11px] font-medium text-slate-600 mb-1">Email</label>
-                <input name="email" type="email" maxlength="120" value="${escapeHtml(c.email)}" class="w-full h-9 px-2.5 text-xs bg-slate-50 border border-slate-200 rounded-md focus:outline-none focus:border-blue-600" />
-              </div>
-              <div class="sm:col-span-7">
-                <label class="block text-[11px] font-medium text-slate-600 mb-1">Endereço Fiscal</label>
-                <input name="address" type="text" required maxlength="160" value="${escapeHtml(c.address)}" class="w-full h-9 px-2.5 text-xs bg-slate-50 border border-slate-200 rounded-md focus:outline-none focus:border-blue-600" />
-              </div>
-              <div class="sm:col-span-5">
-                <label class="block text-[11px] font-medium text-slate-600 mb-1">Assinatura / Rodapé</label>
-                <input name="tagline" type="text" maxlength="120" value="${escapeHtml(c.tagline)}" class="w-full h-9 px-2.5 text-xs bg-slate-50 border border-slate-200 rounded-md focus:outline-none focus:border-blue-600" />
+              <div>
+                <div class="text-[11px] text-slate-500">Subscrição / cobrança</div>
+                <div class="font-semibold text-emerald-700 mt-0.5">
+                  Inativa · Uso gratuito
+                </div>
               </div>
             </div>
           </section>
-
-          <section class="space-y-3 pt-4 border-t border-slate-200">
-            <h2 class="text-xs font-semibold text-slate-900">Caixa e Emissão</h2>
-            <div class="grid grid-cols-2 sm:grid-cols-12 gap-3">
-              <div class="col-span-1 sm:col-span-3">
-                <label class="block text-[11px] font-medium text-slate-600 mb-1">Caixa Padrão</label>
-                <input name="defaultCashier" type="text" required maxlength="16" value="${escapeHtml(this.settings.defaultCashier)}" class="w-full h-9 px-2.5 text-xs font-mono bg-slate-50 border border-slate-200 rounded-md focus:outline-none focus:border-blue-600" />
-              </div>
-              <div class="col-span-1 sm:col-span-3">
-                <label class="block text-[11px] font-medium text-slate-600 mb-1">Operador(a) Padrão</label>
-                <input name="defaultOperator" type="text" required maxlength="32" value="${escapeHtml(this.settings.defaultOperator)}" class="w-full h-9 px-2.5 text-xs font-mono bg-slate-50 border border-slate-200 rounded-md focus:outline-none focus:border-blue-600" />
-              </div>
-              <div class="col-span-1 sm:col-span-3">
-                <label class="block text-[11px] font-medium text-slate-600 mb-1">Tipo de Documento</label>
-                <select name="defaultDocType" class="w-full h-9 px-2.5 text-xs bg-slate-50 border border-slate-200 rounded-md focus:outline-none focus:border-blue-600">
-                  <option value="FR" ${this.settings.defaultDocType === 'FR' ? 'selected' : ''}>Factura / Recibo</option>
-                  <option value="FP" ${this.settings.defaultDocType === 'FP' ? 'selected' : ''}>Factura Proforma</option>
-                </select>
-              </div>
-              <div class="col-span-1 sm:col-span-3">
-                <label class="block text-[11px] font-medium text-slate-600 mb-1">Formato Preferencial</label>
-                <select name="defaultFormat" class="w-full h-9 px-2.5 text-xs bg-slate-50 border border-slate-200 rounded-md focus:outline-none focus:border-blue-600">
-                  <option value="POS" ${this.settings.defaultFormat === 'POS' ? 'selected' : ''}>POS Térmico 80mm</option>
-                  <option value="A4" ${this.settings.defaultFormat === 'A4' ? 'selected' : ''}>Fatura A4</option>
-                </select>
-              </div>
-              <div class="col-span-2 sm:col-span-8">
-                <label class="block text-[11px] font-medium text-slate-600 mb-1">Observação Padrão</label>
-                <input name="defaultNotes" type="text" maxlength="300" value="${escapeHtml(this.settings.defaultNotes)}" class="w-full h-9 px-2.5 text-xs bg-slate-50 border border-slate-200 rounded-md focus:outline-none focus:border-blue-600" />
-              </div>
-              <div class="col-span-2 sm:col-span-4 flex items-end">
-                <label class="flex items-center gap-2 h-9 text-xs text-slate-700 cursor-pointer select-none">
-                  <input name="autoPrintOnEmit" type="checkbox" ${this.settings.autoPrintOnEmit ? 'checked' : ''} class="h-4 w-4 rounded border-slate-300 text-blue-600" />
-                  <span>Imprimir ao clicar em Emitir</span>
-                </label>
-              </div>
-            </div>
-          </section>
-        </form>
+        </div>
       </div>
     `;
   }
@@ -2947,6 +4085,12 @@ export class SilaBillingApp {
     const pSet = this.settings.synced ? 0 : 1;
     const totalPending = pProd + pCust + pInv + pSet;
 
+    const errCount =
+      this.products.filter((p) => p.syncState === 'error').length +
+      this.customers.filter((c) => c.syncState === 'error').length +
+      this.invoices.filter((i) => i.syncState === 'error').length +
+      (this.settings.syncState === 'error' ? 1 : 0);
+
     const lastSync = this.lastSyncedIso ? formatDateTimePt(this.lastSyncedIso) : null;
     const bh = this.backendHealth;
 
@@ -2956,7 +4100,9 @@ export class SilaBillingApp {
           <div class="flex flex-col sm:flex-row sm:items-center justify-between gap-3 pb-3 border-b border-slate-200">
             <div>
               <h1 class="text-sm font-bold text-slate-900">Sincronização, Backend e Backup</h1>
-              <p class="text-xs text-slate-500">Persistência local IndexedDB, Cloud Firestore e API de auditoria.</p>
+              <p class="text-xs text-slate-500">Persistência isolada por empresa (${escapeHtml(
+                this.settings.company.shortName
+              )} · NIF ${escapeHtml(this.settings.company.nif)}).</p>
             </div>
 
             <div class="flex items-center gap-2 shrink-0">
@@ -2993,6 +4139,14 @@ export class SilaBillingApp {
           ${
             this.syncMessage
               ? `<div class="p-3 rounded-lg border border-amber-200 bg-amber-50 text-xs text-amber-800">${escapeHtml(this.syncMessage)}</div>`
+              : ''
+          }
+
+          ${
+            errCount > 0
+              ? `<div class="p-3 rounded-lg border border-red-200 bg-red-50 text-xs text-red-700 tabular-nums">
+                  ${errCount} registo(s) aguardam nova tentativa após erro de sincronização. Os dados permanecem seguros localmente no IndexedDB.
+                </div>`
               : ''
           }
 
@@ -3070,13 +4224,26 @@ export class SilaBillingApp {
             </div>
           </section>
 
-          <!-- Exportação de Backup JSON (Local ou Endpoint Administrativo /api/backup) -->
+          <!-- Exportação de Backup JSON e Snapshot de Segurança -->
           <section class="pt-4 border-t border-slate-200 flex flex-col sm:flex-row sm:items-center justify-between gap-3">
             <div>
               <h2 class="text-xs font-semibold text-slate-900">Exportação Segura de Dados (JSON)</h2>
-              <p class="text-xs text-slate-500">Exporte cópia integral local ou a partir do endpoint administrativo <code>/api/backup</code>.</p>
+              <p class="text-xs text-slate-500">Exporte cópia integral da empresa ativa ou acione reposição de segurança.</p>
             </div>
-            <div class="flex items-center gap-2 shrink-0">
+            <div class="flex flex-wrap items-center gap-2 shrink-0">
+              ${
+                this.hasPreMigrationBackup
+                  ? `<button
+                      type="button"
+                      data-action="restore-v1-snapshot"
+                      title="Restaurar cópia intacta pré-migração da empresa JAIMONA"
+                      class="h-9 px-3 rounded-lg border border-slate-200 text-xs font-medium text-slate-600 hover:bg-slate-50 flex items-center gap-1.5 whitespace-nowrap"
+                    >
+                      ${ICONS.reset}
+                      <span>Restaurar snapshot v1</span>
+                    </button>`
+                  : ''
+              }
               <button
                 type="button"
                 data-action="export-backup-local"

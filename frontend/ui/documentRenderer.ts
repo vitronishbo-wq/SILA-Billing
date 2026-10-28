@@ -1,6 +1,13 @@
 import QRCode from 'qrcode';
 import { formatDateTimePt, formatKzNumber } from '../../src/core/billingEngine';
-import { CompanyProfile, DocumentFormat, InvoiceRecord, JAIMONA_COMPANY } from '../../src/core/types';
+import {
+  CompanyProfile,
+  deriveCompanyInitials,
+  DocumentFormat,
+  InvoiceRecord,
+  JAIMONA_COMPANY,
+  normalizeCompanyNif,
+} from '../../src/core/types';
 
 function escapeHtml(raw: string): string {
   return String(raw || '')
@@ -103,7 +110,7 @@ export function renderDocumentHtml(
               ? `<div class="tabular-nums">NIF Cliente: ${escapeHtml(invoice.customerNif)}</div>`
               : ''
           }
-          <div>Localidade: ${escapeHtml(invoice.customerLocality || 'Saurimo - Angola')}</div>
+          <div>Localidade: ${escapeHtml(invoice.customerLocality || company.cityCountry || 'Angola')}</div>
         </div>
 
         <div class="py-2 border-b border-dashed border-black">
@@ -186,11 +193,15 @@ export function renderDocumentHtml(
     <div class="print-target mx-auto w-full max-w-[794px] bg-white p-6 sm:p-8 text-slate-900 border border-slate-200 text-xs">
       <div class="flex flex-col sm:flex-row sm:items-start justify-between gap-4 pb-5 border-b border-slate-200">
         <div class="flex items-center gap-3.5">
-          <div class="flex h-14 w-14 shrink-0 items-center justify-center rounded-full border-2 border-blue-600 bg-slate-900 text-white font-bold text-lg tracking-tight">JM</div>
+          <div class="flex h-14 w-14 shrink-0 items-center justify-center rounded-full border-2 border-blue-600 bg-slate-900 text-white font-bold text-lg tracking-tight">${escapeHtml(deriveCompanyInitials(company))}</div>
           <div>
             <div class="text-base font-bold tracking-tight text-slate-900">${escapeHtml(company.shortName)}</div>
             <div class="text-[11px] font-medium text-slate-600">${escapeHtml(company.legalName)}</div>
-            <div class="text-[10px] text-blue-700 mt-0.5">Qualidade · Confiança · Soluções</div>
+            <div class="text-[10px] text-blue-700 mt-0.5">${
+              normalizeCompanyNif(company.nif) === '5003069940'
+                ? 'Qualidade · Confiança · Soluções'
+                : escapeHtml(company.tagline || company.cityCountry || 'Comércio & Serviços')
+            }</div>
           </div>
         </div>
         <div class="text-[11px] text-slate-600 space-y-0.5 sm:text-right tabular-nums">
@@ -221,7 +232,7 @@ export function renderDocumentHtml(
                 ? `<div class="text-[11px] text-slate-600 tabular-nums">NIF: ${escapeHtml(invoice.customerNif)}</div>`
                 : ''
             }
-            <div class="text-[11px] text-slate-600">${escapeHtml(invoice.customerLocality || 'Saurimo - Angola')}</div>
+            <div class="text-[11px] text-slate-600">${escapeHtml(invoice.customerLocality || company.cityCountry || 'Angola')}</div>
           </div>
         </div>
 

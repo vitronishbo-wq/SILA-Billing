@@ -166,36 +166,373 @@
         "grandTotal", "taxBase14", "taxAmount14", "taxBase0",
         "auditHash", "verifiedAt"
       ]
+    },
+    "PlatformAdmin": {
+      "title": "PlatformAdmin",
+      "description": "Registo de administrador global autorizado no Painel Master SILA-Billing.",
+      "type": "object",
+      "properties": {
+        "uid": { "type": "string", "maxLength": 128, "pattern": "^[a-zA-Z0-9_\\-]+$" },
+        "email": { "type": "string", "maxLength": 120 },
+        "active": { "type": "boolean" },
+        "updatedAt": { "type": "string", "format": "date-time" }
+      },
+      "required": ["uid", "email", "active", "updatedAt"]
+    },
+    "PlatformAuditLog": {
+      "title": "PlatformAuditLog",
+      "description": "Auditoria administrativa de ações globais no Painel Master SILA-Billing.",
+      "type": "object",
+      "properties": {
+        "adminUid": { "type": "string", "maxLength": 128 },
+        "adminEmail": { "type": "string", "maxLength": 120 },
+        "companyId": { "type": "string", "maxLength": 128 },
+        "companyName": { "type": "string", "maxLength": 80 },
+        "action": { "type": "string", "maxLength": 64 },
+        "details": { "type": "string", "maxLength": 240 },
+        "createdAt": { "type": "string", "format": "date-time" }
+      },
+      "required": ["adminUid", "adminEmail", "companyId", "companyName", "action", "details", "createdAt"]
+    },
+    "CompanyNifRegistry": {
+      "title": "CompanyNifRegistry",
+      "description": "Índice fiscal único global garantindo 1 NIF = 1 única empresa registada no sistema.",
+      "type": "object",
+      "properties": {
+        "normalizedNif": { "type": "string", "maxLength": 20, "minLength": 6, "pattern": "^[A-Z0-9]+$" },
+        "companyId": { "type": "string", "maxLength": 128, "pattern": "^[a-zA-Z0-9_\\-]+$" },
+        "ownerUid": { "type": "string", "maxLength": 128, "pattern": "^[a-zA-Z0-9_\\-]+$" },
+        "shortName": { "type": "string", "maxLength": 64 },
+        "createdAt": { "type": "string", "format": "date-time" },
+        "updatedAt": { "type": "string", "format": "date-time" }
+      },
+      "required": ["normalizedNif", "companyId", "ownerUid", "shortName", "createdAt", "updatedAt"]
+    },
+    "UserCompanyLink": {
+      "title": "UserCompanyLink",
+      "description": "Índice das empresas pertencentes a um utilizador autenticado.",
+      "type": "object",
+      "properties": {
+        "companyId": { "type": "string", "maxLength": 128, "pattern": "^[a-zA-Z0-9_\\-]+$" },
+        "uid": { "type": "string", "maxLength": 128, "pattern": "^[a-zA-Z0-9_\\-]+$" },
+        "role": { "type": "string", "enum": ["owner", "manager", "cashier"], "maxLength": 16 },
+        "shortName": { "type": "string", "maxLength": 64 },
+        "nif": { "type": "string", "maxLength": 32 },
+        "normalizedNif": { "type": "string", "maxLength": 20 },
+        "updatedAt": { "type": "string", "format": "date-time" }
+      },
+      "required": ["companyId", "uid", "role", "shortName", "nif", "normalizedNif", "updatedAt"]
+    },
+    "Company": {
+      "title": "Company",
+      "description": "Entidade empresarial isolada com estado operacional e plano comercial preparado.",
+      "type": "object",
+      "properties": {
+        "id": { "type": "string", "maxLength": 128, "pattern": "^[a-zA-Z0-9_\\-]+$" },
+        "normalizedNif": { "type": "string", "maxLength": 20, "minLength": 6, "pattern": "^[A-Z0-9]+$" },
+        "ownerUid": { "type": "string", "maxLength": 128, "pattern": "^[a-zA-Z0-9_\\-]+$" },
+        "ownerEmail": { "type": "string", "maxLength": 120 },
+        "legalName": { "type": "string", "maxLength": 160 },
+        "shortName": { "type": "string", "maxLength": 64 },
+        "nif": { "type": "string", "maxLength": 32 },
+        "address": { "type": "string", "maxLength": 160 },
+        "cityCountry": { "type": "string", "maxLength": 80 },
+        "phone": { "type": "string", "maxLength": 40 },
+        "email": { "type": "string", "maxLength": 120 },
+        "tagline": { "type": "string", "maxLength": 120 },
+        "status": { "type": "string", "enum": ["active", "suspended", "pending"], "maxLength": 16 },
+        "planTier": { "type": "string", "enum": ["FREE", "ESSENCIAL", "PROFISSIONAL", "ENTERPRISE"], "maxLength": 24 },
+        "commercialActive": { "type": "boolean" },
+        "baseSequence": { "type": "number" },
+        "allowManagerCancel": { "type": "boolean" },
+        "createdAt": { "type": "string", "format": "date-time" },
+        "updatedAt": { "type": "string", "format": "date-time" }
+      },
+      "required": [
+        "id", "normalizedNif", "ownerUid", "ownerEmail", "legalName", "shortName", "nif",
+        "address", "cityCountry", "phone", "email", "tagline", "status", "planTier",
+        "commercialActive", "baseSequence", "allowManagerCancel", "createdAt", "updatedAt"
+      ]
+    },
+    "CompanyMember": {
+      "title": "CompanyMember",
+      "description": "Membro operacional de uma empresa com papel RBAC (owner, manager ou cashier).",
+      "type": "object",
+      "properties": {
+        "id": { "type": "string", "maxLength": 128, "pattern": "^[a-zA-Z0-9_\\-]+$" },
+        "companyId": { "type": "string", "maxLength": 128, "pattern": "^[a-zA-Z0-9_\\-]+$" },
+        "companyOwnerUid": { "type": "string", "maxLength": 128, "pattern": "^[a-zA-Z0-9_\\-]+$" },
+        "uid": { "type": "string", "maxLength": 128, "pattern": "^[a-zA-Z0-9_\\-]+$" },
+        "email": { "type": "string", "maxLength": 120 },
+        "emailLower": { "type": "string", "maxLength": 120 },
+        "displayName": { "type": "string", "maxLength": 120 },
+        "role": { "type": "string", "enum": ["owner", "manager", "cashier"], "maxLength": 16 },
+        "allowInvoiceCancel": { "type": "boolean" },
+        "active": { "type": "boolean" },
+        "createdAt": { "type": "string", "format": "date-time" },
+        "updatedAt": { "type": "string", "format": "date-time" }
+      },
+      "required": [
+        "id", "companyId", "companyOwnerUid", "uid", "email", "emailLower",
+        "displayName", "role", "allowInvoiceCancel", "active", "createdAt", "updatedAt"
+      ]
+    },
+    "CompanyProduct": {
+      "title": "CompanyProduct",
+      "description": "Artigo isolado por empresa.",
+      "type": "object",
+      "properties": {
+        "id": { "type": "string", "maxLength": 128, "pattern": "^[a-zA-Z0-9_\\-]+$" },
+        "companyId": { "type": "string", "maxLength": 128, "pattern": "^[a-zA-Z0-9_\\-]+$" },
+        "companyOwnerUid": { "type": "string", "maxLength": 128, "pattern": "^[a-zA-Z0-9_\\-]+$" },
+        "updatedByUid": { "type": "string", "maxLength": 128, "pattern": "^[a-zA-Z0-9_\\-]+$" },
+        "code": { "type": "string", "maxLength": 32 },
+        "name": { "type": "string", "maxLength": 160 },
+        "category": { "type": "string", "maxLength": 48 },
+        "unit": { "type": "string", "maxLength": 16 },
+        "price": { "type": "number" },
+        "ivaRate": { "type": "number", "enum": [0, 14] },
+        "exemptionReason": { "type": "string", "maxLength": 120 },
+        "active": { "type": "boolean" },
+        "createdAt": { "type": "string", "format": "date-time" },
+        "updatedAt": { "type": "string", "format": "date-time" }
+      },
+      "required": [
+        "id", "companyId", "companyOwnerUid", "updatedByUid", "code", "name",
+        "category", "unit", "price", "ivaRate", "exemptionReason", "active", "createdAt", "updatedAt"
+      ]
+    },
+    "CompanyCustomer": {
+      "title": "CompanyCustomer",
+      "description": "Cliente fiscal isolado por empresa.",
+      "type": "object",
+      "properties": {
+        "id": { "type": "string", "maxLength": 128, "pattern": "^[a-zA-Z0-9_\\-]+$" },
+        "companyId": { "type": "string", "maxLength": 128, "pattern": "^[a-zA-Z0-9_\\-]+$" },
+        "companyOwnerUid": { "type": "string", "maxLength": 128, "pattern": "^[a-zA-Z0-9_\\-]+$" },
+        "updatedByUid": { "type": "string", "maxLength": 128, "pattern": "^[a-zA-Z0-9_\\-]+$" },
+        "name": { "type": "string", "maxLength": 160 },
+        "nif": { "type": "string", "maxLength": 32 },
+        "locality": { "type": "string", "maxLength": 160 },
+        "createdAt": { "type": "string", "format": "date-time" },
+        "updatedAt": { "type": "string", "format": "date-time" }
+      },
+      "required": ["id", "companyId", "companyOwnerUid", "updatedByUid", "name", "nif", "locality", "createdAt", "updatedAt"]
+    },
+    "CompanyCustomerPrivate": {
+      "title": "CompanyCustomerPrivate",
+      "description": "Contacto privado (PII isolada) do cliente empresarial.",
+      "type": "object",
+      "properties": {
+        "companyId": { "type": "string", "maxLength": 128, "pattern": "^[a-zA-Z0-9_\\-]+$" },
+        "companyOwnerUid": { "type": "string", "maxLength": 128, "pattern": "^[a-zA-Z0-9_\\-]+$" },
+        "updatedByUid": { "type": "string", "maxLength": 128, "pattern": "^[a-zA-Z0-9_\\-]+$" },
+        "phone": { "type": "string", "maxLength": 40 },
+        "address": { "type": "string", "maxLength": 200 },
+        "updatedAt": { "type": "string", "format": "date-time" }
+      },
+      "required": ["companyId", "companyOwnerUid", "updatedByUid", "phone", "address", "updatedAt"]
+    },
+    "CompanyInvoice": {
+      "title": "CompanyInvoice",
+      "description": "Fatura emitida isolada por empresa com suporte a anulação justificada.",
+      "type": "object",
+      "properties": {
+        "id": { "type": "string", "maxLength": 128, "pattern": "^[a-zA-Z0-9_\\-]+$" },
+        "companyId": { "type": "string", "maxLength": 128, "pattern": "^[a-zA-Z0-9_\\-]+$" },
+        "companyOwnerUid": { "type": "string", "maxLength": 128, "pattern": "^[a-zA-Z0-9_\\-]+$" },
+        "emittedByUid": { "type": "string", "maxLength": 128, "pattern": "^[a-zA-Z0-9_\\-]+$" },
+        "number": { "type": "string", "maxLength": 40 },
+        "docType": { "type": "string", "enum": ["FR", "FP"], "maxLength": 8 },
+        "issuedAtIso": { "type": "string", "maxLength": 40 },
+        "cashier": { "type": "string", "maxLength": 16 },
+        "operator": { "type": "string", "maxLength": 32 },
+        "paymentMethod": { "type": "string", "enum": ["Dinheiro", "Multicaixa", "Transferência"], "maxLength": 24 },
+        "customerId": { "type": "string", "maxLength": 128 },
+        "customerName": { "type": "string", "maxLength": 160 },
+        "customerNif": { "type": "string", "maxLength": 32 },
+        "customerLocality": { "type": "string", "maxLength": 160 },
+        "merchandiseTotal": { "type": "number" },
+        "discountTotal": { "type": "number" },
+        "taxBase14": { "type": "number" },
+        "taxAmount14": { "type": "number" },
+        "taxBase0": { "type": "number" },
+        "taxAmount0": { "type": "number" },
+        "taxTotal": { "type": "number" },
+        "grandTotal": { "type": "number" },
+        "amountInWords": { "type": "string", "maxLength": 300 },
+        "amountReceived": { "type": "number" },
+        "changeAmount": { "type": "number" },
+        "notes": { "type": "string", "maxLength": 300 },
+        "itemCount": { "type": "number" },
+        "status": { "type": "string", "enum": ["issued", "cancelled"], "maxLength": 16 },
+        "cancelReason": { "type": "string", "maxLength": 240 },
+        "cancelledBy": { "type": "string", "maxLength": 120 },
+        "createdAt": { "type": "string", "format": "date-time" },
+        "updatedAt": { "type": "string", "format": "date-time" }
+      },
+      "required": [
+        "id", "companyId", "companyOwnerUid", "emittedByUid", "number", "docType", "issuedAtIso",
+        "cashier", "operator", "paymentMethod", "customerId", "customerName", "customerNif",
+        "customerLocality", "merchandiseTotal", "discountTotal", "taxBase14", "taxAmount14",
+        "taxBase0", "taxAmount0", "taxTotal", "grandTotal", "amountInWords", "amountReceived",
+        "changeAmount", "notes", "itemCount", "status", "createdAt", "updatedAt"
+      ]
+    },
+    "CompanyInvoiceItem": {
+      "title": "CompanyInvoiceItem",
+      "description": "Linha de artigo de fatura isolada por empresa.",
+      "type": "object",
+      "properties": {
+        "id": { "type": "string", "maxLength": 128, "pattern": "^[a-zA-Z0-9_\\-]+$" },
+        "invoiceId": { "type": "string", "maxLength": 128, "pattern": "^[a-zA-Z0-9_\\-]+$" },
+        "companyId": { "type": "string", "maxLength": 128, "pattern": "^[a-zA-Z0-9_\\-]+$" },
+        "companyOwnerUid": { "type": "string", "maxLength": 128, "pattern": "^[a-zA-Z0-9_\\-]+$" },
+        "code": { "type": "string", "maxLength": 32 },
+        "description": { "type": "string", "maxLength": 160 },
+        "unit": { "type": "string", "maxLength": 16 },
+        "qty": { "type": "number" },
+        "unitPrice": { "type": "number" },
+        "discountPct": { "type": "number" },
+        "ivaRate": { "type": "number", "enum": [0, 14] },
+        "lineGross": { "type": "number" },
+        "lineNet": { "type": "number" },
+        "lineBase": { "type": "number" },
+        "lineTax": { "type": "number" },
+        "lineTotal": { "type": "number" },
+        "createdAt": { "type": "string", "format": "date-time" }
+      },
+      "required": [
+        "id", "invoiceId", "companyId", "companyOwnerUid", "code", "description", "unit", "qty",
+        "unitPrice", "discountPct", "ivaRate", "lineGross", "lineNet",
+        "lineBase", "lineTax", "lineTotal", "createdAt"
+      ]
+    },
+    "CompanySettings": {
+      "title": "CompanySettings",
+      "description": "Configurações operacionais isoladas por empresa.",
+      "type": "object",
+      "properties": {
+        "companyId": { "type": "string", "maxLength": 128, "pattern": "^[a-zA-Z0-9_\\-]+$" },
+        "companyOwnerUid": { "type": "string", "maxLength": 128, "pattern": "^[a-zA-Z0-9_\\-]+$" },
+        "updatedByUid": { "type": "string", "maxLength": 128, "pattern": "^[a-zA-Z0-9_\\-]+$" },
+        "legalName": { "type": "string", "maxLength": 160 },
+        "shortName": { "type": "string", "maxLength": 64 },
+        "nif": { "type": "string", "maxLength": 32 },
+        "address": { "type": "string", "maxLength": 160 },
+        "cityCountry": { "type": "string", "maxLength": 80 },
+        "phone": { "type": "string", "maxLength": 40 },
+        "email": { "type": "string", "maxLength": 120 },
+        "tagline": { "type": "string", "maxLength": 120 },
+        "defaultCashier": { "type": "string", "maxLength": 16 },
+        "defaultOperator": { "type": "string", "maxLength": 32 },
+        "defaultFormat": { "type": "string", "enum": ["POS", "A4"], "maxLength": 8 },
+        "defaultDocType": { "type": "string", "enum": ["FR", "FP"], "maxLength": 8 },
+        "defaultNotes": { "type": "string", "maxLength": 300 },
+        "autoPrintOnEmit": { "type": "boolean" },
+        "updatedAt": { "type": "string", "format": "date-time" }
+      },
+      "required": [
+        "companyId", "companyOwnerUid", "updatedByUid", "legalName", "shortName", "nif",
+        "address", "cityCountry", "phone", "email", "tagline", "defaultCashier", "defaultOperator",
+        "defaultFormat", "defaultDocType", "defaultNotes", "autoPrintOnEmit", "updatedAt"
+      ]
+    },
+    "CompanyAuditLog": {
+      "title": "CompanyAuditLog",
+      "description": "Registo de auditoria fiscal e anulações exclusivo do backend por empresa.",
+      "type": "object",
+      "properties": {
+        "invoiceId": { "type": "string", "maxLength": 128 },
+        "companyId": { "type": "string", "maxLength": 128 },
+        "actorUid": { "type": "string", "maxLength": 128 },
+        "actorEmail": { "type": "string", "maxLength": 120 },
+        "actorRole": { "type": "string", "maxLength": 16 },
+        "verifiedAt": { "type": "string", "format": "date-time" }
+      },
+      "required": ["invoiceId", "companyId", "actorUid", "actorEmail", "actorRole", "verifiedAt"]
     }
   },
   "firestore": {
     "/users/{userId}/products/{productId}": {
       "schema": { "$ref": "#/entities/Product" },
-      "description": "Catálogo de artigos e serviços do operador autenticado."
+      "description": "Catálogo clássico de artigos (compatibilidade JAIMONA v1)."
     },
     "/users/{userId}/customers/{customerId}": {
       "schema": { "$ref": "#/entities/Customer" },
-      "description": "Registo fiscal de clientes do operador autenticado."
+      "description": "Registo clássico de clientes (compatibilidade JAIMONA v1)."
     },
     "/users/{userId}/customers/{customerId}/private/{docId}": {
       "schema": { "$ref": "#/entities/CustomerPrivate" },
-      "description": "Contactos privados (telefone e morada) isolados por PII."
+      "description": "Contactos privados (PII) na estrutura clássica."
     },
     "/users/{userId}/invoices/{invoiceId}": {
       "schema": { "$ref": "#/entities/Invoice" },
-      "description": "Cabeçalhos de faturas emitidas."
+      "description": "Cabeçalhos clássicos de faturas emitidas."
     },
     "/users/{userId}/invoices/{invoiceId}/items/{itemId}": {
       "schema": { "$ref": "#/entities/InvoiceLineItem" },
-      "description": "Linhas de artigos de cada fatura (subcoleção escalável)."
+      "description": "Linhas de artigos de cada fatura clássica."
     },
     "/users/{userId}/settings/{settingId}": {
       "schema": { "$ref": "#/entities/AppSettings" },
-      "description": "Configurações da empresa e predefinições de caixa/impressão."
+      "description": "Configurações clássicas da empresa."
     },
     "/users/{userId}/audit_logs/{invoiceId}": {
       "schema": { "$ref": "#/entities/AuditLog" },
-      "description": "Registo imutável de auditoria fiscal (escrita exclusiva via Admin SDK no backend)."
+      "description": "Registo imutável de auditoria fiscal clássica."
+    },
+    "/users/{userId}/company_links/{companyId}": {
+      "schema": { "$ref": "#/entities/UserCompanyLink" },
+      "description": "Índice das empresas associadas ao utilizador autenticado."
+    },
+    "/platform_admins/{adminUid}": {
+      "schema": { "$ref": "#/entities/PlatformAdmin" },
+      "description": "Administradores globais do Painel Master SILA-Billing."
+    },
+    "/platform_audit_logs/{logId}": {
+      "schema": { "$ref": "#/entities/PlatformAuditLog" },
+      "description": "Registo auditado de ações globais do Painel Master."
+    },
+    "/company_nifs/{normalizedNif}": {
+      "schema": { "$ref": "#/entities/CompanyNifRegistry" },
+      "description": "Registo global único de NIF empresarial (1 NIF = 1 Empresa)."
+    },
+    "/companies/{companyId}": {
+      "schema": { "$ref": "#/entities/Company" },
+      "description": "Documento mestre de cada empresa registada."
+    },
+    "/companies/{companyId}/members/{memberId}": {
+      "schema": { "$ref": "#/entities/CompanyMember" },
+      "description": "Membros e papéis operacionais (owner, manager, cashier) da empresa."
+    },
+    "/companies/{companyId}/products/{productId}": {
+      "schema": { "$ref": "#/entities/CompanyProduct" },
+      "description": "Catálogo de artigos isolado por empresa."
+    },
+    "/companies/{companyId}/customers/{customerId}": {
+      "schema": { "$ref": "#/entities/CompanyCustomer" },
+      "description": "Clientes fiscais isolados por empresa."
+    },
+    "/companies/{companyId}/customers/{customerId}/private/{docId}": {
+      "schema": { "$ref": "#/entities/CompanyCustomerPrivate" },
+      "description": "Contactos privados (PII isolada) dos clientes da empresa."
+    },
+    "/companies/{companyId}/invoices/{invoiceId}": {
+      "schema": { "$ref": "#/entities/CompanyInvoice" },
+      "description": "Faturas emitidas isoladas por empresa."
+    },
+    "/companies/{companyId}/invoices/{invoiceId}/items/{itemId}": {
+      "schema": { "$ref": "#/entities/CompanyInvoiceItem" },
+      "description": "Itens de fatura isolados por empresa."
+    },
+    "/companies/{companyId}/settings/{settingId}": {
+      "schema": { "$ref": "#/entities/CompanySettings" },
+      "description": "Configurações operacionais isoladas por empresa."
+    },
+    "/companies/{companyId}/audit_logs/{logId}": {
+      "schema": { "$ref": "#/entities/CompanyAuditLog" },
+      "description": "Registo imutável de auditoria fiscal e anulações por empresa."
     }
   }
 }

@@ -7,19 +7,32 @@ service cloud.firestore {
       allow read, write: if false;
     }
 
-    // Hardened Global Helpers
+    // ==================== HARDENED GLOBAL HELPERS ====================
+
     function isSignedIn() {
       return request.auth != null;
     }
 
+    function isVerifiedUser() {
+      return isSignedIn() && request.auth.token.email_verified == true;
+    }
+
     function isVerifiedOwner(userId) {
-      return isSignedIn()
-        && request.auth.token.email_verified == true
-        && request.auth.uid == userId;
+      return isVerifiedUser() && request.auth.uid == userId;
     }
 
     function isValidId(id) {
       return id is string && id.size() >= 1 && id.size() <= 128 && id.matches('^[a-zA-Z0-9_\\-]+$');
+    }
+
+    function isValidNifId(nifId) {
+      return nifId is string
+        && nifId.size() >= 6
+        && nifId.size() <= 20
+        && nifId.matches('^[A-Z0-9]+$')
+        && nifId != 'CONSUMIDORFINAL'
+        && nifId != '999999999'
+        && nifId != '000000000';
     }
 
     function incoming() {
@@ -30,7 +43,69 @@ service cloud.firestore {
       return resource.data;
     }
 
-    // Validation Blueprint: Product
+    // Administrador Global da Plataforma (email verificado obrigatório + bootstrap ou documento platform_admins)
+    function isPlatformAdmin() {
+      return isVerifiedUser()
+        && (
+          request.auth.token.email == 'wtmedia0@gmail.com'
+          || exists(/databases/$(database)/documents/platform_admins/$(request.auth.uid))
+        );
+    }
+
+    // Master Gate Multiempresa (usado apenas em operações pontuais; proibido em allow list)
+    function companyDocData(companyId) {
+      return get(/databases/$(database)/documents/companies/$(companyId)).data;
+    }
+
+    function memberDocData(companyId) {
+      return get(/databases/$(database)/documents/companies/$(companyId)/members/$(request.auth.uid)).data;
+    }
+
+    function isCompanyOperational(companyId) {
+      return exists(/databases/$(database)/documents/companies/$(companyId))
+        && companyDocData(companyId).status == 'active';
+    }
+
+    function hasActiveMembership(companyId) {
+      return exists(/databases/$(database)/documents/companies/$(companyId)/members/$(request.auth.uid))
+        && memberDocData(companyId).active == true;
+    }
+
+    function isCompanyOwner(companyId) {
+      return hasActiveMembership(companyId) && memberDocData(companyId).role == 'owner';
+    }
+
+    function isCompanyOwnerOrManager(companyId) {
+      return hasActiveMembership(companyId)
+        && (memberDocData(companyId).role == 'owner' || memberDocData(companyId).role == 'manager');
+    }
+
+    function isCompanyAnyActiveRole(companyId) {
+      return hasActiveMembership(companyId)
+        && (
+          memberDocData(companyId).role == 'owner'
+          || memberDocData(companyId).role == 'manager'
+          || memberDocData(companyId).role == 'cashier'
+        );
+    }
+
+    function canCancelCompanyInvoice(companyId) {
+      return isCompanyOperational(companyId)
+        && hasActiveMembership(companyId)
+        && (
+          memberDocData(companyId).role == 'owner'
+          || (
+            memberDocData(companyId).role == 'manager'
+            && (
+              companyDocData(companyId).allowManagerCancel == true
+              || memberDocData(companyId).allowInvoiceCancel == true
+            )
+          )
+        );
+    }
+
+    // ==================== LEGACY VALIDATION BLUEPRINTS (JAIMONA v1 CONTINUITY) ====================
+
     function isValidProduct(data, productId) {
       return data.keys().hasAll([
           'id', 'ownerId', 'code', 'name', 'unit', 'price',
@@ -54,7 +129,6 @@ service cloud.firestore {
         && data.updatedAt is timestamp;
     }
 
-    // Validation Blueprint: Customer (Public/Fiscal)
     function isValidCustomer(data, customerId) {
       return data.keys().hasAll([
           'id', 'ownerId', 'name', 'nif', 'locality', 'createdAt', 'updatedAt'
@@ -71,7 +145,6 @@ service cloud.firestore {
         && data.updatedAt is timestamp;
     }
 
-    // Validation Blueprint: CustomerPrivate (PII Split Collection)
     function isValidCustomerPrivate(data) {
       return data.keys().hasAll(['ownerId', 'phone', 'address', 'updatedAt'])
         && data.keys().hasOnly(['ownerId', 'phone', 'address', 'updatedAt'])
@@ -81,7 +154,6 @@ service cloud.firestore {
         && data.updatedAt is timestamp;
     }
 
-    // Validation Blueprint: Invoice
     function isValidInvoice(data, invoiceId) {
       return data.keys().hasAll([
           'id', 'ownerId', 'number', 'docType', 'issuedAtIso', 'cashier', 'operator',
@@ -128,7 +200,6 @@ service cloud.firestore {
         && data.updatedAt is timestamp;
     }
 
-    // Validation Blueprint: InvoiceLineItem
     function isValidInvoiceLineItem(data, invoiceId, itemId) {
       return data.keys().hasAll([
           'id', 'invoiceId', 'ownerId', 'code', 'description', 'unit', 'qty',
@@ -158,7 +229,294 @@ service cloud.firestore {
         && data.createdAt is timestamp;
     }
 
-    // Collection: /users/{userId}/products/{productId}
+    function isValidAppSettings(data) {
+      return data.keys().hasAll([
+          'ownerId', 'legalName', 'shortName', 'nif', 'address', 'cityCountry',
+          'phone', 'email', 'tagline', 'defaultCashier', 'defaultOperator',
+          'defaultFormat', 'defaultDocType', 'defaultNotes', 'autoPrintOnEmit', 'updatedAt'
+        ])
+        && data.keys().hasOnly([
+          'ownerId', 'legalName', 'shortName', 'nif', 'address', 'cityCountry',
+          'phone', 'email', 'tagline', 'defaultCashier', 'defaultOperator',
+          'defaultFormat', 'defaultDocType', 'defaultNotes', 'autoPrintOnEmit', 'updatedAt'
+        ])
+        && data.ownerId is string && data.ownerId == request.auth.uid && isValidId(data.ownerId)
+        && data.legalName is string && data.legalName.size() >= 1 && data.legalName.size() <= 160
+        && data.shortName is string && data.shortName.size() >= 1 && data.shortName.size() <= 64
+        && data.nif is string && data.nif.size() >= 1 && data.nif.size() <= 32
+        && data.address is string && data.address.size() >= 1 && data.address.size() <= 160
+        && data.cityCountry is string && data.cityCountry.size() >= 1 && data.cityCountry.size() <= 80
+        && data.phone is string && data.phone.size() <= 40
+        && data.email is string && data.email.size() <= 120
+        && data.tagline is string && data.tagline.size() <= 120
+        && data.defaultCashier is string && data.defaultCashier.size() >= 1 && data.defaultCashier.size() <= 16
+        && data.defaultOperator is string && data.defaultOperator.size() >= 1 && data.defaultOperator.size() <= 32
+        && data.defaultFormat is string && (data.defaultFormat == 'POS' || data.defaultFormat == 'A4')
+        && data.defaultDocType is string && (data.defaultDocType == 'FR' || data.defaultDocType == 'FP')
+        && data.defaultNotes is string && data.defaultNotes.size() <= 300
+        && data.autoPrintOnEmit is bool
+        && data.updatedAt is timestamp;
+    }
+
+    // ==================== MULTI-COMPANY VALIDATION BLUEPRINTS ====================
+
+    function isValidCompanyNifRegistry(data, normalizedNif) {
+      return data.keys().hasAll([
+          'normalizedNif', 'companyId', 'ownerUid', 'shortName', 'createdAt', 'updatedAt'
+        ])
+        && data.keys().hasOnly([
+          'normalizedNif', 'companyId', 'ownerUid', 'shortName', 'createdAt', 'updatedAt'
+        ])
+        && data.normalizedNif is string && data.normalizedNif == normalizedNif && isValidNifId(data.normalizedNif)
+        && data.companyId is string && isValidId(data.companyId)
+        && data.ownerUid is string && data.ownerUid == request.auth.uid && isValidId(data.ownerUid)
+        && data.shortName is string && data.shortName.size() >= 1 && data.shortName.size() <= 64
+        && data.createdAt is timestamp
+        && data.updatedAt is timestamp;
+    }
+
+    function isValidUserCompanyLink(data, companyId) {
+      return data.keys().hasAll([
+          'companyId', 'uid', 'role', 'shortName', 'nif', 'normalizedNif', 'updatedAt'
+        ])
+        && data.keys().hasOnly([
+          'companyId', 'uid', 'role', 'shortName', 'nif', 'normalizedNif', 'updatedAt'
+        ])
+        && data.companyId is string && data.companyId == companyId && isValidId(data.companyId)
+        && data.uid is string && data.uid == request.auth.uid && isValidId(data.uid)
+        && data.role is string && data.role.size() <= 16
+        && (data.role == 'owner' || data.role == 'manager' || data.role == 'cashier')
+        && data.shortName is string && data.shortName.size() >= 1 && data.shortName.size() <= 64
+        && data.nif is string && data.nif.size() >= 1 && data.nif.size() <= 32
+        && data.normalizedNif is string && isValidNifId(data.normalizedNif)
+        && data.updatedAt is timestamp;
+    }
+
+    function isValidCompany(data, companyId) {
+      return data.keys().hasAll([
+          'id', 'normalizedNif', 'ownerUid', 'ownerEmail', 'legalName', 'shortName', 'nif',
+          'address', 'cityCountry', 'phone', 'email', 'tagline', 'status', 'planTier',
+          'commercialActive', 'baseSequence', 'allowManagerCancel', 'createdAt', 'updatedAt'
+        ])
+        && data.keys().hasOnly([
+          'id', 'normalizedNif', 'ownerUid', 'ownerEmail', 'legalName', 'shortName', 'nif',
+          'address', 'cityCountry', 'phone', 'email', 'tagline', 'status', 'planTier',
+          'commercialActive', 'baseSequence', 'allowManagerCancel', 'createdAt', 'updatedAt'
+        ])
+        && data.id is string && data.id == companyId && isValidId(data.id)
+        && data.normalizedNif is string && isValidNifId(data.normalizedNif)
+        && data.ownerUid is string && isValidId(data.ownerUid)
+        && data.ownerEmail is string && data.ownerEmail.size() <= 120
+        && data.legalName is string && data.legalName.size() >= 1 && data.legalName.size() <= 160
+        && data.shortName is string && data.shortName.size() >= 1 && data.shortName.size() <= 64
+        && data.nif is string && data.nif.size() >= 1 && data.nif.size() <= 32
+        && data.address is string && data.address.size() >= 1 && data.address.size() <= 160
+        && data.cityCountry is string && data.cityCountry.size() >= 1 && data.cityCountry.size() <= 80
+        && data.phone is string && data.phone.size() <= 40
+        && data.email is string && data.email.size() <= 120
+        && data.tagline is string && data.tagline.size() <= 120
+        && data.status is string && data.status.size() <= 16
+        && (data.status == 'active' || data.status == 'suspended' || data.status == 'pending')
+        && data.planTier is string && data.planTier.size() <= 24
+        && (data.planTier == 'FREE' || data.planTier == 'ESSENCIAL' || data.planTier == 'PROFISSIONAL' || data.planTier == 'ENTERPRISE')
+        && data.commercialActive is bool
+        && data.baseSequence is number && data.baseSequence >= 0 && data.baseSequence <= 999999999
+        && data.allowManagerCancel is bool
+        && data.createdAt is timestamp
+        && data.updatedAt is timestamp;
+    }
+
+    function isValidCompanyMember(data, companyId, memberId) {
+      return data.keys().hasAll([
+          'id', 'companyId', 'companyOwnerUid', 'uid', 'email', 'emailLower',
+          'displayName', 'role', 'allowInvoiceCancel', 'active', 'createdAt', 'updatedAt'
+        ])
+        && data.keys().hasOnly([
+          'id', 'companyId', 'companyOwnerUid', 'uid', 'email', 'emailLower',
+          'displayName', 'role', 'allowInvoiceCancel', 'active', 'createdAt', 'updatedAt'
+        ])
+        && data.id is string && data.id == memberId && isValidId(data.id)
+        && data.companyId is string && data.companyId == companyId && isValidId(data.companyId)
+        && data.companyOwnerUid is string && isValidId(data.companyOwnerUid)
+        && data.uid is string && isValidId(data.uid)
+        && data.email is string && data.email.size() <= 120
+        && data.emailLower is string && data.emailLower.size() <= 120
+        && data.displayName is string && data.displayName.size() >= 1 && data.displayName.size() <= 120
+        && data.role is string && data.role.size() <= 16
+        && (data.role == 'owner' || data.role == 'manager' || data.role == 'cashier')
+        && data.allowInvoiceCancel is bool
+        && data.active is bool
+        && data.createdAt is timestamp
+        && data.updatedAt is timestamp;
+    }
+
+    function isValidCompanyProduct(data, companyId, productId) {
+      return data.keys().hasAll([
+          'id', 'companyId', 'companyOwnerUid', 'updatedByUid', 'code', 'name',
+          'category', 'unit', 'price', 'ivaRate', 'exemptionReason', 'active', 'createdAt', 'updatedAt'
+        ])
+        && data.keys().hasOnly([
+          'id', 'companyId', 'companyOwnerUid', 'updatedByUid', 'code', 'name',
+          'category', 'unit', 'price', 'ivaRate', 'exemptionReason', 'active', 'createdAt', 'updatedAt'
+        ])
+        && data.id is string && data.id == productId && isValidId(data.id)
+        && data.companyId is string && data.companyId == companyId && isValidId(data.companyId)
+        && data.companyOwnerUid is string && isValidId(data.companyOwnerUid)
+        && data.updatedByUid is string && data.updatedByUid == request.auth.uid && isValidId(data.updatedByUid)
+        && data.code is string && data.code.size() >= 1 && data.code.size() <= 32
+        && data.name is string && data.name.size() >= 1 && data.name.size() <= 160
+        && data.category is string && data.category.size() >= 1 && data.category.size() <= 48
+        && data.unit is string && data.unit.size() >= 1 && data.unit.size() <= 16
+        && data.price is number && data.price >= 0 && data.price <= 999999999
+        && data.ivaRate is number && (data.ivaRate == 0 || data.ivaRate == 14)
+        && data.exemptionReason is string && data.exemptionReason.size() <= 120
+        && data.active is bool
+        && data.createdAt is timestamp
+        && data.updatedAt is timestamp;
+    }
+
+    function isValidCompanyCustomer(data, companyId, customerId) {
+      return data.keys().hasAll([
+          'id', 'companyId', 'companyOwnerUid', 'updatedByUid', 'name', 'nif', 'locality', 'createdAt', 'updatedAt'
+        ])
+        && data.keys().hasOnly([
+          'id', 'companyId', 'companyOwnerUid', 'updatedByUid', 'name', 'nif', 'locality', 'createdAt', 'updatedAt'
+        ])
+        && data.id is string && data.id == customerId && isValidId(data.id)
+        && data.companyId is string && data.companyId == companyId && isValidId(data.companyId)
+        && data.companyOwnerUid is string && isValidId(data.companyOwnerUid)
+        && data.updatedByUid is string && data.updatedByUid == request.auth.uid && isValidId(data.updatedByUid)
+        && data.name is string && data.name.size() >= 1 && data.name.size() <= 160
+        && data.nif is string && data.nif.size() <= 32
+        && data.locality is string && data.locality.size() <= 160
+        && data.createdAt is timestamp
+        && data.updatedAt is timestamp;
+    }
+
+    function isValidCompanyCustomerPrivate(data, companyId) {
+      return data.keys().hasAll(['companyId', 'companyOwnerUid', 'updatedByUid', 'phone', 'address', 'updatedAt'])
+        && data.keys().hasOnly(['companyId', 'companyOwnerUid', 'updatedByUid', 'phone', 'address', 'updatedAt'])
+        && data.companyId is string && data.companyId == companyId && isValidId(data.companyId)
+        && data.companyOwnerUid is string && isValidId(data.companyOwnerUid)
+        && data.updatedByUid is string && data.updatedByUid == request.auth.uid && isValidId(data.updatedByUid)
+        && data.phone is string && data.phone.size() <= 40
+        && data.address is string && data.address.size() <= 200
+        && data.updatedAt is timestamp;
+    }
+
+    function isValidCompanyInvoice(data, companyId, invoiceId) {
+      return data.keys().hasAll([
+          'id', 'companyId', 'companyOwnerUid', 'emittedByUid', 'number', 'docType', 'issuedAtIso',
+          'cashier', 'operator', 'paymentMethod', 'customerId', 'customerName', 'customerNif',
+          'customerLocality', 'merchandiseTotal', 'discountTotal', 'taxBase14', 'taxAmount14',
+          'taxBase0', 'taxAmount0', 'taxTotal', 'grandTotal', 'amountInWords', 'amountReceived',
+          'changeAmount', 'notes', 'itemCount', 'status', 'createdAt', 'updatedAt'
+        ])
+        && data.keys().hasOnly([
+          'id', 'companyId', 'companyOwnerUid', 'emittedByUid', 'number', 'docType', 'issuedAtIso',
+          'cashier', 'operator', 'paymentMethod', 'customerId', 'customerName', 'customerNif',
+          'customerLocality', 'merchandiseTotal', 'discountTotal', 'taxBase14', 'taxAmount14',
+          'taxBase0', 'taxAmount0', 'taxTotal', 'grandTotal', 'amountInWords', 'amountReceived',
+          'changeAmount', 'notes', 'itemCount', 'status', 'cancelReason', 'cancelledBy', 'createdAt', 'updatedAt'
+        ])
+        && data.id is string && data.id == invoiceId && isValidId(data.id)
+        && data.companyId is string && data.companyId == companyId && isValidId(data.companyId)
+        && data.companyOwnerUid is string && isValidId(data.companyOwnerUid)
+        && data.emittedByUid is string && isValidId(data.emittedByUid)
+        && data.number is string && data.number.size() >= 1 && data.number.size() <= 40
+        && data.docType is string && data.docType.size() <= 8 && (data.docType == 'FR' || data.docType == 'FP')
+        && data.issuedAtIso is string && data.issuedAtIso.size() >= 10 && data.issuedAtIso.size() <= 40
+        && data.cashier is string && data.cashier.size() >= 1 && data.cashier.size() <= 16
+        && data.operator is string && data.operator.size() >= 1 && data.operator.size() <= 32
+        && data.paymentMethod is string && data.paymentMethod.size() <= 24
+        && (data.paymentMethod == 'Dinheiro' || data.paymentMethod == 'Multicaixa' || data.paymentMethod == 'Transferência')
+        && data.customerId is string && data.customerId.size() >= 1 && data.customerId.size() <= 128
+        && data.customerName is string && data.customerName.size() >= 1 && data.customerName.size() <= 160
+        && data.customerNif is string && data.customerNif.size() <= 32
+        && data.customerLocality is string && data.customerLocality.size() <= 160
+        && data.merchandiseTotal is number && data.merchandiseTotal >= 0
+        && data.discountTotal is number && data.discountTotal >= 0
+        && data.taxBase14 is number && data.taxBase14 >= 0
+        && data.taxAmount14 is number && data.taxAmount14 >= 0
+        && data.taxBase0 is number && data.taxBase0 >= 0
+        && data.taxAmount0 is number && data.taxAmount0 == 0
+        && data.taxTotal is number && data.taxTotal >= 0
+        && data.grandTotal is number && data.grandTotal >= 0
+        && data.amountInWords is string && data.amountInWords.size() >= 1 && data.amountInWords.size() <= 300
+        && data.amountReceived is number && data.amountReceived >= 0
+        && data.changeAmount is number && data.changeAmount >= 0
+        && data.notes is string && data.notes.size() <= 300
+        && data.itemCount is number && data.itemCount >= 1 && data.itemCount <= 200
+        && data.status is string && data.status.size() <= 16 && (data.status == 'issued' || data.status == 'cancelled')
+        && (!('cancelReason' in data) || (data.cancelReason is string && data.cancelReason.size() >= 4 && data.cancelReason.size() <= 240))
+        && (!('cancelledBy' in data) || (data.cancelledBy is string && data.cancelledBy.size() >= 1 && data.cancelledBy.size() <= 120))
+        && data.createdAt is timestamp
+        && data.updatedAt is timestamp;
+    }
+
+    function isValidCompanyInvoiceItem(data, companyId, invoiceId, itemId) {
+      return data.keys().hasAll([
+          'id', 'invoiceId', 'companyId', 'companyOwnerUid', 'code', 'description', 'unit', 'qty',
+          'unitPrice', 'discountPct', 'ivaRate', 'lineGross', 'lineNet',
+          'lineBase', 'lineTax', 'lineTotal', 'createdAt'
+        ])
+        && data.keys().hasOnly([
+          'id', 'invoiceId', 'companyId', 'companyOwnerUid', 'code', 'description', 'unit', 'qty',
+          'unitPrice', 'discountPct', 'ivaRate', 'lineGross', 'lineNet',
+          'lineBase', 'lineTax', 'lineTotal', 'createdAt'
+        ])
+        && data.id is string && data.id == itemId && isValidId(data.id)
+        && data.invoiceId is string && data.invoiceId == invoiceId && isValidId(data.invoiceId)
+        && data.companyId is string && data.companyId == companyId && isValidId(data.companyId)
+        && data.companyOwnerUid is string && isValidId(data.companyOwnerUid)
+        && data.code is string && data.code.size() >= 1 && data.code.size() <= 32
+        && data.description is string && data.description.size() >= 1 && data.description.size() <= 160
+        && data.unit is string && data.unit.size() >= 1 && data.unit.size() <= 16
+        && data.qty is number && data.qty > 0 && data.qty <= 100000
+        && data.unitPrice is number && data.unitPrice >= 0 && data.unitPrice <= 999999999
+        && data.discountPct is number && data.discountPct >= 0 && data.discountPct <= 100
+        && data.ivaRate is number && (data.ivaRate == 0 || data.ivaRate == 14)
+        && data.lineGross is number && data.lineGross >= 0
+        && data.lineNet is number && data.lineNet >= 0
+        && data.lineBase is number && data.lineBase >= 0
+        && data.lineTax is number && data.lineTax >= 0
+        && data.lineTotal is number && data.lineTotal >= 0
+        && data.createdAt is timestamp;
+    }
+
+    function isValidCompanySettings(data, companyId) {
+      return data.keys().hasAll([
+          'companyId', 'companyOwnerUid', 'updatedByUid', 'legalName', 'shortName', 'nif',
+          'address', 'cityCountry', 'phone', 'email', 'tagline', 'defaultCashier', 'defaultOperator',
+          'defaultFormat', 'defaultDocType', 'defaultNotes', 'autoPrintOnEmit', 'updatedAt'
+        ])
+        && data.keys().hasOnly([
+          'companyId', 'companyOwnerUid', 'updatedByUid', 'legalName', 'shortName', 'nif',
+          'address', 'cityCountry', 'phone', 'email', 'tagline', 'defaultCashier', 'defaultOperator',
+          'defaultFormat', 'defaultDocType', 'defaultNotes', 'autoPrintOnEmit', 'updatedAt'
+        ])
+        && data.companyId is string && data.companyId == companyId && isValidId(data.companyId)
+        && data.companyOwnerUid is string && isValidId(data.companyOwnerUid)
+        && data.updatedByUid is string && data.updatedByUid == request.auth.uid && isValidId(data.updatedByUid)
+        && data.legalName is string && data.legalName.size() >= 1 && data.legalName.size() <= 160
+        && data.shortName is string && data.shortName.size() >= 1 && data.shortName.size() <= 64
+        && data.nif is string && data.nif.size() >= 1 && data.nif.size() <= 32
+        && data.address is string && data.address.size() >= 1 && data.address.size() <= 160
+        && data.cityCountry is string && data.cityCountry.size() >= 1 && data.cityCountry.size() <= 80
+        && data.phone is string && data.phone.size() <= 40
+        && data.email is string && data.email.size() <= 120
+        && data.tagline is string && data.tagline.size() <= 120
+        && data.defaultCashier is string && data.defaultCashier.size() >= 1 && data.defaultCashier.size() <= 16
+        && data.defaultOperator is string && data.defaultOperator.size() >= 1 && data.defaultOperator.size() <= 32
+        && data.defaultFormat is string && (data.defaultFormat == 'POS' || data.defaultFormat == 'A4')
+        && data.defaultDocType is string && (data.defaultDocType == 'FR' || data.defaultDocType == 'FP')
+        && data.defaultNotes is string && data.defaultNotes.size() <= 300
+        && data.autoPrintOnEmit is bool
+        && data.updatedAt is timestamp;
+    }
+
+    // ==================== LEGACY COLLECTIONS (/users/{userId}/...) ====================
+
     match /users/{userId}/products/{productId} {
       allow get: if isVerifiedOwner(userId)
         && isValidId(userId)
@@ -185,7 +543,6 @@ service cloud.firestore {
         && incoming().createdAt == existing().createdAt
         && incoming().updatedAt == request.time
         && (
-          // Action: Edit catalog product details
           incoming().diff(existing()).affectedKeys().hasOnly([
             'code', 'name', 'category', 'unit', 'price', 'ivaRate', 'exemptionReason', 'active', 'updatedAt'
           ])
@@ -197,7 +554,6 @@ service cloud.firestore {
         && existing().ownerId == request.auth.uid;
     }
 
-    // Collection: /users/{userId}/customers/{customerId}
     match /users/{userId}/customers/{customerId} {
       allow get: if isVerifiedOwner(userId)
         && isValidId(userId)
@@ -224,7 +580,6 @@ service cloud.firestore {
         && incoming().createdAt == existing().createdAt
         && incoming().updatedAt == request.time
         && (
-          // Action: Edit customer public/fiscal details
           incoming().diff(existing()).affectedKeys().hasOnly([
             'name', 'nif', 'locality', 'updatedAt'
           ])
@@ -235,7 +590,6 @@ service cloud.firestore {
         && isValidId(customerId)
         && existing().ownerId == request.auth.uid;
 
-      // Subcollection (Split PII): /users/{userId}/customers/{customerId}/private/{docId}
       match /private/{docId} {
         allow get: if isVerifiedOwner(userId)
           && isValidId(userId)
@@ -274,7 +628,6 @@ service cloud.firestore {
       }
     }
 
-    // Collection: /users/{userId}/invoices/{invoiceId}
     match /users/{userId}/invoices/{invoiceId} {
       allow get: if isVerifiedOwner(userId)
         && isValidId(userId)
@@ -303,14 +656,12 @@ service cloud.firestore {
         && existing().status != 'cancelled'
         && incoming().updatedAt == request.time
         && (
-          // Action: Cancel an issued invoice (Terminal State Transition)
           incoming().status == 'cancelled'
           && incoming().diff(existing()).affectedKeys().hasOnly(['status', 'updatedAt'])
         );
 
       allow delete: if false;
 
-      // Subcollection: /users/{userId}/invoices/{invoiceId}/items/{itemId}
       match /items/{itemId} {
         allow get: if isVerifiedOwner(userId)
           && isValidId(userId)
@@ -335,37 +686,6 @@ service cloud.firestore {
       }
     }
 
-    // Validation Blueprint: AppSettings
-    function isValidAppSettings(data) {
-      return data.keys().hasAll([
-          'ownerId', 'legalName', 'shortName', 'nif', 'address', 'cityCountry',
-          'phone', 'email', 'tagline', 'defaultCashier', 'defaultOperator',
-          'defaultFormat', 'defaultDocType', 'defaultNotes', 'autoPrintOnEmit', 'updatedAt'
-        ])
-        && data.keys().hasOnly([
-          'ownerId', 'legalName', 'shortName', 'nif', 'address', 'cityCountry',
-          'phone', 'email', 'tagline', 'defaultCashier', 'defaultOperator',
-          'defaultFormat', 'defaultDocType', 'defaultNotes', 'autoPrintOnEmit', 'updatedAt'
-        ])
-        && data.ownerId is string && data.ownerId == request.auth.uid && isValidId(data.ownerId)
-        && data.legalName is string && data.legalName.size() >= 1 && data.legalName.size() <= 160
-        && data.shortName is string && data.shortName.size() >= 1 && data.shortName.size() <= 64
-        && data.nif is string && data.nif.size() >= 1 && data.nif.size() <= 32
-        && data.address is string && data.address.size() >= 1 && data.address.size() <= 160
-        && data.cityCountry is string && data.cityCountry.size() >= 1 && data.cityCountry.size() <= 80
-        && data.phone is string && data.phone.size() <= 40
-        && data.email is string && data.email.size() <= 120
-        && data.tagline is string && data.tagline.size() <= 120
-        && data.defaultCashier is string && data.defaultCashier.size() >= 1 && data.defaultCashier.size() <= 16
-        && data.defaultOperator is string && data.defaultOperator.size() >= 1 && data.defaultOperator.size() <= 32
-        && data.defaultFormat is string && (data.defaultFormat == 'POS' || data.defaultFormat == 'A4')
-        && data.defaultDocType is string && (data.defaultDocType == 'FR' || data.defaultDocType == 'FP')
-        && data.defaultNotes is string && data.defaultNotes.size() <= 300
-        && data.autoPrintOnEmit is bool
-        && data.updatedAt is timestamp;
-    }
-
-    // Collection: /users/{userId}/settings/{settingId}
     match /users/{userId}/settings/{settingId} {
       allow get: if isVerifiedOwner(userId)
         && isValidId(userId)
@@ -396,7 +716,6 @@ service cloud.firestore {
       allow delete: if false;
     }
 
-    // Collection (System-Only Writes): /users/{userId}/audit_logs/{invoiceId}
     match /users/{userId}/audit_logs/{invoiceId} {
       allow get: if isVerifiedOwner(userId)
         && isValidId(userId)
@@ -406,8 +725,486 @@ service cloud.firestore {
       allow list: if isVerifiedOwner(userId)
         && existing().ownerId == request.auth.uid;
 
-      // Escrita exclusiva pelo servidor administrativo (Firebase Admin SDK via /api/audit/invoices)
       allow create, update, delete: if false;
+    }
+
+    match /users/{userId}/company_links/{companyId} {
+      allow get: if isVerifiedOwner(userId)
+        && isValidId(userId)
+        && isValidId(companyId)
+        && existing().uid == request.auth.uid;
+
+      allow list: if isVerifiedOwner(userId)
+        && existing().uid == request.auth.uid;
+
+      allow create: if isVerifiedOwner(userId)
+        && isValidId(userId)
+        && isValidId(companyId)
+        && isValidUserCompanyLink(incoming(), companyId)
+        && incoming().updatedAt == request.time
+        && existsAfter(/databases/$(database)/documents/companies/$(companyId))
+        && getAfter(/databases/$(database)/documents/companies/$(companyId)).data.ownerUid == request.auth.uid;
+
+      allow update: if isVerifiedOwner(userId)
+        && isValidId(userId)
+        && isValidId(companyId)
+        && isValidUserCompanyLink(incoming(), companyId)
+        && existing().uid == request.auth.uid
+        && incoming().uid == existing().uid
+        && incoming().companyId == existing().companyId
+        && incoming().updatedAt == request.time
+        && (
+          incoming().diff(existing()).affectedKeys().hasOnly([
+            'role', 'shortName', 'nif', 'normalizedNif', 'updatedAt'
+          ])
+        );
+
+      allow delete: if isVerifiedOwner(userId)
+        && isValidId(userId)
+        && isValidId(companyId)
+        && existing().uid == request.auth.uid;
+    }
+
+    // ==================== PLATFORM MASTER COLLECTIONS ====================
+
+    match /platform_admins/{adminUid} {
+      allow get: if isVerifiedOwner(adminUid) && isValidId(adminUid) || (isValidId(adminUid) && isPlatformAdmin());
+      allow list, create, update, delete: if false;
+    }
+
+    match /platform_audit_logs/{logId} {
+      allow get: if isValidId(logId) && isPlatformAdmin();
+      allow list, create, update, delete: if false;
+    }
+
+    // ==================== GLOBAL UNIQUE NIF REGISTRY (1 NIF = 1 EMPRESA) ====================
+
+    match /company_nifs/{normalizedNif} {
+      allow get: if isVerifiedUser()
+        && isValidNifId(normalizedNif)
+        && (existing().ownerUid == request.auth.uid || isPlatformAdmin());
+
+      allow list: if false;
+
+      allow create: if isVerifiedUser()
+        && isValidNifId(normalizedNif)
+        && isValidCompanyNifRegistry(incoming(), normalizedNif)
+        && incoming().createdAt == request.time
+        && incoming().updatedAt == request.time
+        && existsAfter(/databases/$(database)/documents/companies/$(incoming().companyId))
+        && getAfter(/databases/$(database)/documents/companies/$(incoming().companyId)).data.normalizedNif == normalizedNif
+        && getAfter(/databases/$(database)/documents/companies/$(incoming().companyId)).data.ownerUid == request.auth.uid;
+
+      allow update: if isVerifiedUser()
+        && isValidNifId(normalizedNif)
+        && isValidCompanyNifRegistry(incoming(), normalizedNif)
+        && existing().ownerUid == request.auth.uid
+        && incoming().ownerUid == existing().ownerUid
+        && incoming().companyId == existing().companyId
+        && incoming().normalizedNif == existing().normalizedNif
+        && incoming().createdAt == existing().createdAt
+        && incoming().updatedAt == request.time
+        && (
+          incoming().diff(existing()).affectedKeys().hasOnly(['shortName', 'updatedAt'])
+        );
+
+      allow delete: if false;
+    }
+
+    // ==================== MULTI-COMPANY ISOLATION & RBAC (/companies/{companyId}/...) ====================
+
+    match /companies/{companyId} {
+      allow get: if isVerifiedUser()
+        && isValidId(companyId)
+        && (existing().ownerUid == request.auth.uid || isCompanyAnyActiveRole(companyId) || isPlatformAdmin());
+
+      allow list: if isVerifiedUser()
+        && existing().ownerUid == request.auth.uid;
+
+      allow create: if isVerifiedUser()
+        && isValidId(companyId)
+        && isValidCompany(incoming(), companyId)
+        && incoming().ownerUid == request.auth.uid
+        && incoming().status == 'active'
+        && incoming().planTier == 'FREE'
+        && incoming().commercialActive == false
+        && incoming().createdAt == request.time
+        && incoming().updatedAt == request.time
+        && existsAfter(/databases/$(database)/documents/company_nifs/$(incoming().normalizedNif))
+        && getAfter(/databases/$(database)/documents/company_nifs/$(incoming().normalizedNif)).data.companyId == companyId
+        && existsAfter(/databases/$(database)/documents/companies/$(companyId)/members/$(request.auth.uid));
+
+      allow update: if isVerifiedUser()
+        && isValidId(companyId)
+        && isValidCompany(incoming(), companyId)
+        && incoming().id == existing().id
+        && incoming().ownerUid == existing().ownerUid
+        && incoming().normalizedNif == existing().normalizedNif
+        && incoming().nif == existing().nif
+        && incoming().baseSequence == existing().baseSequence
+        && incoming().createdAt == existing().createdAt
+        && incoming().updatedAt == request.time
+        && (
+          // Action 1: Owner updates operational/identity details of an active company
+          (
+            existing().status == 'active'
+            && isCompanyOwner(companyId)
+            && incoming().status == existing().status
+            && incoming().planTier == existing().planTier
+            && incoming().commercialActive == existing().commercialActive
+            && incoming().diff(existing()).affectedKeys().hasOnly([
+              'legalName', 'shortName', 'address', 'cityCountry',
+              'phone', 'email', 'tagline', 'allowManagerCancel', 'updatedAt'
+            ])
+          )
+          // Action 2: Platform Master Admin toggles operational status or prepares commercial plan
+          || (
+            isPlatformAdmin()
+            && incoming().diff(existing()).affectedKeys().hasOnly([
+              'status', 'planTier', 'commercialActive', 'updatedAt'
+            ])
+          )
+        );
+
+      allow delete: if false;
+
+      // Subcollection: /companies/{companyId}/members/{memberId}
+      match /members/{memberId} {
+        allow get: if isVerifiedUser()
+          && isValidId(companyId)
+          && isValidId(memberId)
+          && (memberId == request.auth.uid || isCompanyOwnerOrManager(companyId) || isPlatformAdmin());
+
+        allow list: if isVerifiedUser()
+          && existing().companyId == companyId
+          && existing().companyOwnerUid == request.auth.uid;
+
+        allow create: if isVerifiedUser()
+          && isValidId(companyId)
+          && isValidId(memberId)
+          && isValidCompanyMember(incoming(), companyId, memberId)
+          && incoming().createdAt == request.time
+          && incoming().updatedAt == request.time
+          && (
+            // Bootstrap do proprietário no mesmo lote de criação da empresa
+            (
+              memberId == request.auth.uid
+              && incoming().uid == request.auth.uid
+              && incoming().companyOwnerUid == request.auth.uid
+              && incoming().role == 'owner'
+              && existsAfter(/databases/$(database)/documents/companies/$(companyId))
+              && getAfter(/databases/$(database)/documents/companies/$(companyId)).data.ownerUid == request.auth.uid
+            )
+            // Proprietário adiciona gerente ou operador de caixa
+            || (
+              isCompanyOperational(companyId)
+              && isCompanyOwner(companyId)
+              && incoming().companyOwnerUid == companyDocData(companyId).ownerUid
+              && (incoming().role == 'manager' || incoming().role == 'cashier')
+            )
+          );
+
+        allow update: if isVerifiedUser()
+          && isValidId(companyId)
+          && isValidId(memberId)
+          && isValidCompanyMember(incoming(), companyId, memberId)
+          && incoming().id == existing().id
+          && incoming().companyId == existing().companyId
+          && incoming().companyOwnerUid == existing().companyOwnerUid
+          && incoming().uid == existing().uid
+          && incoming().createdAt == existing().createdAt
+          && incoming().updatedAt == request.time
+          && isCompanyOperational(companyId)
+          && isCompanyOwner(companyId)
+          && (
+            (
+              existing().role != 'owner'
+              && (incoming().role == 'manager' || incoming().role == 'cashier')
+              && incoming().diff(existing()).affectedKeys().hasOnly([
+                'displayName', 'role', 'allowInvoiceCancel', 'active', 'updatedAt'
+              ])
+            )
+            || isPlatformAdmin()
+          );
+
+        allow delete: if isVerifiedUser()
+          && isValidId(companyId)
+          && isValidId(memberId)
+          && existing().role != 'owner'
+          && isCompanyOperational(companyId)
+          && isCompanyOwner(companyId);
+      }
+
+      // Subcollection: /companies/{companyId}/products/{productId}
+      match /products/{productId} {
+        allow get: if isVerifiedUser()
+          && isValidId(companyId)
+          && isValidId(productId)
+          && (isCompanyAnyActiveRole(companyId) || isPlatformAdmin());
+
+        allow list: if isVerifiedUser()
+          && existing().companyId == companyId
+          && existing().companyOwnerUid == request.auth.uid;
+
+        allow create: if isVerifiedUser()
+          && isValidId(companyId)
+          && isValidId(productId)
+          && isValidCompanyProduct(incoming(), companyId, productId)
+          && incoming().createdAt == request.time
+          && incoming().updatedAt == request.time
+          && isCompanyOperational(companyId)
+          && isCompanyOwnerOrManager(companyId)
+          && incoming().companyOwnerUid == companyDocData(companyId).ownerUid;
+
+        allow update: if isVerifiedUser()
+          && isValidId(companyId)
+          && isValidId(productId)
+          && isValidCompanyProduct(incoming(), companyId, productId)
+          && incoming().id == existing().id
+          && incoming().companyId == existing().companyId
+          && incoming().companyOwnerUid == existing().companyOwnerUid
+          && incoming().createdAt == existing().createdAt
+          && incoming().updatedAt == request.time
+          && (
+            (
+              isCompanyOperational(companyId)
+              && isCompanyOwnerOrManager(companyId)
+              && incoming().diff(existing()).affectedKeys().hasOnly([
+                'updatedByUid', 'code', 'name', 'category', 'unit', 'price',
+                'ivaRate', 'exemptionReason', 'active', 'updatedAt'
+              ])
+            )
+            || isPlatformAdmin()
+          );
+
+        allow delete: if isVerifiedUser()
+          && isValidId(companyId)
+          && isValidId(productId)
+          && isCompanyOperational(companyId)
+          && isCompanyOwnerOrManager(companyId);
+      }
+
+      // Subcollection: /companies/{companyId}/customers/{customerId}
+      match /customers/{customerId} {
+        allow get: if isVerifiedUser()
+          && isValidId(companyId)
+          && isValidId(customerId)
+          && (isCompanyAnyActiveRole(companyId) || isPlatformAdmin());
+
+        allow list: if isVerifiedUser()
+          && existing().companyId == companyId
+          && existing().companyOwnerUid == request.auth.uid;
+
+        // Owner, Manager e Cashier podem criar cliente rápido durante a emissão
+        allow create: if isVerifiedUser()
+          && isValidId(companyId)
+          && isValidId(customerId)
+          && isValidCompanyCustomer(incoming(), companyId, customerId)
+          && incoming().createdAt == request.time
+          && incoming().updatedAt == request.time
+          && isCompanyOperational(companyId)
+          && isCompanyAnyActiveRole(companyId)
+          && incoming().companyOwnerUid == companyDocData(companyId).ownerUid;
+
+        // Edição de cliente existente restrita a Owner e Manager
+        allow update: if isVerifiedUser()
+          && isValidId(companyId)
+          && isValidId(customerId)
+          && isValidCompanyCustomer(incoming(), companyId, customerId)
+          && incoming().id == existing().id
+          && incoming().companyId == existing().companyId
+          && incoming().companyOwnerUid == existing().companyOwnerUid
+          && incoming().createdAt == existing().createdAt
+          && incoming().updatedAt == request.time
+          && (
+            (
+              isCompanyOperational(companyId)
+              && isCompanyOwnerOrManager(companyId)
+              && incoming().diff(existing()).affectedKeys().hasOnly([
+                'updatedByUid', 'name', 'nif', 'locality', 'updatedAt'
+              ])
+            )
+            || isPlatformAdmin()
+          );
+
+        allow delete: if isVerifiedUser()
+          && isValidId(companyId)
+          && isValidId(customerId)
+          && isCompanyOperational(companyId)
+          && isCompanyOwnerOrManager(companyId);
+
+        // PII Split Subcollection: /companies/{companyId}/customers/{customerId}/private/{docId}
+        match /private/{docId} {
+          allow get: if isVerifiedUser()
+            && isValidId(companyId)
+            && isValidId(customerId)
+            && docId == 'contact'
+            && (isCompanyOwnerOrManager(companyId) || isPlatformAdmin());
+
+          allow create: if isVerifiedUser()
+            && isValidId(companyId)
+            && isValidId(customerId)
+            && docId == 'contact'
+            && isValidCompanyCustomerPrivate(incoming(), companyId)
+            && incoming().updatedAt == request.time
+            && isCompanyOperational(companyId)
+            && isCompanyAnyActiveRole(companyId)
+            && incoming().companyOwnerUid == companyDocData(companyId).ownerUid
+            && existsAfter(/databases/$(database)/documents/companies/$(companyId)/customers/$(customerId));
+
+          allow update: if isVerifiedUser()
+            && isValidId(companyId)
+            && isValidId(customerId)
+            && docId == 'contact'
+            && isValidCompanyCustomerPrivate(incoming(), companyId)
+            && incoming().companyId == existing().companyId
+            && incoming().companyOwnerUid == existing().companyOwnerUid
+            && incoming().updatedAt == request.time
+            && (
+              (
+                isCompanyOperational(companyId)
+                && isCompanyOwnerOrManager(companyId)
+                && incoming().diff(existing()).affectedKeys().hasOnly([
+                  'updatedByUid', 'phone', 'address', 'updatedAt'
+                ])
+              )
+              || isPlatformAdmin()
+            );
+
+          allow delete: if isVerifiedUser()
+            && isValidId(companyId)
+            && isValidId(customerId)
+            && docId == 'contact'
+            && isCompanyOperational(companyId)
+            && isCompanyOwnerOrManager(companyId);
+        }
+      }
+
+      // Subcollection: /companies/{companyId}/invoices/{invoiceId}
+      match /invoices/{invoiceId} {
+        allow get: if isVerifiedUser()
+          && isValidId(companyId)
+          && isValidId(invoiceId)
+          && (isCompanyAnyActiveRole(companyId) || isPlatformAdmin());
+
+        allow list: if isVerifiedUser()
+          && existing().companyId == companyId
+          && existing().companyOwnerUid == request.auth.uid;
+
+        allow create: if isVerifiedUser()
+          && isValidId(companyId)
+          && isValidId(invoiceId)
+          && isValidCompanyInvoice(incoming(), companyId, invoiceId)
+          && incoming().status == 'issued'
+          && incoming().emittedByUid == request.auth.uid
+          && incoming().createdAt == request.time
+          && incoming().updatedAt == request.time
+          && isCompanyOperational(companyId)
+          && isCompanyAnyActiveRole(companyId)
+          && incoming().companyOwnerUid == companyDocData(companyId).ownerUid;
+
+        // Terminal State Locking: apenas transição única issued -> cancelled com justificação obrigatória
+        allow update: if isVerifiedUser()
+          && isValidId(companyId)
+          && isValidId(invoiceId)
+          && isValidCompanyInvoice(incoming(), companyId, invoiceId)
+          && incoming().id == existing().id
+          && incoming().companyId == existing().companyId
+          && incoming().companyOwnerUid == existing().companyOwnerUid
+          && incoming().emittedByUid == existing().emittedByUid
+          && incoming().createdAt == existing().createdAt
+          && existing().status != 'cancelled'
+          && incoming().updatedAt == request.time
+          && (
+            (
+              canCancelCompanyInvoice(companyId)
+              && incoming().status == 'cancelled'
+              && ('cancelReason' in incoming())
+              && incoming().cancelReason is string
+              && incoming().cancelReason.size() >= 4
+              && incoming().diff(existing()).affectedKeys().hasOnly([
+                'status', 'cancelReason', 'cancelledBy', 'updatedAt'
+              ])
+            )
+            || isPlatformAdmin()
+          );
+
+        allow delete: if false;
+
+        match /items/{itemId} {
+          allow get: if isVerifiedUser()
+            && isValidId(companyId)
+            && isValidId(invoiceId)
+            && isValidId(itemId)
+            && (isCompanyAnyActiveRole(companyId) || isPlatformAdmin());
+
+          allow list: if isVerifiedUser()
+            && existing().companyId == companyId
+            && existing().companyOwnerUid == request.auth.uid;
+
+          allow create: if isVerifiedUser()
+            && isValidId(companyId)
+            && isValidId(invoiceId)
+            && isValidId(itemId)
+            && isValidCompanyInvoiceItem(incoming(), companyId, invoiceId, itemId)
+            && incoming().createdAt == request.time
+            && isCompanyOperational(companyId)
+            && isCompanyAnyActiveRole(companyId)
+            && existsAfter(/databases/$(database)/documents/companies/$(companyId)/invoices/$(invoiceId));
+
+          allow update, delete: if false;
+        }
+      }
+
+      // Subcollection: /companies/{companyId}/settings/{settingId}
+      match /settings/{settingId} {
+        allow get: if isVerifiedUser()
+          && isValidId(companyId)
+          && settingId == 'general'
+          && (isCompanyAnyActiveRole(companyId) || isPlatformAdmin());
+
+        allow create: if isVerifiedUser()
+          && isValidId(companyId)
+          && settingId == 'general'
+          && isValidCompanySettings(incoming(), companyId)
+          && incoming().updatedAt == request.time
+          && isCompanyOperational(companyId)
+          && isCompanyOwner(companyId)
+          && incoming().companyOwnerUid == companyDocData(companyId).ownerUid;
+
+        allow update: if isVerifiedUser()
+          && isValidId(companyId)
+          && settingId == 'general'
+          && isValidCompanySettings(incoming(), companyId)
+          && incoming().companyId == existing().companyId
+          && incoming().companyOwnerUid == existing().companyOwnerUid
+          && incoming().nif == existing().nif
+          && incoming().updatedAt == request.time
+          && (
+            (
+              isCompanyOperational(companyId)
+              && isCompanyOwner(companyId)
+              && incoming().diff(existing()).affectedKeys().hasOnly([
+                'updatedByUid', 'legalName', 'shortName', 'address', 'cityCountry',
+                'phone', 'email', 'tagline', 'defaultCashier', 'defaultOperator',
+                'defaultFormat', 'defaultDocType', 'defaultNotes', 'autoPrintOnEmit', 'updatedAt'
+              ])
+            )
+            || isPlatformAdmin()
+          );
+
+        allow delete: if false;
+      }
+
+      // Subcollection (System-Only Writes): /companies/{companyId}/audit_logs/{logId}
+      match /audit_logs/{logId} {
+        allow get: if isVerifiedUser()
+          && isValidId(companyId)
+          && isValidId(logId)
+          && (isCompanyOwner(companyId) || isPlatformAdmin());
+
+        allow list, create, update, delete: if false;
+      }
     }
   }
 }

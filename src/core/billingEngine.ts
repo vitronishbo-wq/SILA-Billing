@@ -108,10 +108,14 @@ export function calculateInvoiceTotals(draftItems: CartDraftItem[]): InvoiceTota
   };
 }
 
-export function generateNextInvoiceNumber(existingNumbers: string[], docType: 'FR' | 'FP'): string {
+export function generateNextInvoiceNumber(
+  existingNumbers: string[],
+  docType: 'FR' | 'FP',
+  baseSequence = 0
+): string {
   const year = new Date().getFullYear();
   const prefix = docType === 'FP' ? `FP ${year}/` : `FV ${year}/`;
-  let maxSeq = 15678;
+  let maxSeq = Math.max(0, Math.floor(baseSequence));
 
   for (const num of existingNumbers) {
     const match = num.match(/\/(\d+)$/);
