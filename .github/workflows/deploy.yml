@@ -23,7 +23,7 @@ jobs:
           bun install
           bun run build
 
-      - name: Gravar e Validar Credenciais do Firebase Service Account
+      - name: Gravar Credenciais do Firebase Service Account
         shell: bash
         env:
           FIREBASE_SA_JSON: ${{ secrets.FIREBASE_SERVICE_ACCOUNT_ID }}
@@ -31,70 +31,34 @@ jobs:
         run: |
           node -e '
           const fs = require("node:fs");
-          const crypto = require("node:crypto");
           let raw = (process.env.FIREBASE_SA_JSON || "").trim();
           if (!raw) {
             console.error("::error::Secret Firebase ausente.");
             process.exit(1);
           }
-          function parseCredentials(value) {
-            let candidate = value.trim();
-            for (let i = 0; i < 3; i++) {
-              try {
-                const parsed = JSON.parse(candidate);
-                if (typeof parsed === "string") {
-                  candidate = parsed.trim();
-                  continue;
-                }
-                if (parsed && typeof parsed === "object" && !Array.isArray(parsed)) {
-                  return parsed;
-                }
-                throw new Error("Formato JSON inesperado.");
-              } catch (err) {
-                if (i === 0 && !candidate.startsWith("{")) {
-                  const decoded = Buffer.from(
-                    candidate.replace(/\s+/g, "").replace(/-/g, "+").replace(/_/g, "/"),
-                    "base64"
-                  ).toString("utf8").trim();
-                  if (decoded && decoded !== candidate) {
-                    candidate = decoded;
-                    continue;
-                  }
-                }
-                throw new Error("Secret nao contem JSON valido.");
-              }
-            }
-            throw new Error("Secret demasiado aninhado.");
-          }
           let credentials;
           try {
-            credentials = parseCredentials(raw);
+            credentials = JSON.parse(raw);
+            if (typeof credentials === "string") {
+              credentials = JSON.parse(credentials);
+            }
           } catch (err) {
-            console.error(`::error::${err.message}`);
+            console.error(`::error::Secret não contém um JSON válido: ${err.message}`);
             process.exit(1);
           }
-          if (credentials.type !== "service_account" || typeof credentials.project_id !== "string" || typeof credentials.client_email !== "string" || typeof credentials.private_key !== "string") {
-            console.error("::error::Credenciais incompletas ou invalidas.");
+          if (credentials.type !== "service_account" || !credentials.project_id || !credentials.private_key) {
+            console.error("::error::Credenciais incompletas ou inválidas.");
             process.exit(1);
           }
           credentials.private_key = credentials.private_key.replace(/\\n/g, "\n");
           try {
-            const key = crypto.createPrivateKey(credentials.private_key);
-            if (key.asymmetricKeyType !== "rsa") {
-              throw new Error("Chave RSA esperada.");
-            }
-          } catch {
-            console.error("::error::Chave privada invalida.");
-            process.exit(1);
-          }
-          try {
-            fs.writeFileSync(process.env.KEY_OUT, JSON.stringify(credentials), { mode: 0o600, flag: "w" });
+            fs.writeFileSync(process.env.KEY_OUT, JSON.stringify(credentials), { mode: 0o600 });
             fs.appendFileSync(process.env.GITHUB_ENV, `GOOGLE_APPLICATION_CREDENTIALS=${process.env.KEY_OUT}\n`);
-          } catch {
-            console.error("::error::Falha ao guardar as credenciais.");
+            console.log("Credenciais Firebase gravadas com sucesso.");
+          } catch (err) {
+            console.error(`::error::Falha ao guardar as credenciais: ${err.message}`);
             process.exit(1);
           }
-          console.log("Credenciais Firebase validadas com sucesso.");
           '
 
       - name: Deploy para o Firebase Hosting e Regras do Firestore
