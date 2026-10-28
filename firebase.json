@@ -4,6 +4,7 @@
     "rules": "firestore.rules"
   },
   "hosting": {
+    "site": "silabilling",
     "public": "dist",
     "ignore": [
       "firebase.json",

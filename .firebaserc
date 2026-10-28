@@ -1,5 +1,14 @@
 {
   "projects": {
     "default": "gen-lang-client-0982515821"
+  },
+  "targets": {
+    "gen-lang-client-0982515821": {
+      "hosting": {
+        "silabilling": [
+          "silabilling"
+        ]
+      }
+    }
   }
 }
