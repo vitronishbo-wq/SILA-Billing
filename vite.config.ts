@@ -1,22 +1,27 @@
 import tailwindcss from '@tailwindcss/vite';
-import react from '@vitejs/plugin-react';
 import path from 'path';
-import {defineConfig} from 'vite';
-import {VitePWA} from 'vite-plugin-pwa';
+import { defineConfig } from 'vite';
+import { VitePWA } from 'vite-plugin-pwa';
 
 export default defineConfig(() => {
   return {
     plugins: [
-      react(),
       tailwindcss(),
       VitePWA({
         registerType: 'autoUpdate',
-        includeAssets: ['icon.svg', 'apple-touch-icon.png', 'pwa-192x192.png', 'pwa-512x512.png', 'pwa-maskable-512x512.png'],
+        includeAssets: [
+          'icon.svg',
+          'apple-touch-icon.png',
+          'pwa-192x192.png',
+          'pwa-512x512.png',
+          'pwa-maskable-512x512.png',
+        ],
         manifest: {
           id: '/',
           name: 'SILA-Billing — JAIMONA',
           short_name: 'SILA-Billing',
-          description: 'Sistema de faturação POS térmico e A4 offline-first para JAIMONA-COMÉRCIO E SERVIÇOS, (SU) LDA.',
+          description:
+            'Sistema de faturação POS térmico e A4 offline-first para JAIMONA-COMÉRCIO E SERVIÇOS, (SU) LDA.',
           theme_color: '#0F172A',
           background_color: '#F8FAFC',
           display: 'standalone',
@@ -82,9 +87,12 @@ export default defineConfig(() => {
         },
       }),
     ],
+    build: {
+      chunkSizeWarningLimit: 1000,
+    },
     resolve: {
       alias: {
-        '@': path.resolve(__dirname, '.'),
+        '@': path.resolve(import.meta.dirname, '.'),
       },
     },
     server: {

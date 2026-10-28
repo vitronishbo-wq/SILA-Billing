@@ -1,7 +1,14 @@
-import { InvoiceRecord } from '../../src/core/types';
-import { auth } from '../../src/services/firebaseClient';
+import type { InvoiceRecord } from '../../src/core/types.ts';
+import { auth } from '../../src/services/firebaseClient.ts';
 
-const API_BASE = (import.meta.env.VITE_API_BASE_URL || '').replace(/\/$/, '');
+function resolveApiBaseUrl(): string {
+  const raw = typeof import.meta !== 'undefined' && import.meta.env
+    ? String(import.meta.env.VITE_API_BASE_URL || '')
+    : '';
+  return raw.trim().replace(/\/+$/, '').replace(/\/api$/i, '');
+}
+
+const API_BASE = resolveApiBaseUrl();
 
 export interface BackendHealthStatus {
   ok: boolean;
