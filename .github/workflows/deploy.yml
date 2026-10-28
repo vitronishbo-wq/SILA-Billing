@@ -61,9 +61,13 @@ jobs:
           }
           '
 
+      - name: Provisionar Canal Hosting (Obrigatorio para Projetos Novos)
+        run: |
+          npx --yes firebase-tools@15.34.0 hosting:sites:create gen-lang-client-0982515821 || echo "Site já provisionado ou existente."
+
       - name: Deploy para o Firebase Hosting e Regras do Firestore
         run: |
-          npx --yes firebase-tools@latest deploy --only hosting,firestore:rules --project gen-lang-client-0982515821
+          npx --yes firebase-tools@15.34.0 deploy --only hosting,firestore:rules --project gen-lang-client-0982515821
 
       - name: Disparar Atualizacao Automatica no Render
         run: |
