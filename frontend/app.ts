@@ -21,8 +21,10 @@ import {
   getDirectCustomerIdForCompany,
   InvoiceRecord,
   isJaimonaOwnerEmail,
+  isPlatformAdminEmail,
   JAIMONA_COMPANY_ID,
   JAIMONA_OWNER_EMAIL,
+  normalizeCompanyNif,
   PaymentMethod,
   PlanTier,
   Product,
@@ -228,6 +230,7 @@ export class SilaBillingApp {
   private masterAdminSearch = '';
   private adminCloudCompanies: AdminCompanySummary[] = [];
   private adminAuditLogs: AdminAuditEntry[] = [];
+  private supportCompanyId: string | null = null;
 
   // Estado Configurações / Cloud / PWA
   private settingsSavedNotice = false;
@@ -257,6 +260,7 @@ export class SilaBillingApp {
     return {
       uid: this.user.uid,
       email: this.user.email,
+      supportCompanyId: this.supportCompanyId,
     };
   }
 
@@ -304,6 +308,7 @@ export class SilaBillingApp {
         this.masterAdminDenied = false;
         this.adminCloudCompanies = [];
         this.adminAuditLogs = [];
+        this.supportCompanyId = null;
         if (authChanged) {
           try {
             const localBundle = await bootstrapLocalStore(undefined, null);
@@ -420,10 +425,20 @@ export class SilaBillingApp {
     if (!this.user) {
       return 'owner';
     }
+    const emailLower = (this.user.email || '').trim().toLowerCase();
+    if (isPlatformAdminEmail(emailLower) && this.supportCompanyId === this.activeCompany.id) {
+      return 'owner';
+    }
     if (!this.activeCompany.ownerUid || this.activeCompany.ownerUid === this.user.uid) {
       return 'owner';
     }
-    const emailLower = (this.user.email || '').trim().toLowerCase();
+    const compOwnerEmail = (this.activeCompany.ownerEmail || '').trim().toLowerCase();
+    if (emailLower && compOwnerEmail && compOwnerEmail === emailLower) {
+      return 'owner';
+    }
+    if (this.activeCompany.id === JAIMONA_COMPANY_ID && isJaimonaOwnerEmail(emailLower)) {
+      return 'owner';
+    }
     const matched = this.members.find(
       (m) =>
         m.active &&
@@ -833,6 +848,9 @@ export class SilaBillingApp {
       }
       case 'switch-company': {
         if (id && id !== this.activeCompany.id) {
+          if (this.supportCompanyId && id !== this.supportCompanyId) {
+            this.supportCompanyId = null;
+          }
           await this.switchActiveCompany(id);
         } else {
           this.showCompanyDropdown = false;
@@ -925,17 +943,79 @@ export class SilaBillingApp {
         break;
       }
       case 'admin-support-switch': {
+        if (!id) break;
         const targetSummary = this.getMergedAdminCompanies().find((c) => c.id === id);
         if (this.user && this.isOnline && targetSummary) {
           void logPlatformSupportAccess(id, targetSummary.shortName);
         }
-        if (this.companies.some((c) => c.id === id)) {
-          this.showMasterAdminModal = false;
-          await this.switchActiveCompany(id);
-        } else {
-          this.masterAdminError =
-            'Acesso de suporte registado em auditoria. Esta empresa pertence a outro terminal na Cloud.';
-          this.render();
+
+        this.supportCompanyId = id;
+
+        // Se a empresa alvo ainda só existe na Cloud (e não é comp_jaimona, que já é tratada no workspace),
+        // materializa o registo base localmente para inspeção de suporte e descarrega os dados do Firestore
+        if (id !== JAIMONA_COMPANY_ID && targetSummary && !this.companies.some((c) => c.id === id)) {
+          const now = new Date().toISOString();
+          await localDb.saveCompany({
+            id: targetSummary.id,
+            normalizedNif:
+              targetSummary.normalizedNif || normalizeCompanyNif(targetSummary.nif || ''),
+            profile: {
+              legalName: targetSummary.legalName || targetSummary.shortName,
+              shortName: targetSummary.shortName,
+              nif: targetSummary.nif,
+              address: targetSummary.cityCountry || 'Angola',
+              cityCountry: targetSummary.cityCountry || 'Angola',
+              phone: '',
+              email: targetSummary.ownerEmail === 'Local (não vinculado)' ? '' : targetSummary.ownerEmail,
+              tagline: 'Obrigado pela preferência',
+            },
+            status: targetSummary.status,
+            plan: {
+              planTier: targetSummary.planTier,
+              commercialActive: targetSummary.commercialActive,
+              maxUsers: null,
+              maxInvoicesPerMonth: null,
+              updatedAtIso: now,
+            },
+            baseSequence: 0,
+            allowManagerCancel: false,
+            ownerEmail:
+              targetSummary.ownerEmail === 'Local (não vinculado)'
+                ? undefined
+                : targetSummary.ownerEmail,
+            syncState: 'synced',
+            synced: true,
+            createdAtIso: targetSummary.createdAtIso || now,
+            updatedAtIso: now,
+          });
+        }
+
+        this.showMasterAdminModal = false;
+        await this.switchActiveCompany(id);
+
+        if (this.user && this.isOnline) {
+          try {
+            const cloudData = await pullCompanyFromCloud(id);
+            if (cloudData) {
+              for (const cp of cloudData.products) {
+                await localDb.saveProduct(cp, id);
+              }
+              for (const cc of cloudData.customers) {
+                await localDb.saveCustomer(cc, id);
+              }
+              for (const ci of cloudData.invoices) {
+                await localDb.saveInvoice(ci, id);
+              }
+              if (cloudData.settings) {
+                await localDb.saveSettings(cloudData.settings, id).catch(() => null);
+              }
+              const refreshed = await loadCompanyWorkspace(id, this.getViewerIdentity());
+              this.applyWorkspaceBundle(refreshed);
+              this.render();
+            }
+          } catch {
+            // Mantém vista local disponível
+          }
         }
         break;
       }
@@ -1768,6 +1848,7 @@ export class SilaBillingApp {
           }
         }
 
+        this.supportCompanyId = null;
         await this.flushDraftNow();
         const bundle = await loadCompanyWorkspace(createdCompany.id, this.getViewerIdentity());
         this.applyWorkspaceBundle(bundle);

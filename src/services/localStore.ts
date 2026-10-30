@@ -59,6 +59,7 @@ export interface PreMulticompanySnapshot {
 export interface WorkspaceViewerIdentity {
   uid?: string | null;
   email?: string | null;
+  supportCompanyId?: string | null;
 }
 
 export interface CompanyWorkspaceBundle {
@@ -605,29 +606,41 @@ async function healOrphanCompanyRecordsOnce(): Promise<void> {
 function canViewerAccessTenant(
   company: CompanyRecord,
   allMembers: CompanyMember[],
-  viewer?: WorkspaceViewerIdentity | null
+  viewer?: WorkspaceViewerIdentity | null,
+  hasLegacyV1Upgrade = false
 ): boolean {
   const emailLower = String(viewer?.email || '').trim().toLowerCase();
   const uid = String(viewer?.uid || '').trim();
-
-  // Sem autenticação Cloud ativa: o operador no terminal local vê as empresas registadas neste dispositivo
-  if (!uid && !emailLower) {
-    return true;
-  }
-
-  // Super-Admin da plataforma SILA-Billing (wtmedia0@gmail.com) pode inspecionar qualquer empresa para suporte/testes
-  if (isPlatformAdminEmail(emailLower)) {
-    return true;
-  }
-
-  // Proprietário verificado por UID ou Email
-  if (uid && company.ownerUid && company.ownerUid === uid) {
-    return true;
-  }
-  const compOwnerEmail = String(company.ownerEmail || company.profile.email || '')
+  const supportCompanyId = String(viewer?.supportCompanyId || '').trim();
+  const compOwnerUid = String(company.ownerUid || '').trim();
+  const compOwnerEmail = String(company.ownerEmail || '')
     .trim()
     .toLowerCase();
+
+  // Sem autenticação Cloud ativa (aba anónima, navegador novo limpo ou após Logout):
+  // Apenas empresas criadas localmente neste próprio terminal sem titular Cloud atribuído são abertas.
+  // Empresas vinculadas a uma conta Cloud (incluindo comp_jaimona) exigem sessão autenticada.
+  if (!uid && !emailLower) {
+    if (company.id === JAIMONA_COMPANY_ID) {
+      return hasLegacyV1Upgrade;
+    }
+    return !compOwnerUid && !compOwnerEmail;
+  }
+
+  // Super-Admin da plataforma (wtmedia0@gmail.com) só entra em empresas de terceiros quando
+  // aciona explicitamente o modo de Suporte Técnico Auditado no Painel Master.
+  if (isPlatformAdminEmail(emailLower) && supportCompanyId && company.id === supportCompanyId) {
+    return true;
+  }
+
+  // Proprietário verificado por UID ou Email do titular
+  if (uid && compOwnerUid && compOwnerUid === uid) {
+    return true;
+  }
   if (emailLower && compOwnerEmail && compOwnerEmail === emailLower) {
+    return true;
+  }
+  if (company.id === JAIMONA_COMPANY_ID && isJaimonaOwnerEmail(emailLower)) {
     return true;
   }
 
@@ -642,16 +655,18 @@ function canViewerAccessTenant(
     return true;
   }
 
-  // Empresa criada localmente neste terminal ainda sem ownerUid nem ownerEmail atribuídos
-  // (exceto comp_jaimona, cujo titular explícito é jaimonacomercioeservicos@gmail.com)
-  if (!company.ownerUid && !compOwnerEmail && company.id !== JAIMONA_COMPANY_ID) {
+  // Empresa criada localmente neste terminal ainda antes do login (sem ownerUid nem ownerEmail),
+  // exceto comp_jaimona cujo titular explícito é jaimonacomercioeservicos@gmail.com
+  if (!compOwnerUid && !compOwnerEmail && company.id !== JAIMONA_COMPANY_ID) {
     return true;
   }
 
   return false;
 }
 
-export async function ensureJaimonaSeedTenantPresent(): Promise<void> {
+export async function ensureJaimonaSeedTenantPresent(options?: {
+  markSeedAsSynced?: boolean;
+}): Promise<void> {
   const existingJaimona = await getFromStore<CompanyRecord>('companies', JAIMONA_COMPANY_ID);
   if (existingJaimona) {
     if (!existingJaimona.ownerEmail) {
@@ -663,15 +678,40 @@ export async function ensureJaimonaSeedTenantPresent(): Promise<void> {
     return;
   }
 
-  const jaimonaSettings = createDefaultSettingsForCompany(JAIMONA_INITIAL_COMPANY);
-  await putInStore('companies', JAIMONA_INITIAL_COMPANY);
+  const syncedFlag = Boolean(options?.markSeedAsSynced);
+  const syncStateFlag = syncedFlag ? 'synced' : 'pending';
+  const jaimonaSettings: AppSettings = {
+    ...createDefaultSettingsForCompany(JAIMONA_INITIAL_COMPANY),
+    synced: syncedFlag,
+    syncState: syncStateFlag,
+  };
+  await putInStore('companies', {
+    ...JAIMONA_INITIAL_COMPANY,
+    synced: syncedFlag,
+    syncState: syncStateFlag,
+  });
   for (const p of INITIAL_PRODUCTS) {
-    await putInStore('products', { ...p, companyId: JAIMONA_COMPANY_ID });
+    await putInStore('products', {
+      ...p,
+      companyId: JAIMONA_COMPANY_ID,
+      synced: syncedFlag,
+      syncState: syncStateFlag,
+    });
   }
   for (const c of INITIAL_CUSTOMERS) {
-    await putInStore('customers', { ...c, companyId: JAIMONA_COMPANY_ID });
+    await putInStore('customers', {
+      ...c,
+      companyId: JAIMONA_COMPANY_ID,
+      synced: syncedFlag,
+      syncState: syncStateFlag,
+    });
   }
-  await putInStore('invoices', { ...createSeedInvoice(), companyId: JAIMONA_COMPANY_ID });
+  await putInStore('invoices', {
+    ...createSeedInvoice(),
+    companyId: JAIMONA_COMPANY_ID,
+    synced: syncedFlag,
+    syncState: syncStateFlag,
+  });
   await putInStore('meta', {
     key: `app_settings:${JAIMONA_COMPANY_ID}`,
     value: jaimonaSettings,
@@ -682,7 +722,7 @@ async function ensureMulticompanyInitialized(viewer?: WorkspaceViewerIdentity | 
   const seededMeta = await getFromStore<{ key: string; value: boolean }>('meta', 'seeded');
 
   if (!seededMeta?.value) {
-    // Verifica se já existem dados reais gravados antes de semear (proteção extra contra perda de dados)
+    // Verifica se já existem dados reais gravados antes de inicializar (proteção extra contra perda de dados)
     const [existingComps, existingProds, existingCusts, existingInvs] = await Promise.all([
       getAllFromStore<CompanyRecord>('companies'),
       getAllFromStore<Product>('products'),
@@ -696,24 +736,21 @@ async function ensureMulticompanyInitialized(viewer?: WorkspaceViewerIdentity | 
       existingInvs.length > 0;
 
     if (!hasExistingRealData) {
-      const viewerEmail = String(viewer?.email || '').trim().toLowerCase();
-      const isThirdPartyAuthenticated =
-        Boolean(viewer?.uid || viewerEmail) &&
-        !isPlatformAdminEmail(viewerEmail) &&
-        !isJaimonaOwnerEmail(viewerEmail);
-
-      // Se um novo utilizador autenticado (que NÃO é a JAIMONA nem o Super-Admin) abrir num navegador limpo,
-      // NÃO injetamos comp_jaimona por defeito — inicia limpo para onboarding/sincronização do próprio tenant!
-      if (!isThirdPartyAuthenticated) {
-        await ensureJaimonaSeedTenantPresent();
+      // Em abas anónimas, visitantes não autenticados ou contas de terceiros, NUNCA injetamos comp_jaimona.
+      // Apenas se a sessão já autenticada for explicitamente jaimonacomercioeservicos@gmail.com é preparado o tenant JAIMONA.
+      const isExplicitJaimonaOwner = Boolean(viewer && isJaimonaOwnerEmail(viewer.email));
+      if (isExplicitJaimonaOwner) {
+        await ensureJaimonaSeedTenantPresent({ markSeedAsSynced: true });
         await putInStore('meta', { key: 'active_company_id', value: JAIMONA_COMPANY_ID });
+      } else {
+        await putInStore('meta', { key: 'active_company_id', value: '' });
       }
 
       await putInStore('meta', {
         key: 'migration_multicompany_v2',
         value: {
           completedAtIso: new Date().toISOString(),
-          mode: isThirdPartyAuthenticated ? 'clean_saas_onboarding' : 'fresh_install',
+          mode: 'clean_saas_onboarding',
         },
       });
       await putInStore('meta', { key: 'seeded', value: true });
@@ -866,23 +903,36 @@ export async function loadCompanyWorkspace(
 ): Promise<CompanyWorkspaceBundle> {
   await ensureMulticompanyInitialized(viewer);
 
-  // Se o titular da JAIMONA ou o Super-Admin abrir um navegador limpo, garante o tenant JAIMONA disponível
-  if (viewer && (isJaimonaOwnerEmail(viewer.email) || isPlatformAdminEmail(viewer.email))) {
-    await ensureJaimonaSeedTenantPresent();
+  // Apenas o titular explícito da JAIMONA (jaimonacomercioeservicos@gmail.com) — ou o Super-Admin
+  // quando aciona deliberadamente o modo de Suporte Técnico para comp_jaimona — prepara o tenant JAIMONA
+  const isJaimonaOwner = Boolean(viewer && isJaimonaOwnerEmail(viewer.email));
+  const isAdminInspectingJaimona = Boolean(
+    viewer &&
+      isPlatformAdminEmail(viewer.email) &&
+      viewer.supportCompanyId === JAIMONA_COMPANY_ID
+  );
+  if (isJaimonaOwner || isAdminInspectingJaimona) {
+    await ensureJaimonaSeedTenantPresent({ markSeedAsSynced: true });
   }
 
-  const [allCompaniesRaw, allMembersRaw, backupMeta] = await Promise.all([
+  const [allCompaniesRaw, allMembersRaw, backupMeta, migrationMeta] = await Promise.all([
     getAllFromStore<CompanyRecord>('companies'),
     getAllFromStore<CompanyMember>('company_members'),
     getFromStore<{ key: string; value: PreMulticompanySnapshot }>(
       'meta',
       'backup_pre_multicompany_v1'
     ),
+    getFromStore<{ key: string; value: { completedAtIso: string; mode: string } }>(
+      'meta',
+      'migration_multicompany_v2'
+    ),
   ]);
 
-  // Filtra estritamente os tenants acessíveis ao utilizador autenticado (ou locais se offline/sem login)
+  const hasLegacyV1Upgrade = migrationMeta?.value?.mode === 'upgraded_from_v1';
+
+  // Filtra estritamente os tenants acessíveis ao utilizador autenticado (ou empresas locais sem titular Cloud)
   const accessibleCompanies = allCompaniesRaw.filter((comp) =>
-    canViewerAccessTenant(comp, allMembersRaw, viewer)
+    canViewerAccessTenant(comp, allMembersRaw, viewer, hasLegacyV1Upgrade)
   );
 
   // Ordenação 100% neutra entre todos os tenants (sem privilégio fixo para JAIMONA)

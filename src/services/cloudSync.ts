@@ -1055,6 +1055,52 @@ export async function pullOwnedCompaniesFromCloud(): Promise<CompanyRecord[]> {
       }
     }
 
+    if (
+      isJaimonaOwnerEmail(user.email) &&
+      !results.some((r) => r.id === JAIMONA_COMPANY_ID)
+    ) {
+      const jaimonaSnap = await getDoc(doc(db, 'companies', JAIMONA_COMPANY_ID)).catch(() => null);
+      if (jaimonaSnap && jaimonaSnap.exists()) {
+        const cd = jaimonaSnap.data();
+        const now = new Date().toISOString();
+        results.push({
+          id: JAIMONA_COMPANY_ID,
+          normalizedNif: String(cd.normalizedNif || normalizeCompanyNif(String(cd.nif || ''))),
+          profile: {
+            legalName: String(cd.legalName || cd.shortName || JAIMONA_COMPANY_ID),
+            shortName: String(cd.shortName || cd.legalName || JAIMONA_COMPANY_ID),
+            nif: String(cd.nif || ''),
+            address: String(cd.address || 'Angola'),
+            cityCountry: String(cd.cityCountry || 'Angola'),
+            phone: String(cd.phone || ''),
+            email: String(cd.email || ''),
+            tagline: String(cd.tagline || ''),
+          },
+          status:
+            cd.status === 'suspended'
+              ? 'suspended'
+              : cd.status === 'pending'
+                ? 'pending'
+                : 'active',
+          plan: {
+            planTier: cd.planTier || 'FREE',
+            commercialActive: Boolean(cd.commercialActive ?? false),
+            maxUsers: null,
+            maxInvoicesPerMonth: null,
+            updatedAtIso: now,
+          },
+          baseSequence: Math.max(15678, Number(cd.baseSequence) || 0),
+          allowManagerCancel: Boolean(cd.allowManagerCancel ?? false),
+          ownerUid: String(cd.ownerUid || user.uid),
+          ownerEmail: JAIMONA_OWNER_EMAIL,
+          syncState: 'synced',
+          synced: true,
+          createdAtIso: now,
+          updatedAtIso: now,
+        });
+      }
+    }
+
     return results;
   } catch {
     return [];
