@@ -1,6 +1,7 @@
 import { calculateInvoiceTotals } from './billingEngine';
 import {
   AppSettings,
+  canCompanyHideViralFooter,
   CompanyRecord,
   Customer,
   getDirectCustomerIdForCompany,
@@ -11,6 +12,7 @@ import {
   NEUTRAL_PLATFORM_PROFILE,
   normalizeCompanyNif,
   Product,
+  VITRONIS_INSTITUTIONAL,
 } from './types';
 
 const nowIso = new Date().toISOString();
@@ -43,8 +45,8 @@ export const JAIMONA_INITIAL_COMPANY: CompanyRecord = {
   profile: { ...JAIMONA_COMPANY },
   status: 'active',
   plan: {
-    planTier: 'FREE',
-    commercialActive: false,
+    planTier: 'PROFISSIONAL',
+    commercialActive: true,
     maxUsers: null,
     maxInvoicesPerMonth: null,
     updatedAtIso: nowIso,
@@ -52,6 +54,8 @@ export const JAIMONA_INITIAL_COMPANY: CompanyRecord = {
   baseSequence: 15678,
   allowManagerCancel: true,
   ownerEmail: JAIMONA_OWNER_EMAIL,
+  termsAcceptedVersion: VITRONIS_INSTITUTIONAL.termsVersion,
+  termsAcceptedAtIso: nowIso,
   syncState: 'pending',
   synced: false,
   createdAtIso: nowIso,
@@ -156,6 +160,7 @@ export function createDefaultSettingsForCompany(company: CompanyRecord): AppSett
     defaultDocType: 'FR',
     defaultNotes: 'Venda directa a retalho.',
     autoPrintOnEmit: false,
+    hidePromotionalFooter: canCompanyHideViralFooter(company),
     syncState: 'pending',
     synced: false,
     updatedAtIso: new Date().toISOString(),

@@ -11,4 +11,6 @@ interface ImportMeta {
 
 interface Window {
   __SILA_BOOTED__?: boolean;
+  __SILA_DEFERRED_PROMPT__?: Event | null;
+  __SILA_PWA_INSTALLED__?: boolean;
 }

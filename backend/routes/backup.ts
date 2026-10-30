@@ -42,6 +42,20 @@ backupRouter.get('/', requireFirebaseAuth, async (req: AuthenticatedRequest, res
       return;
     }
 
+    const cloudPlan = String(membership.companyData?.planTier || 'FREE');
+    if (
+      rawCompanyId !== JAIMONA_COMPANY_ID &&
+      cloudPlan !== 'PROFISSIONAL' &&
+      cloudPlan !== 'ENTERPRISE'
+    ) {
+      res.status(403).json({
+        ok: false,
+        error:
+          'O Backup Cloud (/api/backup) faz parte do Plano Cloud Profissional. Utilize o botão Backup Local para exportar os seus dados gratuitamente.',
+      });
+      return;
+    }
+
     const rootRef = membership.existsInCloud
       ? ctx.db.collection('companies').doc(rawCompanyId)
       : ctx.db.collection('users').doc(user.uid);

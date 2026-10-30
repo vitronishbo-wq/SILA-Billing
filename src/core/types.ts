@@ -13,6 +13,33 @@ export const PLATFORM_ADMIN_EMAIL = 'wtmedia0@gmail.com';
 export const JAIMONA_COMPANY_ID = 'comp_jaimona';
 export const JAIMONA_OWNER_EMAIL = 'jaimonacomercioeservicos@gmail.com';
 
+export const VITRONIS_INSTITUTIONAL = {
+  legalName: 'VITRONIS – ROBÓTICA E CONTROLE - SERVIÇOS, LDA',
+  shortName: 'VITRONIS',
+  address: 'Huambo, Município de Huambo, Comuna de Huambo, Cidade-Alta',
+  city: 'Huambo',
+  phone: '(244) 948 323 383',
+  whatsappDigits: '244948323383',
+  website: 'www.vitronis.co.ao',
+  websiteUrl: 'https://www.vitronis.co.ao',
+  email: 'inf@vitronis.co.ao',
+  nif: '5002571293',
+  ibanBai: 'AO06.0040.0000.1219.5634.1015.0',
+  termsVersion: '2026.1-VITRONIS',
+} as const;
+
+export const FREE_MONTHLY_INVOICE_LIMIT = 40;
+export const FREE_SOFT_NOTICE_THRESHOLD = 36;
+export const FREE_COURTESY_BUFFER = 10;
+export const CLOUD_PROTECTION_NUDGE_INVOICES = 60;
+export const CLOUD_PROTECTION_NUDGE_RECORDS = 120;
+
+export type GrowthTriggerReason =
+  | 'monthly_limit'
+  | 'cloud_protection'
+  | 'clean_footer'
+  | 'team_access';
+
 export interface CompanyProfile {
   legalName: string;
   shortName: string;
@@ -129,7 +156,7 @@ export function getDirectCustomerIdForCompany(companyId: string): string {
 
 export interface CompanyPlanMetadata {
   planTier: PlanTier;
-  commercialActive: boolean; // false nesta fase (uso gratuito sem bloqueios)
+  commercialActive: boolean;
   maxUsers: number | null;
   maxInvoicesPerMonth: number | null;
   updatedAtIso: string;
@@ -145,11 +172,42 @@ export interface CompanyRecord {
   allowManagerCancel: boolean;
   ownerUid?: string;
   ownerEmail?: string;
+  termsAcceptedVersion?: string;
+  termsAcceptedAtIso?: string;
+  courtesyMonthKey?: string;
+  maxObservedIso?: string;
   syncState?: SyncState;
   syncError?: string;
   synced?: boolean;
   createdAtIso: string;
   updatedAtIso: string;
+}
+
+export function hasPaidCommercialEntitlement(
+  company: Pick<CompanyRecord, 'id' | 'plan'>
+): boolean {
+  if (company.id === JAIMONA_COMPANY_ID) return true;
+  return company.plan?.planTier !== 'FREE';
+}
+
+export function canCompanySyncCloudData(
+  company: Pick<CompanyRecord, 'id' | 'plan'>
+): boolean {
+  if (company.id === JAIMONA_COMPANY_ID) return true;
+  const tier = company.plan?.planTier;
+  return tier === 'PROFISSIONAL' || tier === 'ENTERPRISE';
+}
+
+export function canCompanyManageMultiOperatorTeam(
+  company: Pick<CompanyRecord, 'id' | 'plan'>
+): boolean {
+  return canCompanySyncCloudData(company);
+}
+
+export function canCompanyHideViralFooter(
+  company: Pick<CompanyRecord, 'id' | 'plan'>
+): boolean {
+  return hasPaidCommercialEntitlement(company);
 }
 
 export interface CompanyMember {
@@ -186,10 +244,24 @@ export interface AppSettings {
   defaultDocType: DocumentType;
   defaultNotes: string;
   autoPrintOnEmit: boolean;
+  hidePromotionalFooter?: boolean;
   syncState?: SyncState;
   syncError?: string;
   synced?: boolean;
   updatedAtIso: string;
+}
+
+export function shouldShowViralDocumentFooter(
+  company: Pick<CompanyRecord, 'id' | 'plan'>,
+  settings?: Pick<AppSettings, 'hidePromotionalFooter'> | null
+): boolean {
+  if (!canCompanyHideViralFooter(company)) {
+    return true;
+  }
+  if (typeof settings?.hidePromotionalFooter === 'boolean') {
+    return !settings.hidePromotionalFooter;
+  }
+  return false;
 }
 
 export const DEFAULT_SETTINGS: AppSettings = {
@@ -201,6 +273,7 @@ export const DEFAULT_SETTINGS: AppSettings = {
   defaultDocType: 'FR',
   defaultNotes: 'Venda directa a retalho.',
   autoPrintOnEmit: false,
+  hidePromotionalFooter: false,
   syncState: 'pending',
   synced: false,
   updatedAtIso: new Date().toISOString(),

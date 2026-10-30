@@ -49,8 +49,8 @@ adminRouter.get('/overview', async (req: AuthenticatedRequest, res) => {
           cityCountry: JAIMONA_COMPANY.cityCountry,
           ownerEmail: JAIMONA_OWNER_EMAIL,
           status: 'active',
-          planTier: 'FREE',
-          commercialActive: false,
+          planTier: 'PROFISSIONAL',
+          commercialActive: true,
           invoiceCount: 0,
           createdAtIso: '2026-01-01T08:00:00.000Z',
         },
@@ -105,8 +105,17 @@ adminRouter.get('/overview', async (req: AuthenticatedRequest, res) => {
               ? JAIMONA_OWNER_EMAIL
               : String(d.ownerEmail || d.email || ''),
           status: (VALID_STATUSES.includes(d.status) ? d.status : 'active') as CompanyOperationalStatus,
-          planTier: (VALID_PLANS.includes(d.planTier) ? d.planTier : 'FREE') as PlanTier,
-          commercialActive: Boolean(d.commercialActive ?? false),
+          planTier: (
+            docSnap.id === JAIMONA_COMPANY_ID && (!d.planTier || d.planTier === 'FREE')
+              ? 'PROFISSIONAL'
+              : VALID_PLANS.includes(d.planTier)
+                ? d.planTier
+                : 'FREE'
+          ) as PlanTier,
+          commercialActive:
+            docSnap.id === JAIMONA_COMPANY_ID
+              ? true
+              : Boolean(d.commercialActive ?? (d.planTier && d.planTier !== 'FREE')),
           invoiceCount,
           createdAtIso: createdTs || new Date().toISOString(),
         };
@@ -123,8 +132,8 @@ adminRouter.get('/overview', async (req: AuthenticatedRequest, res) => {
         cityCountry: JAIMONA_COMPANY.cityCountry,
         ownerEmail: JAIMONA_OWNER_EMAIL,
         status: 'active',
-        planTier: 'FREE',
-        commercialActive: false,
+        planTier: 'PROFISSIONAL',
+        commercialActive: true,
         invoiceCount: 0,
         createdAtIso: '2026-01-01T08:00:00.000Z',
       });
@@ -210,18 +219,20 @@ adminRouter.patch('/companies/:companyId', async (req: AuthenticatedRequest, res
     if (nextStatus) updates.status = nextStatus;
     if (nextPlan) {
       updates.planTier = nextPlan;
-      updates.commercialActive = false; // Fase gratuita: planos preparados sem cobrança ativa
+      updates.commercialActive = nextPlan !== 'FREE';
     }
 
     if (compSnap.exists) {
       await compRef.update(updates);
     } else if (companyId === JAIMONA_COMPANY_ID) {
+      const resolvedJaimonaPlan: PlanTier =
+        nextPlan && nextPlan !== 'FREE' ? nextPlan : 'PROFISSIONAL';
       await compRef.set(
         {
           id: JAIMONA_COMPANY_ID,
           normalizedNif: normalizeCompanyNif(JAIMONA_COMPANY.nif),
           ownerUid: adminUser.uid,
-          ownerEmail: adminUser.email || '',
+          ownerEmail: JAIMONA_OWNER_EMAIL,
           legalName: JAIMONA_COMPANY.legalName,
           shortName: JAIMONA_COMPANY.shortName,
           nif: JAIMONA_COMPANY.nif,
@@ -231,8 +242,8 @@ adminRouter.patch('/companies/:companyId', async (req: AuthenticatedRequest, res
           email: JAIMONA_COMPANY.email,
           tagline: JAIMONA_COMPANY.tagline,
           status: nextStatus || 'active',
-          planTier: nextPlan || 'FREE',
-          commercialActive: false,
+          planTier: resolvedJaimonaPlan,
+          commercialActive: true,
           baseSequence: 15678,
           allowManagerCancel: false,
           createdAt: FieldValue.serverTimestamp(),
@@ -257,7 +268,7 @@ adminRouter.patch('/companies/:companyId', async (req: AuthenticatedRequest, res
         body?.reason ||
           (nextStatus
             ? `Estado operacional alterado para ${nextStatus}`
-            : `Plano preparado definido como ${nextPlan} (uso gratuito)`)
+            : `Plano comercial VITRONIS definido como ${nextPlan}`)
       ).slice(0, 240),
       createdAt: FieldValue.serverTimestamp(),
     });

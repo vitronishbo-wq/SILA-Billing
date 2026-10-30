@@ -14,6 +14,7 @@ import {
 import {
   AppSettings,
   CalculatedLineItem,
+  canCompanySyncCloudData,
   CompanyMember,
   CompanyRecord,
   Customer,
@@ -25,6 +26,7 @@ import {
   normalizeCompanyNif,
   Product,
   validateCompanyNif,
+  VITRONIS_INSTITUTIONAL,
 } from '../core/types';
 import { auth, db, handleFirestoreError, OperationType } from './firebaseClient';
 
@@ -90,6 +92,9 @@ export async function ensureCompanyRegisteredCloud(
           ? JAIMONA_OWNER_EMAIL
           : (company.ownerEmail || user.email || '').slice(0, 120);
 
+      const isProtectedJaimona =
+        companyId === JAIMONA_COMPANY_ID && isJaimonaOwnerEmail(user.email);
+
       batch.set(companyRef, {
         id: companyId,
         normalizedNif,
@@ -104,10 +109,18 @@ export async function ensureCompanyRegisteredCloud(
         email: (company.profile.email || '').slice(0, 120),
         tagline: (company.profile.tagline || '').slice(0, 120),
         status: 'active',
-        planTier: 'FREE',
-        commercialActive: false,
+        planTier: isProtectedJaimona ? 'PROFISSIONAL' : 'FREE',
+        commercialActive: isProtectedJaimona,
         baseSequence: Math.max(0, Number(company.baseSequence) || 0),
         allowManagerCancel: Boolean(company.allowManagerCancel),
+        termsAcceptedVersion: (
+          company.termsAcceptedVersion || VITRONIS_INSTITUTIONAL.termsVersion
+        ).slice(0, 32),
+        termsAcceptedAtIso: (
+          company.termsAcceptedAtIso ||
+          company.createdAtIso ||
+          new Date().toISOString()
+        ).slice(0, 40),
         createdAt: serverTimestamp(),
         updatedAt: serverTimestamp(),
       });
@@ -163,6 +176,7 @@ export async function upsertCompanyMemberCloud(
 ): Promise<void> {
   const user = auth.currentUser;
   if (!user || !user.emailVerified) return;
+  if (member.role !== 'owner' && !canCompanySyncCloudData(company)) return;
 
   const companyId = sanitizeId(company.id);
   const memberDocId = sanitizeId(member.uid || member.id);
@@ -208,6 +222,7 @@ export async function upsertProductCloud(
 ): Promise<void> {
   const user = auth.currentUser;
   if (!user || !user.emailVerified) return;
+  if (company && !canCompanySyncCloudData(company)) return;
 
   const rawCompanyId = company?.id || product.companyId || '';
   if (!rawCompanyId) return;
@@ -296,10 +311,12 @@ export async function upsertProductCloud(
 
 export async function removeProductCloud(
   productIdRaw: string,
-  companyIdRaw: string
+  companyIdRaw: string,
+  company?: CompanyRecord
 ): Promise<void> {
   const user = auth.currentUser;
   if (!user || !user.emailVerified || !companyIdRaw) return;
+  if (company && !canCompanySyncCloudData(company)) return;
   const companyId = sanitizeId(companyIdRaw);
   const productId = sanitizeId(productIdRaw);
   const path = `companies/${companyId}/products/${productId}`;
@@ -319,6 +336,7 @@ export async function upsertCustomerCloud(
 ): Promise<void> {
   const user = auth.currentUser;
   if (!user || !user.emailVerified) return;
+  if (company && !canCompanySyncCloudData(company)) return;
 
   const rawCompanyId = company?.id || customer.companyId || '';
   if (!rawCompanyId) return;
@@ -430,10 +448,12 @@ export async function upsertCustomerCloud(
 
 export async function removeCustomerCloud(
   customerIdRaw: string,
-  companyIdRaw: string
+  companyIdRaw: string,
+  company?: CompanyRecord
 ): Promise<void> {
   const user = auth.currentUser;
   if (!user || !user.emailVerified || !companyIdRaw) return;
+  if (company && !canCompanySyncCloudData(company)) return;
   const companyId = sanitizeId(companyIdRaw);
   const customerId = sanitizeId(customerIdRaw);
   const custPath = `companies/${companyId}/customers/${customerId}`;
@@ -460,6 +480,7 @@ export async function createInvoiceCloud(
 ): Promise<void> {
   const user = auth.currentUser;
   if (!user || !user.emailVerified) return;
+  if (company && !canCompanySyncCloudData(company)) return;
 
   const rawCompanyId = company?.id || invoice.companyId || '';
   if (!rawCompanyId) return;
@@ -553,10 +574,12 @@ export async function createInvoiceCloud(
 export async function cancelInvoiceCloud(
   invoiceIdRaw: string,
   cancelReason: string,
-  companyIdRaw: string
+  companyIdRaw: string,
+  company?: CompanyRecord
 ): Promise<void> {
   const user = auth.currentUser;
   if (!user || !user.emailVerified || !companyIdRaw) return;
+  if (company && !canCompanySyncCloudData(company)) return;
   const companyId = sanitizeId(companyIdRaw);
   const invoiceId = sanitizeId(invoiceIdRaw);
   const invPath = `companies/${companyId}/invoices/${invoiceId}`;
@@ -582,6 +605,7 @@ export async function upsertSettingsCloud(
 ): Promise<void> {
   const user = auth.currentUser;
   if (!user || !user.emailVerified) return;
+  if (company && !canCompanySyncCloudData(company)) return;
 
   const rawCompanyId = company?.id || settings.companyId || '';
   if (!rawCompanyId) return;
@@ -611,6 +635,7 @@ export async function upsertSettingsCloud(
     defaultDocType: settings.defaultDocType === 'FP' ? 'FP' : 'FR',
     defaultNotes: (settings.defaultNotes || '').slice(0, 300),
     autoPrintOnEmit: Boolean(settings.autoPrintOnEmit),
+    hidePromotionalFooter: Boolean(settings.hidePromotionalFooter ?? true),
     updatedAt: serverTimestamp(),
   };
 
@@ -634,6 +659,7 @@ export async function upsertSettingsCloud(
         defaultDocType: payload.defaultDocType,
         defaultNotes: payload.defaultNotes,
         autoPrintOnEmit: payload.autoPrintOnEmit,
+        hidePromotionalFooter: payload.hidePromotionalFooter,
         updatedAt: serverTimestamp(),
       });
     }
@@ -652,6 +678,30 @@ export async function pullCompanyFromCloud(companyIdRaw: string): Promise<{
   if (!user || !user.emailVerified || !companyIdRaw) return null;
 
   const companyId = sanitizeId(companyIdRaw);
+
+  // Proteção estrita: nunca executar queries client-side de proprietário em comp_jaimona
+  // quando autenticado com outra conta (ex.: Super-Admin ou terceiros)
+  if (companyId === JAIMONA_COMPANY_ID && !isJaimonaOwnerEmail(user.email)) {
+    return null;
+  }
+
+  const compDocSnap = await getDoc(doc(db, 'companies', companyId)).catch(() => null);
+  if (
+    compDocSnap &&
+    compDocSnap.exists() &&
+    compDocSnap.data().ownerUid &&
+    compDocSnap.data().ownerUid !== user.uid
+  ) {
+    return null;
+  }
+
+  if (compDocSnap && compDocSnap.exists() && companyId !== JAIMONA_COMPANY_ID) {
+    const cloudTier = compDocSnap.data().planTier;
+    if (cloudTier !== 'PROFISSIONAL' && cloudTier !== 'ENTERPRISE') {
+      return null;
+    }
+  }
+
   const prodPath = `companies/${companyId}/products`;
   const custPath = `companies/${companyId}/customers`;
   const invPath = `companies/${companyId}/invoices`;
@@ -659,9 +709,27 @@ export async function pullCompanyFromCloud(companyIdRaw: string): Promise<{
 
   try {
     const [prodSnap, custSnap, invSnap, settingsSnap] = await Promise.all([
-      getDocs(query(collection(db, prodPath), where('companyOwnerUid', '==', user.uid))),
-      getDocs(query(collection(db, custPath), where('companyOwnerUid', '==', user.uid))),
-      getDocs(query(collection(db, invPath), where('companyOwnerUid', '==', user.uid))),
+      getDocs(
+        query(
+          collection(db, prodPath),
+          where('companyId', '==', companyId),
+          where('companyOwnerUid', '==', user.uid)
+        )
+      ),
+      getDocs(
+        query(
+          collection(db, custPath),
+          where('companyId', '==', companyId),
+          where('companyOwnerUid', '==', user.uid)
+        )
+      ),
+      getDocs(
+        query(
+          collection(db, invPath),
+          where('companyId', '==', companyId),
+          where('companyOwnerUid', '==', user.uid)
+        )
+      ),
       getDoc(settingsRef).catch(() => null),
     ]);
 
@@ -734,7 +802,11 @@ export async function pullCompanyFromCloud(companyIdRaw: string): Promise<{
         const data = d.data();
         const itemsPath = `companies/${companyId}/invoices/${data.id}/items`;
         const itemsSnap = await getDocs(
-          query(collection(db, itemsPath), where('companyOwnerUid', '==', user.uid))
+          query(
+            collection(db, itemsPath),
+            where('companyId', '==', companyId),
+            where('companyOwnerUid', '==', user.uid)
+          )
         );
         const lines: CalculatedLineItem[] = itemsSnap.docs.map((itemDoc) => {
           const it = itemDoc.data();
@@ -815,6 +887,8 @@ export async function pullCompanyFromCloud(companyIdRaw: string): Promise<{
         defaultDocType: sd.defaultDocType === 'FP' ? 'FP' : 'FR',
         defaultNotes: sd.defaultNotes || '',
         autoPrintOnEmit: Boolean(sd.autoPrintOnEmit),
+        hidePromotionalFooter:
+          typeof sd.hidePromotionalFooter === 'boolean' ? sd.hidePromotionalFooter : true,
         syncState: 'synced',
         synced: true,
         updatedAtIso: new Date().toISOString(),
@@ -1010,6 +1084,11 @@ export async function pullOwnedCompaniesFromCloud(): Promise<CompanyRecord[]> {
     for (const linkDoc of linksSnap.docs) {
       const ld = linkDoc.data();
       const compId = sanitizeId(ld.companyId || linkDoc.id);
+      if (compId === JAIMONA_COMPANY_ID && !isJaimonaOwnerEmail(user.email)) {
+        // Remove vínculo legado obsoleto gravado antes do desacoplamento multi-tenant
+        await deleteDoc(doc(db, linksPath, linkDoc.id)).catch(() => null);
+        continue;
+      }
       const compSnap = await getDoc(doc(db, 'companies', compId)).catch(() => null);
       if (compSnap && compSnap.exists()) {
         const cd = compSnap.data();
@@ -1034,8 +1113,14 @@ export async function pullOwnedCompaniesFromCloud(): Promise<CompanyRecord[]> {
                 ? 'pending'
                 : 'active',
           plan: {
-            planTier: cd.planTier || 'FREE',
-            commercialActive: Boolean(cd.commercialActive ?? false),
+            planTier:
+              compId === JAIMONA_COMPANY_ID && (!cd.planTier || cd.planTier === 'FREE')
+                ? 'PROFISSIONAL'
+                : cd.planTier || 'FREE',
+            commercialActive:
+              compId === JAIMONA_COMPANY_ID
+                ? true
+                : Boolean(cd.commercialActive ?? (cd.planTier && cd.planTier !== 'FREE')),
             maxUsers: null,
             maxInvoicesPerMonth: null,
             updatedAtIso: now,
@@ -1047,6 +1132,10 @@ export async function pullOwnedCompaniesFromCloud(): Promise<CompanyRecord[]> {
           allowManagerCancel: Boolean(cd.allowManagerCancel ?? false),
           ownerUid: String(cd.ownerUid || user.uid),
           ownerEmail: String(cd.ownerEmail || user.email || ''),
+          termsAcceptedVersion: cd.termsAcceptedVersion
+            ? String(cd.termsAcceptedVersion)
+            : undefined,
+          termsAcceptedAtIso: cd.termsAcceptedAtIso ? String(cd.termsAcceptedAtIso) : undefined,
           syncState: 'synced',
           synced: true,
           createdAtIso: now,
@@ -1083,8 +1172,9 @@ export async function pullOwnedCompaniesFromCloud(): Promise<CompanyRecord[]> {
                 ? 'pending'
                 : 'active',
           plan: {
-            planTier: cd.planTier || 'FREE',
-            commercialActive: Boolean(cd.commercialActive ?? false),
+            planTier:
+              !cd.planTier || cd.planTier === 'FREE' ? 'PROFISSIONAL' : cd.planTier,
+            commercialActive: true,
             maxUsers: null,
             maxInvoicesPerMonth: null,
             updatedAtIso: now,

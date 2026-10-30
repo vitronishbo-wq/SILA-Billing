@@ -245,6 +245,8 @@
         "commercialActive": { "type": "boolean" },
         "baseSequence": { "type": "number" },
         "allowManagerCancel": { "type": "boolean" },
+        "termsAcceptedVersion": { "type": "string", "maxLength": 32 },
+        "termsAcceptedAtIso": { "type": "string", "maxLength": 40 },
         "createdAt": { "type": "string", "format": "date-time" },
         "updatedAt": { "type": "string", "format": "date-time" }
       },
@@ -430,6 +432,7 @@
         "defaultDocType": { "type": "string", "enum": ["FR", "FP"], "maxLength": 8 },
         "defaultNotes": { "type": "string", "maxLength": 300 },
         "autoPrintOnEmit": { "type": "boolean" },
+        "hidePromotionalFooter": { "type": "boolean" },
         "updatedAt": { "type": "string", "format": "date-time" }
       },
       "required": [

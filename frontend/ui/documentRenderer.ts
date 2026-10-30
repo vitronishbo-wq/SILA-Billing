@@ -46,10 +46,12 @@ export function renderDocumentHtml(
   invoice: InvoiceRecord,
   format: DocumentFormat,
   company: CompanyProfile = NEUTRAL_PLATFORM_PROFILE,
-  qrDataUrl = ''
+  qrDataUrl = '',
+  options?: { showViralFooter?: boolean }
 ): string {
   const dt = formatDateTimePt(invoice.issuedAtIso);
   const titleLabel = invoice.docType === 'FP' ? 'FACTURA PROFORMA' : 'FACTURA / RECIBO';
+  const showViralFooter = Boolean(options?.showViralFooter);
 
   if (format === 'POS') {
     const itemsHtml = invoice.lines
@@ -166,6 +168,11 @@ export function renderDocumentHtml(
             <div class="font-bold">Documento de demonstração</div>
             <div class="tabular-nums">NIF: ${escapeHtml(company.nif)} | Caixa: ${escapeHtml(invoice.cashier)}</div>
             <div>Não substitui factura fiscal</div>
+            ${
+              showViralFooter
+                ? `<div class="pt-1 mt-1 border-t border-dashed border-black/60 text-[9.5px] font-medium">Processado por SILA-Billing · VITRONIS (www.vitronis.co.ao)</div>`
+                : ''
+            }
           </div>
         </div>
       </div>
@@ -369,6 +376,11 @@ export function renderDocumentHtml(
         </div>
         <div class="text-right text-xs font-semibold text-slate-700">${escapeHtml(company.tagline)}</div>
       </div>
+      ${
+        showViralFooter
+          ? `<div class="mt-3 pt-2 border-t border-slate-100 text-center text-[10px] text-slate-400">Processado por SILA-Billing · Solução institucional VITRONIS (www.vitronis.co.ao)</div>`
+          : ''
+      }
     </div>
   `;
 }

@@ -6,6 +6,7 @@ import {
   JAIMONA_OWNER_EMAIL,
   normalizeCompanyNif,
   validateCompanyNif,
+  VITRONIS_INSTITUTIONAL,
   type PlanTier,
 } from '../../src/core/types.ts';
 import { getFirebaseAdminContext } from '../firebaseAdmin.ts';
@@ -42,6 +43,8 @@ companiesRouter.post('/register', requireFirebaseAuth, async (req: Authenticated
     email?: string;
     tagline?: string;
     baseSequence?: number;
+    termsAcceptedVersion?: string;
+    termsAcceptedAtIso?: string;
   };
 
   const legalName = String(body?.legalName || '').trim();
@@ -99,7 +102,7 @@ companiesRouter.post('/register', requireFirebaseAuth, async (req: Authenticated
       if (!alreadyOwnsTarget && ownedSnap.size >= MAX_COMPANIES_PER_STANDARD_USER) {
         res.status(429).json({
           ok: false,
-          error: `Limite atingido: cada conta pode registar até ${MAX_COMPANIES_PER_STANDARD_USER} empresas nesta fase gratuita.`,
+          error: `Limite atingido: cada conta pode registar até ${MAX_COMPANIES_PER_STANDARD_USER} empresas autonomamente. Contacte o suporte VITRONIS para expansão corporativa.`,
         });
         return;
       }
@@ -140,11 +143,31 @@ companiesRouter.post('/register', requireFirebaseAuth, async (req: Authenticated
         throw new Error('FORBIDDEN_COMPANY:Esta empresa pertence a outro proprietário.');
       }
 
-      const planTier: PlanTier = (compSnap.data()?.planTier as PlanTier) || 'FREE';
+      const defaultPlan: PlanTier =
+        companyId === JAIMONA_COMPANY_ID ? 'PROFISSIONAL' : 'FREE';
+      const existingPlan = compSnap.data()?.planTier as PlanTier | undefined;
+      const planTier: PlanTier =
+        companyId === JAIMONA_COMPANY_ID && (!existingPlan || existingPlan === 'FREE')
+          ? 'PROFISSIONAL'
+          : existingPlan || defaultPlan;
+      const commercialActive =
+        companyId === JAIMONA_COMPANY_ID
+          ? true
+          : Boolean(compSnap.data()?.commercialActive ?? planTier !== 'FREE');
       const resolvedOwnerEmail =
         companyId === JAIMONA_COMPANY_ID
           ? JAIMONA_OWNER_EMAIL
           : (compSnap.data()?.ownerEmail || user.email || '').slice(0, 120);
+      const termsAcceptedVersion = String(
+        compSnap.data()?.termsAcceptedVersion ||
+          body?.termsAcceptedVersion ||
+          VITRONIS_INSTITUTIONAL.termsVersion
+      ).slice(0, 32);
+      const termsAcceptedAtIso = String(
+        compSnap.data()?.termsAcceptedAtIso ||
+          body?.termsAcceptedAtIso ||
+          new Date().toISOString()
+      ).slice(0, 40);
 
       tx.set(
         nifRef,
@@ -176,9 +199,11 @@ companiesRouter.post('/register', requireFirebaseAuth, async (req: Authenticated
           tagline,
           status: compSnap.data()?.status || 'active',
           planTier,
-          commercialActive: Boolean(compSnap.data()?.commercialActive ?? false),
+          commercialActive,
           baseSequence: Number(compSnap.data()?.baseSequence ?? baseSequence) || baseSequence,
           allowManagerCancel: Boolean(compSnap.data()?.allowManagerCancel ?? false),
+          termsAcceptedVersion,
+          termsAcceptedAtIso,
           createdAt: compSnap.exists ? compSnap.data()!.createdAt : FieldValue.serverTimestamp(),
           updatedAt: FieldValue.serverTimestamp(),
         },
@@ -379,6 +404,17 @@ companiesRouter.post(
         ok: false,
         error: 'Esta empresa encontra-se temporariamente suspensa.',
       });
+      return;
+    }
+
+    const cloudPlan = String(membership.companyData?.planTier || 'FREE');
+    const canPersistCloud =
+      companyId === JAIMONA_COMPANY_ID ||
+      cloudPlan === 'PROFISSIONAL' ||
+      cloudPlan === 'ENTERPRISE';
+
+    if (!canPersistCloud) {
+      res.status(200).json({ ok: true, persistedInFirestore: false });
       return;
     }
 

@@ -25,6 +25,7 @@ export default defineConfig((): UserConfig => {
           theme_color: '#0F172A',
           background_color: '#F8FAFC',
           display: 'standalone',
+          orientation: 'any',
           start_url: '/',
           scope: '/',
           icons: [

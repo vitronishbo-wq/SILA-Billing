@@ -8,7 +8,12 @@ import {
 } from '../src/core/billingEngine';
 import {
   AppSettings,
+  canCompanyHideViralFooter,
+  canCompanyManageMultiOperatorTeam,
+  canCompanySyncCloudData,
   CartDraftItem,
+  CLOUD_PROTECTION_NUDGE_INVOICES,
+  CLOUD_PROTECTION_NUDGE_RECORDS,
   CompanyMember,
   CompanyOperationalStatus,
   CompanyRecord,
@@ -18,7 +23,12 @@ import {
   DEFAULT_SETTINGS,
   DocumentFormat,
   DocumentType,
+  FREE_COURTESY_BUFFER,
+  FREE_MONTHLY_INVOICE_LIMIT,
+  FREE_SOFT_NOTICE_THRESHOLD,
   getDirectCustomerIdForCompany,
+  GrowthTriggerReason,
+  hasPaidCommercialEntitlement,
   InvoiceRecord,
   isJaimonaOwnerEmail,
   isPlatformAdminEmail,
@@ -28,8 +38,16 @@ import {
   PaymentMethod,
   PlanTier,
   Product,
+  shouldShowViralDocumentFooter,
   TaxRate,
+  VITRONIS_INSTITUTIONAL,
 } from '../src/core/types';
+import {
+  filterCustomersSmart,
+  filterInvoicesSmart,
+  searchProductsSmart,
+  SmartProductSearchResult,
+} from '../src/core/smartSearch';
 import { UNASSIGNED_TENANT_RECORD } from '../src/core/seedData';
 import {
   cancelInvoiceCloud,
@@ -68,6 +86,7 @@ import {
   cancelInvoiceBackend,
   downloadCloudBackupJson,
   fetchBackendHealth,
+  fetchCompanyWorkspaceBackend,
   fetchPlatformAdminOverview,
   logPlatformSupportAccess,
   registerCompanyBackend,
@@ -82,6 +101,7 @@ import {
   formatRoleLabelPt,
   renderCancelInvoiceModal,
   renderCompanySwitcherDropdown,
+  renderFriendlyGrowthModal,
   renderMasterAdminModal,
   renderNewCompanyModal,
   renderTenantOnboardingView,
@@ -245,7 +265,22 @@ export class SilaBillingApp {
   private deferredPrompt: BeforeInstallPromptEvent | null = null;
   private isInstalled = false;
   private isIOS = false;
+  private isIOSInAppBrowser = false;
+  private iosBannerDismissed = false;
   private showIOSGuide = false;
+
+  // Crescimento Orgânico & Ativação Institucional VITRONIS
+  private growthModalReason: GrowthTriggerReason | null = null;
+  private copiedIbanFeedback = false;
+  private isVerifyingPlan = false;
+  private growthModalNotice: string | null = null;
+
+  // Leitor de Código de Barras (USB/Bluetooth HID) & Feedback Rápido no POS
+  private barcodeBuffer = '';
+  private barcodeLastKeyTime = 0;
+  private scannerNotice: string | null = null;
+  private scannerNoticeIsError = false;
+  private scannerNoticeTimer: number | null = null;
 
   // Cache de QR Codes para renderização fluida sem flicker
   private qrCache = new Map<string, string>();
@@ -392,6 +427,8 @@ export class SilaBillingApp {
     this.cancelInvoiceError = null;
     this.settingsErrorMessage = null;
     this.memberFormError = null;
+    this.growthModalReason = null;
+    this.growthModalNotice = null;
 
     if (data.posDraft) {
       this.activeModule = data.posDraft.activeModule || 'NEW_POS';
@@ -629,8 +666,44 @@ export class SilaBillingApp {
     }, 120);
   }
 
+  private getMonthlyInvoiceUsage(): {
+    monthKey: string;
+    effectiveNowIso: string;
+    usedCount: number;
+    courtesyActive: boolean;
+    effectiveLimit: number;
+  } {
+    let effectiveNowIso = new Date().toISOString();
+    if (this.activeCompany.maxObservedIso && this.activeCompany.maxObservedIso > effectiveNowIso) {
+      effectiveNowIso = this.activeCompany.maxObservedIso;
+    }
+    for (const inv of this.invoices) {
+      if (inv.issuedAtIso && inv.issuedAtIso > effectiveNowIso) {
+        effectiveNowIso = inv.issuedAtIso;
+      }
+    }
+    const monthKey = effectiveNowIso.slice(0, 7);
+    const usedCount = this.invoices.filter(
+      (inv) => inv.status !== 'cancelled' && (inv.issuedAtIso || '').slice(0, 7) === monthKey
+    ).length;
+    const courtesyActive = this.activeCompany.courtesyMonthKey === monthKey;
+    const effectiveLimit =
+      FREE_MONTHLY_INVOICE_LIMIT + (courtesyActive ? FREE_COURTESY_BUFFER : 0);
+
+    return {
+      monthKey,
+      effectiveNowIso,
+      usedCount,
+      courtesyActive,
+      effectiveLimit,
+    };
+  }
+
   private hasUnsyncedLocalRecords(): boolean {
     if (!this.activeCompany.id || this.requiresCompanyOnboarding) return false;
+    if (!canCompanySyncCloudData(this.activeCompany)) {
+      return !this.activeCompany.synced;
+    }
     return (
       !this.activeCompany.synced ||
       this.invoices.some((i) => !i.synced) ||
@@ -641,19 +714,58 @@ export class SilaBillingApp {
   }
 
   private setupGlobalListeners(): void {
+    const standaloneMedia =
+      typeof window.matchMedia === 'function'
+        ? window.matchMedia('(display-mode: standalone)')
+        : null;
     const standalone =
-      window.matchMedia('(display-mode: standalone)').matches ||
-      (window.navigator as unknown as { standalone?: boolean }).standalone === true;
+      Boolean(standaloneMedia && standaloneMedia.matches) ||
+      (window.navigator as unknown as { standalone?: boolean }).standalone === true ||
+      Boolean(window.__SILA_PWA_INSTALLED__);
     this.isInstalled = standalone;
-    this.isIOS = /iphone|ipad|ipod/.test(window.navigator.userAgent.toLowerCase());
+
+    const ua = window.navigator.userAgent || '';
+    const isClassicIOS = /iPad|iPhone|iPod/i.test(ua) && !('MSStream' in window);
+    const isModernIPadOS =
+      window.navigator.platform === 'MacIntel' && (window.navigator.maxTouchPoints || 0) > 1;
+    this.isIOS = isClassicIOS || isModernIPadOS;
+    this.isIOSInAppBrowser =
+      this.isIOS && /FBAN|FBAV|Instagram|WhatsApp|Line\/|Musical\.ly|Bytedance/i.test(ua);
+
+    try {
+      this.iosBannerDismissed = localStorage.getItem('sila_ios_install_dismissed_v1') === '1';
+    } catch {
+      this.iosBannerDismissed = false;
+    }
+
+    if (window.__SILA_DEFERRED_PROMPT__ && !this.isInstalled) {
+      this.deferredPrompt = window.__SILA_DEFERRED_PROMPT__ as BeforeInstallPromptEvent;
+    }
+
+    if (standaloneMedia) {
+      const onDisplayModeChange = (evt: MediaQueryListEvent) => {
+        if (evt.matches) {
+          this.isInstalled = true;
+          this.deferredPrompt = null;
+          window.__SILA_DEFERRED_PROMPT__ = null;
+          this.render();
+        }
+      };
+      if (typeof standaloneMedia.addEventListener === 'function') {
+        standaloneMedia.addEventListener('change', onDisplayModeChange);
+      }
+    }
 
     window.addEventListener('beforeinstallprompt', (e) => {
       e.preventDefault();
+      window.__SILA_DEFERRED_PROMPT__ = e;
       this.deferredPrompt = e as BeforeInstallPromptEvent;
       this.render();
     });
 
     window.addEventListener('appinstalled', () => {
+      window.__SILA_PWA_INSTALLED__ = true;
+      window.__SILA_DEFERRED_PROMPT__ = null;
       this.isInstalled = true;
       this.deferredPrompt = null;
       this.render();
@@ -685,29 +797,43 @@ export class SilaBillingApp {
       void this.flushDraftNow();
     });
 
-    // Event Delegation Centralizada (Zero listeners duplicados)
+    // Event Delegation Centralizada + Atalhos Globais / Leitor de Código de Barras
     this.root.addEventListener('click', (e) => this.handleClick(e));
     this.root.addEventListener('input', (e) => this.handleInput(e));
     this.root.addEventListener('change', (e) => this.handleChange(e));
-    this.root.addEventListener('keydown', (e) => this.handleKeyDown(e));
     this.root.addEventListener('submit', (e) => this.handleSubmit(e));
+    window.addEventListener('keydown', (e) => this.handleKeyDown(e));
   }
 
-  private getFilteredPosProducts(): Product[] {
-    const q = this.posSearch.trim().toLowerCase();
-    return this.products.filter((p) => {
+  private showScannerFeedback(message: string, isError: boolean): void {
+    this.scannerNotice = message;
+    this.scannerNoticeIsError = isError;
+    if (this.scannerNoticeTimer !== null) {
+      window.clearTimeout(this.scannerNoticeTimer);
+    }
+    this.scannerNoticeTimer = window.setTimeout(() => {
+      this.scannerNotice = null;
+      this.scannerNoticeTimer = null;
+      if (this.activeModule === 'NEW_POS' || this.activeModule === 'NEW_A4') {
+        this.render();
+      }
+    }, 2800);
+  }
+
+  private getPosProductSearchResult(): SmartProductSearchResult {
+    const baseProducts = this.products.filter((p) => {
       if (!p.active) return false;
       if (this.posCategoryFilter !== 'ALL' && (p.category || 'Geral') !== this.posCategoryFilter) {
         return false;
       }
       if (this.posTaxFilter !== 'ALL' && p.ivaRate !== this.posTaxFilter) return false;
-      if (!q) return true;
-      return (
-        p.name.toLowerCase().includes(q) ||
-        p.code.toLowerCase().includes(q) ||
-        (p.category || '').toLowerCase().includes(q)
-      );
+      return true;
     });
+    return searchProductsSmart(baseProducts, this.posSearch);
+  }
+
+  private getFilteredPosProducts(): Product[] {
+    return this.getPosProductSearchResult().matches;
   }
 
   private addProductToCart(prod: Product): void {
@@ -995,7 +1121,8 @@ export class SilaBillingApp {
 
         if (this.user && this.isOnline) {
           try {
-            const cloudData = await pullCompanyFromCloud(id);
+            const cloudData =
+              (await fetchCompanyWorkspaceBackend(id)) || (await pullCompanyFromCloud(id));
             if (cloudData) {
               for (const cp of cloudData.products) {
                 await localDb.saveProduct(cp, id);
@@ -1073,6 +1200,15 @@ export class SilaBillingApp {
         if (!prod) return;
         this.addProductToCart(prod);
         this.render();
+        break;
+      }
+      case 'add-suggested-to-cart': {
+        if (this.isCompanySuspended()) return;
+        const prod = this.products.find((p) => p.id === id);
+        if (!prod) return;
+        this.addProductToCart(prod);
+        this.posSearch = '';
+        this.renderPreservingFocus('pos-search-input', 0);
         break;
       }
       case 'qty-delta': {
@@ -1279,7 +1415,7 @@ export class SilaBillingApp {
           if (this.user && this.isOnline) {
             try {
               await ensureCompanyRegisteredCloud(this.activeCompany);
-              await removeProductCloud(id, this.activeCompany.id);
+              await removeProductCloud(id, this.activeCompany.id, this.activeCompany);
             } catch {
               // Mantém estado local
             }
@@ -1346,7 +1482,7 @@ export class SilaBillingApp {
         if (this.user && this.isOnline) {
           try {
             await ensureCompanyRegisteredCloud(this.activeCompany);
-            await removeCustomerCloud(id, this.activeCompany.id);
+            await removeCustomerCloud(id, this.activeCompany.id, this.activeCompany);
           } catch {
             // Removido localmente
           }
@@ -1405,6 +1541,7 @@ export class SilaBillingApp {
           defaultDocType: 'FR',
           defaultNotes: 'Venda directa a retalho.',
           autoPrintOnEmit: false,
+          hidePromotionalFooter: canCompanyHideViralFooter(this.activeCompany),
           syncState: 'pending',
           synced: false,
           updatedAtIso: new Date().toISOString(),
@@ -1448,7 +1585,7 @@ export class SilaBillingApp {
         break;
       }
       case 'sync-now': {
-        await this.syncAllWithCloud();
+        await this.syncAllWithCloud(true);
         break;
       }
       case 'export-backup-local': {
@@ -1458,6 +1595,15 @@ export class SilaBillingApp {
       }
       case 'export-backup-cloud': {
         if (!this.activeCompany.id || this.requiresCompanyOnboarding) break;
+        const isSupportInspection =
+          Boolean(this.supportCompanyId && this.supportCompanyId === this.activeCompany.id) &&
+          Boolean(this.user && isPlatformAdminEmail(this.user.email));
+        if (!isSupportInspection && !canCompanySyncCloudData(this.activeCompany)) {
+          this.growthModalNotice = null;
+          this.growthModalReason = 'cloud_protection';
+          this.render();
+          break;
+        }
         try {
           this.syncMessage = null;
           await downloadCloudBackupJson(this.activeCompany.id);
@@ -1468,14 +1614,92 @@ export class SilaBillingApp {
         }
         break;
       }
+      case 'open-growth-modal': {
+        const nextReason = (value || 'monthly_limit') as GrowthTriggerReason;
+        this.growthModalNotice = null;
+        this.growthModalReason = nextReason;
+        this.render();
+        break;
+      }
+      case 'close-growth-modal': {
+        this.growthModalReason = null;
+        this.growthModalNotice = null;
+        this.render();
+        break;
+      }
+      case 'activate-monthly-courtesy': {
+        if (!this.activeCompany.id || this.requiresCompanyOnboarding) break;
+        const usage = this.getMonthlyInvoiceUsage();
+        if (usage.courtesyActive) break;
+        const now = new Date().toISOString();
+        const updatedComp: CompanyRecord = {
+          ...this.activeCompany,
+          courtesyMonthKey: usage.monthKey,
+          maxObservedIso: usage.effectiveNowIso > now ? usage.effectiveNowIso : now,
+          updatedAtIso: now,
+        };
+        await localDb.saveCompany(updatedComp);
+        this.activeCompany = updatedComp;
+        this.companies = this.companies.map((c) => (c.id === updatedComp.id ? updatedComp : c));
+        this.growthModalReason = null;
+        this.growthModalNotice = null;
+        this.showScannerFeedback(
+          'Cortesia mensal ativada: +10 documentos disponíveis para atendimento imediato.',
+          false
+        );
+        this.render();
+        break;
+      }
+      case 'copy-vitronis-iban': {
+        try {
+          if (navigator.clipboard && typeof navigator.clipboard.writeText === 'function') {
+            await navigator.clipboard.writeText(VITRONIS_INSTITUTIONAL.ibanBai);
+            this.copiedIbanFeedback = true;
+            this.render();
+            window.setTimeout(() => {
+              this.copiedIbanFeedback = false;
+              if (this.growthModalReason) this.render();
+            }, 2200);
+          }
+        } catch {
+          // Seleção direta continua disponível no elemento font-mono select-all
+        }
+        break;
+      }
+      case 'verify-plan-activation': {
+        if (!this.user || !this.isOnline || this.isVerifyingPlan) break;
+        this.isVerifyingPlan = true;
+        this.growthModalNotice = null;
+        this.render();
+        try {
+          await this.syncAllWithCloud(false);
+          if (hasPaidCommercialEntitlement(this.activeCompany)) {
+            this.growthModalReason = null;
+            this.growthModalNotice = null;
+            this.showScannerFeedback(
+              `Plano ${formatPlanLabelPt(this.activeCompany.plan.planTier)} confirmado com sucesso.`,
+              false
+            );
+          } else {
+            this.growthModalNotice =
+              'Ainda não consta ativação comercial para este NIF na Cloud. Assim que a equipa VITRONIS validar o comprovativo, clique novamente neste botão.';
+          }
+        } finally {
+          this.isVerifyingPlan = false;
+          this.render();
+        }
+        break;
+      }
       case 'install-pwa': {
         if (this.deferredPrompt) {
           const promptEvent = this.deferredPrompt;
           this.deferredPrompt = null;
+          window.__SILA_DEFERRED_PROMPT__ = null;
           await promptEvent.prompt();
           const choice = await promptEvent.userChoice;
           if (choice.outcome === 'accepted') {
             this.isInstalled = true;
+            window.__SILA_PWA_INSTALLED__ = true;
           }
           this.render();
         } else if (this.isIOS) {
@@ -1484,40 +1708,85 @@ export class SilaBillingApp {
         }
         break;
       }
+      case 'open-ios-guide': {
+        this.showIOSGuide = true;
+        this.render();
+        break;
+      }
       case 'close-ios-guide': {
         this.showIOSGuide = false;
+        this.render();
+        break;
+      }
+      case 'dismiss-ios-banner': {
+        this.iosBannerDismissed = true;
+        try {
+          localStorage.setItem('sila_ios_install_dismissed_v1', '1');
+        } catch {
+          // Ignora modo privado sem escrita no localStorage
+        }
         this.render();
         break;
       }
     }
   }
 
-  private handleKeyDown(e: KeyboardEvent): void {
-    const el = e.target as HTMLInputElement;
-    if (!el || !el.dataset) return;
+  private focusActiveModuleSearch(): void {
+    let targetInputId = '';
+    if (this.activeModule === 'NEW_POS' || this.activeModule === 'NEW_A4') {
+      if (this.mobilePane !== 'CATALOG' && window.innerWidth < 1024) {
+        this.mobilePane = 'CATALOG';
+        this.render();
+      }
+      targetInputId = 'pos-search-input';
+    } else if (this.activeModule === 'CUSTOMERS') {
+      targetInputId = 'customer-search-input';
+    } else if (this.activeModule === 'PRODUCTS') {
+      targetInputId = 'product-search-input';
+    } else if (this.activeModule === 'HISTORY') {
+      targetInputId = 'history-search-input';
+    }
 
-    if (el.dataset.field === 'pos-search' && e.key === 'Enter') {
+    if (!targetInputId) return;
+    const input = document.getElementById(targetInputId) as HTMLInputElement | null;
+    if (input) {
+      input.focus();
+      try {
+        input.select();
+      } catch {
+        // Ignore on legacy inputs
+      }
+    }
+  }
+
+  private handleKeyDown(e: KeyboardEvent): void {
+    const rawTarget = e.target as HTMLElement | null;
+    const inputTarget = rawTarget as HTMLInputElement | null;
+    const tag = rawTarget?.tagName || '';
+    const isEditableTarget =
+      tag === 'INPUT' ||
+      tag === 'TEXTAREA' ||
+      tag === 'SELECT' ||
+      Boolean(rawTarget?.isContentEditable);
+
+    // 1. Enter rápido nos campos dedicados de pesquisa POS
+    if (inputTarget?.dataset?.field === 'pos-search' && e.key === 'Enter') {
       e.preventDefault();
       if (this.isCompanySuspended()) return;
-      const matches = this.getFilteredPosProducts();
-      if (matches.length > 0) {
-        this.addProductToCart(matches[0]!);
+      const result = this.getPosProductSearchResult();
+      const chosen = result.exactCodeMatch || result.matches[0] || null;
+      if (chosen) {
+        this.addProductToCart(chosen);
         this.posSearch = '';
         this.renderPreservingFocus('pos-search-input', 0);
       }
       return;
     }
 
-    if (el.dataset.field === 'pos-customer-search' && e.key === 'Enter') {
+    if (inputTarget?.dataset?.field === 'pos-customer-search' && e.key === 'Enter') {
       e.preventDefault();
-      const cq = this.posCustomerSearch.trim().toLowerCase();
-      const match = this.customers.find(
-        (c) =>
-          !cq ||
-          c.name.toLowerCase().includes(cq) ||
-          c.nif.toLowerCase().includes(cq) ||
-          c.locality.toLowerCase().includes(cq)
-      );
+      const matching = filterCustomersSmart(this.customers, this.posCustomerSearch);
+      const match = matching[0] || null;
       if (match) {
         this.selectedCustomerId = match.id;
         this.showCustomerPicker = false;
@@ -1528,13 +1797,158 @@ export class SilaBillingApp {
       return;
     }
 
+    const hasBlockingModal =
+      this.showIOSGuide ||
+      Boolean(this.growthModalReason) ||
+      Boolean(this.cancellingInvoiceId) ||
+      this.showNewCompanyModal ||
+      this.showMasterAdminModal;
+
+    // 2. Escape inteligente em cascata (Modais -> Painéis -> Limpeza de Pesquisa)
     if (e.key === 'Escape') {
-      if (this.showCompanyDropdown || this.showCustomerPicker || this.showQuickCustomerForm || this.cancellingInvoiceId) {
+      this.barcodeBuffer = '';
+      if (this.showIOSGuide) {
+        this.showIOSGuide = false;
+        this.render();
+        return;
+      }
+      if (this.growthModalReason) {
+        this.growthModalReason = null;
+        this.growthModalNotice = null;
+        this.render();
+        return;
+      }
+      if (this.cancellingInvoiceId) {
+        this.cancellingInvoiceId = null;
+        this.cancelInvoiceError = null;
+        this.render();
+        return;
+      }
+      if (this.showNewCompanyModal && !this.isCreatingCompany) {
+        this.showNewCompanyModal = false;
+        this.newCompanyError = null;
+        this.render();
+        return;
+      }
+      if (this.showMasterAdminModal) {
+        this.showMasterAdminModal = false;
+        this.render();
+        return;
+      }
+      if (
+        this.showCompanyDropdown ||
+        this.showCustomerPicker ||
+        this.showQuickCustomerForm ||
+        this.showOptionsDrawer
+      ) {
         this.showCompanyDropdown = false;
         this.showCustomerPicker = false;
         this.showQuickCustomerForm = false;
-        this.cancellingInvoiceId = null;
+        this.showOptionsDrawer = false;
         this.render();
+        return;
+      }
+      if (this.editingProduct || this.editingCustomer) {
+        this.editingProduct = null;
+        this.editingCustomer = null;
+        this.render();
+        return;
+      }
+      if ((this.activeModule === 'NEW_POS' || this.activeModule === 'NEW_A4') && this.posSearch) {
+        this.posSearch = '';
+        this.renderPreservingFocus('pos-search-input', 0);
+        return;
+      }
+      if (this.activeModule === 'PRODUCTS' && this.productSearch) {
+        this.productSearch = '';
+        this.renderPreservingFocus('product-search-input', 0);
+        return;
+      }
+      if (this.activeModule === 'CUSTOMERS' && this.customerSearch) {
+        this.customerSearch = '';
+        this.renderPreservingFocus('customer-search-input', 0);
+        return;
+      }
+      if (this.activeModule === 'HISTORY' && this.historySearch) {
+        this.historySearch = '';
+        this.renderPreservingFocus('history-search-input', 0);
+      }
+      return;
+    }
+
+    if (hasBlockingModal || this.requiresCompanyOnboarding || !this.activeCompany.id) {
+      return;
+    }
+
+    // 3. F2 (ou "/" fora de campos de texto) foca e seleciona a pesquisa do módulo ativo
+    if (
+      e.key === 'F2' ||
+      (e.key === '/' &&
+        !isEditableTarget &&
+        this.barcodeBuffer.length === 0 &&
+        !e.ctrlKey &&
+        !e.metaKey &&
+        !e.altKey)
+    ) {
+      e.preventDefault();
+      this.focusActiveModuleSearch();
+      return;
+    }
+
+    // 4. F4 ou Ctrl+Enter finaliza a emissão rápida da fatura no POS / A4
+    const isPosModule = this.activeModule === 'NEW_POS' || this.activeModule === 'NEW_A4';
+    const insideSubForm = Boolean(rawTarget?.closest('form[data-form]'));
+    if (
+      isPosModule &&
+      !insideSubForm &&
+      (e.key === 'F4' || ((e.ctrlKey || e.metaKey) && e.key === 'Enter'))
+    ) {
+      if (this.cart.length > 0 && !this.isEmitting && !this.isCompanySuspended()) {
+        e.preventDefault();
+        void this.emitCurrentInvoice(this.settings.autoPrintOnEmit);
+      }
+      return;
+    }
+
+    // 5. Captura Global de Leitor de Código de Barras (USB / Bluetooth HID) sem foco no input
+    if (
+      isPosModule &&
+      !isEditableTarget &&
+      !this.isCompanySuspended() &&
+      !e.ctrlKey &&
+      !e.metaKey &&
+      !e.altKey
+    ) {
+      const now = Date.now();
+      if (e.key === 'Enter') {
+        const scanned = this.barcodeBuffer.trim();
+        const elapsed = now - this.barcodeLastKeyTime;
+        this.barcodeBuffer = '';
+        if (scanned.length >= 2 && elapsed <= 120) {
+          e.preventDefault();
+          const scannedLower = scanned.toLowerCase();
+          const exactProd = this.products.find(
+            (p) => p.active && p.code.trim().toLowerCase() === scannedLower
+          );
+          if (exactProd) {
+            this.addProductToCart(exactProd);
+            this.showScannerFeedback(`${exactProd.code} · ${exactProd.name}`, false);
+            this.render();
+          } else {
+            this.posSearch = scanned;
+            this.showScannerFeedback(`Código "${scanned}" não encontrado no catálogo`, true);
+            this.renderPreservingFocus('pos-search-input', scanned.length);
+          }
+        }
+        return;
+      }
+
+      if (e.key.length === 1) {
+        if (now - this.barcodeLastKeyTime > 85) {
+          this.barcodeBuffer = '';
+        }
+        this.barcodeBuffer += e.key;
+        this.barcodeLastKeyTime = now;
       }
     }
   }
@@ -1709,12 +2123,22 @@ export class SilaBillingApp {
         }
         break;
       }
+      case 'toggle-clean-footer': {
+        const checkbox = el as HTMLInputElement;
+        if (!canCompanyHideViralFooter(this.activeCompany)) {
+          checkbox.checked = false;
+          this.growthModalNotice = null;
+          this.growthModalReason = 'clean_footer';
+          this.render();
+        }
+        break;
+      }
       case 'admin-company-plan': {
         const planTier = el.value as PlanTier;
         if (this.user && this.isOnline) {
           const res = await updatePlatformCompanyAdmin(id, { planTier });
           if (!res.ok) {
-            this.masterAdminError = res.error || 'Erro ao preparar plano comercial.';
+            this.masterAdminError = res.error || 'Erro ao atualizar plano comercial.';
             this.render();
             return;
           }
@@ -1727,7 +2151,7 @@ export class SilaBillingApp {
             plan: {
               ...localComp.plan,
               planTier,
-              commercialActive: false,
+              commercialActive: planTier !== 'FREE',
               updatedAtIso: now,
             },
             updatedAtIso: now,
@@ -1807,6 +2231,7 @@ export class SilaBillingApp {
         const phone = String(fd.get('phone') || '').trim();
         const address = String(fd.get('address') || '').trim();
         const copyStarterCatalog = fd.get('copyStarterCatalog') === 'on';
+        const termsAccepted = fd.get('acceptTerms') === 'on';
 
         const createdCompany = await registerNewCompanyLocal({
           legalName,
@@ -1816,6 +2241,7 @@ export class SilaBillingApp {
           phone,
           address,
           copyStarterCatalog,
+          termsAccepted,
           ownerUid: this.user?.uid,
           ownerEmail: this.user?.email || undefined,
           ownerDisplayName: this.user?.displayName || undefined,
@@ -1844,7 +2270,7 @@ export class SilaBillingApp {
             };
             await localDb.saveCompany(syncedComp);
           } catch {
-            // Se o backend Admin SDK já reservou o NIF, mantém operacional e sincroniza subcoleções
+            // Se o backend Admin SDK já reservou o NIF, mantém operacional
           }
         }
 
@@ -1857,7 +2283,7 @@ export class SilaBillingApp {
         this.previewFormat = 'POS';
         this.render();
 
-        if (this.user && this.isOnline) {
+        if (this.user && this.isOnline && canCompanySyncCloudData(this.activeCompany)) {
           void this.syncAllWithCloud();
         }
       } catch (err) {
@@ -1916,14 +2342,16 @@ export class SilaBillingApp {
       if (this.user && this.isOnline) {
         try {
           await ensureCompanyRegisteredCloud(this.activeCompany);
-          await cancelInvoiceCloud(invoiceId, cancelReason, this.activeCompany.id);
-          await cancelInvoiceBackend(this.activeCompany.id, invoiceId, cancelReason).catch(
-            () => null
-          );
-          const synced: InvoiceRecord = { ...cancelled, syncState: 'synced', synced: true };
-          await localDb.saveInvoice(synced, this.activeCompany.id);
-          this.invoices = this.invoices.map((x) => (x.id === invoiceId ? synced : x));
-          this.render();
+          if (canCompanySyncCloudData(this.activeCompany)) {
+            await cancelInvoiceCloud(invoiceId, cancelReason, this.activeCompany.id, this.activeCompany);
+            await cancelInvoiceBackend(this.activeCompany.id, invoiceId, cancelReason).catch(
+              () => null
+            );
+            const synced: InvoiceRecord = { ...cancelled, syncState: 'synced', synced: true };
+            await localDb.saveInvoice(synced, this.activeCompany.id);
+            this.invoices = this.invoices.map((x) => (x.id === invoiceId ? synced : x));
+            this.render();
+          }
         } catch {
           // Mantém pendente localmente para reenvio
         }
@@ -1933,6 +2361,12 @@ export class SilaBillingApp {
 
     if (formName === 'add-member-form') {
       if (!this.canManageCompanySettings()) return;
+      if (!canCompanyManageMultiOperatorTeam(this.activeCompany)) {
+        this.growthModalNotice = null;
+        this.growthModalReason = 'team_access';
+        this.render();
+        return;
+      }
       this.memberFormError = null;
 
       const displayName = String(fd.get('displayName') || '').trim();
@@ -2042,11 +2476,13 @@ export class SilaBillingApp {
       if (this.user && this.isOnline) {
         try {
           await ensureCompanyRegisteredCloud(this.activeCompany);
-          await upsertCustomerCloud(created, this.activeCompany);
-          const synced: Customer = { ...created, syncState: 'synced', synced: true };
-          await localDb.saveCustomer(synced, this.activeCompany.id);
-          this.customers = this.customers.map((c) => (c.id === synced.id ? synced : c));
-          this.render();
+          if (canCompanySyncCloudData(this.activeCompany)) {
+            await upsertCustomerCloud(created, this.activeCompany);
+            const synced: Customer = { ...created, syncState: 'synced', synced: true };
+            await localDb.saveCustomer(synced, this.activeCompany.id);
+            this.customers = this.customers.map((c) => (c.id === synced.id ? synced : c));
+            this.render();
+          }
         } catch {
           // Mantém pendente localmente
         }
@@ -2131,11 +2567,13 @@ export class SilaBillingApp {
       if (this.user && this.isOnline) {
         try {
           await ensureCompanyRegisteredCloud(this.activeCompany);
-          await upsertProductCloud(updated, wasNew, this.activeCompany);
-          const synced: Product = { ...updated, syncState: 'synced', synced: true };
-          await localDb.saveProduct(synced, this.activeCompany.id);
-          this.products = this.products.map((p) => (p.id === synced.id ? synced : p));
-          this.render();
+          if (canCompanySyncCloudData(this.activeCompany)) {
+            await upsertProductCloud(updated, wasNew, this.activeCompany);
+            const synced: Product = { ...updated, syncState: 'synced', synced: true };
+            await localDb.saveProduct(synced, this.activeCompany.id);
+            this.products = this.products.map((p) => (p.id === synced.id ? synced : p));
+            this.render();
+          }
         } catch {
           // Fica pendente para sync
         }
@@ -2217,11 +2655,13 @@ export class SilaBillingApp {
       if (this.user && this.isOnline) {
         try {
           await ensureCompanyRegisteredCloud(this.activeCompany);
-          await upsertCustomerCloud(updated, this.activeCompany);
-          const synced: Customer = { ...updated, syncState: 'synced', synced: true };
-          await localDb.saveCustomer(synced, this.activeCompany.id);
-          this.customers = this.customers.map((c) => (c.id === synced.id ? synced : c));
-          this.render();
+          if (canCompanySyncCloudData(this.activeCompany)) {
+            await upsertCustomerCloud(updated, this.activeCompany);
+            const synced: Customer = { ...updated, syncState: 'synced', synced: true };
+            await localDb.saveCustomer(synced, this.activeCompany.id);
+            this.customers = this.customers.map((c) => (c.id === synced.id ? synced : c));
+            this.render();
+          }
         } catch {
           // Fica pendente localmente
         }
@@ -2231,6 +2671,7 @@ export class SilaBillingApp {
 
     if (formName === 'settings-form') {
       if (!this.canManageCompanySettings()) return;
+      const canCleanFooter = canCompanyHideViralFooter(this.activeCompany);
       const nextSettings: AppSettings = {
         companyId: this.activeCompany.id,
         company: {
@@ -2252,6 +2693,7 @@ export class SilaBillingApp {
         defaultFormat: fd.get('defaultFormat') === 'A4' ? 'A4' : 'POS',
         defaultNotes: String(fd.get('defaultNotes') || '').trim(),
         autoPrintOnEmit: fd.get('autoPrintOnEmit') === 'on',
+        hidePromotionalFooter: canCleanFooter ? fd.get('hidePromotionalFooter') === 'on' : false,
         syncState: 'pending',
         synced: false,
         updatedAtIso: new Date().toISOString(),
@@ -2294,15 +2736,17 @@ export class SilaBillingApp {
     if (this.user && this.isOnline) {
       try {
         await ensureCompanyRegisteredCloud(this.activeCompany, true);
-        await upsertSettingsCloud(nextSettings, this.activeCompany);
-        const synced: AppSettings = { ...nextSettings, syncState: 'synced', synced: true };
-        const syncedCompany = await localDb.saveSettings(synced, this.activeCompany.id);
-        this.activeCompany = syncedCompany;
-        this.companies = this.companies.map((c) =>
-          c.id === syncedCompany.id ? syncedCompany : c
-        );
-        this.settings = synced;
-        this.render();
+        if (canCompanySyncCloudData(this.activeCompany)) {
+          await upsertSettingsCloud(nextSettings, this.activeCompany);
+          const synced: AppSettings = { ...nextSettings, syncState: 'synced', synced: true };
+          const syncedCompany = await localDb.saveSettings(synced, this.activeCompany.id);
+          this.activeCompany = syncedCompany;
+          this.companies = this.companies.map((c) =>
+            c.id === syncedCompany.id ? syncedCompany : c
+          );
+          this.settings = synced;
+          this.render();
+        }
       } catch {
         // Mantém pendente
       }
@@ -2311,6 +2755,17 @@ export class SilaBillingApp {
 
   private async emitCurrentInvoice(autoPrint: boolean): Promise<void> {
     if (this.cart.length === 0 || this.isEmitting || this.isCompanySuspended()) return;
+
+    if (!hasPaidCommercialEntitlement(this.activeCompany)) {
+      const usage = this.getMonthlyInvoiceUsage();
+      if (usage.usedCount >= usage.effectiveLimit) {
+        this.growthModalNotice = null;
+        this.growthModalReason = 'monthly_limit';
+        this.render();
+        return;
+      }
+    }
+
     this.isEmitting = true;
     this.render();
 
@@ -2329,6 +2784,19 @@ export class SilaBillingApp {
       };
 
       await localDb.saveInvoice(invoice, this.activeCompany.id);
+      if (!this.activeCompany.maxObservedIso || now > this.activeCompany.maxObservedIso) {
+        const trackedCompany: CompanyRecord = {
+          ...this.activeCompany,
+          maxObservedIso: now,
+          updatedAtIso: now,
+        };
+        await localDb.saveCompany(trackedCompany);
+        this.activeCompany = trackedCompany;
+        this.companies = this.companies.map((c) =>
+          c.id === trackedCompany.id ? trackedCompany : c
+        );
+      }
+
       this.invoices = [invoice, ...this.invoices];
       this.selectedHistoryId = invoice.id;
       this.lastEmitted = invoice;
@@ -2342,17 +2810,19 @@ export class SilaBillingApp {
       if (this.user && this.isOnline) {
         try {
           await ensureCompanyRegisteredCloud(this.activeCompany);
-          await createInvoiceCloud(invoice, this.activeCompany);
-          const syncedInv: InvoiceRecord = { ...invoice, syncState: 'synced', synced: true };
-          await localDb.saveInvoice(syncedInv, this.activeCompany.id);
-          this.invoices = this.invoices.map((i) => (i.id === syncedInv.id ? syncedInv : i));
-          this.lastEmitted = syncedInv;
+          if (canCompanySyncCloudData(this.activeCompany)) {
+            await createInvoiceCloud(invoice, this.activeCompany);
+            const syncedInv: InvoiceRecord = { ...invoice, syncState: 'synced', synced: true };
+            await localDb.saveInvoice(syncedInv, this.activeCompany.id);
+            this.invoices = this.invoices.map((i) => (i.id === syncedInv.id ? syncedInv : i));
+            this.lastEmitted = syncedInv;
 
-          const auditRes = await submitInvoiceAudit(syncedInv, this.activeCompany.id);
-          if (auditRes.ok && auditRes.auditHash) {
-            this.lastAuditHash = auditRes.auditHash.slice(0, 12);
+            const auditRes = await submitInvoiceAudit(syncedInv, this.activeCompany.id);
+            if (auditRes.ok && auditRes.auditHash) {
+              this.lastAuditHash = auditRes.auditHash.slice(0, 12);
+            }
+            this.render();
           }
-          this.render();
         } catch {
           // Guardada localmente para sincronização posterior
         }
@@ -2367,14 +2837,14 @@ export class SilaBillingApp {
     }
   }
 
-  private async syncAllWithCloud(): Promise<void> {
+  private async syncAllWithCloud(manualTrigger = false): Promise<void> {
     if (!this.user || !this.isOnline || this.isSyncing) return;
     this.isSyncing = true;
     this.syncMessage = null;
     this.render();
 
     try {
-      // 1. Descobre empresas da conta autenticada na Cloud antes de sincronizar o workspace ativo
+      // 1. Descobre empresas da conta autenticada na Cloud e sincroniza eventuais ativações de planos comerciais
       const ownedCloudCompanies = await pullOwnedCompaniesFromCloud();
       for (const cloudComp of ownedCloudCompanies) {
         const localExisting = this.companies.find(
@@ -2383,7 +2853,7 @@ export class SilaBillingApp {
         if (!localExisting) {
           await localDb.saveCompany(cloudComp);
         } else {
-          await localDb.saveCompany({
+          const mergedComp: CompanyRecord = {
             ...localExisting,
             status: cloudComp.status,
             plan: cloudComp.plan,
@@ -2392,7 +2862,11 @@ export class SilaBillingApp {
             ownerEmail: cloudComp.ownerEmail,
             syncState: 'synced',
             synced: true,
-          });
+          };
+          await localDb.saveCompany(mergedComp);
+          if (this.activeCompany.id === mergedComp.id) {
+            this.activeCompany = mergedComp;
+          }
         }
       }
 
@@ -2410,105 +2884,141 @@ export class SilaBillingApp {
         }
       }
 
-      // 2. Regista/atualiza a empresa ativa e o respetivo NIF único no Firestore
-      await ensureCompanyRegisteredCloud(this.activeCompany, !this.activeCompany.synced);
-      const canClaimCompanyOwnership =
-        this.activeCompany.id !== JAIMONA_COMPANY_ID || isJaimonaOwnerEmail(this.user.email);
-      if (!this.activeCompany.synced && canClaimCompanyOwnership) {
-        const markedComp: CompanyRecord = {
-          ...this.activeCompany,
-          ownerUid: this.activeCompany.ownerUid || this.user.uid,
-          ownerEmail:
-            this.activeCompany.id === JAIMONA_COMPANY_ID
-              ? JAIMONA_OWNER_EMAIL
-              : this.activeCompany.ownerEmail || this.user.email || undefined,
-          syncState: 'synced',
-          synced: true,
-        };
-        await localDb.saveCompany(markedComp);
-        this.activeCompany = markedComp;
-      }
+      const isSupportInspection =
+        Boolean(this.supportCompanyId && this.supportCompanyId === this.activeCompany.id) &&
+        isPlatformAdminEmail(this.user.email) &&
+        this.activeCompany.ownerUid !== this.user.uid;
 
-      // 3. Envia registos pendentes da empresa ativa com controlo explícito de erro por item
-      const unsyncedProducts = this.products.filter((p) => !p.synced);
-      for (const prod of unsyncedProducts) {
-        try {
-          await upsertProductCloud(prod, true, this.activeCompany);
-          await localDb.saveProduct(
-            { ...prod, syncState: 'synced', synced: true, syncError: undefined },
-            this.activeCompany.id
-          );
-        } catch (itemErr) {
-          await localDb.saveProduct(
-            {
-              ...prod,
-              syncState: 'error',
-              synced: false,
-              syncError: itemErr instanceof Error ? itemErr.message : 'Erro de sincronização',
-            },
-            this.activeCompany.id
-          );
+      if (!isSupportInspection) {
+        // 2. Regista/atualiza sempre a identidade leve da empresa e NIF único no Firestore
+        await ensureCompanyRegisteredCloud(this.activeCompany, !this.activeCompany.synced);
+        const canClaimCompanyOwnership =
+          this.activeCompany.id !== JAIMONA_COMPANY_ID || isJaimonaOwnerEmail(this.user.email);
+        if (!this.activeCompany.synced && canClaimCompanyOwnership) {
+          const markedComp: CompanyRecord = {
+            ...this.activeCompany,
+            ownerUid: this.activeCompany.ownerUid || this.user.uid,
+            ownerEmail:
+              this.activeCompany.id === JAIMONA_COMPANY_ID
+                ? JAIMONA_OWNER_EMAIL
+                : this.activeCompany.ownerEmail || this.user.email || undefined,
+            syncState: 'synced',
+            synced: true,
+          };
+          await localDb.saveCompany(markedComp);
+          this.activeCompany = markedComp;
         }
       }
 
-      const unsyncedCustomers = this.customers.filter((c) => !c.synced);
-      for (const cust of unsyncedCustomers) {
-        try {
-          await upsertCustomerCloud(cust, this.activeCompany);
-          await localDb.saveCustomer(
-            { ...cust, syncState: 'synced', synced: true, syncError: undefined },
-            this.activeCompany.id
-          );
-        } catch (itemErr) {
-          await localDb.saveCustomer(
-            {
-              ...cust,
-              syncState: 'error',
-              synced: false,
-              syncError: itemErr instanceof Error ? itemErr.message : 'Erro de sincronização',
-            },
-            this.activeCompany.id
-          );
-        }
-      }
+      // Empresas em plano Base Orgânico (FREE) ou Essencial (1.000 Kz) operam com base de dados 100% local (custo zero de subcoleções Cloud)
+      if (!isSupportInspection && !canCompanySyncCloudData(this.activeCompany)) {
+        const refreshedLocal = await loadCompanyWorkspace(
+          this.activeCompany.id,
+          this.getViewerIdentity()
+        );
+        this.activeCompany = refreshedLocal.activeCompany;
+        this.companies = refreshedLocal.companies;
+        this.members = refreshedLocal.members;
+        this.lastSyncedIso = new Date().toISOString();
+        await this.refreshBackendHealth();
 
-      const unsyncedInvoices = this.invoices.filter((i) => !i.synced);
-      for (const inv of unsyncedInvoices) {
-        try {
-          await createInvoiceCloud(inv, this.activeCompany);
-          if (inv.status === 'cancelled' && inv.cancelReason) {
-            await cancelInvoiceCloud(inv.id, inv.cancelReason, this.activeCompany.id);
+        if (manualTrigger) {
+          if (this.activeCompany.plan.planTier === 'ESSENCIAL') {
+            this.syncMessage =
+              'Licença Essencial verificada — faturação local ilimitada ativa neste dispositivo. Para backup automático na Cloud, conheça o Plano Cloud Profissional.';
+          } else {
+            this.growthModalNotice = null;
+            this.growthModalReason = 'cloud_protection';
           }
-          await submitInvoiceAudit(inv, this.activeCompany.id).catch(() => null);
-          await localDb.saveInvoice(
-            { ...inv, syncState: 'synced', synced: true, syncError: undefined },
-            this.activeCompany.id
-          );
-        } catch (itemErr) {
-          await localDb.saveInvoice(
-            {
-              ...inv,
-              syncState: 'error',
-              synced: false,
-              syncError: itemErr instanceof Error ? itemErr.message : 'Erro de sincronização',
-            },
-            this.activeCompany.id
-          );
+        }
+        return;
+      }
+
+      if (!isSupportInspection) {
+        // 3. Envia registos pendentes da empresa ativa (apenas planos Cloud Profissional / Enterprise / JAIMONA)
+        const unsyncedProducts = this.products.filter((p) => !p.synced);
+        for (const prod of unsyncedProducts) {
+          try {
+            await upsertProductCloud(prod, true, this.activeCompany);
+            await localDb.saveProduct(
+              { ...prod, syncState: 'synced', synced: true, syncError: undefined },
+              this.activeCompany.id
+            );
+          } catch (itemErr) {
+            await localDb.saveProduct(
+              {
+                ...prod,
+                syncState: 'error',
+                synced: false,
+                syncError: itemErr instanceof Error ? itemErr.message : 'Erro de sincronização',
+              },
+              this.activeCompany.id
+            );
+          }
+        }
+
+        const unsyncedCustomers = this.customers.filter((c) => !c.synced);
+        for (const cust of unsyncedCustomers) {
+          try {
+            await upsertCustomerCloud(cust, this.activeCompany);
+            await localDb.saveCustomer(
+              { ...cust, syncState: 'synced', synced: true, syncError: undefined },
+              this.activeCompany.id
+            );
+          } catch (itemErr) {
+            await localDb.saveCustomer(
+              {
+                ...cust,
+                syncState: 'error',
+                synced: false,
+                syncError: itemErr instanceof Error ? itemErr.message : 'Erro de sincronização',
+              },
+              this.activeCompany.id
+            );
+          }
+        }
+
+        const unsyncedInvoices = this.invoices.filter((i) => !i.synced);
+        for (const inv of unsyncedInvoices) {
+          try {
+            await createInvoiceCloud(inv, this.activeCompany);
+            if (inv.status === 'cancelled' && inv.cancelReason) {
+              await cancelInvoiceCloud(inv.id, inv.cancelReason, this.activeCompany.id, this.activeCompany);
+            }
+            await submitInvoiceAudit(inv, this.activeCompany.id).catch(() => null);
+            await localDb.saveInvoice(
+              { ...inv, syncState: 'synced', synced: true, syncError: undefined },
+              this.activeCompany.id
+            );
+          } catch (itemErr) {
+            await localDb.saveInvoice(
+              {
+                ...inv,
+                syncState: 'error',
+                synced: false,
+                syncError: itemErr instanceof Error ? itemErr.message : 'Erro de sincronização',
+              },
+              this.activeCompany.id
+            );
+          }
+        }
+
+        if (!this.settings.synced && this.canManageCompanySettings()) {
+          await upsertSettingsCloud(this.settings, this.activeCompany);
+          const syncedSettings: AppSettings = {
+            ...this.settings,
+            syncState: 'synced',
+            synced: true,
+          };
+          await localDb.saveSettings(syncedSettings, this.activeCompany.id);
         }
       }
 
-      if (!this.settings.synced && this.canManageCompanySettings()) {
-        await upsertSettingsCloud(this.settings, this.activeCompany);
-        const syncedSettings: AppSettings = {
-          ...this.settings,
-          syncState: 'synced',
-          synced: true,
-        };
-        await localDb.saveSettings(syncedSettings, this.activeCompany.id);
-      }
-
-      // 4. Descarrega dados atualizados da empresa ativa a partir do Firestore
-      const cloudData = await pullCompanyFromCloud(this.activeCompany.id);
+      // 4. Descarrega dados atualizados da empresa ativa (Admin SDK em modo suporte/membro ou Firestore direto para proprietário)
+      const cloudData = isSupportInspection
+        ? await fetchCompanyWorkspaceBackend(this.activeCompany.id)
+        : (await pullCompanyFromCloud(this.activeCompany.id)) ||
+          (await fetchCompanyWorkspaceBackend(this.activeCompany.id));
       if (cloudData) {
         // Proteção estrita: nunca sobrescrever registos locais ainda pendentes de sincronização
         const preMergeLocal = await loadCompanyWorkspace(
@@ -2664,7 +3174,8 @@ export class SilaBillingApp {
 
   private render(): void {
     const isUnassigned = this.requiresCompanyOnboarding || !this.activeCompany.id;
-    const pendingCount = isUnassigned
+    const cloudSyncEntitled = !isUnassigned && canCompanySyncCloudData(this.activeCompany);
+    const pendingCount = !cloudSyncEntitled
       ? 0
       : this.products.filter((p) => !p.synced).length +
         this.customers.filter((c) => !c.synced).length +
@@ -2676,11 +3187,13 @@ export class SilaBillingApp {
     const cancellingInvoice = this.cancellingInvoiceId
       ? this.invoices.find((i) => i.id === this.cancellingInvoiceId) || null
       : null;
+    const showViralFooter = shouldShowViralDocumentFooter(this.activeCompany, this.settings);
+    const monthlyUsage = isUnassigned ? null : this.getMonthlyInvoiceUsage();
 
     this.root.innerHTML = `
       <div class="no-print h-dvh w-screen flex flex-col overflow-hidden bg-slate-50 text-slate-900">
-        <!-- Top Bar Limpa (3 Zonas) -->
-        <header class="h-12 px-3 bg-slate-900 text-white border-b border-slate-800 flex items-center justify-between gap-4 shrink-0">
+        <!-- Top Bar Limpa (3 Zonas) com suporte a Safe Area em iPhone / iPad Standalone -->
+        <header class="min-h-12 py-1.5 px-3 safe-area-top bg-slate-900 text-white border-b border-slate-800 flex items-center justify-between gap-4 shrink-0">
           <div class="flex items-center gap-2 shrink-0">
             <button
               type="button"
@@ -2746,7 +3259,7 @@ export class SilaBillingApp {
                     data-action="install-pwa"
                     class="h-8 px-2.5 rounded-md bg-blue-600 hover:bg-blue-700 text-xs font-medium text-white flex items-center gap-1.5 whitespace-nowrap"
                   >
-                    ${ICONS.download}
+                    ${this.isIOS && !this.deferredPrompt ? ICONS.iosShare : ICONS.download}
                     <span>Instalar</span>
                   </button>`
                 : `<button
@@ -2763,6 +3276,7 @@ export class SilaBillingApp {
             }
           </div>
         </header>
+        ${this.renderIOSInstallBanner()}
 
         <!-- Área Principal com Aba Esquerda 100% Recolhível -->
         <div class="flex-1 flex overflow-hidden">
@@ -2806,6 +3320,22 @@ export class SilaBillingApp {
             : ''
         }
         ${
+          this.growthModalReason && !isUnassigned && monthlyUsage
+            ? renderFriendlyGrowthModal({
+                reason: this.growthModalReason,
+                company: this.activeCompany,
+                monthlyUsed: monthlyUsage.usedCount,
+                monthlyLimit: monthlyUsage.effectiveLimit,
+                canActivateCourtesy: !monthlyUsage.courtesyActive,
+                isSignedIn: Boolean(this.user),
+                isOnline: this.isOnline,
+                isVerifyingPlan: this.isVerifyingPlan,
+                copiedIbanFeedback: this.copiedIbanFeedback,
+                noticeMessage: this.growthModalNotice,
+              })
+            : ''
+        }
+        ${
           this.showMasterAdminModal
             ? renderMasterAdminModal({
                 isSignedIn: Boolean(this.user),
@@ -2830,7 +3360,8 @@ export class SilaBillingApp {
                 this.printJob.invoice,
                 this.printJob.format,
                 this.settings.company,
-                this.printJob.qr
+                this.printJob.qr,
+                { showViralFooter }
               )}
             </div>`
           : ''
@@ -3003,11 +3534,13 @@ export class SilaBillingApp {
       a.localeCompare(b, 'pt')
     );
 
-    const visibleProducts = this.getFilteredPosProducts();
+    const posSearchResult = this.getPosProductSearchResult();
+    const visibleProducts = posSearchResult.matches;
+    const posSuggestions = posSearchResult.suggestions;
 
     const totals = calculateInvoiceTotals(this.cart);
     const liveInvoice = this.buildLivePreviewInvoice();
-    const cartCount = roundKz(this.cart.reduce((acc, c) => acc + c.qty, 0));
+    const cartCount = roundKz(this.cart.reduce((acc, c) => c.qty + acc, 0));
 
     const directCustId = getDirectCustomerIdForCompany(this.activeCompany.id);
     const defaultLocality = this.activeCompany.profile.cityCountry || 'Angola';
@@ -3022,14 +3555,7 @@ export class SilaBillingApp {
         locality: defaultLocality,
       };
 
-    const cq = this.posCustomerSearch.trim().toLowerCase();
-    const matchingCustomers = this.customers.filter(
-      (c) =>
-        !cq ||
-        c.name.toLowerCase().includes(cq) ||
-        c.nif.toLowerCase().includes(cq) ||
-        c.locality.toLowerCase().includes(cq)
-    );
+    const matchingCustomers = filterCustomersSmart(this.customers, this.posCustomerSearch);
 
     const cacheKey = `${liveInvoice.number}|${liveInvoice.grandTotal.toFixed(2)}|${this.settings.company.nif}`;
     const cachedQr = this.qrCache.get(cacheKey) || '';
@@ -3091,7 +3617,7 @@ export class SilaBillingApp {
                     autocomplete="off"
                     data-field="pos-search"
                     value="${escapeHtml(this.posSearch)}"
-                    placeholder="Pesquisar código, artigo ou Enter p/ adicionar..."
+                    placeholder="Código, artigo ou leitor de barras (F2)..."
                     class="w-full h-10 pl-9 ${this.posSearch ? 'pr-8' : 'pr-3'} text-xs bg-slate-50 border border-slate-200 rounded-lg focus:outline-none focus:border-blue-600"
                   />
                   ${
@@ -3099,7 +3625,7 @@ export class SilaBillingApp {
                       ? `<button
                           type="button"
                           data-action="clear-pos-search"
-                          title="Limpar pesquisa"
+                          title="Limpar pesquisa (Esc)"
                           class="h-7 w-7 absolute right-1.5 top-1/2 -translate-y-1/2 flex items-center justify-center rounded text-slate-400 hover:text-slate-700 hover:bg-slate-200/60"
                         >${ICONS.close}</button>`
                       : ''
@@ -3124,6 +3650,19 @@ export class SilaBillingApp {
                     .join('')}
                 </div>
               </div>
+
+              ${
+                this.scannerNotice
+                  ? `<div class="px-2.5 py-1.5 rounded-md border text-[11px] flex items-center gap-1.5 ${
+                      this.scannerNoticeIsError
+                        ? 'bg-amber-50 border-amber-200 text-amber-800'
+                        : 'bg-emerald-50 border-emerald-200 text-emerald-800'
+                    }">
+                      ${ICONS.barcode}
+                      <span class="truncate">${escapeHtml(this.scannerNotice)}</span>
+                    </div>`
+                  : ''
+              }
 
               <!-- Categorias de produtos em seletores compactos -->
               <div class="flex items-center gap-1 overflow-x-auto pb-0.5 no-scrollbar">
@@ -3161,32 +3700,62 @@ export class SilaBillingApp {
             <div class="flex-1 overflow-y-auto p-3">
               ${
                 visibleProducts.length === 0
-                  ? `<div class="h-40 flex flex-col items-center justify-center gap-2 text-xs text-slate-500 text-center px-4">
-                      <span>${
-                        this.products.length === 0
-                          ? 'Catálogo vazio nesta empresa.'
-                          : 'Nenhum artigo encontrado para o filtro atual.'
-                      }</span>
-                      ${
-                        this.products.length === 0 && this.canManageCatalog()
-                          ? `<button
-                              type="button"
-                              data-action="nav"
-                              data-value="PRODUCTS"
-                              class="text-blue-600 hover:underline font-medium"
-                            >Registar primeiro artigo</button>`
-                          : this.posSearch ||
-                              this.posCategoryFilter !== 'ALL' ||
-                              this.posTaxFilter !== 'ALL'
+                  ? posSuggestions.length > 0
+                    ? `<div class="space-y-2.5">
+                        <div class="flex items-center justify-between gap-2 text-xs text-slate-600 px-0.5">
+                          <span>Sem resultado exato para <strong>${escapeHtml(this.posSearch)}</strong>. Sugestões próximas:</span>
+                          <button
+                            type="button"
+                            data-action="clear-pos-search"
+                            class="text-[11px] text-blue-600 hover:underline font-medium shrink-0"
+                          >Limpar</button>
+                        </div>
+                        <div class="grid grid-cols-2 sm:grid-cols-3 lg:grid-cols-2 xl:grid-cols-3 gap-2">
+                          ${posSuggestions
+                            .map(
+                              (prod) => `
+                              <button
+                                type="button"
+                                data-action="add-suggested-to-cart"
+                                data-id="${escapeHtml(prod.id)}"
+                                ${isSuspended ? 'disabled' : ''}
+                                class="text-left p-2.5 rounded-lg border border-slate-200 bg-white hover:border-blue-600 active:bg-slate-50 transition-colors min-h-[84px] flex flex-col justify-between disabled:opacity-50"
+                              >
+                                <div class="text-[10px] font-mono text-slate-400 truncate">${escapeHtml(prod.code)} · ${escapeHtml(prod.category || 'Geral')}</div>
+                                <div class="text-xs font-semibold text-slate-900 line-clamp-2 leading-snug my-1">${escapeHtml(prod.name)}</div>
+                                <div class="text-xs font-bold text-slate-900 font-mono tabular-nums pt-1 border-t border-slate-100">${formatKzNumber(prod.price)} Kz</div>
+                              </button>
+                            `
+                            )
+                            .join('')}
+                        </div>
+                      </div>`
+                    : `<div class="h-40 flex flex-col items-center justify-center gap-2 text-xs text-slate-500 text-center px-4">
+                        <span>${
+                          this.products.length === 0
+                            ? 'Catálogo vazio nesta empresa.'
+                            : 'Nenhum artigo encontrado para o filtro atual.'
+                        }</span>
+                        ${
+                          this.products.length === 0 && this.canManageCatalog()
                             ? `<button
                                 type="button"
-                                data-action="pos-category"
-                                data-value="ALL"
+                                data-action="nav"
+                                data-value="PRODUCTS"
                                 class="text-blue-600 hover:underline font-medium"
-                              >Mostrar todas as categorias</button>`
-                            : ''
-                      }
-                    </div>`
+                              >Registar primeiro artigo</button>`
+                            : this.posSearch ||
+                                this.posCategoryFilter !== 'ALL' ||
+                                this.posTaxFilter !== 'ALL'
+                              ? `<button
+                                  type="button"
+                                  data-action="pos-category"
+                                  data-value="ALL"
+                                  class="text-blue-600 hover:underline font-medium"
+                                >Mostrar todas as categorias</button>`
+                              : ''
+                        }
+                      </div>`
                   : `<div class="grid grid-cols-2 sm:grid-cols-3 lg:grid-cols-2 xl:grid-cols-3 gap-2">
                       ${visibleProducts
                         .map((prod) => {
@@ -3300,7 +3869,7 @@ export class SilaBillingApp {
                         autocomplete="off"
                         data-field="pos-customer-search"
                         value="${escapeHtml(this.posCustomerSearch)}"
-                        placeholder="Filtrar cliente por nome ou NIF..."
+                        placeholder="Filtrar cliente por nome, NIF ou telefone..."
                         class="w-full h-8 pl-8 pr-2.5 text-xs bg-white border border-slate-200 rounded-md focus:outline-none focus:border-blue-600"
                       />
                     </div>
@@ -3719,11 +4288,29 @@ export class SilaBillingApp {
                   : ''
               }
 
+              ${(() => {
+                if (hasPaidCommercialEntitlement(this.activeCompany)) return '';
+                const usage = this.getMonthlyInvoiceUsage();
+                if (usage.usedCount < FREE_SOFT_NOTICE_THRESHOLD) return '';
+                return `
+                  <div class="flex items-center justify-between gap-2 text-[11px] text-slate-500 pt-0.5 tabular-nums">
+                    <span>Movimento mensal: ${usage.usedCount}/${usage.effectiveLimit} documentos</span>
+                    <button
+                      type="button"
+                      data-action="open-growth-modal"
+                      data-value="monthly_limit"
+                      class="text-blue-600 hover:underline font-medium whitespace-nowrap"
+                    >Ativar ilimitado</button>
+                  </div>
+                `;
+              })()}
+
               <div class="flex items-center gap-2 pt-1">
                 <button
                   type="button"
                   data-action="emit-invoice"
                   data-value="save"
+                  title="Atalho rápido: F4 ou Ctrl+Enter"
                   ${this.cart.length === 0 || this.isEmitting || isSuspended ? 'disabled' : ''}
                   class="flex-1 h-11 rounded-lg bg-slate-900 text-white text-xs font-semibold hover:bg-slate-800 disabled:opacity-40 transition-colors flex items-center justify-center gap-1.5 whitespace-nowrap"
                 >
@@ -3785,7 +4372,9 @@ export class SilaBillingApp {
                   ? `<div class="h-full flex items-center justify-center text-xs text-slate-400 text-center px-4">
                       ${isA4 ? 'A fatura A4 aparecerá aqui em tempo real ao adicionar artigos.' : 'O talão térmico aparecerá aqui em tempo real ao adicionar artigos.'}
                     </div>`
-                  : renderDocumentHtml(liveInvoice, this.previewFormat, this.settings.company, cachedQr)
+                  : renderDocumentHtml(liveInvoice, this.previewFormat, this.settings.company, cachedQr, {
+                      showViralFooter: shouldShowViralDocumentFooter(this.activeCompany, this.settings),
+                    })
               }
             </div>
           </section>
@@ -3797,18 +4386,11 @@ export class SilaBillingApp {
   // ==================== 3. CLIENTES ====================
 
   private renderCustomersWorkspace(): string {
-    const q = this.customerSearch.trim().toLowerCase();
     const directCustId = getDirectCustomerIdForCompany(this.activeCompany.id);
     const canEditCust = this.canEditExistingCustomers();
     const isSuspended = this.isCompanySuspended();
 
-    const filtered = this.customers.filter(
-      (c) =>
-        !q ||
-        c.name.toLowerCase().includes(q) ||
-        c.nif.toLowerCase().includes(q) ||
-        c.locality.toLowerCase().includes(q)
-    );
+    const filtered = filterCustomersSmart(this.customers, this.customerSearch);
 
     return `
       <div class="h-full flex flex-col bg-white overflow-hidden">
@@ -3820,7 +4402,7 @@ export class SilaBillingApp {
               type="text"
               data-field="customer-search"
               value="${escapeHtml(this.customerSearch)}"
-              placeholder="Filtrar clientes por nome, NIF ou localidade..."
+              placeholder="Filtrar clientes por nome, NIF, telefone ou localidade (F2)..."
               class="w-full h-10 pl-9 pr-3 text-xs bg-slate-50 border border-slate-200 rounded-lg focus:outline-none focus:border-blue-600"
             />
           </div>
@@ -3980,16 +4562,12 @@ export class SilaBillingApp {
   // ==================== 4. PRODUTOS E SERVIÇOS ====================
 
   private renderProductsWorkspace(): string {
-    const q = this.productSearch.trim().toLowerCase();
     const canManageCat = this.canManageCatalog();
 
-    const filtered = this.products.filter(
-      (p) =>
-        !q ||
-        p.name.toLowerCase().includes(q) ||
-        p.code.toLowerCase().includes(q) ||
-        (p.category || '').toLowerCase().includes(q)
-    );
+    const prodResult = searchProductsSmart(this.products, this.productSearch);
+    const showingSuggestionsOnly =
+      prodResult.matches.length === 0 && prodResult.suggestions.length > 0;
+    const filtered = showingSuggestionsOnly ? prodResult.suggestions : prodResult.matches;
 
     const allCategories = Array.from(
       new Set([
@@ -4008,7 +4586,7 @@ export class SilaBillingApp {
               type="text"
               data-field="product-search"
               value="${escapeHtml(this.productSearch)}"
-              placeholder="Filtrar artigos por código, descrição ou categoria..."
+              placeholder="Filtrar artigos por código, descrição ou categoria (F2)..."
               class="w-full h-10 pl-9 pr-3 text-xs bg-slate-50 border border-slate-200 rounded-lg focus:outline-none focus:border-blue-600"
             />
           </div>
@@ -4152,6 +4730,15 @@ export class SilaBillingApp {
             </thead>
             <tbody class="divide-y divide-slate-100 text-xs">
               ${
+                showingSuggestionsOnly
+                  ? `<tr class="bg-slate-50/90">
+                      <td colspan="7" class="py-2 px-3 text-[11px] text-slate-600">
+                        Sem correspondência exata para <strong>${escapeHtml(this.productSearch)}</strong> — sugestões próximas encontradas:
+                      </td>
+                    </tr>`
+                  : ''
+              }
+              ${
                 filtered.length === 0
                   ? `<tr>
                       <td colspan="7" class="py-10 px-3 text-center text-xs text-slate-500">
@@ -4207,15 +4794,9 @@ export class SilaBillingApp {
   // ==================== 5. HISTÓRICO DE FATURAS ====================
 
   private renderHistoryWorkspace(): string {
-    const q = this.historySearch.trim().toLowerCase();
     const canCancel = this.canCancelInvoices();
 
-    const filtered = this.invoices.filter(
-      (inv) =>
-        !q ||
-        inv.number.toLowerCase().includes(q) ||
-        inv.customerName.toLowerCase().includes(q)
-    );
+    const filtered = filterInvoicesSmart(this.invoices, this.historySearch);
 
     const active = filtered.find((i) => i.id === this.selectedHistoryId) || filtered[0] || null;
     let cachedQr = '';
@@ -4236,7 +4817,7 @@ export class SilaBillingApp {
                 type="text"
                 data-field="history-search"
                 value="${escapeHtml(this.historySearch)}"
-                placeholder="Pesquisar n.º de fatura ou cliente..."
+                placeholder="Pesquisar n.º de fatura, cliente ou NIF (F2)..."
                 class="w-full h-10 pl-9 pr-3 text-xs bg-slate-50 border border-slate-200 rounded-lg focus:outline-none focus:border-blue-600"
               />
             </div>
@@ -4336,7 +4917,9 @@ export class SilaBillingApp {
               </div>
 
               <div class="flex-1 overflow-y-auto p-4">
-                ${renderDocumentHtml(active, this.historyViewFormat, this.settings.company, cachedQr)}
+                ${renderDocumentHtml(active, this.historyViewFormat, this.settings.company, cachedQr, {
+                  showViralFooter: shouldShowViralDocumentFooter(this.activeCompany, this.settings),
+                })}
               </div>
             `
               : `<div class="h-full flex items-center justify-center text-xs text-slate-400">Selecione uma fatura para visualizar ou reimprimir.</div>`
@@ -4481,6 +5064,19 @@ export class SilaBillingApp {
                     <span>Imprimir ao clicar em Emitir</span>
                   </label>
                 </div>
+                <div class="col-span-2 sm:col-span-12 pt-1">
+                  <label class="flex items-center gap-2 text-xs text-slate-700 cursor-pointer select-none">
+                    <input
+                      name="hidePromotionalFooter"
+                      type="checkbox"
+                      data-field="toggle-clean-footer"
+                      ${!canManage ? 'disabled' : ''}
+                      ${!shouldShowViralDocumentFooter(this.activeCompany, this.settings) ? 'checked' : ''}
+                      class="h-4 w-4 rounded border-slate-300 text-blue-600"
+                    />
+                    <span>Emitir talões POS 80mm e faturas A4 sem a linha institucional "Processado por SILA-Billing · VITRONIS"</span>
+                  </label>
+                </div>
               </div>
             </section>
           </form>
@@ -4617,31 +5213,42 @@ export class SilaBillingApp {
             }
           </section>
 
-          <!-- Estrutura Preparada para Planos Comerciais (Inativa / Fase Gratuita) -->
+          <!-- Entidade Institucional & Recursos Empresariais -->
           <section class="space-y-3 pt-6 border-t border-slate-200">
-            <div>
-              <h2 class="text-xs font-semibold text-slate-900">Plano Comercial e Estado Operacional</h2>
-              <p class="text-xs text-slate-500">Estrutura preparada para futuros planos comerciais, sem cobrança ativa nesta fase.</p>
+            <div class="flex flex-col sm:flex-row sm:items-center justify-between gap-2">
+              <div>
+                <h2 class="text-xs font-semibold text-slate-900">Informação Institucional e Suporte Oficial</h2>
+                <p class="text-xs text-slate-500">O SILA-Billing é dependência institucional da VITRONIS para efeitos comerciais e de relações públicas.</p>
+              </div>
+              <button
+                type="button"
+                data-action="open-growth-modal"
+                data-value="cloud_protection"
+                class="h-8 px-3 rounded-md border border-slate-200 text-xs font-medium text-slate-700 hover:bg-slate-50 whitespace-nowrap self-start sm:self-auto"
+              >Recursos empresariais e Cloud</button>
             </div>
-            <div class="grid grid-cols-1 sm:grid-cols-3 gap-4 py-3 px-4 rounded-lg border border-slate-200 bg-slate-50/70 text-xs">
-              <div>
-                <div class="text-[11px] text-slate-500">Estado operacional</div>
-                <div class="font-semibold text-slate-900 mt-0.5">
-                  ${this.isCompanySuspended() ? 'Suspensa (emissão bloqueada)' : 'Ativa'}
-                </div>
+            <div class="p-4 rounded-lg border border-slate-200 bg-slate-50/70 space-y-2 text-xs">
+              <div class="flex flex-col sm:flex-row sm:items-center justify-between gap-1">
+                <span class="font-bold text-slate-900">${escapeHtml(VITRONIS_INSTITUTIONAL.legalName)}</span>
+                <span class="font-mono text-slate-600 tabular-nums">Contribuinte: ${escapeHtml(VITRONIS_INSTITUTIONAL.nif)}</span>
               </div>
-              <div>
-                <div class="text-[11px] text-slate-500">Plano associado</div>
-                <div class="font-semibold text-slate-900 mt-0.5">
-                  ${escapeHtml(formatPlanLabelPt(this.activeCompany.plan.planTier))}
-                </div>
+              <div class="text-[11px] text-slate-600">
+                ${escapeHtml(VITRONIS_INSTITUTIONAL.address)} · ${escapeHtml(VITRONIS_INSTITUTIONAL.city)}
               </div>
-              <div>
-                <div class="text-[11px] text-slate-500">Subscrição / cobrança</div>
-                <div class="font-semibold text-emerald-700 mt-0.5">
-                  Inativa · Uso gratuito
-                </div>
+              <div class="flex flex-wrap items-center gap-x-3 gap-y-1 text-[11px] text-slate-600 tabular-nums">
+                <span>Tel: ${escapeHtml(VITRONIS_INSTITUTIONAL.phone)}</span>
+                <span aria-hidden="true">·</span>
+                <span>E-mail: ${escapeHtml(VITRONIS_INSTITUTIONAL.email)}</span>
+                <span aria-hidden="true">·</span>
+                <a href="${escapeHtml(VITRONIS_INSTITUTIONAL.websiteUrl)}" target="_blank" rel="noopener noreferrer" class="text-blue-600 hover:underline">${escapeHtml(VITRONIS_INSTITUTIONAL.website)}</a>
               </div>
+              ${
+                hasPaidCommercialEntitlement(this.activeCompany)
+                  ? `<div class="pt-2 border-t border-slate-200/80 text-[11px] text-emerald-700 font-medium">
+                      Licença ativa nesta empresa: ${escapeHtml(formatPlanLabelPt(this.activeCompany.plan.planTier))}
+                    </div>`
+                  : ''
+              }
             </div>
           </section>
         </div>
@@ -4653,18 +5260,25 @@ export class SilaBillingApp {
 
   private renderSyncWorkspace(): string {
     const isUnassigned = this.requiresCompanyOnboarding || !this.activeCompany.id;
-    const pProd = isUnassigned ? 0 : this.products.filter((p) => !p.synced).length;
-    const pCust = isUnassigned ? 0 : this.customers.filter((c) => !c.synced).length;
-    const pInv = isUnassigned ? 0 : this.invoices.filter((i) => !i.synced).length;
-    const pSet = isUnassigned ? 0 : this.settings.synced ? 0 : 1;
+    const cloudSyncEntitled = !isUnassigned && canCompanySyncCloudData(this.activeCompany);
+    const pProd = !cloudSyncEntitled ? 0 : this.products.filter((p) => !p.synced).length;
+    const pCust = !cloudSyncEntitled ? 0 : this.customers.filter((c) => !c.synced).length;
+    const pInv = !cloudSyncEntitled ? 0 : this.invoices.filter((i) => !i.synced).length;
+    const pSet = !cloudSyncEntitled ? 0 : this.settings.synced ? 0 : 1;
     const totalPending = pProd + pCust + pInv + pSet;
 
-    const errCount = isUnassigned
+    const errCount = !cloudSyncEntitled
       ? 0
       : this.products.filter((p) => p.syncState === 'error').length +
         this.customers.filter((c) => c.syncState === 'error').length +
         this.invoices.filter((i) => i.syncState === 'error').length +
         (this.settings.syncState === 'error' ? 1 : 0);
+
+    const showCloudProtectionNudge =
+      !isUnassigned &&
+      !cloudSyncEntitled &&
+      (this.invoices.length >= CLOUD_PROTECTION_NUDGE_INVOICES ||
+        this.products.length + this.customers.length >= CLOUD_PROTECTION_NUDGE_RECORDS);
 
     const lastSync = this.lastSyncedIso ? formatDateTimePt(this.lastSyncedIso) : null;
     const bh = this.backendHealth;
@@ -4722,6 +5336,23 @@ export class SilaBillingApp {
           }
 
           ${
+            showCloudProtectionNudge
+              ? `<div class="p-3.5 rounded-lg border border-blue-200 bg-blue-50/70 flex flex-col sm:flex-row sm:items-center justify-between gap-3 text-xs">
+                  <div class="text-slate-700 leading-relaxed">
+                    <span class="font-semibold text-slate-900">Histórico relevante neste dispositivo:</span>
+                    existem ${this.invoices.length} faturas e ${this.products.length + this.customers.length} registos guardados localmente. Exporte cópia em JSON ou ative o backup automático na Cloud.
+                  </div>
+                  <button
+                    type="button"
+                    data-action="open-growth-modal"
+                    data-value="cloud_protection"
+                    class="h-8 px-3 rounded-md bg-blue-600 hover:bg-blue-700 text-white text-xs font-semibold whitespace-nowrap shrink-0"
+                  >Proteger na Cloud</button>
+                </div>`
+              : ''
+          }
+
+          ${
             errCount > 0
               ? `<div class="p-3 rounded-lg border border-red-200 bg-red-50 text-xs text-red-700 tabular-nums">
                   ${errCount} registo(s) aguardam nova tentativa após erro de sincronização. Os dados permanecem seguros localmente no IndexedDB.
@@ -4746,7 +5377,9 @@ export class SilaBillingApp {
               <div class="text-xs font-bold text-slate-900 truncate">
                 ${this.user ? escapeHtml(this.user.email || 'Autenticado') : 'Modo Local'}
               </div>
-              <p class="text-[11px] text-slate-500 font-mono tabular-nums">${totalPending} registo(s) pendente(s)</p>
+              <p class="text-[11px] text-slate-500 font-mono tabular-nums">${
+                cloudSyncEntitled ? `${totalPending} registo(s) pendente(s)` : 'Armazenamento autónomo local'
+              }</p>
             </div>
 
             <div class="p-3.5 rounded-lg border border-slate-200 bg-slate-50/70 space-y-1">
@@ -4762,44 +5395,85 @@ export class SilaBillingApp {
           </section>
 
           <section class="space-y-2.5">
-            <h2 class="text-xs font-semibold text-slate-900">Registos Locais vs Cloud Firestore</h2>
+            <h2 class="text-xs font-semibold text-slate-900">Registos Guardados no Dispositivo${cloudSyncEntitled ? ' vs Cloud Firestore' : ''}</h2>
             <div class="border border-slate-200 rounded-lg overflow-hidden">
               <table class="w-full text-left border-collapse text-xs">
                 <thead class="bg-slate-50 border-b border-slate-200 text-[11px] text-slate-500">
                   <tr>
                     <th class="py-2.5 px-3 font-medium">Entidade</th>
                     <th class="py-2.5 px-3 font-medium text-right">Local (IndexedDB)</th>
-                    <th class="py-2.5 px-3 font-medium text-right">Sincronizados</th>
-                    <th class="py-2.5 px-3 font-medium text-right">Pendentes</th>
+                    <th class="py-2.5 px-3 font-medium text-right">${cloudSyncEntitled ? 'Sincronizados' : 'Modo de Persistência'}</th>
+                    ${cloudSyncEntitled ? '<th class="py-2.5 px-3 font-medium text-right">Pendentes</th>' : ''}
                   </tr>
                 </thead>
                 <tbody class="divide-y divide-slate-100 tabular-nums">
                   <tr>
                     <td class="py-2.5 px-3 font-medium text-slate-900">Faturas emitidas</td>
                     <td class="py-2.5 px-3 text-right font-mono">${this.invoices.length}</td>
-                    <td class="py-2.5 px-3 text-right font-mono text-emerald-700">${this.invoices.length - pInv}</td>
-                    <td class="py-2.5 px-3 text-right font-mono text-amber-700">${pInv}</td>
+                    <td class="py-2.5 px-3 text-right font-mono ${cloudSyncEntitled ? 'text-emerald-700' : 'text-slate-600'}">${cloudSyncEntitled ? this.invoices.length - pInv : 'Local seguro'}</td>
+                    ${cloudSyncEntitled ? `<td class="py-2.5 px-3 text-right font-mono text-amber-700">${pInv}</td>` : ''}
                   </tr>
                   <tr>
                     <td class="py-2.5 px-3 font-medium text-slate-900">Produtos e serviços</td>
                     <td class="py-2.5 px-3 text-right font-mono">${this.products.length}</td>
-                    <td class="py-2.5 px-3 text-right font-mono text-emerald-700">${this.products.length - pProd}</td>
-                    <td class="py-2.5 px-3 text-right font-mono text-amber-700">${pProd}</td>
+                    <td class="py-2.5 px-3 text-right font-mono ${cloudSyncEntitled ? 'text-emerald-700' : 'text-slate-600'}">${cloudSyncEntitled ? this.products.length - pProd : 'Local seguro'}</td>
+                    ${cloudSyncEntitled ? `<td class="py-2.5 px-3 text-right font-mono text-amber-700">${pProd}</td>` : ''}
                   </tr>
                   <tr>
                     <td class="py-2.5 px-3 font-medium text-slate-900">Clientes</td>
                     <td class="py-2.5 px-3 text-right font-mono">${this.customers.length}</td>
-                    <td class="py-2.5 px-3 text-right font-mono text-emerald-700">${this.customers.length - pCust}</td>
-                    <td class="py-2.5 px-3 text-right font-mono text-amber-700">${pCust}</td>
+                    <td class="py-2.5 px-3 text-right font-mono ${cloudSyncEntitled ? 'text-emerald-700' : 'text-slate-600'}">${cloudSyncEntitled ? this.customers.length - pCust : 'Local seguro'}</td>
+                    ${cloudSyncEntitled ? `<td class="py-2.5 px-3 text-right font-mono text-amber-700">${pCust}</td>` : ''}
                   </tr>
                   <tr>
                     <td class="py-2.5 px-3 font-medium text-slate-900">Configurações</td>
                     <td class="py-2.5 px-3 text-right font-mono">1</td>
-                    <td class="py-2.5 px-3 text-right font-mono text-emerald-700">${this.settings.synced ? 1 : 0}</td>
-                    <td class="py-2.5 px-3 text-right font-mono text-amber-700">${pSet}</td>
+                    <td class="py-2.5 px-3 text-right font-mono ${cloudSyncEntitled ? 'text-emerald-700' : 'text-slate-600'}">${cloudSyncEntitled ? (this.settings.synced ? 1 : 0) : 'Local seguro'}</td>
+                    ${cloudSyncEntitled ? `<td class="py-2.5 px-3 text-right font-mono text-amber-700">${pSet}</td>` : ''}
                   </tr>
                 </tbody>
               </table>
+            </div>
+          </section>
+
+          <!-- Instalação Universal no Dispositivo (Android, Windows 7/10/11, iPhone/iPad) -->
+          <section class="pt-4 border-t border-slate-200 flex flex-col sm:flex-row sm:items-center justify-between gap-3">
+            <div class="space-y-0.5">
+              <h2 class="text-xs font-semibold text-slate-900">Instalação neste Terminal / Telemóvel (PWA Offline)</h2>
+              <p class="text-xs text-slate-500">${
+                this.isInstalled
+                  ? 'Aplicativo já instalado e em execução em modo autónomo neste dispositivo.'
+                  : this.deferredPrompt
+                    ? 'Pronto para instalar com 1 clique no ecrã principal ou área de trabalho.'
+                    : this.isIOS
+                      ? 'Em iPhone e iPad, a Apple exige confirmação manual através do menu Partilhar do Safari.'
+                      : 'Pode instalar pelo menu do navegador (⋮ → Instalar SILA-Billing / Guardar atalho) para abertura direta offline.'
+              }</p>
+            </div>
+            <div class="flex items-center gap-2 shrink-0">
+              ${
+                this.isInstalled
+                  ? `<span class="text-xs font-semibold text-emerald-700 flex items-center gap-1.5">${ICONS.check}<span>Instalado</span></span>`
+                  : this.deferredPrompt
+                    ? `<button
+                        type="button"
+                        data-action="install-pwa"
+                        class="h-9 px-3.5 rounded-lg bg-blue-600 text-white text-xs font-semibold hover:bg-blue-700 flex items-center gap-1.5 whitespace-nowrap"
+                      >
+                        ${ICONS.download}
+                        <span>Instalar Aplicativo</span>
+                      </button>`
+                    : this.isIOS
+                      ? `<button
+                          type="button"
+                          data-action="open-ios-guide"
+                          class="h-9 px-3.5 rounded-lg bg-slate-900 text-white text-xs font-semibold hover:bg-slate-800 flex items-center gap-1.5 whitespace-nowrap"
+                        >
+                          ${ICONS.iosShare}
+                          <span>Como instalar no iPhone / iPad</span>
+                        </button>`
+                      : ''
+              }
             </div>
           </section>
 
@@ -4848,20 +5522,79 @@ export class SilaBillingApp {
     `;
   }
 
+  private renderIOSInstallBanner(): string {
+    if (!this.isIOS || this.isInstalled || this.iosBannerDismissed) {
+      return '';
+    }
+
+    return `
+      <div class="bg-slate-800 border-b border-slate-700 text-slate-100 px-3 py-2 text-xs flex items-center justify-between gap-2 shrink-0">
+        <div class="flex items-center gap-2 min-w-0 leading-snug">
+          <span class="text-blue-400 shrink-0">${ICONS.iosShare}</span>
+          <div class="min-w-0">
+            ${
+              this.isIOSInAppBrowser
+                ? `<span class="font-semibold text-white">Instalar no iPhone:</span> abra primeiro no <strong>Safari</strong> e toque em <strong>Partilhar</strong> → <strong>Adicionar ao Ecrã Principal</strong>.`
+                : `<span class="font-semibold text-white">Instalar no iPhone / iPad:</span> toque em <strong class="text-white">Partilhar</strong> na barra do navegador e escolha <strong class="text-white">Adicionar ao Ecrã Principal</strong>.`
+            }
+          </div>
+        </div>
+        <div class="flex items-center gap-1.5 shrink-0">
+          <button
+            type="button"
+            data-action="open-ios-guide"
+            class="h-7 px-2.5 rounded bg-slate-700 hover:bg-slate-600 text-[11px] font-semibold text-white whitespace-nowrap transition-colors"
+          >Passos</button>
+          <button
+            type="button"
+            data-action="dismiss-ios-banner"
+            aria-label="Ocultar aviso de instalação"
+            class="h-7 w-7 flex items-center justify-center rounded text-slate-400 hover:text-white hover:bg-slate-700 transition-colors"
+          >${ICONS.close}</button>
+        </div>
+      </div>
+    `;
+  }
+
   private renderIOSModal(): string {
     return `
       <div class="fixed inset-0 z-50 bg-black/50 flex items-center justify-center p-4">
-        <div class="bg-white rounded-xl p-5 max-w-xs w-full space-y-3 border border-slate-200">
-          <div class="text-sm font-bold text-slate-900">Instalar no iPhone / iPad</div>
-          <p class="text-xs text-slate-600 leading-relaxed">
-            1. Toque em <strong>Partilhar</strong> na barra do Safari.<br />
-            2. Selecione <strong>Adicionar ao Ecrã Principal</strong>.
-          </p>
+        <div class="bg-white rounded-xl p-5 max-w-sm w-full space-y-4 border border-slate-200 shadow-lg">
+          <div class="flex items-center justify-between gap-2">
+            <h2 class="text-sm font-bold text-slate-900">Instalar SILA-Billing no iPhone / iPad</h2>
+            <button
+              type="button"
+              data-action="close-ios-guide"
+              aria-label="Fechar guia"
+              class="h-7 w-7 flex items-center justify-center rounded-md text-slate-400 hover:text-slate-700 hover:bg-slate-100"
+            >${ICONS.close}</button>
+          </div>
+          ${
+            this.isIOSInAppBrowser
+              ? `<div class="p-2.5 rounded-lg bg-amber-50 border border-amber-200 text-xs text-amber-800 leading-relaxed">
+                  Está a visualizar dentro de uma aplicação externa. Toque nos três pontos ou no ícone do navegador para <strong>Abrir no Safari</strong> antes de instalar.
+                </div>`
+              : ''
+          }
+          <ol class="space-y-2.5 text-xs text-slate-600 leading-relaxed">
+            <li class="flex items-start gap-2.5">
+              <span class="h-6 w-6 rounded-md bg-slate-100 text-slate-700 flex items-center justify-center shrink-0 mt-0.5">${ICONS.iosShare}</span>
+              <span><strong>1.</strong> Toque no botão <strong>Partilhar</strong> na barra inferior ou superior do Safari.</span>
+            </li>
+            <li class="flex items-start gap-2.5">
+              <span class="h-6 w-6 rounded-md bg-slate-100 text-slate-700 flex items-center justify-center shrink-0 mt-0.5">${ICONS.plusSquare}</span>
+              <span><strong>2.</strong> Deslize a lista de opções e selecione <strong>Adicionar ao Ecrã Principal</strong>.</span>
+            </li>
+            <li class="flex items-start gap-2.5">
+              <span class="h-6 w-6 rounded-md bg-slate-100 text-slate-700 flex items-center justify-center shrink-0 mt-0.5">${ICONS.check}</span>
+              <span><strong>3.</strong> Confirme em <strong>Adicionar</strong> no canto superior direito para abrir o SILA-Billing em ecrã inteiro, inclusive sem internet.</span>
+            </li>
+          </ol>
           <button
             type="button"
             data-action="close-ios-guide"
-            class="w-full h-9 rounded-lg bg-slate-900 text-white text-xs font-semibold"
-          >Fechar</button>
+            class="w-full h-10 rounded-lg bg-slate-900 hover:bg-slate-800 text-white text-xs font-semibold transition-colors"
+          >Entendido</button>
         </div>
       </div>
     `;

@@ -3,7 +3,7 @@
   <head>
     <meta charset="UTF-8" />
     <meta http-equiv="X-UA-Compatible" content="IE=edge" />
-    <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no, viewport-fit=cover" />
     <title>SILA-Billing</title>
     <meta name="description" content="Plataforma comercial multiempresa de faturação POS térmico e A4 offline-first para Angola." />
     <meta property="og:title" content="SILA-Billing" />
@@ -81,6 +81,21 @@
       /* Micro-shim 100% local e offline para motores antigos (Windows 7 / Chrome legado) — 0 pedidos externos */
       (function () {
         window.__SILA_BOOTED__ = false;
+        window.__SILA_DEFERRED_PROMPT__ = null;
+        window.__SILA_PWA_INSTALLED__ = false;
+
+        if (window.addEventListener) {
+          window.addEventListener('beforeinstallprompt', function (e) {
+            if (e && typeof e.preventDefault === 'function') {
+              e.preventDefault();
+            }
+            window.__SILA_DEFERRED_PROMPT__ = e;
+          });
+          window.addEventListener('appinstalled', function () {
+            window.__SILA_PWA_INSTALLED__ = true;
+            window.__SILA_DEFERRED_PROMPT__ = null;
+          });
+        }
 
         if (typeof Object.assign !== 'function') {
           Object.assign = function (target) {

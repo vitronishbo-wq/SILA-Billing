@@ -30,6 +30,7 @@ import {
   Product,
   SyncQueueEntry,
   validateCompanyNif,
+  VITRONIS_INSTITUTIONAL,
 } from '../core/types';
 
 export interface PosWorkspaceDraft {
@@ -88,6 +89,7 @@ export interface RegisterCompanyInput {
   ownerEmail?: string;
   ownerDisplayName?: string;
   copyStarterCatalog?: boolean;
+  termsAccepted?: boolean;
 }
 
 const DB_NAME = 'sila_billing_idb_v1';
@@ -669,10 +671,23 @@ export async function ensureJaimonaSeedTenantPresent(options?: {
 }): Promise<void> {
   const existingJaimona = await getFromStore<CompanyRecord>('companies', JAIMONA_COMPANY_ID);
   if (existingJaimona) {
-    if (!existingJaimona.ownerEmail) {
+    const needsOwnerFix = !isJaimonaOwnerEmail(existingJaimona.ownerEmail);
+    const needsPlanUpgrade =
+      !existingJaimona.plan || existingJaimona.plan.planTier === 'FREE';
+    if (needsOwnerFix || needsPlanUpgrade) {
       await putInStore('companies', {
         ...existingJaimona,
+        ownerUid: needsOwnerFix ? undefined : existingJaimona.ownerUid,
         ownerEmail: JAIMONA_OWNER_EMAIL,
+        plan: needsPlanUpgrade
+          ? {
+              planTier: 'PROFISSIONAL',
+              commercialActive: true,
+              maxUsers: null,
+              maxInvoicesPerMonth: null,
+              updatedAtIso: new Date().toISOString(),
+            }
+          : existingJaimona.plan,
       });
     }
     return;
@@ -769,10 +784,26 @@ async function ensureMulticompanyInitialized(viewer?: WorkspaceViewerIdentity | 
   }>('meta', 'migration_multicompany_v2');
 
   const existingJaimona = await getFromStore<CompanyRecord>('companies', JAIMONA_COMPANY_ID);
-  if (existingJaimona && !existingJaimona.ownerEmail) {
+  if (
+    existingJaimona &&
+    (!isJaimonaOwnerEmail(existingJaimona.ownerEmail) ||
+      existingJaimona.plan?.planTier === 'FREE')
+  ) {
+    const needsOwnerFix = !isJaimonaOwnerEmail(existingJaimona.ownerEmail);
     await putInStore('companies', {
       ...existingJaimona,
+      ownerUid: needsOwnerFix ? undefined : existingJaimona.ownerUid,
       ownerEmail: JAIMONA_OWNER_EMAIL,
+      plan:
+        existingJaimona.plan?.planTier === 'FREE'
+          ? {
+              planTier: 'PROFISSIONAL',
+              commercialActive: true,
+              maxUsers: null,
+              maxInvoicesPerMonth: null,
+              updatedAtIso: new Date().toISOString(),
+            }
+          : existingJaimona.plan,
     });
   }
 
@@ -1081,6 +1112,12 @@ export async function registerNewCompanyLocal(
     );
   }
 
+  if (input.termsAccepted === false) {
+    throw new Error(
+      `É obrigatório aceitar os Termos de Utilização institucionais (${VITRONIS_INSTITUTIONAL.shortName}) para registar a empresa.`
+    );
+  }
+
   const legalName = input.legalName.trim();
   const shortName = (input.shortName || legalName).trim().slice(0, 64);
   if (!legalName) {
@@ -1117,6 +1154,9 @@ export async function registerNewCompanyLocal(
     allowManagerCancel: false,
     ownerUid: input.ownerUid,
     ownerEmail: input.ownerEmail,
+    termsAcceptedVersion: VITRONIS_INSTITUTIONAL.termsVersion,
+    termsAcceptedAtIso: now,
+    maxObservedIso: now,
     syncState: 'pending',
     synced: false,
     createdAtIso: now,

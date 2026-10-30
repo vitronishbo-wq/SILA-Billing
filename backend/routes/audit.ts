@@ -151,160 +151,168 @@ auditRouter.post('/invoices', requireFirebaseAuth, async (req: AuthenticatedRequ
         return;
       }
 
-      const safeInvoiceId = String(body.id).replace(/[^a-zA-Z0-9_-]/g, '_').slice(0, 128);
-      const batch = ctx.db.batch();
+      const cloudPlan = String(membership.companyData?.planTier || 'FREE');
+      const canPersistCloud =
+        safeCompanyId === JAIMONA_COMPANY_ID ||
+        cloudPlan === 'PROFISSIONAL' ||
+        cloudPlan === 'ENTERPRISE';
 
-      const invoicePayloadBase = {
-        id: safeInvoiceId,
-        number: String(body.number).slice(0, 40),
-        docType: body.docType === 'FP' ? 'FP' : 'FR',
-        issuedAtIso: String(body.issuedAtIso || new Date().toISOString()).slice(0, 40),
-        cashier: String(body.cashier || '01').slice(0, 16),
-        operator: String(body.operator || '001').slice(0, 32),
-        paymentMethod:
-          body.paymentMethod === 'Multicaixa' || body.paymentMethod === 'Transferência'
-            ? body.paymentMethod
-            : 'Dinheiro',
-        customerId: String(body.customerId || 'cust_direct')
-          .replace(/[^a-zA-Z0-9_-]/g, '_')
-          .slice(0, 128),
-        customerName: String(body.customerName || 'Cliente de Venda Directa').slice(0, 160),
-        customerNif: String(body.customerNif || 'Consumidor Final').slice(0, 32),
-        customerLocality: String(body.customerLocality || 'Angola').slice(0, 160),
-        merchandiseTotal: serverCalc.merchandiseTotal,
-        discountTotal: serverCalc.discountTotal,
-        taxBase14: serverCalc.taxBase14,
-        taxAmount14: serverCalc.taxAmount14,
-        taxBase0: serverCalc.taxBase0,
-        taxAmount0: 0,
-        taxTotal: serverCalc.taxTotal,
-        grandTotal: serverCalc.grandTotal,
-        amountInWords: serverCalc.amountInWords.slice(0, 300),
-        amountReceived,
-        changeAmount,
-        notes: String(body.notes || '').slice(0, 300),
-        itemCount: serverCalc.lines.length,
-        status: 'issued',
-        createdAt: FieldValue.serverTimestamp(),
-        updatedAt: FieldValue.serverTimestamp(),
-      };
+      if (canPersistCloud) {
+        const safeInvoiceId = String(body.id).replace(/[^a-zA-Z0-9_-]/g, '_').slice(0, 128);
+        const batch = ctx.db.batch();
 
-      if (membership.existsInCloud) {
-        const companyOwnerUid = String(membership.companyData?.ownerUid || user.uid);
-        const compInvRef = ctx.db
-          .collection('companies')
-          .doc(safeCompanyId)
-          .collection('invoices')
-          .doc(safeInvoiceId);
-        const compAuditRef = ctx.db
-          .collection('companies')
-          .doc(safeCompanyId)
-          .collection('audit_logs')
-          .doc(safeInvoiceId);
-
-        batch.set(
-          compInvRef,
-          {
-            ...invoicePayloadBase,
-            companyId: safeCompanyId,
-            companyOwnerUid,
-            emittedByUid: user.uid,
-          },
-          { merge: true }
-        );
-
-        for (const line of serverCalc.lines) {
-          const safeItemId = line.id.replace(/[^a-zA-Z0-9_-]/g, '_').slice(0, 128);
-          batch.set(compInvRef.collection('items').doc(safeItemId), {
-            id: safeItemId,
-            invoiceId: safeInvoiceId,
-            companyId: safeCompanyId,
-            companyOwnerUid,
-            code: line.code,
-            description: line.description,
-            unit: line.unit,
-            qty: line.qty,
-            unitPrice: line.unitPrice,
-            discountPct: line.discountPct,
-            ivaRate: line.ivaRate,
-            lineGross: line.lineGross,
-            lineNet: line.lineNet,
-            lineBase: line.lineBase,
-            lineTax: line.lineTax,
-            lineTotal: line.lineTotal,
-            createdAt: FieldValue.serverTimestamp(),
-          });
-        }
-
-        batch.set(compAuditRef, {
-          invoiceId: safeInvoiceId,
-          companyId: safeCompanyId,
-          invoiceNumber: String(body.number).slice(0, 40),
-          actorUid: user.uid,
-          actorEmail: user.email || '',
-          actorRole: membership.role,
-          grandTotal: serverCalc.grandTotal,
+        const invoicePayloadBase = {
+          id: safeInvoiceId,
+          number: String(body.number).slice(0, 40),
+          docType: body.docType === 'FP' ? 'FP' : 'FR',
+          issuedAtIso: String(body.issuedAtIso || new Date().toISOString()).slice(0, 40),
+          cashier: String(body.cashier || '01').slice(0, 16),
+          operator: String(body.operator || '001').slice(0, 32),
+          paymentMethod:
+            body.paymentMethod === 'Multicaixa' || body.paymentMethod === 'Transferência'
+              ? body.paymentMethod
+              : 'Dinheiro',
+          customerId: String(body.customerId || 'cust_direct')
+            .replace(/[^a-zA-Z0-9_-]/g, '_')
+            .slice(0, 128),
+          customerName: String(body.customerName || 'Cliente de Venda Directa').slice(0, 160),
+          customerNif: String(body.customerNif || 'Consumidor Final').slice(0, 32),
+          customerLocality: String(body.customerLocality || 'Angola').slice(0, 160),
+          merchandiseTotal: serverCalc.merchandiseTotal,
+          discountTotal: serverCalc.discountTotal,
           taxBase14: serverCalc.taxBase14,
           taxAmount14: serverCalc.taxAmount14,
           taxBase0: serverCalc.taxBase0,
-          auditHash,
-          verifiedAt: FieldValue.serverTimestamp(),
-        });
-      }
+          taxAmount0: 0,
+          taxTotal: serverCalc.taxTotal,
+          grandTotal: serverCalc.grandTotal,
+          amountInWords: serverCalc.amountInWords.slice(0, 300),
+          amountReceived,
+          changeAmount,
+          notes: String(body.notes || '').slice(0, 300),
+          itemCount: serverCalc.lines.length,
+          status: 'issued',
+          createdAt: FieldValue.serverTimestamp(),
+          updatedAt: FieldValue.serverTimestamp(),
+        };
 
-      // Mantém continuidade na coleção clássica estritamente para o titular real da JAIMONA
-      if (safeCompanyId === JAIMONA_COMPANY_ID && isJaimonaOwnerEmail(user.email)) {
-        const invRef = ctx.db
-          .collection('users')
-          .doc(user.uid)
-          .collection('invoices')
-          .doc(safeInvoiceId);
-        const auditRef = ctx.db
-          .collection('users')
-          .doc(user.uid)
-          .collection('audit_logs')
-          .doc(safeInvoiceId);
+        if (membership.existsInCloud) {
+          const companyOwnerUid = String(membership.companyData?.ownerUid || user.uid);
+          const compInvRef = ctx.db
+            .collection('companies')
+            .doc(safeCompanyId)
+            .collection('invoices')
+            .doc(safeInvoiceId);
+          const compAuditRef = ctx.db
+            .collection('companies')
+            .doc(safeCompanyId)
+            .collection('audit_logs')
+            .doc(safeInvoiceId);
 
-        batch.set(invRef, { ...invoicePayloadBase, ownerId: user.uid }, { merge: true });
+          batch.set(
+            compInvRef,
+            {
+              ...invoicePayloadBase,
+              companyId: safeCompanyId,
+              companyOwnerUid,
+              emittedByUid: user.uid,
+            },
+            { merge: true }
+          );
 
-        for (const line of serverCalc.lines) {
-          const safeItemId = line.id.replace(/[^a-zA-Z0-9_-]/g, '_').slice(0, 128);
-          batch.set(invRef.collection('items').doc(safeItemId), {
-            id: safeItemId,
+          for (const line of serverCalc.lines) {
+            const safeItemId = line.id.replace(/[^a-zA-Z0-9_-]/g, '_').slice(0, 128);
+            batch.set(compInvRef.collection('items').doc(safeItemId), {
+              id: safeItemId,
+              invoiceId: safeInvoiceId,
+              companyId: safeCompanyId,
+              companyOwnerUid,
+              code: line.code,
+              description: line.description,
+              unit: line.unit,
+              qty: line.qty,
+              unitPrice: line.unitPrice,
+              discountPct: line.discountPct,
+              ivaRate: line.ivaRate,
+              lineGross: line.lineGross,
+              lineNet: line.lineNet,
+              lineBase: line.lineBase,
+              lineTax: line.lineTax,
+              lineTotal: line.lineTotal,
+              createdAt: FieldValue.serverTimestamp(),
+            });
+          }
+
+          batch.set(compAuditRef, {
             invoiceId: safeInvoiceId,
+            companyId: safeCompanyId,
+            invoiceNumber: String(body.number).slice(0, 40),
+            actorUid: user.uid,
+            actorEmail: user.email || '',
+            actorRole: membership.role,
+            grandTotal: serverCalc.grandTotal,
+            taxBase14: serverCalc.taxBase14,
+            taxAmount14: serverCalc.taxAmount14,
+            taxBase0: serverCalc.taxBase0,
+            auditHash,
+            verifiedAt: FieldValue.serverTimestamp(),
+          });
+        }
+
+        // Mantém continuidade na coleção clássica estritamente para o titular real da JAIMONA
+        if (safeCompanyId === JAIMONA_COMPANY_ID && isJaimonaOwnerEmail(user.email)) {
+          const invRef = ctx.db
+            .collection('users')
+            .doc(user.uid)
+            .collection('invoices')
+            .doc(safeInvoiceId);
+          const auditRef = ctx.db
+            .collection('users')
+            .doc(user.uid)
+            .collection('audit_logs')
+            .doc(safeInvoiceId);
+
+          batch.set(invRef, { ...invoicePayloadBase, ownerId: user.uid }, { merge: true });
+
+          for (const line of serverCalc.lines) {
+            const safeItemId = line.id.replace(/[^a-zA-Z0-9_-]/g, '_').slice(0, 128);
+            batch.set(invRef.collection('items').doc(safeItemId), {
+              id: safeItemId,
+              invoiceId: safeInvoiceId,
+              ownerId: user.uid,
+              code: line.code,
+              description: line.description,
+              unit: line.unit,
+              qty: line.qty,
+              unitPrice: line.unitPrice,
+              discountPct: line.discountPct,
+              ivaRate: line.ivaRate,
+              lineGross: line.lineGross,
+              lineNet: line.lineNet,
+              lineBase: line.lineBase,
+              lineTax: line.lineTax,
+              lineTotal: line.lineTotal,
+              createdAt: FieldValue.serverTimestamp(),
+            });
+          }
+
+          batch.set(auditRef, {
+            invoiceId: safeInvoiceId,
+            invoiceNumber: String(body.number).slice(0, 40),
             ownerId: user.uid,
-            code: line.code,
-            description: line.description,
-            unit: line.unit,
-            qty: line.qty,
-            unitPrice: line.unitPrice,
-            discountPct: line.discountPct,
-            ivaRate: line.ivaRate,
-            lineGross: line.lineGross,
-            lineNet: line.lineNet,
-            lineBase: line.lineBase,
-            lineTax: line.lineTax,
-            lineTotal: line.lineTotal,
-            createdAt: FieldValue.serverTimestamp(),
+            ownerEmail: user.email || '',
+            grandTotal: serverCalc.grandTotal,
+            taxBase14: serverCalc.taxBase14,
+            taxAmount14: serverCalc.taxAmount14,
+            taxBase0: serverCalc.taxBase0,
+            auditHash,
+            verifiedAt: FieldValue.serverTimestamp(),
           });
         }
 
-        batch.set(auditRef, {
-          invoiceId: safeInvoiceId,
-          invoiceNumber: String(body.number).slice(0, 40),
-          ownerId: user.uid,
-          ownerEmail: user.email || '',
-          grandTotal: serverCalc.grandTotal,
-          taxBase14: serverCalc.taxBase14,
-          taxAmount14: serverCalc.taxAmount14,
-          taxBase0: serverCalc.taxBase0,
-          auditHash,
-          verifiedAt: FieldValue.serverTimestamp(),
-        });
+        await batch.commit();
+        persistedInFirestore = true;
       }
-
-      await batch.commit();
-      persistedInFirestore = true;
     } catch (err) {
       res.status(500).json({
         ok: false,

@@ -1,10 +1,12 @@
 import { formatDateTimePt } from '../../src/core/billingEngine';
-import type {
+import {
   CompanyOperationalStatus,
   CompanyRecord,
   CompanyRole,
+  GrowthTriggerReason,
   InvoiceRecord,
   PlanTier,
+  VITRONIS_INSTITUTIONAL,
 } from '../../src/core/types';
 import type { AdminAuditEntry, AdminCompanySummary } from '../services/backendApi';
 import { ICONS } from './icons';
@@ -27,13 +29,13 @@ export function formatRoleLabelPt(role: CompanyRole): string {
 export function formatPlanLabelPt(plan: PlanTier): string {
   switch (plan) {
     case 'ESSENCIAL':
-      return 'Essencial';
+      return 'Essencial (Local Ilimitado)';
     case 'PROFISSIONAL':
-      return 'Profissional';
+      return 'Cloud Profissional';
     case 'ENTERPRISE':
       return 'Enterprise';
     default:
-      return 'Gratuito';
+      return 'Base Orgânico';
   }
 }
 
@@ -218,9 +220,22 @@ export function renderNewCompanyModal(params: {
             <span>Incluir artigos base de demonstração (desmarcado inicia catálogo limpo)</span>
           </label>
 
-          <div class="text-[11px] text-slate-500 pt-1 border-t border-slate-100">
-            Numeração própria iniciada em <span class="font-mono tabular-nums font-semibold">000001</span> · Uso gratuito ativo${
-              isSignedIn ? ' · Reserva imediata na Cloud' : ' · Sincroniza ao autenticar na Cloud'
+          <label class="flex items-start gap-2 pt-2 border-t border-slate-100 text-[11px] text-slate-600 leading-snug cursor-pointer select-none">
+            <input
+              name="acceptTerms"
+              type="checkbox"
+              required
+              checked
+              class="h-4 w-4 mt-0.5 rounded border-slate-300 text-blue-600 shrink-0"
+            />
+            <span>
+              Declaro aceitar as condições operacionais do <strong>SILA-Billing</strong>, dependência institucional de <strong>${escapeHtml(VITRONIS_INSTITUTIONAL.legalName)}</strong> (NIF ${escapeHtml(VITRONIS_INSTITUTIONAL.nif)}), assumindo responsabilidade pelos dados emitidos.
+            </span>
+          </label>
+
+          <div class="text-[11px] text-slate-500 pt-1">
+            Numeração própria iniciada em <span class="font-mono tabular-nums font-semibold">000001</span> · Armazenamento autónomo neste dispositivo${
+              isSignedIn ? ' · Identidade empresarial vinculada' : ''
             }.
           </div>
 
@@ -349,7 +364,7 @@ export function renderMasterAdminModal(params: {
           <div class="min-w-0">
             <h2 class="text-sm font-bold tracking-tight">Painel Master SILA-Billing</h2>
             <p class="text-[11px] text-slate-400 truncate">
-              Administração multiempresa · Fase gratuita sem cobrança ativa${
+              Governança Multiempresa · ${escapeHtml(VITRONIS_INSTITUTIONAL.legalName)}${
                 isSignedIn ? ` · ${escapeHtml(userEmail)}` : ''
               }
             </p>
@@ -437,8 +452,8 @@ export function renderMasterAdminModal(params: {
                   <div class="text-lg font-bold font-mono text-slate-700 mt-0.5">${suspendedCount}</div>
                 </div>
                 <div class="p-3 rounded-lg border border-slate-200 bg-slate-50/60">
-                  <div class="text-[11px] text-slate-500">Cobrança comercial</div>
-                  <div class="text-xs font-semibold text-slate-900 mt-1.5">Inativa · Uso Gratuito</div>
+                  <div class="text-[11px] text-slate-500">Planos comerciais ativos</div>
+                  <div class="text-lg font-bold font-mono text-blue-700 mt-0.5">${mergedCompanies.filter((c) => c.planTier !== 'FREE').length}</div>
                 </div>
               </div>
 
@@ -474,7 +489,7 @@ export function renderMasterAdminModal(params: {
                       <th class="py-2.5 px-3 font-medium">NIF Único</th>
                       <th class="py-2.5 px-3 font-medium hidden md:table-cell">Registo</th>
                       <th class="py-2.5 px-3 font-medium text-right">Faturas</th>
-                      <th class="py-2.5 px-3 font-medium">Plano Preparado</th>
+                      <th class="py-2.5 px-3 font-medium">Plano Comercial</th>
                       <th class="py-2.5 px-3 font-medium">Estado</th>
                       <th class="py-2.5 px-3 font-medium text-right">Ações</th>
                     </tr>
@@ -503,14 +518,17 @@ export function renderMasterAdminModal(params: {
                                     <select
                                       data-field="admin-company-plan"
                                       data-id="${escapeHtml(comp.id)}"
-                                      aria-label="Plano preparado"
+                                      aria-label="Plano comercial"
                                       class="h-8 px-2 text-xs bg-white border border-slate-200 rounded-md focus:outline-none focus:border-blue-600"
                                     >
                                       ${(['FREE', 'ESSENCIAL', 'PROFISSIONAL', 'ENTERPRISE'] as PlanTier[])
-                                        .map(
-                                          (tier) =>
-                                            `<option value="${tier}" ${comp.planTier === tier ? 'selected' : ''}>${formatPlanLabelPt(tier)} (Inativo)</option>`
-                                        )
+                                        .map((tier) => {
+                                          const label =
+                                            tier === 'ESSENCIAL'
+                                              ? 'Essencial (1.000 Kz)'
+                                              : formatPlanLabelPt(tier);
+                                          return `<option value="${tier}" ${comp.planTier === tier ? 'selected' : ''}>${escapeHtml(label)}</option>`;
+                                        })
                                         .join('')}
                                     </select>
                                   </td>
@@ -662,6 +680,220 @@ export function renderTenantOnboardingView(params: {
                   class="h-10 px-3.5 rounded-lg border border-slate-200 text-xs font-medium text-slate-700 hover:bg-slate-50 disabled:opacity-40 whitespace-nowrap"
                 >Já tenho empresa na Cloud (Entrar)</button>`
           }
+        </div>
+
+        <div class="pt-3 border-t border-slate-100 text-[11px] text-slate-400 leading-relaxed">
+          SILA-Billing · Dependência institucional de <span class="text-slate-600 font-medium">${escapeHtml(VITRONIS_INSTITUTIONAL.legalName)}</span> · Cidade-Alta, ${escapeHtml(VITRONIS_INSTITUTIONAL.city)} · ${escapeHtml(VITRONIS_INSTITUTIONAL.website)}
+        </div>
+      </div>
+    </div>
+  `;
+}
+
+export function renderFriendlyGrowthModal(params: {
+  reason: GrowthTriggerReason;
+  company: CompanyRecord;
+  monthlyUsed: number;
+  monthlyLimit: number;
+  canActivateCourtesy: boolean;
+  isSignedIn: boolean;
+  isOnline: boolean;
+  isVerifyingPlan: boolean;
+  copiedIbanFeedback: boolean;
+  noticeMessage: string | null;
+}): string {
+  const {
+    reason,
+    company,
+    monthlyUsed,
+    monthlyLimit,
+    canActivateCourtesy,
+    isSignedIn,
+    isOnline,
+    isVerifyingPlan,
+    copiedIbanFeedback,
+    noticeMessage,
+  } = params;
+
+  let kicker = 'Crescimento Empresarial SILA-Billing';
+  let headline = `Parabéns pelo movimento da ${company.profile.shortName}`;
+  let lead =
+    'A sua operação superou o ciclo mensal orgânico. Desbloqueie emissão local ilimitada ou proteção automática na Cloud com ativação institucional imediata.';
+
+  if (reason === 'monthly_limit') {
+    kicker = 'Volume Mensal Atingido';
+    headline = `Excelente ritmo comercial na ${company.profile.shortName}`;
+    lead = `Emitiu ${monthlyUsed} de ${monthlyLimit} documentos incluídos neste mês neste terminal. Para continuar a faturar sem limites todos os meses e emitir documentos sem rodapé promocional, ative o Plano Essencial por apenas 1.000 Kz/mês.`;
+  } else if (reason === 'cloud_protection') {
+    kicker = 'Proteção e Continuidade na Cloud';
+    headline = `Proteja o histórico da ${company.profile.shortName} na nuvem`;
+    lead =
+      'O armazenamento local no dispositivo funciona a custo zero. Para sincronizar automaticamente faturas, catálogo e clientes na Cloud contra perda ou avaria de equipamento, ative o Plano Cloud Profissional.';
+  } else if (reason === 'clean_footer') {
+    kicker = 'Identidade Corporativa Limpa';
+    headline = 'Documentos exclusivos com a marca da sua empresa';
+    lead =
+      'A ocultação da assinatura institucional no rodapé dos talões POS 80mm e faturas A4 fica disponível automaticamente a partir do Plano Essencial (1.000 Kz/mês).';
+  } else if (reason === 'team_access') {
+    kicker = 'Operação Multi-Operador';
+    headline = 'Equipa sincronizada com Gerentes e Operadores de Caixa';
+    lead =
+      'A adição de múltiplos colaboradores autenticados e sincronização entre terminais faz parte do Plano Cloud Profissional.';
+  }
+
+  const waText = encodeURIComponent(
+    `Olá VITRONIS! Pretendo ativar o plano comercial no SILA-Billing para a empresa ${company.profile.shortName} (NIF: ${company.profile.nif}). Segue comprovativo.`
+  );
+  const waHref = `https://wa.me/${VITRONIS_INSTITUTIONAL.whatsappDigits}?text=${waText}`;
+
+  return `
+    <div class="fixed inset-0 z-50 bg-slate-950/60 flex items-center justify-center p-3 sm:p-5">
+      <div class="bg-white rounded-xl border border-slate-200 w-full max-w-2xl max-h-[92vh] flex flex-col overflow-hidden shadow-2xl">
+        <div class="px-5 py-4 border-b border-slate-200 flex items-start justify-between gap-4 shrink-0">
+          <div class="space-y-1 min-w-0">
+            <div class="text-[11px] font-semibold text-blue-600">${escapeHtml(kicker)}</div>
+            <h2 class="text-base font-bold text-slate-900 tracking-tight">${escapeHtml(headline)}</h2>
+            <p class="text-xs text-slate-600 leading-relaxed">${escapeHtml(lead)}</p>
+          </div>
+          <button
+            type="button"
+            data-action="close-growth-modal"
+            aria-label="Fechar"
+            class="h-8 w-8 rounded-md flex items-center justify-center text-slate-400 hover:text-slate-700 hover:bg-slate-100 shrink-0"
+          >${ICONS.close}</button>
+        </div>
+
+        <div class="flex-1 overflow-y-auto p-5 space-y-4">
+          ${
+            noticeMessage
+              ? `<div class="p-3 rounded-lg border border-blue-200 bg-blue-50 text-xs text-blue-900 leading-relaxed">${escapeHtml(noticeMessage)}</div>`
+              : ''
+          }
+
+          ${
+            reason === 'monthly_limit' && canActivateCourtesy
+              ? `<div class="p-3.5 rounded-lg border border-emerald-200 bg-emerald-50/80 flex flex-col sm:flex-row sm:items-center justify-between gap-3">
+                  <div class="text-xs text-emerald-950 leading-snug">
+                    <span class="font-semibold">Está com cliente no balcão agora?</span>
+                    Liberamos de imediato +10 documentos de cortesia neste mês para não interromper o seu atendimento.
+                  </div>
+                  <button
+                    type="button"
+                    data-action="activate-monthly-courtesy"
+                    class="h-9 px-3.5 rounded-lg bg-emerald-700 hover:bg-emerald-800 text-white text-xs font-semibold whitespace-nowrap shrink-0 transition-colors"
+                  >Liberar +10 documentos agora</button>
+                </div>`
+              : ''
+          }
+
+          <div class="grid grid-cols-1 sm:grid-cols-2 gap-3">
+            <div class="p-4 rounded-lg border ${
+              reason === 'monthly_limit' || reason === 'clean_footer'
+                ? 'border-blue-600 bg-blue-50/30'
+                : 'border-slate-200 bg-slate-50/60'
+            } flex flex-col justify-between space-y-3">
+              <div class="space-y-1.5">
+                <div class="flex items-baseline justify-between gap-2">
+                  <h3 class="text-xs font-bold text-slate-900">Plano Essencial</h3>
+                  <span class="text-sm font-bold font-mono text-slate-900 tabular-nums">1.000 Kz <span class="text-[11px] font-normal text-slate-500">/ mês</span></span>
+                </div>
+                <p class="text-[11px] text-slate-600 leading-relaxed">
+                  Ideal para comércio, serviços e retalho com operação 100% local neste dispositivo.
+                </p>
+                <ul class="space-y-1 text-[11px] text-slate-700 pt-1">
+                  <li class="flex items-center gap-1.5"><span class="text-emerald-600">${ICONS.check}</span><span>Faturas POS 80mm e A4 ilimitadas</span></li>
+                  <li class="flex items-center gap-1.5"><span class="text-emerald-600">${ICONS.check}</span><span>Documentos limpos sem rodapé promocional</span></li>
+                  <li class="flex items-center gap-1.5"><span class="text-emerald-600">${ICONS.check}</span><span>Funcionamento 100% autónomo offline</span></li>
+                </ul>
+              </div>
+            </div>
+
+            <div class="p-4 rounded-lg border ${
+              reason === 'cloud_protection' || reason === 'team_access'
+                ? 'border-blue-600 bg-blue-50/30'
+                : 'border-slate-200 bg-slate-50/60'
+            } flex flex-col justify-between space-y-3">
+              <div class="space-y-1.5">
+                <div class="flex items-baseline justify-between gap-2">
+                  <h3 class="text-xs font-bold text-slate-900">Plano Cloud Profissional</h3>
+                  <span class="text-xs font-semibold text-blue-700">Sob consulta corporativa</span>
+                </div>
+                <p class="text-[11px] text-slate-600 leading-relaxed">
+                  Para empresas que exigem salvaguarda automática na nuvem e equipa multi-operador.
+                </p>
+                <ul class="space-y-1 text-[11px] text-slate-700 pt-1">
+                  <li class="flex items-center gap-1.5"><span class="text-blue-600">${ICONS.check}</span><span>Tudo do Plano Essencial incluído</span></li>
+                  <li class="flex items-center gap-1.5"><span class="text-blue-600">${ICONS.check}</span><span>Sincronização e Backup Cloud automático</span></li>
+                  <li class="flex items-center gap-1.5"><span class="text-blue-600">${ICONS.check}</span><span>Equipa com Gerentes e Operadores de Caixa</span></li>
+                </ul>
+              </div>
+            </div>
+          </div>
+
+          <!-- Dados Institucionais VITRONIS para Ativação Rápida -->
+          <div class="p-4 rounded-lg border border-slate-200 bg-slate-50 space-y-2.5 text-xs">
+            <div class="flex flex-col sm:flex-row sm:items-center justify-between gap-1">
+              <div class="font-bold text-slate-900">${escapeHtml(VITRONIS_INSTITUTIONAL.legalName)}</div>
+              <div class="font-mono text-[11px] text-slate-600 tabular-nums">Contribuinte: ${escapeHtml(VITRONIS_INSTITUTIONAL.nif)}</div>
+            </div>
+            <div class="text-[11px] text-slate-500">
+              ${escapeHtml(VITRONIS_INSTITUTIONAL.address)} · Tel: ${escapeHtml(VITRONIS_INSTITUTIONAL.phone)} · ${escapeHtml(VITRONIS_INSTITUTIONAL.email)}
+            </div>
+
+            <div class="pt-2 border-t border-slate-200/80 flex flex-col sm:flex-row sm:items-center justify-between gap-2">
+              <div class="min-w-0">
+                <div class="text-[10.5px] text-slate-500">Coordenada Bancária Oficial (IBAN BAI)</div>
+                <div class="font-mono font-bold text-xs text-slate-900 tabular-nums select-all break-all">${escapeHtml(VITRONIS_INSTITUTIONAL.ibanBai)}</div>
+              </div>
+              <button
+                type="button"
+                data-action="copy-vitronis-iban"
+                class="h-8 px-3 rounded-md border border-slate-200 bg-white hover:bg-slate-100 text-xs font-medium text-slate-800 flex items-center justify-center gap-1.5 whitespace-nowrap shrink-0 transition-colors"
+              >
+                ${copiedIbanFeedback ? ICONS.check : ICONS.copy}
+                <span>${copiedIbanFeedback ? 'IBAN copiado' : 'Copiar IBAN'}</span>
+              </button>
+            </div>
+          </div>
+        </div>
+
+        <div class="px-5 py-3.5 border-t border-slate-200 bg-slate-50 flex flex-wrap items-center justify-between gap-2 shrink-0">
+          <div class="flex flex-wrap items-center gap-2">
+            <a
+              href="${waHref}"
+              target="_blank"
+              rel="noopener noreferrer"
+              class="h-9 px-3.5 rounded-lg bg-slate-900 hover:bg-slate-800 text-white text-xs font-semibold inline-flex items-center gap-1.5 whitespace-nowrap transition-colors"
+            >
+              ${ICONS.externalLink}
+              <span>Enviar comprovativo no WhatsApp</span>
+            </a>
+
+            ${
+              isSignedIn
+                ? `<button
+                    type="button"
+                    data-action="verify-plan-activation"
+                    ${!isOnline || isVerifyingPlan ? 'disabled' : ''}
+                    class="h-9 px-3 rounded-lg border border-slate-200 bg-white hover:bg-slate-100 text-xs font-medium text-slate-700 disabled:opacity-40 inline-flex items-center gap-1.5 whitespace-nowrap transition-colors"
+                  >
+                    ${ICONS.refresh}
+                    <span>${isVerifyingPlan ? 'A verificar licença...' : 'Já ativei — Atualizar licença'}</span>
+                  </button>`
+                : `<button
+                    type="button"
+                    data-action="signin-google"
+                    ${!isOnline ? 'disabled' : ''}
+                    class="h-9 px-3 rounded-lg border border-slate-200 bg-white hover:bg-slate-100 text-xs font-medium text-slate-700 disabled:opacity-40 whitespace-nowrap transition-colors"
+                  >Autenticar conta para sincronizar licença</button>`
+            }
+          </div>
+
+          <button
+            type="button"
+            data-action="close-growth-modal"
+            class="h-9 px-3 rounded-lg text-xs font-medium text-slate-600 hover:bg-slate-200/60 whitespace-nowrap"
+          >Voltar</button>
         </div>
       </div>
     </div>

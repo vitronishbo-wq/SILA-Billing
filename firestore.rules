@@ -66,6 +66,15 @@ service cloud.firestore {
         && companyDocData(companyId).status == 'active';
     }
 
+    function canSyncCompanyCloudData(companyId) {
+      return isCompanyOperational(companyId)
+        && (
+          companyId == 'comp_jaimona'
+          || companyDocData(companyId).planTier == 'PROFISSIONAL'
+          || companyDocData(companyId).planTier == 'ENTERPRISE'
+        );
+    }
+
     function hasActiveMembership(companyId) {
       return exists(/databases/$(database)/documents/companies/$(companyId)/members/$(request.auth.uid))
         && memberDocData(companyId).active == true;
@@ -90,7 +99,7 @@ service cloud.firestore {
     }
 
     function canCancelCompanyInvoice(companyId) {
-      return isCompanyOperational(companyId)
+      return canSyncCompanyCloudData(companyId)
         && hasActiveMembership(companyId)
         && (
           memberDocData(companyId).role == 'owner'
@@ -301,7 +310,8 @@ service cloud.firestore {
         && data.keys().hasOnly([
           'id', 'normalizedNif', 'ownerUid', 'ownerEmail', 'legalName', 'shortName', 'nif',
           'address', 'cityCountry', 'phone', 'email', 'tagline', 'status', 'planTier',
-          'commercialActive', 'baseSequence', 'allowManagerCancel', 'createdAt', 'updatedAt'
+          'commercialActive', 'baseSequence', 'allowManagerCancel',
+          'termsAcceptedVersion', 'termsAcceptedAtIso', 'createdAt', 'updatedAt'
         ])
         && data.id is string && data.id == companyId && isValidId(data.id)
         && data.normalizedNif is string && isValidNifId(data.normalizedNif)
@@ -322,6 +332,8 @@ service cloud.firestore {
         && data.commercialActive is bool
         && data.baseSequence is number && data.baseSequence >= 0 && data.baseSequence <= 999999999
         && data.allowManagerCancel is bool
+        && (!('termsAcceptedVersion' in data) || (data.termsAcceptedVersion is string && data.termsAcceptedVersion.size() >= 1 && data.termsAcceptedVersion.size() <= 32))
+        && (!('termsAcceptedAtIso' in data) || (data.termsAcceptedAtIso is string && data.termsAcceptedAtIso.size() >= 10 && data.termsAcceptedAtIso.size() <= 40))
         && data.createdAt is timestamp
         && data.updatedAt is timestamp;
     }
@@ -493,7 +505,8 @@ service cloud.firestore {
         && data.keys().hasOnly([
           'companyId', 'companyOwnerUid', 'updatedByUid', 'legalName', 'shortName', 'nif',
           'address', 'cityCountry', 'phone', 'email', 'tagline', 'defaultCashier', 'defaultOperator',
-          'defaultFormat', 'defaultDocType', 'defaultNotes', 'autoPrintOnEmit', 'updatedAt'
+          'defaultFormat', 'defaultDocType', 'defaultNotes', 'autoPrintOnEmit',
+          'hidePromotionalFooter', 'updatedAt'
         ])
         && data.companyId is string && data.companyId == companyId && isValidId(data.companyId)
         && data.companyOwnerUid is string && isValidId(data.companyOwnerUid)
@@ -512,6 +525,7 @@ service cloud.firestore {
         && data.defaultDocType is string && (data.defaultDocType == 'FR' || data.defaultDocType == 'FP')
         && data.defaultNotes is string && data.defaultNotes.size() <= 300
         && data.autoPrintOnEmit is bool
+        && (!('hidePromotionalFooter' in data) || data.hidePromotionalFooter is bool)
         && data.updatedAt is timestamp;
     }
 
@@ -826,8 +840,15 @@ service cloud.firestore {
         && isValidCompany(incoming(), companyId)
         && incoming().ownerUid == request.auth.uid
         && incoming().status == 'active'
-        && incoming().planTier == 'FREE'
-        && incoming().commercialActive == false
+        && (
+          (incoming().planTier == 'FREE' && incoming().commercialActive == false)
+          || (
+            companyId == 'comp_jaimona'
+            && request.auth.token.email == 'jaimonacomercioeservicos@gmail.com'
+            && incoming().planTier == 'PROFISSIONAL'
+            && incoming().commercialActive == true
+          )
+        )
         && incoming().createdAt == request.time
         && incoming().updatedAt == request.time
         && existsAfter(/databases/$(database)/documents/company_nifs/$(incoming().normalizedNif))
@@ -854,10 +875,11 @@ service cloud.firestore {
             && incoming().commercialActive == existing().commercialActive
             && incoming().diff(existing()).affectedKeys().hasOnly([
               'legalName', 'shortName', 'address', 'cityCountry',
-              'phone', 'email', 'tagline', 'allowManagerCancel', 'updatedAt'
+              'phone', 'email', 'tagline', 'allowManagerCancel',
+              'termsAcceptedVersion', 'termsAcceptedAtIso', 'updatedAt'
             ])
           )
-          // Action 2: Platform Master Admin toggles operational status or prepares commercial plan
+          // Action 2: Platform Master Admin toggles operational status or commercial plan
           || (
             isPlatformAdmin()
             && incoming().diff(existing()).affectedKeys().hasOnly([
@@ -895,9 +917,9 @@ service cloud.firestore {
               && existsAfter(/databases/$(database)/documents/companies/$(companyId))
               && getAfter(/databases/$(database)/documents/companies/$(companyId)).data.ownerUid == request.auth.uid
             )
-            // Proprietário adiciona gerente ou operador de caixa
+            // Proprietário adiciona gerente ou operador de caixa (Planos Cloud Profissional / Enterprise)
             || (
-              isCompanyOperational(companyId)
+              canSyncCompanyCloudData(companyId)
               && isCompanyOwner(companyId)
               && incoming().companyOwnerUid == companyDocData(companyId).ownerUid
               && (incoming().role == 'manager' || incoming().role == 'cashier')
@@ -914,11 +936,11 @@ service cloud.firestore {
           && incoming().uid == existing().uid
           && incoming().createdAt == existing().createdAt
           && incoming().updatedAt == request.time
-          && isCompanyOperational(companyId)
-          && isCompanyOwner(companyId)
           && (
             (
-              existing().role != 'owner'
+              canSyncCompanyCloudData(companyId)
+              && isCompanyOwner(companyId)
+              && existing().role != 'owner'
               && (incoming().role == 'manager' || incoming().role == 'cashier')
               && incoming().diff(existing()).affectedKeys().hasOnly([
                 'displayName', 'role', 'allowInvoiceCancel', 'active', 'updatedAt'
@@ -931,7 +953,7 @@ service cloud.firestore {
           && isValidId(companyId)
           && isValidId(memberId)
           && existing().role != 'owner'
-          && isCompanyOperational(companyId)
+          && canSyncCompanyCloudData(companyId)
           && isCompanyOwner(companyId);
       }
 
@@ -952,7 +974,7 @@ service cloud.firestore {
           && isValidCompanyProduct(incoming(), companyId, productId)
           && incoming().createdAt == request.time
           && incoming().updatedAt == request.time
-          && isCompanyOperational(companyId)
+          && canSyncCompanyCloudData(companyId)
           && isCompanyOwnerOrManager(companyId)
           && incoming().companyOwnerUid == companyDocData(companyId).ownerUid;
 
@@ -967,7 +989,7 @@ service cloud.firestore {
           && incoming().updatedAt == request.time
           && (
             (
-              isCompanyOperational(companyId)
+              canSyncCompanyCloudData(companyId)
               && isCompanyOwnerOrManager(companyId)
               && incoming().diff(existing()).affectedKeys().hasOnly([
                 'updatedByUid', 'code', 'name', 'category', 'unit', 'price',
@@ -980,7 +1002,7 @@ service cloud.firestore {
         allow delete: if isVerifiedUser()
           && isValidId(companyId)
           && isValidId(productId)
-          && isCompanyOperational(companyId)
+          && canSyncCompanyCloudData(companyId)
           && isCompanyOwnerOrManager(companyId);
       }
 
@@ -995,14 +1017,14 @@ service cloud.firestore {
           && existing().companyId == companyId
           && existing().companyOwnerUid == request.auth.uid;
 
-        // Owner, Manager e Cashier podem criar cliente rápido durante a emissão
+        // Owner, Manager e Cashier podem criar cliente rápido durante a emissão (em planos Cloud ativos)
         allow create: if isVerifiedUser()
           && isValidId(companyId)
           && isValidId(customerId)
           && isValidCompanyCustomer(incoming(), companyId, customerId)
           && incoming().createdAt == request.time
           && incoming().updatedAt == request.time
-          && isCompanyOperational(companyId)
+          && canSyncCompanyCloudData(companyId)
           && isCompanyAnyActiveRole(companyId)
           && incoming().companyOwnerUid == companyDocData(companyId).ownerUid;
 
@@ -1018,7 +1040,7 @@ service cloud.firestore {
           && incoming().updatedAt == request.time
           && (
             (
-              isCompanyOperational(companyId)
+              canSyncCompanyCloudData(companyId)
               && isCompanyOwnerOrManager(companyId)
               && incoming().diff(existing()).affectedKeys().hasOnly([
                 'updatedByUid', 'name', 'nif', 'locality', 'updatedAt'
@@ -1030,7 +1052,7 @@ service cloud.firestore {
         allow delete: if isVerifiedUser()
           && isValidId(companyId)
           && isValidId(customerId)
-          && isCompanyOperational(companyId)
+          && canSyncCompanyCloudData(companyId)
           && isCompanyOwnerOrManager(companyId);
 
         // PII Split Subcollection: /companies/{companyId}/customers/{customerId}/private/{docId}
@@ -1047,7 +1069,7 @@ service cloud.firestore {
             && docId == 'contact'
             && isValidCompanyCustomerPrivate(incoming(), companyId)
             && incoming().updatedAt == request.time
-            && isCompanyOperational(companyId)
+            && canSyncCompanyCloudData(companyId)
             && isCompanyAnyActiveRole(companyId)
             && incoming().companyOwnerUid == companyDocData(companyId).ownerUid
             && existsAfter(/databases/$(database)/documents/companies/$(companyId)/customers/$(customerId));
@@ -1062,7 +1084,7 @@ service cloud.firestore {
             && incoming().updatedAt == request.time
             && (
               (
-                isCompanyOperational(companyId)
+                canSyncCompanyCloudData(companyId)
                 && isCompanyOwnerOrManager(companyId)
                 && incoming().diff(existing()).affectedKeys().hasOnly([
                   'updatedByUid', 'phone', 'address', 'updatedAt'
@@ -1075,7 +1097,7 @@ service cloud.firestore {
             && isValidId(companyId)
             && isValidId(customerId)
             && docId == 'contact'
-            && isCompanyOperational(companyId)
+            && canSyncCompanyCloudData(companyId)
             && isCompanyOwnerOrManager(companyId);
         }
       }
@@ -1099,7 +1121,7 @@ service cloud.firestore {
           && incoming().emittedByUid == request.auth.uid
           && incoming().createdAt == request.time
           && incoming().updatedAt == request.time
-          && isCompanyOperational(companyId)
+          && canSyncCompanyCloudData(companyId)
           && isCompanyAnyActiveRole(companyId)
           && incoming().companyOwnerUid == companyDocData(companyId).ownerUid;
 
@@ -1148,7 +1170,7 @@ service cloud.firestore {
             && isValidId(itemId)
             && isValidCompanyInvoiceItem(incoming(), companyId, invoiceId, itemId)
             && incoming().createdAt == request.time
-            && isCompanyOperational(companyId)
+            && canSyncCompanyCloudData(companyId)
             && isCompanyAnyActiveRole(companyId)
             && existsAfter(/databases/$(database)/documents/companies/$(companyId)/invoices/$(invoiceId));
 
@@ -1168,7 +1190,7 @@ service cloud.firestore {
           && settingId == 'general'
           && isValidCompanySettings(incoming(), companyId)
           && incoming().updatedAt == request.time
-          && isCompanyOperational(companyId)
+          && canSyncCompanyCloudData(companyId)
           && isCompanyOwner(companyId)
           && incoming().companyOwnerUid == companyDocData(companyId).ownerUid;
 
@@ -1182,12 +1204,13 @@ service cloud.firestore {
           && incoming().updatedAt == request.time
           && (
             (
-              isCompanyOperational(companyId)
+              canSyncCompanyCloudData(companyId)
               && isCompanyOwner(companyId)
               && incoming().diff(existing()).affectedKeys().hasOnly([
                 'updatedByUid', 'legalName', 'shortName', 'address', 'cityCountry',
                 'phone', 'email', 'tagline', 'defaultCashier', 'defaultOperator',
-                'defaultFormat', 'defaultDocType', 'defaultNotes', 'autoPrintOnEmit', 'updatedAt'
+                'defaultFormat', 'defaultDocType', 'defaultNotes', 'autoPrintOnEmit',
+                'hidePromotionalFooter', 'updatedAt'
               ])
             )
             || isPlatformAdmin()

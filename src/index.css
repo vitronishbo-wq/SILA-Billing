@@ -41,6 +41,16 @@
   }
 }
 
+/* Safe areas para iPhone (Dynamic Island / Home Bar) em modo PWA standalone — 0 impacto em Windows 7 */
+@supports (padding-top: env(safe-area-inset-top)) {
+  .safe-area-top {
+    padding-top: env(safe-area-inset-top, 0px);
+  }
+  .safe-area-bottom {
+    padding-bottom: env(safe-area-inset-bottom, 0px);
+  }
+}
+
 /* Print rules for POS 80mm thermal receipt and A4 invoice */
 @media print {
   body {
