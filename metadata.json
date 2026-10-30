@@ -1,6 +1,6 @@
 {
   "name": "SILA-Billing",
-  "description": "Sistema de faturação POS térmico e A4 offline-first para JAIMONA-COMÉRCIO E SERVIÇOS, (SU) LDA.",
+  "description": "Plataforma comercial multiempresa de faturação POS térmico e A4 offline-first para Angola.",
   "requestFramePermissions": [],
   "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
 }

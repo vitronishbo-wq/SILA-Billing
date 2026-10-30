@@ -7,11 +7,35 @@ import {
   InvoiceRecord,
   JAIMONA_COMPANY,
   JAIMONA_COMPANY_ID,
+  JAIMONA_OWNER_EMAIL,
+  NEUTRAL_PLATFORM_PROFILE,
   normalizeCompanyNif,
   Product,
 } from './types';
 
 const nowIso = new Date().toISOString();
+
+export const UNASSIGNED_COMPANY_ID = '';
+
+export const UNASSIGNED_TENANT_RECORD: CompanyRecord = {
+  id: UNASSIGNED_COMPANY_ID,
+  normalizedNif: '',
+  profile: { ...NEUTRAL_PLATFORM_PROFILE },
+  status: 'pending',
+  plan: {
+    planTier: 'FREE',
+    commercialActive: false,
+    maxUsers: null,
+    maxInvoicesPerMonth: null,
+    updatedAtIso: nowIso,
+  },
+  baseSequence: 0,
+  allowManagerCancel: false,
+  syncState: 'synced',
+  synced: true,
+  createdAtIso: nowIso,
+  updatedAtIso: nowIso,
+};
 
 export const JAIMONA_INITIAL_COMPANY: CompanyRecord = {
   id: JAIMONA_COMPANY_ID,
@@ -27,11 +51,82 @@ export const JAIMONA_INITIAL_COMPANY: CompanyRecord = {
   },
   baseSequence: 15678,
   allowManagerCancel: true,
+  ownerEmail: JAIMONA_OWNER_EMAIL,
   syncState: 'pending',
   synced: false,
   createdAtIso: nowIso,
   updatedAtIso: nowIso,
 };
+
+export function createStarterProductsForCompany(companyId: string): Product[] {
+  const ts = new Date().toISOString();
+  const templates: Array<
+    Pick<Product, 'code' | 'name' | 'category' | 'unit' | 'price' | 'ivaRate' | 'exemptionReason'>
+  > = [
+    {
+      code: '00001',
+      name: 'Água Mineral 1,5L',
+      category: 'Bebidas',
+      unit: 'un',
+      price: 700,
+      ivaRate: 14,
+      exemptionReason: '',
+    },
+    {
+      code: '00002',
+      name: 'Refrigerante 350ml',
+      category: 'Bebidas',
+      unit: 'un',
+      price: 450,
+      ivaRate: 14,
+      exemptionReason: '',
+    },
+    {
+      code: '00003',
+      name: 'Arroz Agulha 5kg',
+      category: 'Mercearia',
+      unit: 'saco',
+      price: 6500,
+      ivaRate: 0,
+      exemptionReason: 'Isento nos termos da Lei do IVA (Cesta Básica)',
+    },
+    {
+      code: '00004',
+      name: 'Óleo Alimentar 1L',
+      category: 'Mercearia',
+      unit: 'un',
+      price: 1850,
+      ivaRate: 0,
+      exemptionReason: 'Isento nos termos da Lei do IVA (Cesta Básica)',
+    },
+    {
+      code: '00005',
+      name: 'Prestação de Serviço Geral',
+      category: 'Serviços',
+      unit: 'un',
+      price: 5000,
+      ivaRate: 14,
+      exemptionReason: '',
+    },
+  ];
+
+  return templates.map((tpl) => ({
+    id: `${companyId}_${tpl.code}`,
+    companyId,
+    code: tpl.code,
+    name: tpl.name,
+    category: tpl.category,
+    unit: tpl.unit,
+    price: tpl.price,
+    ivaRate: tpl.ivaRate,
+    exemptionReason: tpl.exemptionReason,
+    active: true,
+    syncState: 'pending',
+    synced: false,
+    createdAtIso: ts,
+    updatedAtIso: ts,
+  }));
+}
 
 export function createDirectCustomerForCompany(company: CompanyRecord): Customer {
   const ts = new Date().toISOString();

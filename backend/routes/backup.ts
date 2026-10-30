@@ -19,7 +19,16 @@ backupRouter.get('/', requireFirebaseAuth, async (req: AuthenticatedRequest, res
     return;
   }
 
-  const rawCompanyId = String(req.query.companyId || JAIMONA_COMPANY_ID)
+  const rawQueryCompanyId = String(req.query.companyId || '').trim();
+  if (!rawQueryCompanyId) {
+    res.status(400).json({
+      ok: false,
+      error: 'Indique o companyId da empresa ativa para exportar o backup administrativo.',
+    });
+    return;
+  }
+
+  const rawCompanyId = rawQueryCompanyId
     .replace(/[^a-zA-Z0-9_-]/g, '_')
     .slice(0, 128);
 
@@ -81,7 +90,9 @@ backupRouter.get('/', requireFirebaseAuth, async (req: AuthenticatedRequest, res
           address: membership.companyData.address,
           cityCountry: membership.companyData.cityCountry,
         }
-      : { id: JAIMONA_COMPANY_ID, ...JAIMONA_COMPANY };
+      : rawCompanyId === JAIMONA_COMPANY_ID
+        ? { id: JAIMONA_COMPANY_ID, ...JAIMONA_COMPANY }
+        : { id: rawCompanyId };
 
     const exportBundle = {
       schemaVersion: '2.0.0',

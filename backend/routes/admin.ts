@@ -3,6 +3,7 @@ import { FieldValue } from 'firebase-admin/firestore';
 import {
   JAIMONA_COMPANY,
   JAIMONA_COMPANY_ID,
+  JAIMONA_OWNER_EMAIL,
   normalizeCompanyNif,
   type CompanyOperationalStatus,
   type PlanTier,
@@ -46,7 +47,7 @@ adminRouter.get('/overview', async (req: AuthenticatedRequest, res) => {
           nif: JAIMONA_COMPANY.nif,
           normalizedNif: normalizeCompanyNif(JAIMONA_COMPANY.nif),
           cityCountry: JAIMONA_COMPANY.cityCountry,
-          ownerEmail: adminUser.email || JAIMONA_COMPANY.email,
+          ownerEmail: JAIMONA_OWNER_EMAIL,
           status: 'active',
           planTier: 'FREE',
           commercialActive: false,
@@ -99,7 +100,10 @@ adminRouter.get('/overview', async (req: AuthenticatedRequest, res) => {
           nif: String(d.nif || d.normalizedNif || ''),
           normalizedNif: String(d.normalizedNif || normalizeCompanyNif(String(d.nif || ''))),
           cityCountry: String(d.cityCountry || 'Angola'),
-          ownerEmail: String(d.ownerEmail || d.email || ''),
+          ownerEmail:
+            docSnap.id === JAIMONA_COMPANY_ID
+              ? JAIMONA_OWNER_EMAIL
+              : String(d.ownerEmail || d.email || ''),
           status: (VALID_STATUSES.includes(d.status) ? d.status : 'active') as CompanyOperationalStatus,
           planTier: (VALID_PLANS.includes(d.planTier) ? d.planTier : 'FREE') as PlanTier,
           commercialActive: Boolean(d.commercialActive ?? false),
@@ -110,14 +114,14 @@ adminRouter.get('/overview', async (req: AuthenticatedRequest, res) => {
     );
 
     if (!companies.some((c) => c.id === JAIMONA_COMPANY_ID)) {
-      companies.unshift({
+      companies.push({
         id: JAIMONA_COMPANY_ID,
         shortName: JAIMONA_COMPANY.shortName,
         legalName: JAIMONA_COMPANY.legalName,
         nif: JAIMONA_COMPANY.nif,
         normalizedNif: normalizeCompanyNif(JAIMONA_COMPANY.nif),
         cityCountry: JAIMONA_COMPANY.cityCountry,
-        ownerEmail: JAIMONA_COMPANY.email,
+        ownerEmail: JAIMONA_OWNER_EMAIL,
         status: 'active',
         planTier: 'FREE',
         commercialActive: false,
@@ -281,7 +285,12 @@ adminRouter.post('/support-access', async (req: AuthenticatedRequest, res) => {
   const adminUser = req.firebaseUser!;
   const ctx = getFirebaseAdminContext();
   const body = req.body as { companyId?: string; companyName?: string };
-  const companyId = sanitizeId(body?.companyId || JAIMONA_COMPANY_ID);
+  const rawCompanyId = String(body?.companyId || '').trim();
+  if (!rawCompanyId) {
+    res.status(400).json({ ok: false, error: 'Identificador da empresa (companyId) é obrigatório.' });
+    return;
+  }
+  const companyId = sanitizeId(rawCompanyId);
   const companyName = String(body?.companyName || companyId).slice(0, 80);
 
   if (ctx.db && ctx.hasExplicitCredentials) {

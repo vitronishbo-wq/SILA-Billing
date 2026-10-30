@@ -1,14 +1,17 @@
 import type { NextFunction, Response } from 'express';
 import type { DecodedIdToken } from 'firebase-admin/auth';
 import type { Firestore } from 'firebase-admin/firestore';
-import { JAIMONA_COMPANY_ID, type CompanyRole } from '../../src/core/types.ts';
+import {
+  isJaimonaOwnerEmail,
+  JAIMONA_COMPANY_ID,
+  PLATFORM_ADMIN_EMAIL,
+  type CompanyRole,
+} from '../../src/core/types.ts';
 import { getFirebaseAdminContext } from '../firebaseAdmin.ts';
 import type { AuthenticatedRequest } from './requireFirebaseAuth.ts';
 
-const BOOTSTRAP_PLATFORM_ADMIN_EMAIL = 'wtmedia0@gmail.com';
-
 function getAllowedAdminEmails(): Set<string> {
-  const emails = new Set<string>([BOOTSTRAP_PLATFORM_ADMIN_EMAIL]);
+  const emails = new Set<string>([PLATFORM_ADMIN_EMAIL]);
   const rawEnv = process.env.PLATFORM_ADMIN_EMAILS || '';
   for (const part of rawEnv.split(',')) {
     const clean = part.trim().toLowerCase();
@@ -87,9 +90,12 @@ export async function verifyCompanyMembershipServer(
   companyId: string,
   user: DecodedIdToken
 ): Promise<VerifiedCompanyMembership | null> {
-  const safeCompanyId = String(companyId || JAIMONA_COMPANY_ID)
+  const safeCompanyId = String(companyId || '')
     .replace(/[^a-zA-Z0-9_-]/g, '_')
     .slice(0, 128);
+  if (!safeCompanyId) {
+    return null;
+  }
 
   const companyRef = db.collection('companies').doc(safeCompanyId);
   const [companySnap, memberSnap] = await Promise.all([
@@ -98,8 +104,9 @@ export async function verifyCompanyMembershipServer(
   ]);
 
   if (!companySnap.exists) {
-    // Compatibilidade com a empresa inicial JAIMONA antes da primeira sincronização multiempresa
-    if (safeCompanyId === JAIMONA_COMPANY_ID) {
+    // Compatibilidade pré-sincronização restrita ao e-mail titular da JAIMONA ou Super-Admin SILA-Billing
+    const isGlobalAdmin = await checkIsPlatformAdmin(user, db);
+    if (safeCompanyId === JAIMONA_COMPANY_ID && (isJaimonaOwnerEmail(user.email) || isGlobalAdmin)) {
       return {
         existsInCloud: false,
         companyStatus: 'active',

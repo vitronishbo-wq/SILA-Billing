@@ -2,9 +2,11 @@ import {
   createDefaultSettingsForCompany,
   createDirectCustomerForCompany,
   createSeedInvoice,
+  createStarterProductsForCompany,
   INITIAL_CUSTOMERS,
   INITIAL_PRODUCTS,
   JAIMONA_INITIAL_COMPANY,
+  UNASSIGNED_TENANT_RECORD,
 } from '../core/seedData';
 import {
   AppSettings,
@@ -18,7 +20,11 @@ import {
   DocumentType,
   getDirectCustomerIdForCompany,
   InvoiceRecord,
+  isJaimonaOwnerEmail,
+  isPlatformAdminEmail,
+  JAIMONA_COMPANY,
   JAIMONA_COMPANY_ID,
+  JAIMONA_OWNER_EMAIL,
   normalizeCompanyNif,
   PaymentMethod,
   Product,
@@ -50,6 +56,11 @@ export interface PreMulticompanySnapshot {
   posDraft: PosWorkspaceDraft | null;
 }
 
+export interface WorkspaceViewerIdentity {
+  uid?: string | null;
+  email?: string | null;
+}
+
 export interface CompanyWorkspaceBundle {
   activeCompany: CompanyRecord;
   companies: CompanyRecord[];
@@ -60,6 +71,7 @@ export interface CompanyWorkspaceBundle {
   settings: AppSettings;
   posDraft: PosWorkspaceDraft | null;
   hasPreMigrationBackup: boolean;
+  requiresCompanyOnboarding?: boolean;
 }
 
 export interface RegisterCompanyInput {
@@ -590,38 +602,119 @@ async function healOrphanCompanyRecordsOnce(): Promise<void> {
   }
 }
 
-async function ensureMulticompanyInitialized(): Promise<void> {
+function canViewerAccessTenant(
+  company: CompanyRecord,
+  allMembers: CompanyMember[],
+  viewer?: WorkspaceViewerIdentity | null
+): boolean {
+  const emailLower = String(viewer?.email || '').trim().toLowerCase();
+  const uid = String(viewer?.uid || '').trim();
+
+  // Sem autenticação Cloud ativa: o operador no terminal local vê as empresas registadas neste dispositivo
+  if (!uid && !emailLower) {
+    return true;
+  }
+
+  // Super-Admin da plataforma SILA-Billing (wtmedia0@gmail.com) pode inspecionar qualquer empresa para suporte/testes
+  if (isPlatformAdminEmail(emailLower)) {
+    return true;
+  }
+
+  // Proprietário verificado por UID ou Email
+  if (uid && company.ownerUid && company.ownerUid === uid) {
+    return true;
+  }
+  const compOwnerEmail = String(company.ownerEmail || company.profile.email || '')
+    .trim()
+    .toLowerCase();
+  if (emailLower && compOwnerEmail && compOwnerEmail === emailLower) {
+    return true;
+  }
+
+  // Membro explícito ativo (owner / manager / cashier)
+  const hasMembership = allMembers.some(
+    (m) =>
+      m.companyId === company.id &&
+      m.active &&
+      ((uid && m.uid === uid) || (emailLower && m.email.trim().toLowerCase() === emailLower))
+  );
+  if (hasMembership) {
+    return true;
+  }
+
+  // Empresa criada localmente neste terminal ainda sem ownerUid nem ownerEmail atribuídos
+  // (exceto comp_jaimona, cujo titular explícito é jaimonacomercioeservicos@gmail.com)
+  if (!company.ownerUid && !compOwnerEmail && company.id !== JAIMONA_COMPANY_ID) {
+    return true;
+  }
+
+  return false;
+}
+
+export async function ensureJaimonaSeedTenantPresent(): Promise<void> {
+  const existingJaimona = await getFromStore<CompanyRecord>('companies', JAIMONA_COMPANY_ID);
+  if (existingJaimona) {
+    if (!existingJaimona.ownerEmail) {
+      await putInStore('companies', {
+        ...existingJaimona,
+        ownerEmail: JAIMONA_OWNER_EMAIL,
+      });
+    }
+    return;
+  }
+
+  const jaimonaSettings = createDefaultSettingsForCompany(JAIMONA_INITIAL_COMPANY);
+  await putInStore('companies', JAIMONA_INITIAL_COMPANY);
+  for (const p of INITIAL_PRODUCTS) {
+    await putInStore('products', { ...p, companyId: JAIMONA_COMPANY_ID });
+  }
+  for (const c of INITIAL_CUSTOMERS) {
+    await putInStore('customers', { ...c, companyId: JAIMONA_COMPANY_ID });
+  }
+  await putInStore('invoices', { ...createSeedInvoice(), companyId: JAIMONA_COMPANY_ID });
+  await putInStore('meta', {
+    key: `app_settings:${JAIMONA_COMPANY_ID}`,
+    value: jaimonaSettings,
+  });
+}
+
+async function ensureMulticompanyInitialized(viewer?: WorkspaceViewerIdentity | null): Promise<void> {
   const seededMeta = await getFromStore<{ key: string; value: boolean }>('meta', 'seeded');
 
   if (!seededMeta?.value) {
     // Verifica se já existem dados reais gravados antes de semear (proteção extra contra perda de dados)
-    const [existingProds, existingCusts, existingInvs] = await Promise.all([
+    const [existingComps, existingProds, existingCusts, existingInvs] = await Promise.all([
+      getAllFromStore<CompanyRecord>('companies'),
       getAllFromStore<Product>('products'),
       getAllFromStore<Customer>('customers'),
       getAllFromStore<InvoiceRecord>('invoices'),
     ]);
     const hasExistingRealData =
-      existingProds.length > 0 || existingCusts.length > 0 || existingInvs.length > 0;
+      existingComps.length > 0 ||
+      existingProds.length > 0 ||
+      existingCusts.length > 0 ||
+      existingInvs.length > 0;
 
     if (!hasExistingRealData) {
-      // Instalação limpa: cria JAIMONA como 1.ª empresa de referência mantendo todos os IDs clássicos
-      await putInStore('companies', JAIMONA_INITIAL_COMPANY);
-      for (const p of INITIAL_PRODUCTS) {
-        await putInStore('products', { ...p, companyId: JAIMONA_COMPANY_ID });
+      const viewerEmail = String(viewer?.email || '').trim().toLowerCase();
+      const isThirdPartyAuthenticated =
+        Boolean(viewer?.uid || viewerEmail) &&
+        !isPlatformAdminEmail(viewerEmail) &&
+        !isJaimonaOwnerEmail(viewerEmail);
+
+      // Se um novo utilizador autenticado (que NÃO é a JAIMONA nem o Super-Admin) abrir num navegador limpo,
+      // NÃO injetamos comp_jaimona por defeito — inicia limpo para onboarding/sincronização do próprio tenant!
+      if (!isThirdPartyAuthenticated) {
+        await ensureJaimonaSeedTenantPresent();
+        await putInStore('meta', { key: 'active_company_id', value: JAIMONA_COMPANY_ID });
       }
-      for (const c of INITIAL_CUSTOMERS) {
-        await putInStore('customers', { ...c, companyId: JAIMONA_COMPANY_ID });
-      }
-      await putInStore('invoices', { ...createSeedInvoice(), companyId: JAIMONA_COMPANY_ID });
-      await putInStore('meta', { key: 'app_settings', value: DEFAULT_SETTINGS });
-      await putInStore('meta', {
-        key: `app_settings:${JAIMONA_COMPANY_ID}`,
-        value: DEFAULT_SETTINGS,
-      });
-      await putInStore('meta', { key: 'active_company_id', value: JAIMONA_COMPANY_ID });
+
       await putInStore('meta', {
         key: 'migration_multicompany_v2',
-        value: { completedAtIso: new Date().toISOString(), mode: 'fresh_install' },
+        value: {
+          completedAtIso: new Date().toISOString(),
+          mode: isThirdPartyAuthenticated ? 'clean_saas_onboarding' : 'fresh_install',
+        },
       });
       await putInStore('meta', { key: 'seeded', value: true });
       orphanRecordsChecked = true;
@@ -639,7 +732,14 @@ async function ensureMulticompanyInitialized(): Promise<void> {
   }>('meta', 'migration_multicompany_v2');
 
   const existingJaimona = await getFromStore<CompanyRecord>('companies', JAIMONA_COMPANY_ID);
-  if (migrationDone?.value && existingJaimona) {
+  if (existingJaimona && !existingJaimona.ownerEmail) {
+    await putInStore('companies', {
+      ...existingJaimona,
+      ownerEmail: JAIMONA_OWNER_EMAIL,
+    });
+  }
+
+  if (migrationDone?.value) {
     await healOrphanCompanyRecordsOnce();
     return;
   }
@@ -670,25 +770,33 @@ async function ensureMulticompanyInitialized(): Promise<void> {
     await putInStore('meta', { key: 'backup_pre_multicompany_v1', value: snapshot });
   }
 
-  // 2. Regista a JAIMONA preservando eventuais personalizações já feitas nas configurações
-  const legacySettings = legacySettingsMeta?.value || DEFAULT_SETTINGS;
+  // 2. Regista a JAIMONA como tenant regular preservando personalizações existentes e fixando ownerEmail
+  const legacySettings = legacySettingsMeta?.value;
+  const hasValidLegacyNif =
+    legacySettings?.company?.nif && legacySettings.company.nif !== '---';
   const jaimonaProfile: CompanyProfile = {
-    ...JAIMONA_INITIAL_COMPANY.profile,
-    ...legacySettings.company,
-    nif: legacySettings.company?.nif || JAIMONA_INITIAL_COMPANY.profile.nif,
+    ...JAIMONA_COMPANY,
+    ...(hasValidLegacyNif ? legacySettings!.company : {}),
+    nif: hasValidLegacyNif ? legacySettings!.company.nif : JAIMONA_COMPANY.nif,
   };
 
-  const jaimonaRecord: CompanyRecord = existingJaimona || {
-    ...JAIMONA_INITIAL_COMPANY,
-    normalizedNif: normalizeCompanyNif(jaimonaProfile.nif),
-    profile: jaimonaProfile,
-    synced: Boolean(legacySettings.synced),
-    syncState: legacySettings.synced ? 'synced' : 'pending',
-    updatedAtIso: new Date().toISOString(),
-  };
+  const jaimonaRecord: CompanyRecord = existingJaimona
+    ? {
+        ...existingJaimona,
+        ownerEmail: existingJaimona.ownerEmail || JAIMONA_OWNER_EMAIL,
+      }
+    : {
+        ...JAIMONA_INITIAL_COMPANY,
+        normalizedNif: normalizeCompanyNif(jaimonaProfile.nif),
+        profile: jaimonaProfile,
+        ownerEmail: JAIMONA_OWNER_EMAIL,
+        synced: Boolean(legacySettings?.synced),
+        syncState: legacySettings?.synced ? 'synced' : 'pending',
+        updatedAtIso: new Date().toISOString(),
+      };
   await putInStore('companies', jaimonaRecord);
 
-  // 3. Associa registos existentes a comp_jaimona preservando 100% dos IDs originais
+  // 3. Associa registos v1 existentes a comp_jaimona preservando 100% dos IDs originais
   for (const p of rawProducts) {
     const category = inferProductCategory(p);
     if (!p.companyId || !p.category) {
@@ -722,11 +830,12 @@ async function ensureMulticompanyInitialized(): Promise<void> {
   }
 
   // 4. Espelha configurações e rascunho POS para as chaves particionadas por empresa
+  const baseJaimonaSettings = createDefaultSettingsForCompany(jaimonaRecord);
   const scopedSettings: AppSettings = {
-    ...legacySettings,
+    ...(legacySettings || baseJaimonaSettings),
     companyId: JAIMONA_COMPANY_ID,
     company: jaimonaProfile,
-    syncState: legacySettings.syncState || (legacySettings.synced ? 'synced' : 'pending'),
+    syncState: legacySettings?.syncState || (legacySettings?.synced ? 'synced' : 'pending'),
   };
   await putInStore('meta', { key: `app_settings:${JAIMONA_COMPANY_ID}`, value: scopedSettings });
 
@@ -751,30 +860,63 @@ async function ensureMulticompanyInitialized(): Promise<void> {
   });
 }
 
-export async function loadCompanyWorkspace(companyId: string): Promise<CompanyWorkspaceBundle> {
-  await ensureMulticompanyInitialized();
+export async function loadCompanyWorkspace(
+  companyId: string,
+  viewer?: WorkspaceViewerIdentity | null
+): Promise<CompanyWorkspaceBundle> {
+  await ensureMulticompanyInitialized(viewer);
 
-  const [allCompanies, backupMeta] = await Promise.all([
+  // Se o titular da JAIMONA ou o Super-Admin abrir um navegador limpo, garante o tenant JAIMONA disponível
+  if (viewer && (isJaimonaOwnerEmail(viewer.email) || isPlatformAdminEmail(viewer.email))) {
+    await ensureJaimonaSeedTenantPresent();
+  }
+
+  const [allCompaniesRaw, allMembersRaw, backupMeta] = await Promise.all([
     getAllFromStore<CompanyRecord>('companies'),
+    getAllFromStore<CompanyMember>('company_members'),
     getFromStore<{ key: string; value: PreMulticompanySnapshot }>(
       'meta',
       'backup_pre_multicompany_v1'
     ),
   ]);
 
-  allCompanies.sort((a, b) =>
-    a.id === JAIMONA_COMPANY_ID
-      ? -1
-      : b.id === JAIMONA_COMPANY_ID
-        ? 1
-        : a.profile.shortName.localeCompare(b.profile.shortName, 'pt')
+  // Filtra estritamente os tenants acessíveis ao utilizador autenticado (ou locais se offline/sem login)
+  const accessibleCompanies = allCompaniesRaw.filter((comp) =>
+    canViewerAccessTenant(comp, allMembersRaw, viewer)
   );
 
+  // Ordenação 100% neutra entre todos os tenants (sem privilégio fixo para JAIMONA)
+  accessibleCompanies.sort((a, b) =>
+    a.profile.shortName.localeCompare(b.profile.shortName, 'pt')
+  );
+
+  // Se não houver nenhum tenant acessível (ex: novo utilizador autenticado ainda sem empresa registada),
+  // devolve workspace neutro de onboarding sem carregar nem expor dados da JAIMONA!
+  if (accessibleCompanies.length === 0) {
+    await putInStore('meta', { key: 'active_company_id', value: '' });
+    return {
+      activeCompany: UNASSIGNED_TENANT_RECORD,
+      companies: [],
+      members: [],
+      products: [],
+      customers: [],
+      invoices: [],
+      settings: { ...DEFAULT_SETTINGS },
+      posDraft: null,
+      hasPreMigrationBackup: Boolean(backupMeta?.value),
+      requiresCompanyOnboarding: true,
+    };
+  }
+
   const activeCompany =
-    allCompanies.find((c) => c.id === companyId) ||
-    allCompanies.find((c) => c.id === JAIMONA_COMPANY_ID) ||
-    allCompanies[0] ||
-    JAIMONA_INITIAL_COMPANY;
+    (companyId ? accessibleCompanies.find((c) => c.id === companyId) : undefined) ||
+    accessibleCompanies[0]!;
+
+  // Coloca a empresa ativa no topo do seletor mantendo ordem alfabética nas restantes
+  const sortedForSwitcher = [
+    activeCompany,
+    ...accessibleCompanies.filter((c) => c.id !== activeCompany.id),
+  ];
 
   await putInStore('meta', { key: 'active_company_id', value: activeCompany.id });
 
@@ -828,15 +970,19 @@ export async function loadCompanyWorkspace(companyId: string): Promise<CompanyWo
   invoices.sort((a, b) => b.issuedAtIso.localeCompare(a.issuedAtIso));
 
   const fallbackSettings = createDefaultSettingsForCompany(activeCompany);
+  const validLegacySettings =
+    legacySettingsMeta?.value && legacySettingsMeta.value.company?.nif !== '---'
+      ? legacySettingsMeta.value
+      : undefined;
   const resolvedSettings: AppSettings = scopedSettingsMeta?.value
     ? { ...scopedSettingsMeta.value, companyId: activeCompany.id, company: activeCompany.profile }
-    : legacySettingsMeta?.value
-      ? { ...legacySettingsMeta.value, companyId: activeCompany.id }
+    : validLegacySettings
+      ? { ...validLegacySettings, companyId: activeCompany.id, company: activeCompany.profile }
       : fallbackSettings;
 
   return {
     activeCompany,
-    companies: allCompanies,
+    companies: sortedForSwitcher,
     members,
     products,
     customers,
@@ -844,19 +990,21 @@ export async function loadCompanyWorkspace(companyId: string): Promise<CompanyWo
     settings: resolvedSettings,
     posDraft: draftMeta?.value || null,
     hasPreMigrationBackup: Boolean(backupMeta?.value),
+    requiresCompanyOnboarding: false,
   };
 }
 
 export async function bootstrapLocalStore(
-  preferredCompanyId?: string
+  preferredCompanyId?: string,
+  viewer?: WorkspaceViewerIdentity | null
 ): Promise<CompanyWorkspaceBundle> {
-  await ensureMulticompanyInitialized();
+  await ensureMulticompanyInitialized(viewer);
   const savedActiveMeta = await getFromStore<{ key: string; value: string }>(
     'meta',
     'active_company_id'
   );
-  const targetCompanyId = preferredCompanyId || savedActiveMeta?.value || JAIMONA_COMPANY_ID;
-  return loadCompanyWorkspace(targetCompanyId);
+  const targetCompanyId = preferredCompanyId ?? savedActiveMeta?.value ?? '';
+  return loadCompanyWorkspace(targetCompanyId, viewer);
 }
 
 /**
@@ -866,7 +1014,10 @@ export async function bootstrapLocalStore(
 export async function registerNewCompanyLocal(
   input: RegisterCompanyInput
 ): Promise<CompanyRecord> {
-  await ensureMulticompanyInitialized();
+  await ensureMulticompanyInitialized({
+    uid: input.ownerUid,
+    email: input.ownerEmail,
+  });
 
   const nifCheck = validateCompanyNif(input.nif);
   if (!nifCheck.valid) {
@@ -901,7 +1052,7 @@ export async function registerNewCompanyLocal(
       address: (input.address || cityCountry).trim().slice(0, 160),
       cityCountry: cityCountry.slice(0, 80),
       phone: (input.phone || '').trim().slice(0, 40),
-      email: (input.email || '').trim().slice(0, 120),
+      email: (input.email || input.ownerEmail || '').trim().slice(0, 120),
       tagline: (input.tagline || 'Obrigado pela preferência').trim().slice(0, 120),
     },
     status: 'active',
@@ -947,17 +1098,9 @@ export async function registerNewCompanyLocal(
   }
 
   if (input.copyStarterCatalog) {
-    for (const sp of INITIAL_PRODUCTS) {
-      const cloned: Product = {
-        ...sp,
-        id: `${companyId}_${sp.code}`,
-        companyId,
-        syncState: 'pending',
-        synced: false,
-        createdAtIso: now,
-        updatedAtIso: now,
-      };
-      await putInStore('products', cloned);
+    const starterProducts = createStarterProductsForCompany(companyId);
+    for (const sp of starterProducts) {
+      await putInStore('products', sp);
     }
   }
 
@@ -971,6 +1114,10 @@ export async function saveCompanySettingsScoped(
   companyId: string,
   settings: AppSettings
 ): Promise<CompanyRecord> {
+  if (!companyId) {
+    throw new Error('Selecione ou cadastre uma empresa antes de gravar as configurações.');
+  }
+
   const nifCheck = validateCompanyNif(settings.company.nif);
   if (!nifCheck.valid) {
     throw new Error(nifCheck.error || 'NIF inválido.');
@@ -983,8 +1130,10 @@ export async function saveCompanySettingsScoped(
     );
   }
 
-  const existingCompany =
-    (await getFromStore<CompanyRecord>('companies', companyId)) || JAIMONA_INITIAL_COMPANY;
+  const existingCompany = await getFromStore<CompanyRecord>('companies', companyId);
+  if (!existingCompany) {
+    throw new Error('Registo da empresa não encontrado na base local.');
+  }
 
   const now = new Date().toISOString();
   const updatedCompany: CompanyRecord = {
@@ -1070,30 +1219,45 @@ export const localDb = {
   deleteMember: (id: string) => deleteFromStore('company_members', id),
   enqueueSync: (entry: SyncQueueEntry) => putInStore('sync_queue', entry),
   deleteSyncEntry: (id: string) => deleteFromStore('sync_queue', id),
-  saveProduct: (p: Product, companyId = JAIMONA_COMPANY_ID) => {
-    const resolvedId = String(p.id || '').trim() || `prod_${Date.now()}_${Math.random().toString(36).slice(2, 6)}`;
-    const resolvedCompanyId = String(p.companyId || companyId || JAIMONA_COMPANY_ID).trim() || JAIMONA_COMPANY_ID;
+  saveProduct: (p: Product, companyId: string) => {
+    const resolvedCompanyId = String(companyId || p.companyId || '').trim();
+    if (!resolvedCompanyId) {
+      return Promise.reject(new Error('Selecione ou cadastre uma empresa antes de guardar artigos.'));
+    }
+    const resolvedId =
+      String(p.id || '').trim() || `prod_${Date.now()}_${Math.random().toString(36).slice(2, 6)}`;
     return putInStore('products', { ...p, id: resolvedId, companyId: resolvedCompanyId });
   },
   deleteProduct: (id: string) => deleteFromStore('products', id),
-  saveCustomer: (c: Customer, companyId = JAIMONA_COMPANY_ID) => {
-    const resolvedId = String(c.id || '').trim() || `cust_${Date.now()}_${Math.random().toString(36).slice(2, 6)}`;
-    const resolvedCompanyId = String(c.companyId || companyId || JAIMONA_COMPANY_ID).trim() || JAIMONA_COMPANY_ID;
+  saveCustomer: (c: Customer, companyId: string) => {
+    const resolvedCompanyId = String(companyId || c.companyId || '').trim();
+    if (!resolvedCompanyId) {
+      return Promise.reject(new Error('Selecione ou cadastre uma empresa antes de guardar clientes.'));
+    }
+    const resolvedId =
+      String(c.id || '').trim() || `cust_${Date.now()}_${Math.random().toString(36).slice(2, 6)}`;
     return putInStore('customers', { ...c, id: resolvedId, companyId: resolvedCompanyId });
   },
   deleteCustomer: (id: string) => deleteFromStore('customers', id),
-  saveInvoice: (inv: InvoiceRecord, companyId = JAIMONA_COMPANY_ID) => {
-    const resolvedId = String(inv.id || '').trim() || `inv_${Date.now()}_${Math.random().toString(36).slice(2, 6)}`;
-    const resolvedCompanyId = String(inv.companyId || companyId || JAIMONA_COMPANY_ID).trim() || JAIMONA_COMPANY_ID;
+  saveInvoice: (inv: InvoiceRecord, companyId: string) => {
+    const resolvedCompanyId = String(companyId || inv.companyId || '').trim();
+    if (!resolvedCompanyId) {
+      return Promise.reject(new Error('Selecione ou cadastre uma empresa antes de emitir faturas.'));
+    }
+    const resolvedId =
+      String(inv.id || '').trim() || `inv_${Date.now()}_${Math.random().toString(36).slice(2, 6)}`;
     return putInStore('invoices', { ...inv, id: resolvedId, companyId: resolvedCompanyId });
   },
-  saveSettings: (settings: AppSettings, companyId = JAIMONA_COMPANY_ID) =>
+  saveSettings: (settings: AppSettings, companyId: string) =>
     saveCompanySettingsScoped(companyId, settings),
-  savePosDraft: (draft: PosWorkspaceDraft, companyId = JAIMONA_COMPANY_ID) =>
-    putInStore('meta', {
-      key: `pos_draft:${companyId}`,
-      value: { ...draft, companyId },
-    }),
+  savePosDraft: (draft: PosWorkspaceDraft, companyId: string) => {
+    const resolvedCompanyId = String(companyId || draft.companyId || '').trim();
+    if (!resolvedCompanyId) return Promise.resolve();
+    return putInStore('meta', {
+      key: `pos_draft:${resolvedCompanyId}`,
+      value: { ...draft, companyId: resolvedCompanyId },
+    });
+  },
   getPreMigrationSnapshot: async (): Promise<PreMulticompanySnapshot | null> => {
     const m = await getFromStore<{ key: string; value: PreMulticompanySnapshot }>(
       'meta',

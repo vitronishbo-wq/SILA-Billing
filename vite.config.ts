@@ -18,10 +18,10 @@ export default defineConfig((): UserConfig => {
         ],
         manifest: {
           id: '/',
-          name: 'SILA-Billing — JAIMONA',
+          name: 'SILA-Billing',
           short_name: 'SILA-Billing',
           description:
-            'Sistema de faturação POS térmico e A4 offline-first para JAIMONA-COMÉRCIO E SERVIÇOS, (SU) LDA.',
+            'Plataforma comercial multiempresa de faturação POS térmico e A4 offline-first para Angola.',
           theme_color: '#0F172A',
           background_color: '#F8FAFC',
           display: 'standalone',

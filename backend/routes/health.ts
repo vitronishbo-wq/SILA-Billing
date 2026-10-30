@@ -1,4 +1,5 @@
 import { Router } from 'express';
+import { PLATFORM_ADMIN_EMAIL } from '../../src/core/types.ts';
 import { ensureFirebaseAuthorizedDomains, getFirebaseAdminContext } from '../firebaseAdmin.ts';
 
 export const healthRouter = Router();
@@ -25,8 +26,9 @@ healthRouter.get('/', async (_req, res) => {
   res.status(200).json({
     ok: true,
     service: 'sila-billing-backend',
-    company: 'JAIMONA-COMÉRCIO E SERVIÇOS, (SU) LDA',
-    nif: '5003069940',
+    platform: 'SILA-Billing',
+    architecture: 'multitenant-isolated',
+    platformAdminEmail: PLATFORM_ADMIN_EMAIL,
     projectId: ctx.projectId,
     firestoreDatabaseId: ctx.databaseId,
     credentialSource: ctx.credentialSource,

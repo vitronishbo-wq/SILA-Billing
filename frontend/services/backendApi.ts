@@ -4,7 +4,6 @@ import type {
   InvoiceRecord,
   PlanTier,
 } from '../../src/core/types.ts';
-import { JAIMONA_COMPANY_ID } from '../../src/core/types.ts';
 import { auth } from '../../src/services/firebaseClient.ts';
 
 const PRODUCTION_RENDER_API_URL = 'https://sila-billing.onrender.com';
@@ -141,12 +140,16 @@ export async function requestEnsureAuthDomains(): Promise<{
 
 export async function submitInvoiceAudit(
   invoice: InvoiceRecord,
-  companyId = JAIMONA_COMPANY_ID
+  companyId: string
 ): Promise<AuditInvoiceResponse> {
+  const resolvedCompanyId = String(companyId || invoice.companyId || '').trim();
+  if (!resolvedCompanyId) {
+    return { ok: false, error: 'Selecione uma empresa ativa antes de submeter auditoria.' };
+  }
   const headers = await getBearerHeaders();
   const payload = {
     id: invoice.id,
-    companyId: invoice.companyId || companyId,
+    companyId: resolvedCompanyId,
     number: invoice.number,
     docType: invoice.docType,
     issuedAtIso: invoice.issuedAtIso,
@@ -223,10 +226,14 @@ export async function cancelInvoiceBackend(
   return (await res.json().catch(() => ({ ok: false }))) as { ok: boolean; error?: string };
 }
 
-export async function downloadCloudBackupJson(companyId = JAIMONA_COMPANY_ID): Promise<void> {
+export async function downloadCloudBackupJson(companyId: string): Promise<void> {
+  const resolvedCompanyId = String(companyId || '').trim();
+  if (!resolvedCompanyId) {
+    throw new Error('Selecione uma empresa ativa para exportar o backup da Cloud.');
+  }
   const headers = await getBearerHeaders();
   const res = await fetch(
-    `${API_BASE}/api/backup?companyId=${encodeURIComponent(companyId)}`,
+    `${API_BASE}/api/backup?companyId=${encodeURIComponent(resolvedCompanyId)}`,
     {
       method: 'GET',
       headers,
@@ -248,7 +255,7 @@ export async function downloadCloudBackupJson(companyId = JAIMONA_COMPANY_ID): P
   const url = URL.createObjectURL(blob);
   const a = document.createElement('a');
   a.href = url;
-  a.download = `sila-billing-backup-${companyId}-${new Date().toISOString().slice(0, 10)}.json`;
+  a.download = `sila-billing-backup-${resolvedCompanyId}-${new Date().toISOString().slice(0, 10)}.json`;
   document.body.appendChild(a);
   a.click();
   a.remove();

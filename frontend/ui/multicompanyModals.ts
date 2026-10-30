@@ -52,41 +52,47 @@ export function renderCompanySwitcherDropdown(params: {
       </div>
 
       <div class="max-h-64 overflow-y-auto divide-y divide-slate-100">
-        ${companies
-          .map((comp) => {
-            const isActive = comp.id === activeCompany.id;
-            const isSuspended = comp.status === 'suspended';
-            return `
-              <button
-                type="button"
-                data-action="switch-company"
-                data-id="${escapeHtml(comp.id)}"
-                class="w-full px-3 py-2.5 text-left flex items-center justify-between gap-2 transition-colors ${
-                  isActive ? 'bg-blue-50/70' : 'hover:bg-slate-50'
-                }"
-              >
-                <div class="min-w-0">
-                  <div class="flex items-center gap-1.5 text-xs font-semibold text-slate-900 truncate">
-                    <span class="truncate">${escapeHtml(comp.profile.shortName)}</span>
-                    ${
-                      isSuspended
-                        ? `<span class="text-[10px] text-red-600 font-medium shrink-0">· Suspensa</span>`
-                        : ''
-                    }
-                  </div>
-                  <div class="text-[10.5px] font-mono text-slate-500 tabular-nums truncate">
-                    NIF ${escapeHtml(comp.profile.nif)} · ${escapeHtml(comp.profile.cityCountry)}
-                  </div>
-                </div>
-                ${
-                  isActive
-                    ? `<span class="text-blue-600 shrink-0">${ICONS.check}</span>`
-                    : ''
-                }
-              </button>
-            `;
-          })
-          .join('')}
+        ${
+          companies.length === 0
+            ? `<div class="px-3 py-5 text-center text-xs text-slate-500">
+                Nenhuma empresa associada a esta sessão. Cadastre a sua empresa abaixo para iniciar a faturação.
+              </div>`
+            : companies
+                .map((comp) => {
+                  const isActive = comp.id === activeCompany.id;
+                  const isSuspended = comp.status === 'suspended';
+                  return `
+                    <button
+                      type="button"
+                      data-action="switch-company"
+                      data-id="${escapeHtml(comp.id)}"
+                      class="w-full px-3 py-2.5 text-left flex items-center justify-between gap-2 transition-colors ${
+                        isActive ? 'bg-blue-50/70' : 'hover:bg-slate-50'
+                      }"
+                    >
+                      <div class="min-w-0">
+                        <div class="flex items-center gap-1.5 text-xs font-semibold text-slate-900 truncate">
+                          <span class="truncate">${escapeHtml(comp.profile.shortName)}</span>
+                          ${
+                            isSuspended
+                              ? `<span class="text-[10px] text-red-600 font-medium shrink-0">· Suspensa</span>`
+                              : ''
+                          }
+                        </div>
+                        <div class="text-[10.5px] font-mono text-slate-500 tabular-nums truncate">
+                          NIF ${escapeHtml(comp.profile.nif)} · ${escapeHtml(comp.profile.cityCountry)}
+                        </div>
+                      </div>
+                      ${
+                        isActive
+                          ? `<span class="text-blue-600 shrink-0">${ICONS.check}</span>`
+                          : ''
+                      }
+                    </button>
+                  `;
+                })
+                .join('')
+        }
       </div>
 
       <div class="p-2 bg-slate-50 border-t border-slate-200">
@@ -571,6 +577,90 @@ export function renderMasterAdminModal(params: {
                   : ''
               }
             `
+          }
+        </div>
+      </div>
+    </div>
+  `;
+}
+
+export function renderTenantOnboardingView(params: {
+  userEmail: string;
+  isSignedIn: boolean;
+  isOnline: boolean;
+  isSyncing: boolean;
+  syncMessage: string | null;
+}): string {
+  const { userEmail, isSignedIn, isOnline, isSyncing, syncMessage } = params;
+
+  return `
+    <div class="h-full overflow-y-auto bg-slate-50 p-4 sm:p-8 flex items-center justify-center">
+      <div class="w-full max-w-xl bg-white border border-slate-200 rounded-xl p-6 sm:p-8 space-y-6">
+        <div class="space-y-2">
+          <div class="text-[11px] font-bold tracking-wide text-blue-600 uppercase">SILA-Billing · Plataforma Multiempresa</div>
+          <h1 class="text-lg font-bold text-slate-900 tracking-tight">Cadastre ou sincronize a sua empresa</h1>
+          <p class="text-xs text-slate-600 leading-relaxed">
+            ${
+              isSignedIn
+                ? `A conta autenticada (<strong>${escapeHtml(userEmail)}</strong>) ainda não tem nenhuma empresa associada neste terminal. Crie a sua empresa com isolamento próprio ou sincronize empresas já registadas na Cloud.`
+                : 'Inicie o seu espaço empresarial isolado para emitir faturas térmicas POS 80mm e A4 com numeração própria.'
+            }
+          </p>
+        </div>
+
+        ${
+          syncMessage
+            ? `<div class="p-3 rounded-lg border border-amber-200 bg-amber-50 text-xs text-amber-800">${escapeHtml(syncMessage)}</div>`
+            : ''
+        }
+
+        <div class="grid grid-cols-1 sm:grid-cols-3 gap-3 text-xs border-y border-slate-100 py-4 tabular-nums">
+          <div class="space-y-0.5">
+            <div class="font-semibold text-slate-900">1 NIF = 1 Empresa</div>
+            <div class="text-[11px] text-slate-500">Contribuinte único validado localmente e na Cloud.</div>
+          </div>
+          <div class="space-y-0.5">
+            <div class="font-semibold text-slate-900">Série 000001</div>
+            <div class="text-[11px] text-slate-500">Numeração, clientes e catálogo 100% isolados.</div>
+          </div>
+          <div class="space-y-0.5">
+            <div class="font-semibold text-slate-900">POS 80mm &amp; A4</div>
+            <div class="text-[11px] text-slate-500">Operação imediata offline-first e sincronização segura.</div>
+          </div>
+        </div>
+
+        <div class="flex flex-wrap items-center gap-2.5">
+          <button
+            type="button"
+            data-action="open-new-company-modal"
+            class="h-10 px-4 rounded-lg bg-slate-900 text-white text-xs font-semibold hover:bg-slate-800 flex items-center gap-1.5 whitespace-nowrap"
+          >
+            ${ICONS.plus}
+            <span>Cadastrar Nova Empresa</span>
+          </button>
+
+          ${
+            isSignedIn
+              ? `<button
+                  type="button"
+                  data-action="sync-now"
+                  ${!isOnline || isSyncing ? 'disabled' : ''}
+                  class="h-10 px-3.5 rounded-lg border border-slate-200 text-xs font-medium text-slate-700 hover:bg-slate-50 disabled:opacity-40 flex items-center gap-1.5 whitespace-nowrap"
+                >
+                  ${ICONS.refresh}
+                  <span>${isSyncing ? 'A procurar na Cloud...' : 'Procurar empresas na Cloud'}</span>
+                </button>
+                <button
+                  type="button"
+                  data-action="signout-google"
+                  class="h-10 px-3.5 rounded-lg border border-slate-200 text-xs font-medium text-slate-600 hover:bg-slate-50 whitespace-nowrap"
+                >Trocar de conta</button>`
+              : `<button
+                  type="button"
+                  data-action="signin-google"
+                  ${!isOnline ? 'disabled' : ''}
+                  class="h-10 px-3.5 rounded-lg border border-slate-200 text-xs font-medium text-slate-700 hover:bg-slate-50 disabled:opacity-40 whitespace-nowrap"
+                >Já tenho empresa na Cloud (Entrar)</button>`
           }
         </div>
       </div>

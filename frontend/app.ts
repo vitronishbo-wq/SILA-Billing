@@ -20,14 +20,15 @@ import {
   DocumentType,
   getDirectCustomerIdForCompany,
   InvoiceRecord,
-  JAIMONA_COMPANY,
+  isJaimonaOwnerEmail,
   JAIMONA_COMPANY_ID,
+  JAIMONA_OWNER_EMAIL,
   PaymentMethod,
   PlanTier,
   Product,
   TaxRate,
 } from '../src/core/types';
-import { JAIMONA_INITIAL_COMPANY } from '../src/core/seedData';
+import { UNASSIGNED_TENANT_RECORD } from '../src/core/seedData';
 import {
   cancelInvoiceCloud,
   createInvoiceCloud,
@@ -56,6 +57,7 @@ import {
   localDb,
   registerNewCompanyLocal,
   restorePreMulticompanySnapshot,
+  WorkspaceViewerIdentity,
 } from '../src/services/localStore';
 import {
   AdminAuditEntry,
@@ -80,6 +82,7 @@ import {
   renderCompanySwitcherDropdown,
   renderMasterAdminModal,
   renderNewCompanyModal,
+  renderTenantOnboardingView,
 } from './ui/multicompanyModals';
 
 type ActiveModule =
@@ -151,8 +154,9 @@ export class SilaBillingApp {
     typeof window !== 'undefined' && window.innerWidth >= 1024 ? 'EXPANDED' : 'ICONS';
 
   // Contexto Multiempresa e Dados Persistentes (IndexedDB v2 + Firestore)
-  private activeCompany: CompanyRecord = JAIMONA_INITIAL_COMPANY;
-  private companies: CompanyRecord[] = [JAIMONA_INITIAL_COMPANY];
+  private activeCompany: CompanyRecord = UNASSIGNED_TENANT_RECORD;
+  private companies: CompanyRecord[] = [];
+  private requiresCompanyOnboarding = false;
   private members: CompanyMember[] = [];
   private hasPreMigrationBackup = false;
   private products: Product[] = [];
@@ -248,14 +252,36 @@ export class SilaBillingApp {
     this.root = root;
   }
 
+  private getViewerIdentity(): WorkspaceViewerIdentity | null {
+    if (!this.user) return null;
+    return {
+      uid: this.user.uid,
+      email: this.user.email,
+    };
+  }
+
   public async mount(): Promise<void> {
     this.setupGlobalListeners();
     this.render();
 
     validateFirestoreConnection();
 
+    // Aguarda brevemente pela restauração da sessão Firebase Auth (com timeout curto de 600ms
+    // para nunca atrasar terminais offline/Windows 7), evitando injetar empresas alheias no arranque.
     try {
-      const data = await bootstrapLocalStore();
+      if (typeof auth.authStateReady === 'function') {
+        await Promise.race([
+          auth.authStateReady(),
+          new Promise<void>((resolve) => window.setTimeout(resolve, 600)),
+        ]);
+      }
+      this.user = auth.currentUser;
+    } catch {
+      // Prossegue normalmente em modo local caso Auth esteja indisponível
+    }
+
+    try {
+      const data = await bootstrapLocalStore(undefined, this.getViewerIdentity());
       this.applyWorkspaceBundle(data);
       this.dbBootError = null;
     } catch (err) {
@@ -266,19 +292,58 @@ export class SilaBillingApp {
       this.refreshBackendHealth();
     }
 
-    onAuthStateChanged(auth, (u) => {
+    let lastAuthKey = '';
+
+    onAuthStateChanged(auth, async (u) => {
+      const nextAuthKey = u ? `${u.uid}|${u.email || ''}` : '';
+      const authChanged = nextAuthKey !== lastAuthKey;
+      lastAuthKey = nextAuthKey;
       this.user = u;
+
       if (!u) {
         this.masterAdminDenied = false;
         this.adminCloudCompanies = [];
         this.adminAuditLogs = [];
+        if (authChanged) {
+          try {
+            const localBundle = await bootstrapLocalStore(undefined, null);
+            this.applyWorkspaceBundle(localBundle);
+          } catch {
+            // Mantém estado atual
+          }
+        }
+        this.render();
+        return;
       }
+
+      if (authChanged) {
+        try {
+          if (this.isOnline) {
+            const ownedCloud = await pullOwnedCompaniesFromCloud();
+            for (const cloudComp of ownedCloud) {
+              await localDb.saveCompany(cloudComp);
+            }
+          }
+          const scopedBundle = await loadCompanyWorkspace(
+            this.activeCompany.id,
+            this.getViewerIdentity()
+          );
+          this.applyWorkspaceBundle(scopedBundle);
+        } catch {
+          // Mantém workspace seguro
+        }
+      }
+
       this.render();
-      if (u && this.isOnline) {
+      if (this.isOnline) {
         if (this.showMasterAdminModal) {
           void this.refreshMasterAdminData();
         }
-        if (this.hasUnsyncedLocalRecords()) {
+        if (
+          !this.requiresCompanyOnboarding &&
+          this.activeCompany.id &&
+          (authChanged || this.hasUnsyncedLocalRecords())
+        ) {
           void this.syncAllWithCloud();
         }
       }
@@ -288,6 +353,9 @@ export class SilaBillingApp {
   private applyWorkspaceBundle(data: CompanyWorkspaceBundle): void {
     this.activeCompany = data.activeCompany;
     this.companies = data.companies;
+    this.requiresCompanyOnboarding = Boolean(
+      data.requiresCompanyOnboarding || !data.activeCompany.id
+    );
     this.members = data.members;
     this.hasPreMigrationBackup = data.hasPreMigrationBackup;
     this.products = data.products;
@@ -341,7 +409,10 @@ export class SilaBillingApp {
     }
 
     if (typeof document !== 'undefined') {
-      document.title = `SILA-Billing — ${this.settings.company.shortName}`;
+      document.title =
+        this.requiresCompanyOnboarding || !this.activeCompany.id
+          ? 'SILA-Billing'
+          : `SILA-Billing — ${this.settings.company.shortName}`;
     }
   }
 
@@ -410,7 +481,7 @@ export class SilaBillingApp {
   private async switchActiveCompany(companyId: string): Promise<void> {
     if (!companyId) return;
     await this.flushDraftNow();
-    const bundle = await loadCompanyWorkspace(companyId);
+    const bundle = await loadCompanyWorkspace(companyId, this.getViewerIdentity());
     this.applyWorkspaceBundle(bundle);
     this.showCompanyDropdown = false;
     this.render();
@@ -423,11 +494,18 @@ export class SilaBillingApp {
   private getMergedAdminCompanies(): AdminCompanySummary[] {
     const byId = new Map<string, AdminCompanySummary>();
     for (const cc of this.adminCloudCompanies) {
-      byId.set(cc.id, cc);
+      if (cc.id) {
+        byId.set(cc.id, cc);
+      }
     }
     for (const lc of this.companies) {
+      if (!lc.id) continue;
       const existing = byId.get(lc.id);
       const localInvCount = lc.id === this.activeCompany.id ? this.invoices.length : 0;
+      const resolvedOwnerEmail =
+        lc.id === JAIMONA_COMPANY_ID
+          ? lc.ownerEmail || JAIMONA_OWNER_EMAIL
+          : lc.ownerEmail || lc.profile.email || 'Local';
       if (!existing) {
         byId.set(lc.id, {
           id: lc.id,
@@ -436,7 +514,7 @@ export class SilaBillingApp {
           nif: lc.profile.nif,
           normalizedNif: lc.normalizedNif,
           cityCountry: lc.profile.cityCountry,
-          ownerEmail: lc.ownerEmail || this.user?.email || 'Local',
+          ownerEmail: resolvedOwnerEmail,
           status: lc.status,
           planTier: lc.plan.planTier,
           commercialActive: lc.plan.commercialActive,
@@ -451,12 +529,10 @@ export class SilaBillingApp {
       }
     }
 
-    return Array.from(byId.values()).sort((a, b) =>
-      a.id === JAIMONA_COMPANY_ID
-        ? -1
-        : b.id === JAIMONA_COMPANY_ID
-          ? 1
-          : b.createdAtIso.localeCompare(a.createdAtIso)
+    return Array.from(byId.values()).sort(
+      (a, b) =>
+        b.createdAtIso.localeCompare(a.createdAtIso) ||
+        a.shortName.localeCompare(b.shortName, 'pt')
     );
   }
 
@@ -503,7 +579,7 @@ export class SilaBillingApp {
       window.clearTimeout(this.draftSaveTimer);
       this.draftSaveTimer = null;
     }
-    if (this.isBooting) return;
+    if (this.isBooting || !this.activeCompany.id || this.requiresCompanyOnboarding) return;
     try {
       await localDb.savePosDraft(
         {
@@ -528,7 +604,7 @@ export class SilaBillingApp {
   }
 
   private scheduleDraftSave(): void {
-    if (this.isBooting) return;
+    if (this.isBooting || !this.activeCompany.id || this.requiresCompanyOnboarding) return;
     if (this.draftSaveTimer !== null) {
       window.clearTimeout(this.draftSaveTimer);
     }
@@ -539,6 +615,7 @@ export class SilaBillingApp {
   }
 
   private hasUnsyncedLocalRecords(): boolean {
+    if (!this.activeCompany.id || this.requiresCompanyOnboarding) return false;
     return (
       !this.activeCompany.synced ||
       this.invoices.some((i) => !i.synced) ||
@@ -994,7 +1071,10 @@ export class SilaBillingApp {
         this.isBooting = true;
         this.render();
         try {
-          const data = await bootstrapLocalStore(this.activeCompany.id);
+          const data = await bootstrapLocalStore(
+            this.activeCompany.id || undefined,
+            this.getViewerIdentity()
+          );
           this.applyWorkspaceBundle(data);
         } catch (err) {
           this.dbBootError = formatStorageErrorPt(err, 'os dados locais');
@@ -1235,14 +1315,10 @@ export class SilaBillingApp {
         break;
       }
       case 'reset-settings': {
-        if (!this.canManageCompanySettings()) return;
-        const defaultProfile =
-          this.activeCompany.id === JAIMONA_COMPANY_ID
-            ? JAIMONA_COMPANY
-            : this.activeCompany.profile;
+        if (!this.canManageCompanySettings() || !this.activeCompany.id) return;
         const resetVal: AppSettings = {
           companyId: this.activeCompany.id,
-          company: { ...defaultProfile },
+          company: { ...this.activeCompany.profile },
           defaultCashier: '01',
           defaultOperator: '001',
           defaultFormat: 'POS',
@@ -1257,9 +1333,13 @@ export class SilaBillingApp {
         break;
       }
       case 'restore-v1-snapshot': {
+        if (this.activeCompany.id !== JAIMONA_COMPANY_ID) break;
         const restored = await restorePreMulticompanySnapshot();
         if (restored) {
-          const refreshed = await bootstrapLocalStore(JAIMONA_COMPANY_ID);
+          const refreshed = await bootstrapLocalStore(
+            JAIMONA_COMPANY_ID,
+            this.getViewerIdentity()
+          );
           this.applyWorkspaceBundle(refreshed);
           this.syncMessage = 'Snapshot v1 pré-migração restaurado com sucesso na empresa JAIMONA.';
           this.render();
@@ -1292,10 +1372,12 @@ export class SilaBillingApp {
         break;
       }
       case 'export-backup-local': {
+        if (!this.activeCompany.id || this.requiresCompanyOnboarding) break;
         this.exportLocalJsonBackup();
         break;
       }
       case 'export-backup-cloud': {
+        if (!this.activeCompany.id || this.requiresCompanyOnboarding) break;
         try {
           this.syncMessage = null;
           await downloadCloudBackupJson(this.activeCompany.id);
@@ -1687,7 +1769,7 @@ export class SilaBillingApp {
         }
 
         await this.flushDraftNow();
-        const bundle = await loadCompanyWorkspace(createdCompany.id);
+        const bundle = await loadCompanyWorkspace(createdCompany.id, this.getViewerIdentity());
         this.applyWorkspaceBundle(bundle);
         this.showNewCompanyModal = false;
         this.activeModule = 'NEW_POS';
@@ -2211,13 +2293,54 @@ export class SilaBillingApp {
     this.render();
 
     try {
-      // 1. Regista/atualiza a empresa ativa e o respetivo NIF único no Firestore
+      // 1. Descobre empresas da conta autenticada na Cloud antes de sincronizar o workspace ativo
+      const ownedCloudCompanies = await pullOwnedCompaniesFromCloud();
+      for (const cloudComp of ownedCloudCompanies) {
+        const localExisting = this.companies.find(
+          (c) => c.id === cloudComp.id || c.normalizedNif === cloudComp.normalizedNif
+        );
+        if (!localExisting) {
+          await localDb.saveCompany(cloudComp);
+        } else {
+          await localDb.saveCompany({
+            ...localExisting,
+            status: cloudComp.status,
+            plan: cloudComp.plan,
+            allowManagerCancel: cloudComp.allowManagerCancel,
+            ownerUid: cloudComp.ownerUid,
+            ownerEmail: cloudComp.ownerEmail,
+            syncState: 'synced',
+            synced: true,
+          });
+        }
+      }
+
+      if (!this.activeCompany.id || this.requiresCompanyOnboarding) {
+        if (ownedCloudCompanies.length > 0) {
+          const recovered = await loadCompanyWorkspace(
+            ownedCloudCompanies[0]!.id,
+            this.getViewerIdentity()
+          );
+          this.applyWorkspaceBundle(recovered);
+        } else {
+          this.syncMessage =
+            'Nenhuma empresa registada na Cloud para esta conta. Cadastre a sua empresa para iniciar.';
+          return;
+        }
+      }
+
+      // 2. Regista/atualiza a empresa ativa e o respetivo NIF único no Firestore
       await ensureCompanyRegisteredCloud(this.activeCompany, !this.activeCompany.synced);
-      if (!this.activeCompany.synced) {
+      const canClaimCompanyOwnership =
+        this.activeCompany.id !== JAIMONA_COMPANY_ID || isJaimonaOwnerEmail(this.user.email);
+      if (!this.activeCompany.synced && canClaimCompanyOwnership) {
         const markedComp: CompanyRecord = {
           ...this.activeCompany,
           ownerUid: this.activeCompany.ownerUid || this.user.uid,
-          ownerEmail: this.activeCompany.ownerEmail || this.user.email || undefined,
+          ownerEmail:
+            this.activeCompany.id === JAIMONA_COMPANY_ID
+              ? JAIMONA_OWNER_EMAIL
+              : this.activeCompany.ownerEmail || this.user.email || undefined,
           syncState: 'synced',
           synced: true,
         };
@@ -2225,7 +2348,7 @@ export class SilaBillingApp {
         this.activeCompany = markedComp;
       }
 
-      // 2. Envia registos pendentes da empresa ativa com controlo explícito de erro por item
+      // 3. Envia registos pendentes da empresa ativa com controlo explícito de erro por item
       const unsyncedProducts = this.products.filter((p) => !p.synced);
       for (const prod of unsyncedProducts) {
         try {
@@ -2303,32 +2426,14 @@ export class SilaBillingApp {
         await localDb.saveSettings(syncedSettings, this.activeCompany.id);
       }
 
-      // 3. Descobre outras empresas da conta autenticada e sincroniza dados da empresa ativa
-      const ownedCloudCompanies = await pullOwnedCompaniesFromCloud();
-      for (const cloudComp of ownedCloudCompanies) {
-        const localExisting = this.companies.find(
-          (c) => c.id === cloudComp.id || c.normalizedNif === cloudComp.normalizedNif
-        );
-        if (!localExisting) {
-          await localDb.saveCompany(cloudComp);
-        } else {
-          await localDb.saveCompany({
-            ...localExisting,
-            status: cloudComp.status,
-            plan: cloudComp.plan,
-            allowManagerCancel: cloudComp.allowManagerCancel,
-            ownerUid: cloudComp.ownerUid,
-            ownerEmail: cloudComp.ownerEmail,
-            syncState: 'synced',
-            synced: true,
-          });
-        }
-      }
-
+      // 4. Descarrega dados atualizados da empresa ativa a partir do Firestore
       const cloudData = await pullCompanyFromCloud(this.activeCompany.id);
       if (cloudData) {
         // Proteção estrita: nunca sobrescrever registos locais ainda pendentes de sincronização
-        const preMergeLocal = await loadCompanyWorkspace(this.activeCompany.id);
+        const preMergeLocal = await loadCompanyWorkspace(
+          this.activeCompany.id,
+          this.getViewerIdentity()
+        );
         const pendingProdIds = new Set(
           preMergeLocal.products.filter((p) => !p.synced).map((p) => p.id)
         );
@@ -2359,13 +2464,19 @@ export class SilaBillingApp {
         }
       }
 
-      const refreshed = await loadCompanyWorkspace(this.activeCompany.id);
+      const refreshed = await loadCompanyWorkspace(
+        this.activeCompany.id,
+        this.getViewerIdentity()
+      );
       this.products = refreshed.products;
       this.customers = refreshed.customers;
       this.invoices = refreshed.invoices;
       this.settings = refreshed.settings;
       this.activeCompany = refreshed.activeCompany;
       this.companies = refreshed.companies;
+      this.requiresCompanyOnboarding = Boolean(
+        refreshed.requiresCompanyOnboarding || !refreshed.activeCompany.id
+      );
       this.members = refreshed.members;
 
       this.lastSyncedIso = new Date().toISOString();
@@ -2471,11 +2582,13 @@ export class SilaBillingApp {
   // ==================== RENDERIZAÇÃO MODULAR VANILLA JS ====================
 
   private render(): void {
-    const pendingCount =
-      this.products.filter((p) => !p.synced).length +
-      this.customers.filter((c) => !c.synced).length +
-      this.invoices.filter((i) => !i.synced).length +
-      (this.settings.synced ? 0 : 1);
+    const isUnassigned = this.requiresCompanyOnboarding || !this.activeCompany.id;
+    const pendingCount = isUnassigned
+      ? 0
+      : this.products.filter((p) => !p.synced).length +
+        this.customers.filter((c) => !c.synced).length +
+        this.invoices.filter((i) => !i.synced).length +
+        (this.settings.synced ? 0 : 1);
 
     const canInstall = !this.isInstalled && (Boolean(this.deferredPrompt) || this.isIOS);
     const effectiveRole = this.getEffectiveRole();
@@ -2506,21 +2619,32 @@ export class SilaBillingApp {
           </div>
 
           <div data-company-switcher-zone class="relative flex items-center min-w-0">
-            <button
-              type="button"
-              data-action="toggle-company-dropdown"
-              class="h-8 px-2.5 rounded-md hover:bg-slate-800 text-xs text-slate-300 hover:text-white flex items-center gap-1.5 transition-colors max-w-[240px] sm:max-w-xs md:max-w-md"
-            >
-              <span class="font-medium text-white truncate">${escapeHtml(this.settings.company.shortName)}</span>
-              <span aria-hidden="true" class="text-slate-500 hidden sm:inline">·</span>
-              <span class="font-mono tabular-nums text-slate-400 hidden sm:inline shrink-0">NIF ${escapeHtml(this.settings.company.nif)}</span>
-              ${
-                this.isCompanySuspended()
-                  ? `<span class="text-[10px] text-red-400 font-medium shrink-0">· Suspensa</span>`
-                  : ''
-              }
-              <span class="text-slate-400 shrink-0">${this.showCompanyDropdown ? ICONS.chevronUp : ICONS.chevronDown}</span>
-            </button>
+            ${
+              isUnassigned
+                ? `<button
+                    type="button"
+                    data-action="open-new-company-modal"
+                    class="h-8 px-3 rounded-md bg-blue-600 hover:bg-blue-700 text-xs font-semibold text-white flex items-center gap-1.5 transition-colors whitespace-nowrap"
+                  >
+                    ${ICONS.plus}
+                    <span>Cadastrar Empresa</span>
+                  </button>`
+                : `<button
+                    type="button"
+                    data-action="toggle-company-dropdown"
+                    class="h-8 px-2.5 rounded-md hover:bg-slate-800 text-xs text-slate-300 hover:text-white flex items-center gap-1.5 transition-colors max-w-[240px] sm:max-w-xs md:max-w-md"
+                  >
+                    <span class="font-medium text-white truncate">${escapeHtml(this.settings.company.shortName)}</span>
+                    <span aria-hidden="true" class="text-slate-500 hidden sm:inline">·</span>
+                    <span class="font-mono tabular-nums text-slate-400 hidden sm:inline shrink-0">NIF ${escapeHtml(this.settings.company.nif)}</span>
+                    ${
+                      this.isCompanySuspended()
+                        ? `<span class="text-[10px] text-red-400 font-medium shrink-0">· Suspensa</span>`
+                        : ''
+                    }
+                    <span class="text-slate-400 shrink-0">${this.showCompanyDropdown ? ICONS.chevronUp : ICONS.chevronDown}</span>
+                  </button>`
+            }
 
             ${
               this.showCompanyDropdown
@@ -2753,6 +2877,19 @@ export class SilaBillingApp {
   }
 
   private renderActiveWorkspace(): string {
+    if (
+      (this.requiresCompanyOnboarding || !this.activeCompany.id) &&
+      this.activeModule !== 'SYNC'
+    ) {
+      return renderTenantOnboardingView({
+        userEmail: this.user?.email || '',
+        isSignedIn: Boolean(this.user),
+        isOnline: this.isOnline,
+        isSyncing: this.isSyncing,
+        syncMessage: this.syncMessage,
+      });
+    }
+
     switch (this.activeModule) {
       case 'NEW_POS':
       case 'NEW_A4':
@@ -4434,17 +4571,19 @@ export class SilaBillingApp {
   // ==================== 7. SINCRONIZAÇÃO / ESTADO OFFLINE & BACKUP ====================
 
   private renderSyncWorkspace(): string {
-    const pProd = this.products.filter((p) => !p.synced).length;
-    const pCust = this.customers.filter((c) => !c.synced).length;
-    const pInv = this.invoices.filter((i) => !i.synced).length;
-    const pSet = this.settings.synced ? 0 : 1;
+    const isUnassigned = this.requiresCompanyOnboarding || !this.activeCompany.id;
+    const pProd = isUnassigned ? 0 : this.products.filter((p) => !p.synced).length;
+    const pCust = isUnassigned ? 0 : this.customers.filter((c) => !c.synced).length;
+    const pInv = isUnassigned ? 0 : this.invoices.filter((i) => !i.synced).length;
+    const pSet = isUnassigned ? 0 : this.settings.synced ? 0 : 1;
     const totalPending = pProd + pCust + pInv + pSet;
 
-    const errCount =
-      this.products.filter((p) => p.syncState === 'error').length +
-      this.customers.filter((c) => c.syncState === 'error').length +
-      this.invoices.filter((i) => i.syncState === 'error').length +
-      (this.settings.syncState === 'error' ? 1 : 0);
+    const errCount = isUnassigned
+      ? 0
+      : this.products.filter((p) => p.syncState === 'error').length +
+        this.customers.filter((c) => c.syncState === 'error').length +
+        this.invoices.filter((i) => i.syncState === 'error').length +
+        (this.settings.syncState === 'error' ? 1 : 0);
 
     const lastSync = this.lastSyncedIso ? formatDateTimePt(this.lastSyncedIso) : null;
     const bh = this.backendHealth;
@@ -4455,9 +4594,13 @@ export class SilaBillingApp {
           <div class="flex flex-col sm:flex-row sm:items-center justify-between gap-3 pb-3 border-b border-slate-200">
             <div>
               <h1 class="text-sm font-bold text-slate-900">Sincronização, Backend e Backup</h1>
-              <p class="text-xs text-slate-500">Persistência isolada por empresa (${escapeHtml(
-                this.settings.company.shortName
-              )} · NIF ${escapeHtml(this.settings.company.nif)}).</p>
+              <p class="text-xs text-slate-500">${
+                isUnassigned
+                  ? 'Sessão multiempresa pronta · Selecione ou cadastre uma empresa para sincronizar dados.'
+                  : `Persistência isolada por empresa (${escapeHtml(
+                      this.settings.company.shortName
+                    )} · NIF ${escapeHtml(this.settings.company.nif)}).`
+              }</p>
             </div>
 
             <div class="flex items-center gap-2 shrink-0">
@@ -4587,7 +4730,7 @@ export class SilaBillingApp {
             </div>
             <div class="flex flex-wrap items-center gap-2 shrink-0">
               ${
-                this.hasPreMigrationBackup
+                this.hasPreMigrationBackup && this.activeCompany.id === JAIMONA_COMPANY_ID
                   ? `<button
                       type="button"
                       data-action="restore-v1-snapshot"
@@ -4602,7 +4745,8 @@ export class SilaBillingApp {
               <button
                 type="button"
                 data-action="export-backup-local"
-                class="h-9 px-3 rounded-lg border border-slate-200 text-xs font-semibold text-slate-800 hover:bg-slate-50 flex items-center gap-1.5 whitespace-nowrap"
+                ${isUnassigned ? 'disabled' : ''}
+                class="h-9 px-3 rounded-lg border border-slate-200 text-xs font-semibold text-slate-800 hover:bg-slate-50 disabled:opacity-40 flex items-center gap-1.5 whitespace-nowrap"
               >
                 ${ICONS.download}
                 <span>Backup Local</span>
@@ -4610,7 +4754,7 @@ export class SilaBillingApp {
               <button
                 type="button"
                 data-action="export-backup-cloud"
-                ${!this.user || !this.isOnline ? 'disabled' : ''}
+                ${!this.user || !this.isOnline || isUnassigned ? 'disabled' : ''}
                 class="h-9 px-3 rounded-lg bg-slate-900 text-white text-xs font-semibold hover:bg-slate-800 disabled:opacity-40 flex items-center gap-1.5 whitespace-nowrap"
               >
                 ${ICONS.download}

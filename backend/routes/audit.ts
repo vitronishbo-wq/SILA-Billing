@@ -2,7 +2,12 @@ import { createHash } from 'crypto';
 import { Router } from 'express';
 import { FieldValue } from 'firebase-admin/firestore';
 import { calculateInvoiceTotals, roundKz } from '../../src/core/billingEngine.ts';
-import { JAIMONA_COMPANY_ID, type CartDraftItem, type TaxRate } from '../../src/core/types.ts';
+import {
+  isJaimonaOwnerEmail,
+  JAIMONA_COMPANY_ID,
+  type CartDraftItem,
+  type TaxRate,
+} from '../../src/core/types.ts';
 import { getFirebaseAdminContext } from '../firebaseAdmin.ts';
 import { requireFirebaseAuth, type AuthenticatedRequest } from '../middleware/requireFirebaseAuth.ts';
 import { verifyCompanyMembershipServer } from '../middleware/requirePlatformAdmin.ts';
@@ -49,9 +54,16 @@ auditRouter.post('/invoices', requireFirebaseAuth, async (req: AuthenticatedRequ
     return;
   }
 
-  const safeCompanyId = String(body.companyId || JAIMONA_COMPANY_ID)
-    .replace(/[^a-zA-Z0-9_-]/g, '_')
-    .slice(0, 128);
+  const rawCompanyId = String(body.companyId || '').trim();
+  if (!rawCompanyId) {
+    res.status(400).json({
+      ok: false,
+      error: 'O identificador da empresa (companyId) é obrigatório para auditoria fiscal.',
+    });
+    return;
+  }
+
+  const safeCompanyId = rawCompanyId.replace(/[^a-zA-Z0-9_-]/g, '_').slice(0, 128);
 
   // Normaliza e valida cada linha segundo o regime de IVA angolano (14% ou Isento 0%)
   const draftItems: CartDraftItem[] = [];
@@ -240,8 +252,8 @@ auditRouter.post('/invoices', requireFirebaseAuth, async (req: AuthenticatedRequ
         });
       }
 
-      // Mantém continuidade na coleção clássica para a empresa inicial JAIMONA
-      if (safeCompanyId === JAIMONA_COMPANY_ID) {
+      // Mantém continuidade na coleção clássica estritamente para o titular real da JAIMONA
+      if (safeCompanyId === JAIMONA_COMPANY_ID && isJaimonaOwnerEmail(user.email)) {
         const invRef = ctx.db
           .collection('users')
           .doc(user.uid)

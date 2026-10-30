@@ -1,7 +1,9 @@
 import { Router } from 'express';
 import { FieldValue } from 'firebase-admin/firestore';
 import {
+  isJaimonaOwnerEmail,
   JAIMONA_COMPANY_ID,
+  JAIMONA_OWNER_EMAIL,
   normalizeCompanyNif,
   validateCompanyNif,
   type PlanTier,
@@ -76,9 +78,17 @@ companiesRouter.post('/register', requireFirebaseAuth, async (req: Authenticated
   const companyId = sanitizeId(body?.id || `comp_${Date.now()}`);
   const isGlobalAdmin = await checkIsPlatformAdmin(user, db);
 
+  if (companyId === JAIMONA_COMPANY_ID && !isJaimonaOwnerEmail(user.email) && !isGlobalAdmin) {
+    res.status(403).json({
+      ok: false,
+      error: 'Este identificador empresarial pertence exclusivamente ao titular registado da empresa JAIMONA.',
+    });
+    return;
+  }
+
   try {
-    // Limita criação gratuita por utilizador comum para evitar abuso
-    if (!isGlobalAdmin && companyId !== JAIMONA_COMPANY_ID) {
+    // Regra igualitária para todas as empresas: limite de criação gratuita por conta comum
+    if (!isGlobalAdmin) {
       const ownedSnap = await db
         .collection('companies')
         .where('ownerUid', '==', user.uid)
@@ -102,8 +112,7 @@ companiesRouter.post('/register', requireFirebaseAuth, async (req: Authenticated
     const tagline =
       String(body?.tagline || 'Obrigado pela preferência').trim().slice(0, 120) ||
       'Obrigado pela preferência';
-    const baseSequence =
-      companyId === JAIMONA_COMPANY_ID ? 15678 : Math.max(0, Number(body?.baseSequence) || 0);
+    const baseSequence = Math.max(0, Number(body?.baseSequence) || 0);
 
     await db.runTransaction(async (tx) => {
       const nifRef = db.collection('company_nifs').doc(normalizedNif);
@@ -132,6 +141,10 @@ companiesRouter.post('/register', requireFirebaseAuth, async (req: Authenticated
       }
 
       const planTier: PlanTier = (compSnap.data()?.planTier as PlanTier) || 'FREE';
+      const resolvedOwnerEmail =
+        companyId === JAIMONA_COMPANY_ID
+          ? JAIMONA_OWNER_EMAIL
+          : (compSnap.data()?.ownerEmail || user.email || '').slice(0, 120);
 
       tx.set(
         nifRef,
@@ -152,7 +165,7 @@ companiesRouter.post('/register', requireFirebaseAuth, async (req: Authenticated
           id: companyId,
           normalizedNif,
           ownerUid: compSnap.data()?.ownerUid || user.uid,
-          ownerEmail: (compSnap.data()?.ownerEmail || user.email || '').slice(0, 120),
+          ownerEmail: resolvedOwnerEmail,
           legalName: legalName.slice(0, 160),
           shortName: shortName.slice(0, 64),
           nif: rawNif.slice(0, 32),
@@ -164,7 +177,7 @@ companiesRouter.post('/register', requireFirebaseAuth, async (req: Authenticated
           status: compSnap.data()?.status || 'active',
           planTier,
           commercialActive: Boolean(compSnap.data()?.commercialActive ?? false),
-          baseSequence,
+          baseSequence: Number(compSnap.data()?.baseSequence ?? baseSequence) || baseSequence,
           allowManagerCancel: Boolean(compSnap.data()?.allowManagerCancel ?? false),
           createdAt: compSnap.exists ? compSnap.data()!.createdAt : FieldValue.serverTimestamp(),
           updatedAt: FieldValue.serverTimestamp(),
@@ -240,7 +253,12 @@ companiesRouter.get(
       return;
     }
 
-    const companyId = sanitizeId(req.params.companyId || JAIMONA_COMPANY_ID);
+    const rawCompanyId = String(req.params.companyId || '').trim();
+    if (!rawCompanyId) {
+      res.status(400).json({ ok: false, error: 'Identificador da empresa (companyId) é obrigatório.' });
+      return;
+    }
+    const companyId = sanitizeId(rawCompanyId);
     const membership = await verifyCompanyMembershipServer(ctx.db, companyId, user);
     if (!membership || !membership.existsInCloud) {
       res.status(403).json({
@@ -323,7 +341,12 @@ companiesRouter.post(
   async (req: AuthenticatedRequest, res) => {
     const user = req.firebaseUser!;
     const ctx = getFirebaseAdminContext();
-    const companyId = sanitizeId(req.params.companyId || JAIMONA_COMPANY_ID);
+    const rawCompanyId = String(req.params.companyId || '').trim();
+    if (!rawCompanyId) {
+      res.status(400).json({ ok: false, error: 'Identificador da empresa (companyId) é obrigatório.' });
+      return;
+    }
+    const companyId = sanitizeId(rawCompanyId);
     const body = req.body as { invoiceId?: string; cancelReason?: string };
 
     const invoiceId = sanitizeId(body?.invoiceId || '');
@@ -374,7 +397,7 @@ companiesRouter.post(
         });
       }
 
-      if (companyId === JAIMONA_COMPANY_ID) {
+      if (companyId === JAIMONA_COMPANY_ID && isJaimonaOwnerEmail(user.email)) {
         const legacyRef = ctx.db
           .collection('users')
           .doc(user.uid)

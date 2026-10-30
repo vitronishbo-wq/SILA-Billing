@@ -5,7 +5,7 @@ import {
   deriveCompanyInitials,
   DocumentFormat,
   InvoiceRecord,
-  JAIMONA_COMPANY,
+  NEUTRAL_PLATFORM_PROFILE,
   normalizeCompanyNif,
 } from '../../src/core/types';
 
@@ -20,7 +20,7 @@ function escapeHtml(raw: string): string {
 
 export async function generateInvoiceQrDataUrl(
   invoice: InvoiceRecord,
-  company: CompanyProfile = JAIMONA_COMPANY
+  company: CompanyProfile = NEUTRAL_PLATFORM_PROFILE
 ): Promise<string> {
   const dt = formatDateTimePt(invoice.issuedAtIso);
   const payload = [
@@ -45,7 +45,7 @@ export async function generateInvoiceQrDataUrl(
 export function renderDocumentHtml(
   invoice: InvoiceRecord,
   format: DocumentFormat,
-  company: CompanyProfile = JAIMONA_COMPANY,
+  company: CompanyProfile = NEUTRAL_PLATFORM_PROFILE,
   qrDataUrl = ''
 ): string {
   const dt = formatDateTimePt(invoice.issuedAtIso);

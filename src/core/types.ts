@@ -9,7 +9,9 @@ export type CompanyOperationalStatus = 'active' | 'suspended' | 'pending';
 export type CompanyRole = 'owner' | 'manager' | 'cashier';
 export type SyncState = 'synced' | 'pending' | 'error';
 
+export const PLATFORM_ADMIN_EMAIL = 'wtmedia0@gmail.com';
 export const JAIMONA_COMPANY_ID = 'comp_jaimona';
+export const JAIMONA_OWNER_EMAIL = 'jaimonacomercioeservicos@gmail.com';
 
 export interface CompanyProfile {
   legalName: string;
@@ -22,6 +24,17 @@ export interface CompanyProfile {
   tagline: string;
 }
 
+export const NEUTRAL_PLATFORM_PROFILE: CompanyProfile = {
+  legalName: 'SILA-Billing — Selecionar ou Cadastrar Empresa',
+  shortName: 'Nova Empresa',
+  nif: '---',
+  address: 'Angola',
+  cityCountry: 'Luanda - Angola',
+  phone: '',
+  email: '',
+  tagline: 'Obrigado pela preferência',
+};
+
 export const JAIMONA_COMPANY: CompanyProfile = {
   legalName: 'JAIMONA-COMÉRCIO E SERVIÇOS, (SU) LDA',
   shortName: 'JAIMONA',
@@ -29,9 +42,17 @@ export const JAIMONA_COMPANY: CompanyProfile = {
   address: 'Rua Fapla, Bairro Verde A – Saurimo',
   cityCountry: 'Saurimo - Angola',
   phone: '(+244) 943671515',
-  email: 'jaimonacomercioeservicos@gmail.com',
+  email: JAIMONA_OWNER_EMAIL,
   tagline: 'Servimos com Qualidade',
 };
+
+export function isPlatformAdminEmail(email?: string | null): boolean {
+  return String(email || '').trim().toLowerCase() === PLATFORM_ADMIN_EMAIL;
+}
+
+export function isJaimonaOwnerEmail(email?: string | null): boolean {
+  return String(email || '').trim().toLowerCase() === JAIMONA_OWNER_EMAIL;
+}
 
 /**
  * Normaliza o NIF fiscal removendo espaços, pontos, traços ou barras
@@ -172,8 +193,8 @@ export interface AppSettings {
 }
 
 export const DEFAULT_SETTINGS: AppSettings = {
-  companyId: JAIMONA_COMPANY_ID,
-  company: JAIMONA_COMPANY,
+  companyId: '',
+  company: NEUTRAL_PLATFORM_PROFILE,
   defaultCashier: '01',
   defaultOperator: '001',
   defaultFormat: 'POS',
