@@ -2,12 +2,18 @@ import {
   DEFAULT_SETTINGS,
   type AppSettings,
   type CalculatedLineItem,
+  type CashMovement,
+  type CashMovementType,
+  type CashSession,
   type CompanyOperationalStatus,
   type CompanyRecord,
   type Customer,
+  type DirectPaymentMethod,
   type InvoiceRecord,
+  type PaymentSplit,
   type PlanTier,
   type Product,
+  type ProductPriceChange,
 } from '../../src/core/types.ts';
 import { auth } from '../../src/services/firebaseClient.ts';
 
@@ -165,7 +171,13 @@ export async function submitInvoiceAudit(
     customerName: invoice.customerName,
     customerNif: invoice.customerNif,
     customerLocality: invoice.customerLocality,
+    globalDiscountPct: invoice.globalDiscountPct || 0,
     amountReceived: invoice.amountReceived,
+    transferReference: invoice.transferReference,
+    paymentSummary: invoice.paymentSummary,
+    returnOriginInvoiceId: invoice.returnOriginInvoiceId,
+    returnOriginNumber: invoice.returnOriginNumber,
+    returnCreditApplied: invoice.returnCreditApplied,
     notes: invoice.notes,
     clientGrandTotal: invoice.grandTotal,
     lines: invoice.lines.map((l) => ({
@@ -320,6 +332,8 @@ export async function fetchCompanyWorkspaceBackend(companyId: string): Promise<{
   products: Product[];
   customers: Customer[];
   invoices: InvoiceRecord[];
+  cashSessions: CashSession[];
+  cashMovements: CashMovement[];
   settings: AppSettings | null;
 } | null> {
   const resolvedId = String(companyId || '').trim();
@@ -341,27 +355,54 @@ export async function fetchCompanyWorkspaceBackend(companyId: string): Promise<{
       products?: Array<Record<string, unknown>>;
       customers?: Array<Record<string, unknown>>;
       invoices?: Array<Record<string, unknown>>;
+      cashSessions?: Array<Record<string, unknown>>;
+      cashMovements?: Array<Record<string, unknown>>;
       settings?: Record<string, unknown> | null;
     };
     if (!json.ok) return null;
 
     const now = new Date().toISOString();
-    const products: Product[] = (json.products || []).map((p) => ({
-      id: String(p.id || ''),
-      companyId: resolvedId,
-      code: String(p.code || ''),
-      name: String(p.name || ''),
-      category: String(p.category || 'Geral'),
-      unit: String(p.unit || 'UN'),
-      price: Number(p.price) || 0,
-      ivaRate: Number(p.ivaRate) === 14 ? 14 : 0,
-      exemptionReason: String(p.exemptionReason || ''),
-      active: Boolean(p.active ?? true),
-      syncState: 'synced',
-      synced: true,
-      createdAtIso: now,
-      updatedAtIso: now,
-    }));
+    const products: Product[] = (json.products || []).map((p) => {
+      const rawHist = Array.isArray(p.priceHistory)
+        ? (p.priceHistory as Array<Record<string, unknown>>).slice(0, 20)
+        : [];
+      const priceHistory: ProductPriceChange[] = rawHist.map((h) => ({
+        changedAtIso: String(h.changedAtIso || now),
+        previousPrice: Number(h.previousPrice) || 0,
+        newPrice: Number(h.newPrice) || 0,
+        ...(typeof h.previousCost === 'number' ? { previousCost: Number(h.previousCost) } : {}),
+        ...(typeof h.newCost === 'number' ? { newCost: Number(h.newCost) } : {}),
+        changedBy: String(h.changedBy || 'Operador'),
+      }));
+      return {
+        id: String(p.id || ''),
+        companyId: resolvedId,
+        code: String(p.code || ''),
+        ...(p.barcode ? { barcode: String(p.barcode) } : {}),
+        name: String(p.name || ''),
+        category: String(p.category || 'Geral'),
+        unit: String(p.unit || 'UN'),
+        ...(typeof p.costPrice === 'number' && p.costPrice > 0
+          ? { costPrice: Number(p.costPrice) }
+          : {}),
+        price: Number(p.price) || 0,
+        ivaRate: Number(p.ivaRate) === 14 ? 14 : 0,
+        exemptionReason: String(p.exemptionReason || ''),
+        active: Boolean(p.active ?? true),
+        ...(typeof p.trackStock === 'boolean'
+          ? {
+              trackStock: p.trackStock,
+              stockQty: Number(p.stockQty) || 0,
+              minStockQty: Math.max(0, Number(p.minStockQty) || 0),
+            }
+          : {}),
+        ...(priceHistory.length > 0 ? { priceHistory } : {}),
+        syncState: 'synced',
+        synced: true,
+        createdAtIso: now,
+        updatedAtIso: now,
+      };
+    });
 
     const customers: Customer[] = (json.customers || []).map((c) => ({
       id: String(c.id || ''),
@@ -371,6 +412,9 @@ export async function fetchCompanyWorkspaceBackend(companyId: string): Promise<{
       locality: String(c.locality || ''),
       phone: String(c.phone || ''),
       address: String(c.address || ''),
+      ...(typeof c.creditLimit === 'number' && c.creditLimit > 0
+        ? { creditLimit: Number(c.creditLimit) }
+        : {}),
       syncState: 'synced',
       synced: true,
       createdAtIso: now,
@@ -417,13 +461,19 @@ export async function fetchCompanyWorkspaceBackend(companyId: string): Promise<{
             ? 'Multicaixa'
             : inv.paymentMethod === 'Transferência'
               ? 'Transferência'
-              : 'Dinheiro',
+              : inv.paymentMethod === 'Crédito'
+                ? 'Crédito'
+                : inv.paymentMethod === 'Combinado'
+                  ? 'Combinado'
+                  : 'Dinheiro',
         customerId: String(inv.customerId || ''),
         customerName: String(inv.customerName || 'Consumidor Final'),
         customerNif: String(inv.customerNif || ''),
         customerLocality: String(inv.customerLocality || ''),
         merchandiseTotal: Number(inv.merchandiseTotal) || 0,
         discountTotal: Number(inv.discountTotal) || 0,
+        globalDiscountPct: typeof inv.globalDiscountPct === 'number' ? inv.globalDiscountPct : undefined,
+        globalDiscountAmount: typeof inv.globalDiscountAmount === 'number' ? inv.globalDiscountAmount : undefined,
         taxBase14: Number(inv.taxBase14) || 0,
         taxAmount14: Number(inv.taxAmount14) || 0,
         taxBase0: Number(inv.taxBase0) || 0,
@@ -431,8 +481,37 @@ export async function fetchCompanyWorkspaceBackend(companyId: string): Promise<{
         taxTotal: Number(inv.taxTotal) || 0,
         grandTotal: Number(inv.grandTotal) || 0,
         amountInWords: String(inv.amountInWords || ''),
+        sessionId: inv.sessionId ? String(inv.sessionId) : undefined,
         amountReceived: Number(inv.amountReceived) || 0,
+        initialAmountReceived:
+          typeof inv.initialAmountReceived === 'number' ? inv.initialAmountReceived : undefined,
         changeAmount: Number(inv.changeAmount) || 0,
+        initialChangeAmount:
+          typeof inv.initialChangeAmount === 'number' ? inv.initialChangeAmount : undefined,
+        amountDue: typeof inv.amountDue === 'number' ? inv.amountDue : undefined,
+        transferReference: inv.transferReference ? String(inv.transferReference) : undefined,
+        paymentSplits: Array.isArray(inv.paymentSplits)
+          ? (inv.paymentSplits as Array<Record<string, unknown>>)
+              .filter(
+                (sp) =>
+                  sp &&
+                  (sp.method === 'Dinheiro' ||
+                    sp.method === 'Multicaixa' ||
+                    sp.method === 'Transferência') &&
+                  Number(sp.amount) > 0
+              )
+              .map(
+                (sp): PaymentSplit => ({
+                  method: sp.method as DirectPaymentMethod,
+                  amount: Number(sp.amount),
+                  ...(sp.reference ? { reference: String(sp.reference) } : {}),
+                })
+              )
+          : undefined,
+        paymentSummary: inv.paymentSummary ? String(inv.paymentSummary) : undefined,
+        returnOriginInvoiceId: inv.returnOriginInvoiceId ? String(inv.returnOriginInvoiceId) : undefined,
+        returnOriginNumber: inv.returnOriginNumber ? String(inv.returnOriginNumber) : undefined,
+        returnCreditApplied: typeof inv.returnCreditApplied === 'number' ? inv.returnCreditApplied : undefined,
         notes: String(inv.notes || ''),
         status: inv.status === 'cancelled' ? 'cancelled' : 'issued',
         cancelReason: inv.cancelReason ? String(inv.cancelReason) : undefined,
@@ -442,6 +521,81 @@ export async function fetchCompanyWorkspaceBackend(companyId: string): Promise<{
         synced: true,
         createdAtIso: issuedAtIso,
         updatedAtIso: issuedAtIso,
+      };
+    });
+
+    const cashSessions: CashSession[] = (json.cashSessions || []).map((s) => {
+      const openedAtIso = String(s.openedAtIso || now);
+      return {
+        id: String(s.id || ''),
+        companyId: resolvedId,
+        cashier: String(s.cashier || '01'),
+        operator: String(s.operator || '001'),
+        openedByUid: s.openedByUid ? String(s.openedByUid) : undefined,
+        closedByOperator: s.closedByOperator ? String(s.closedByOperator) : undefined,
+        closedByUid: s.closedByUid ? String(s.closedByUid) : undefined,
+        status: s.status === 'closed' ? 'closed' : 'open',
+        openingFloat: Number(s.openingFloat) || 0,
+        openingNotes: s.openingNotes ? String(s.openingNotes) : undefined,
+        openedAtIso,
+        closedAtIso: s.closedAtIso ? String(s.closedAtIso) : undefined,
+        expectedCash: typeof s.expectedCash === 'number' ? s.expectedCash : undefined,
+        countedCash: typeof s.countedCash === 'number' ? s.countedCash : undefined,
+        differenceAmount: typeof s.differenceAmount === 'number' ? s.differenceAmount : undefined,
+        salesCash: typeof s.salesCash === 'number' ? s.salesCash : undefined,
+        salesMulticaixa: typeof s.salesMulticaixa === 'number' ? s.salesMulticaixa : undefined,
+        salesTransfer: typeof s.salesTransfer === 'number' ? s.salesTransfer : undefined,
+        salesCredit: typeof s.salesCredit === 'number' ? s.salesCredit : undefined,
+        debtCash: typeof s.debtCash === 'number' ? s.debtCash : undefined,
+        debtMulticaixa: typeof s.debtMulticaixa === 'number' ? s.debtMulticaixa : undefined,
+        debtTransfer: typeof s.debtTransfer === 'number' ? s.debtTransfer : undefined,
+        reforcosTotal: typeof s.reforcosTotal === 'number' ? s.reforcosTotal : undefined,
+        entradasTotal: typeof s.entradasTotal === 'number' ? s.entradasTotal : undefined,
+        sangriasTotal: typeof s.sangriasTotal === 'number' ? s.sangriasTotal : undefined,
+        saidasTotal: typeof s.saidasTotal === 'number' ? s.saidasTotal : undefined,
+        invoiceCount: typeof s.invoiceCount === 'number' ? s.invoiceCount : undefined,
+        closingNotes: s.closingNotes ? String(s.closingNotes) : undefined,
+        syncState: 'synced',
+        synced: true,
+        createdAtIso: openedAtIso,
+        updatedAtIso: String(s.closedAtIso || openedAtIso),
+      };
+    });
+
+    const cashMovements: CashMovement[] = (json.cashMovements || []).map((m) => {
+      const rawType = String(m.type || 'ENTRADA') as CashMovementType;
+      const validType: CashMovementType =
+        rawType === 'REFORCO' ||
+        rawType === 'SANGRIA' ||
+        rawType === 'ENTRADA' ||
+        rawType === 'SAIDA' ||
+        rawType === 'LIQUIDACAO_DIVIDA'
+          ? rawType
+          : 'ENTRADA';
+      const pm: DirectPaymentMethod =
+        m.paymentMethod === 'Multicaixa'
+          ? 'Multicaixa'
+          : m.paymentMethod === 'Transferência'
+            ? 'Transferência'
+            : 'Dinheiro';
+      return {
+        id: String(m.id || ''),
+        companyId: resolvedId,
+        sessionId: String(m.sessionId || 'unassigned'),
+        cashier: String(m.cashier || '01'),
+        operator: String(m.operator || '001'),
+        type: validType,
+        amount: Number(m.amount) || 0,
+        paymentMethod: pm,
+        reason: String(m.reason || ''),
+        reference: m.reference ? String(m.reference) : undefined,
+        invoiceId: m.invoiceId ? String(m.invoiceId) : undefined,
+        invoiceNumber: m.invoiceNumber ? String(m.invoiceNumber) : undefined,
+        customerName: m.customerName ? String(m.customerName) : undefined,
+        createdByUid: m.createdByUid ? String(m.createdByUid) : undefined,
+        syncState: 'synced',
+        synced: true,
+        createdAtIso: String(m.createdAtIso || now),
       };
     });
 
@@ -468,13 +622,14 @@ export async function fetchCompanyWorkspaceBackend(companyId: string): Promise<{
         autoPrintOnEmit: Boolean(sd.autoPrintOnEmit),
         hidePromotionalFooter:
           typeof sd.hidePromotionalFooter === 'boolean' ? sd.hidePromotionalFooter : true,
+        allowCashierPriceEdit: Boolean(sd.allowCashierPriceEdit ?? false),
         syncState: 'synced',
         synced: true,
         updatedAtIso: now,
       };
     }
 
-    return { products, customers, invoices, settings };
+    return { products, customers, invoices, cashSessions, cashMovements, settings };
   } catch {
     return null;
   }

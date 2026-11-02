@@ -191,22 +191,38 @@ export function searchProductsSmart(
     const p = products[idx]!;
     const codeLower = String(p.code || '').trim().toLowerCase();
     const codeCompact = normalizeIdentifierSearch(p.code);
+    const barcodeLower = String(p.barcode || '').trim().toLowerCase();
+    const barcodeCompact = normalizeIdentifierSearch(p.barcode || '');
 
     if (
       (codeLower && codeLower === rawLower) ||
-      (qCompactCode.length >= 2 && codeCompact === qCompactCode)
+      (barcodeLower && barcodeLower === rawLower) ||
+      (qCompactCode.length >= 2 &&
+        (codeCompact === qCompactCode || (barcodeCompact && barcodeCompact === qCompactCode)))
     ) {
       if (!exactCodeMatch) exactCodeMatch = p;
       scoredMatches.push({ product: p, score: 1000 });
       continue;
     }
 
-    if (codeLower.startsWith(rawLower) || (qCompactCode.length >= 2 && codeCompact.startsWith(qCompactCode))) {
+    if (
+      codeLower.startsWith(rawLower) ||
+      (barcodeLower && barcodeLower.startsWith(rawLower)) ||
+      (qCompactCode.length >= 2 &&
+        (codeCompact.startsWith(qCompactCode) ||
+          (barcodeCompact && barcodeCompact.startsWith(qCompactCode))))
+    ) {
       scoredMatches.push({ product: p, score: 860 });
       continue;
     }
 
-    if (codeLower.includes(rawLower) || (qCompactCode.length >= 3 && codeCompact.includes(qCompactCode))) {
+    if (
+      codeLower.includes(rawLower) ||
+      (barcodeLower && barcodeLower.includes(rawLower)) ||
+      (qCompactCode.length >= 3 &&
+        (codeCompact.includes(qCompactCode) ||
+          (barcodeCompact && barcodeCompact.includes(qCompactCode))))
+    ) {
       scoredMatches.push({ product: p, score: 760 });
       continue;
     }
@@ -216,7 +232,8 @@ export function searchProductsSmart(
     const normName = normalizeSearchText(p.name);
     const normCat = normalizeSearchText(p.category || '');
     const normCode = normalizeSearchText(p.code);
-    const fullNorm = `${normCode} ${normName} ${normCat}`.trim();
+    const normBarcode = normalizeSearchText(p.barcode || '');
+    const fullNorm = `${normCode} ${normBarcode} ${normName} ${normCat}`.trim();
 
     if (normName.startsWith(qNorm)) {
       scoredMatches.push({ product: p, score: 700 });
@@ -236,7 +253,7 @@ export function searchProductsSmart(
     // Camada 2: Equivalência ortográfica PT-AO (ex.: facto <-> fato, contacto <-> contato)
     const foldedName = foldOrthographyPt(normName);
     const foldedCat = foldOrthographyPt(normCat);
-    const fullFolded = `${normCode} ${foldedName} ${foldedCat}`.trim();
+    const fullFolded = `${normCode} ${normBarcode} ${foldedName} ${foldedCat}`.trim();
 
     if (qFolded && (foldedName.includes(qFolded) || foldedCat.includes(qFolded))) {
       scoredMatches.push({ product: p, score: 500 });
@@ -322,7 +339,8 @@ export function filterCustomersSmart(customers: Customer[], rawQuery: string): C
 
     const normName = normalizeSearchText(c.name);
     const normLoc = normalizeSearchText(c.locality || '');
-    const fullNorm = `${normName} ${normLoc}`.trim();
+    const normAddr = normalizeSearchText(c.address || '');
+    const fullNorm = `${normName} ${normAddr} ${normLoc}`.trim();
 
     if (normName.startsWith(qNorm)) {
       scored.push({ customer: c, score: 750 });

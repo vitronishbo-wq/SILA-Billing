@@ -1,6 +1,9 @@
 import QRCode from 'qrcode';
 import { formatDateTimePt, formatKzNumber } from '../../src/core/billingEngine';
 import {
+  CashMovement,
+  CashSession,
+  CashSessionSummary,
   CompanyProfile,
   deriveCompanyInitials,
   DocumentFormat,
@@ -47,11 +50,15 @@ export function renderDocumentHtml(
   format: DocumentFormat,
   company: CompanyProfile = NEUTRAL_PLATFORM_PROFILE,
   qrDataUrl = '',
-  options?: { showViralFooter?: boolean }
+  options?: { showViralFooter?: boolean; customerAddress?: string; customerPhone?: string }
 ): string {
   const dt = formatDateTimePt(invoice.issuedAtIso);
   const titleLabel = invoice.docType === 'FP' ? 'FACTURA PROFORMA' : 'FACTURA / RECIBO';
   const showViralFooter = Boolean(options?.showViralFooter);
+  const custLoc = (invoice.customerLocality || company.cityCountry || 'Angola').trim();
+  const custAddr = (options?.customerAddress || '').trim();
+  const hasDistinctAddr = Boolean(custAddr && custAddr.toLowerCase() !== custLoc.toLowerCase());
+  const custPhone = (options?.customerPhone || '').trim();
 
   if (format === 'POS') {
     const itemsHtml = invoice.lines
@@ -112,7 +119,9 @@ export function renderDocumentHtml(
               ? `<div class="tabular-nums">NIF Cliente: ${escapeHtml(invoice.customerNif)}</div>`
               : ''
           }
-          <div>Localidade: ${escapeHtml(invoice.customerLocality || company.cityCountry || 'Angola')}</div>
+          ${custPhone ? `<div class="tabular-nums">Tel. Cliente: ${escapeHtml(custPhone)}</div>` : ''}
+          ${hasDistinctAddr ? `<div>Endereço: ${escapeHtml(custAddr)}</div>` : ''}
+          <div>Localidade: ${escapeHtml(custLoc)}</div>
         </div>
 
         <div class="py-2 border-b border-dashed border-black">
@@ -130,7 +139,7 @@ export function renderDocumentHtml(
               <span class="font-bold">${formatKzNumber(invoice.merchandiseTotal)}</span>
             </div>
             <div class="flex justify-between">
-              <span>Desconto comercial</span>
+              <span>Desconto comercial${invoice.globalDiscountPct ? ` (incl. global ${formatKzNumber(invoice.globalDiscountPct)}%)` : ''}</span>
               <span>${formatKzNumber(invoice.discountTotal)}</span>
             </div>
             <div class="flex justify-between">
@@ -148,8 +157,31 @@ export function renderDocumentHtml(
 
         <div class="py-2 border-b border-black text-[11px] space-y-0.5 tabular-nums">
           <div class="font-bold">Meio de pagamento: ${escapeHtml(invoice.paymentMethod)}</div>
+          ${
+            invoice.paymentSummary
+              ? `<div class="text-[10.5px]">${escapeHtml(invoice.paymentSummary)}</div>`
+              : ''
+          }
+          ${
+            invoice.transferReference
+              ? `<div class="text-[10.5px]">Ref. Pagamento: ${escapeHtml(invoice.transferReference)}</div>`
+              : ''
+          }
+          ${
+            invoice.returnOriginNumber
+              ? `<div class="text-[10.5px]">Ref. Troca/Devolução: ${escapeHtml(invoice.returnOriginNumber)}${
+                  invoice.returnCreditApplied
+                    ? ` (Crédito: ${formatKzNumber(invoice.returnCreditApplied)} Kz)`
+                    : ''
+                }</div>`
+              : ''
+          }
           <div>Valor recebido: ${formatKzNumber(invoice.amountReceived)} Kz</div>
-          <div>Troco: ${formatKzNumber(invoice.changeAmount)} Kz</div>
+          ${
+            invoice.amountDue && invoice.amountDue > 0
+              ? `<div class="font-bold">Em dívida (Conta Corrente): ${formatKzNumber(invoice.amountDue)} Kz</div>`
+              : `<div>Troco: ${formatKzNumber(invoice.changeAmount)} Kz</div>`
+          }
         </div>
 
         ${
@@ -239,7 +271,9 @@ export function renderDocumentHtml(
                 ? `<div class="text-[11px] text-slate-600 tabular-nums">NIF: ${escapeHtml(invoice.customerNif)}</div>`
                 : ''
             }
-            <div class="text-[11px] text-slate-600">${escapeHtml(invoice.customerLocality || company.cityCountry || 'Angola')}</div>
+            ${custPhone ? `<div class="text-[11px] text-slate-600 tabular-nums">Tel.: ${escapeHtml(custPhone)}</div>` : ''}
+            ${hasDistinctAddr ? `<div class="text-[11px] text-slate-600">${escapeHtml(custAddr)}</div>` : ''}
+            <div class="text-[11px] text-slate-600">${escapeHtml(custLoc)}</div>
           </div>
         </div>
 
@@ -315,7 +349,7 @@ export function renderDocumentHtml(
               <span class="font-semibold text-slate-900">${formatKzNumber(invoice.merchandiseTotal)}</span>
             </div>
             <div class="flex justify-between">
-              <span class="text-slate-600">Desconto comercial</span>
+              <span class="text-slate-600">Desconto comercial${invoice.globalDiscountPct ? ` (incl. global ${formatKzNumber(invoice.globalDiscountPct)}%)` : ''}</span>
               <span class="font-semibold text-slate-900">${formatKzNumber(invoice.discountTotal)}</span>
             </div>
             <div class="flex justify-between">
@@ -340,14 +374,29 @@ export function renderDocumentHtml(
           <div>
             <div class="text-[10px] text-slate-500">Meio de pagamento</div>
             <div class="font-bold text-slate-900">${escapeHtml(invoice.paymentMethod)}</div>
+            ${
+              invoice.paymentSummary
+                ? `<div class="text-[10px] text-slate-600 mt-0.5">${escapeHtml(invoice.paymentSummary)}</div>`
+                : ''
+            }
+            ${
+              invoice.transferReference
+                ? `<div class="text-[10px] text-slate-600 mt-0.5">Ref.: ${escapeHtml(invoice.transferReference)}</div>`
+                : ''
+            }
+            ${
+              invoice.returnOriginNumber
+                ? `<div class="text-[10px] text-slate-600 mt-0.5">Troca/Dev.: ${escapeHtml(invoice.returnOriginNumber)}</div>`
+                : ''
+            }
           </div>
           <div>
             <div class="text-[10px] text-slate-500">Valor recebido</div>
             <div class="font-bold text-slate-900">${formatKzNumber(invoice.amountReceived)} Kz</div>
           </div>
           <div>
-            <div class="text-[10px] text-slate-500">Troco</div>
-            <div class="font-bold text-slate-900">${formatKzNumber(invoice.changeAmount)} Kz</div>
+            <div class="text-[10px] text-slate-500">${invoice.amountDue && invoice.amountDue > 0 ? 'Em dívida (Conta Corrente)' : 'Troco'}</div>
+            <div class="font-bold ${invoice.amountDue && invoice.amountDue > 0 ? 'text-amber-700' : 'text-slate-900'}">${formatKzNumber(invoice.amountDue && invoice.amountDue > 0 ? invoice.amountDue : invoice.changeAmount)} Kz</div>
           </div>
         </div>
 
@@ -384,3 +433,242 @@ export function renderDocumentHtml(
     </div>
   `;
 }
+
+function formatMovementTypeLabelPt(type: CashMovement['type']): string {
+  switch (type) {
+    case 'REFORCO':
+      return 'Reforço';
+    case 'SANGRIA':
+      return 'Sangria';
+    case 'ENTRADA':
+      return 'Entrada';
+    case 'SAIDA':
+      return 'Saída';
+    case 'LIQUIDACAO_DIVIDA':
+      return 'Liq. Dívida';
+  }
+}
+
+export function renderCashClosureReportHtml(
+  session: CashSession,
+  summary: CashSessionSummary,
+  movements: ReadonlyArray<CashMovement>,
+  company: CompanyProfile = NEUTRAL_PLATFORM_PROFILE,
+  format: DocumentFormat = 'POS',
+  showViralFooter = false
+): string {
+  const openDt = formatDateTimePt(session.openedAtIso);
+  const closeDt = session.closedAtIso ? formatDateTimePt(session.closedAtIso) : null;
+  const counted = summary.countedCash;
+  const diff = summary.differenceAmount;
+  const diffLabel =
+    diff === null
+      ? 'Em aberto (Contagem pendente)'
+      : Math.abs(diff) < 0.005
+        ? 'CONFERIDO (0,00 Kz)'
+        : diff > 0
+          ? `SOBRA (+${formatKzNumber(diff)} Kz)`
+          : `QUEBRA (${formatKzNumber(diff)} Kz)`;
+
+  const sessionMovs = movements
+    .filter((m) => m.sessionId === session.id)
+    .slice()
+    .sort((a, b) => a.createdAtIso.localeCompare(b.createdAtIso));
+
+  if (format === 'POS') {
+    const movLines =
+      sessionMovs.length === 0
+        ? `<div class="text-[10.5px] text-slate-600">Sem movimentos manuais registados.</div>`
+        : sessionMovs
+            .map((m) => {
+              const dt = formatDateTimePt(m.createdAtIso);
+              const isOut = m.type === 'SANGRIA' || m.type === 'SAIDA';
+              const sign = isOut ? '-' : '+';
+              return `
+                <div class="text-[10.5px] leading-snug">
+                  <div class="flex justify-between tabular-nums font-semibold">
+                    <span>${dt.time} · ${escapeHtml(formatMovementTypeLabelPt(m.type))} (${escapeHtml(m.paymentMethod)})</span>
+                    <span>${sign}${formatKzNumber(m.amount)}</span>
+                  </div>
+                  <div class="pl-1.5 text-[10px]">${escapeHtml(m.reason)}${m.invoiceNumber ? ` · ${escapeHtml(m.invoiceNumber)}` : ''}</div>
+                </div>
+              `;
+            })
+            .join('');
+
+    return `
+      <div class="print-target mx-auto w-full max-w-[330px] bg-white p-4 text-[12px] leading-snug text-black font-sans border border-slate-200">
+        <div class="text-center space-y-0.5">
+          <div class="font-bold text-[13px] leading-tight">${escapeHtml(company.legalName)}</div>
+          <div class="text-[11px]">Contribuinte: ${escapeHtml(company.nif)}</div>
+          <div class="text-[11px]">${escapeHtml(company.address)}</div>
+        </div>
+
+        <div class="border-y border-black py-1.5 text-center my-2">
+          <div class="font-bold text-[13px]">${session.status === 'closed' ? 'MAPA DE FECHO DE CAIXA' : 'RELATÓRIO PARCIAL DE CAIXA'}</div>
+          <div class="text-[11px] tabular-nums">Caixa ${escapeHtml(session.cashier)} · Operador(a): ${escapeHtml(session.operator)}</div>
+        </div>
+
+        <div class="space-y-0.5 text-[11px] pb-2 border-b border-black tabular-nums">
+          <div>Abertura: ${openDt.slashDate} ${openDt.time}</div>
+          <div>Fecho: ${closeDt ? `${closeDt.slashDate} ${closeDt.time}` : 'Turno em curso'}</div>
+          ${session.closedByOperator ? `<div>Conferido por: ${escapeHtml(session.closedByOperator)}</div>` : ''}
+          <div>Documentos FR válidos: ${summary.invoiceCount}${summary.cancelledCount > 0 ? ` (Anul.: ${summary.cancelledCount})` : ''}</div>
+        </div>
+
+        <div class="py-2 border-b border-dashed border-black text-[11px] space-y-0.5 tabular-nums">
+          <div class="font-bold text-[11.5px] mb-0.5">RECEBIMENTOS POR MÉTODO</div>
+          <div class="flex justify-between"><span>Dinheiro (líquido)</span><span>${formatKzNumber(summary.totalByMethod.Dinheiro)} Kz</span></div>
+          <div class="flex justify-between"><span>Multicaixa (TPA)</span><span>${formatKzNumber(summary.totalByMethod.Multicaixa)} Kz</span></div>
+          <div class="flex justify-between"><span>Transferência</span><span>${formatKzNumber(summary.totalByMethod.Transferência)} Kz</span></div>
+          <div class="flex justify-between font-bold pt-0.5 border-t border-black/30"><span>Total Recebido</span><span>${formatKzNumber(summary.totalReceivedAllMethods)} Kz</span></div>
+          ${summary.salesCredit > 0 ? `<div class="flex justify-between pt-0.5"><span>Vendas a Crédito (Dívida)</span><span>${formatKzNumber(summary.salesCredit)} Kz</span></div>` : ''}
+        </div>
+
+        <div class="py-2 border-b border-black text-[11px] space-y-0.5 tabular-nums">
+          <div class="font-bold text-[11.5px] mb-0.5">CONFERÊNCIA DE GAVETA (NUMERÁRIO)</div>
+          <div class="flex justify-between"><span>(+) Fundo inicial</span><span>${formatKzNumber(summary.openingFloat)} Kz</span></div>
+          <div class="flex justify-between"><span>(+) Vendas em Dinheiro</span><span>${formatKzNumber(summary.salesCash)} Kz</span></div>
+          ${summary.debtCash > 0 ? `<div class="flex justify-between"><span>(+) Liq. Dívida Dinheiro</span><span>${formatKzNumber(summary.debtCash)} Kz</span></div>` : ''}
+          <div class="flex justify-between"><span>(+) Reforços de caixa</span><span>${formatKzNumber(summary.reforcosTotal)} Kz</span></div>
+          <div class="flex justify-between"><span>(+) Outras entradas</span><span>${formatKzNumber(summary.entradasTotal)} Kz</span></div>
+          <div class="flex justify-between"><span>(-) Sangrias de caixa</span><span>${formatKzNumber(summary.sangriasTotal)} Kz</span></div>
+          <div class="flex justify-between"><span>(-) Saídas / Despesas</span><span>${formatKzNumber(summary.saidasTotal)} Kz</span></div>
+          <div class="flex justify-between font-bold pt-1 border-t border-black text-[12px]">
+            <span>Saldo Esperado</span>
+            <span>${formatKzNumber(summary.expectedCash)} Kz</span>
+          </div>
+          <div class="flex justify-between font-bold text-[12px]">
+            <span>Dinheiro Contado</span>
+            <span>${counted !== null ? `${formatKzNumber(counted)} Kz` : '—'}</span>
+          </div>
+          <div class="flex justify-between font-bold pt-0.5">
+            <span>Diferença</span>
+            <span>${diffLabel}</span>
+          </div>
+        </div>
+
+        <div class="py-2 border-b border-dashed border-black space-y-1">
+          <div class="font-bold text-[11.5px]">MOVIMENTOS REGISTADOS (${sessionMovs.length})</div>
+          <div class="space-y-1">${movLines}</div>
+        </div>
+
+        ${
+          session.closingNotes
+            ? `<div class="py-2 border-b border-black text-[11px]">
+                <div class="font-bold">Observações / Justificação</div>
+                <div>${escapeHtml(session.closingNotes)}</div>
+              </div>`
+            : ''
+        }
+
+        <div class="pt-5 text-center space-y-3 text-[10.5px]">
+          <div class="pt-3 border-t border-black mx-4">Assinatura do Operador / Responsável</div>
+          ${
+            showViralFooter
+              ? `<div class="pt-1 border-t border-dashed border-black/50 text-[9.5px]">Processado por SILA-Billing · VITRONIS (www.vitronis.co.ao)</div>`
+              : ''
+          }
+        </div>
+      </div>
+    `;
+  }
+
+  // Formato A4 de Mapa de Fecho de Caixa
+  const movRowsA4 =
+    sessionMovs.length === 0
+      ? `<tr><td colspan="5" class="py-3 px-3 text-slate-500 text-center">Nenhum movimento manual ou liquidação avulsa registada neste turno.</td></tr>`
+      : sessionMovs
+          .map((m) => {
+            const dt = formatDateTimePt(m.createdAtIso);
+            const isOut = m.type === 'SANGRIA' || m.type === 'SAIDA';
+            return `
+              <tr>
+                <td class="py-2 px-2.5 font-mono text-slate-600">${dt.slashDate} ${dt.time}</td>
+                <td class="py-2 px-2.5 font-semibold text-slate-900">${escapeHtml(formatMovementTypeLabelPt(m.type))}</td>
+                <td class="py-2 px-2.5 text-slate-700">${escapeHtml(m.paymentMethod)}</td>
+                <td class="py-2 px-2.5 text-slate-700">${escapeHtml(m.reason)}${m.reference ? ` · Ref: ${escapeHtml(m.reference)}` : ''}${m.invoiceNumber ? ` · Doc: ${escapeHtml(m.invoiceNumber)}` : ''}</td>
+                <td class="py-2 px-2.5 text-right font-mono font-semibold ${isOut ? 'text-red-700' : 'text-emerald-700'}">${isOut ? '-' : '+'}${formatKzNumber(m.amount)} Kz</td>
+              </tr>
+            `;
+          })
+          .join('');
+
+  return `
+    <div class="print-target mx-auto w-full max-w-[794px] bg-white p-6 sm:p-8 text-slate-900 border border-slate-200 text-xs">
+      <div class="flex items-start justify-between gap-4 pb-4 border-b border-slate-200">
+        <div>
+          <div class="text-base font-bold text-slate-900">${escapeHtml(company.shortName)} — ${session.status === 'closed' ? 'MAPA DE FECHO DE CAIXA' : 'RELATÓRIO DE TURNO EM ABERTO'}</div>
+          <div class="text-[11px] text-slate-600">${escapeHtml(company.legalName)} · NIF ${escapeHtml(company.nif)}</div>
+        </div>
+        <div class="text-right text-[11px] font-mono tabular-nums text-slate-600 space-y-0.5">
+          <div class="font-bold text-slate-900">Caixa ${escapeHtml(session.cashier)} · Operador: ${escapeHtml(session.operator)}</div>
+          <div>Abertura: ${openDt.slashDate} ${openDt.time}</div>
+          <div>Fecho: ${closeDt ? `${closeDt.slashDate} ${closeDt.time}` : 'Em curso'}</div>
+        </div>
+      </div>
+
+      <div class="grid grid-cols-2 gap-4 py-4">
+        <div class="rounded-lg border border-slate-200 bg-slate-50 p-3.5 space-y-1.5 tabular-nums">
+          <div class="text-[11px] font-bold text-slate-900 pb-1 border-b border-slate-200">Separação por Método de Pagamento</div>
+          <div class="flex justify-between"><span>Dinheiro (Vendas + Liq. Dívida)</span><span class="font-mono font-semibold">${formatKzNumber(summary.totalByMethod.Dinheiro)} Kz</span></div>
+          <div class="flex justify-between"><span>Multicaixa / TPA</span><span class="font-mono font-semibold">${formatKzNumber(summary.totalByMethod.Multicaixa)} Kz</span></div>
+          <div class="flex justify-between"><span>Transferência Bancária</span><span class="font-mono font-semibold">${formatKzNumber(summary.totalByMethod.Transferência)} Kz</span></div>
+          <div class="flex justify-between pt-1 border-t border-slate-200 font-bold text-slate-900"><span>Total Recebido no Turno</span><span class="font-mono">${formatKzNumber(summary.totalReceivedAllMethods)} Kz</span></div>
+          <div class="flex justify-between text-amber-800 pt-0.5"><span>Faturado a Crédito (Conta Corrente)</span><span class="font-mono font-semibold">${formatKzNumber(summary.salesCredit)} Kz</span></div>
+          <div class="text-[10.5px] text-slate-500 pt-1">Faturas/Recibos válidos: ${summary.invoiceCount}${summary.cancelledCount > 0 ? ` · Anulados: ${summary.cancelledCount}` : ''}</div>
+        </div>
+
+        <div class="rounded-lg border border-slate-200 bg-slate-50 p-3.5 space-y-1.5 tabular-nums">
+          <div class="text-[11px] font-bold text-slate-900 pb-1 border-b border-slate-200">Conferência Física de Gaveta (Numerário)</div>
+          <div class="flex justify-between"><span>(+) Fundo inicial de abertura</span><span class="font-mono">${formatKzNumber(summary.openingFloat)} Kz</span></div>
+          <div class="flex justify-between"><span>(+) Vendas líquidas em Dinheiro</span><span class="font-mono">${formatKzNumber(summary.salesCash)} Kz</span></div>
+          <div class="flex justify-between"><span>(+) Liquidações de dívida em Dinheiro</span><span class="font-mono">${formatKzNumber(summary.debtCash)} Kz</span></div>
+          <div class="flex justify-between"><span>(+) Reforços (${formatKzNumber(summary.reforcosTotal)}) + Entradas (${formatKzNumber(summary.entradasTotal)})</span><span class="font-mono">${formatKzNumber(summary.reforcosTotal + summary.entradasTotal)} Kz</span></div>
+          <div class="flex justify-between"><span>(-) Sangrias (${formatKzNumber(summary.sangriasTotal)}) + Saídas (${formatKzNumber(summary.saidasTotal)})</span><span class="font-mono">${formatKzNumber(summary.sangriasTotal + summary.saidasTotal)} Kz</span></div>
+          <div class="flex justify-between pt-1 border-t border-slate-200 font-bold text-slate-900"><span>Saldo Esperado em Caixa</span><span class="font-mono">${formatKzNumber(summary.expectedCash)} Kz</span></div>
+          <div class="flex justify-between font-bold text-blue-700"><span>Dinheiro Contado pelo Operador</span><span class="font-mono">${counted !== null ? `${formatKzNumber(counted)} Kz` : '—'}</span></div>
+          <div class="flex justify-between font-bold ${diff !== null && diff < -0.005 ? 'text-red-700' : diff !== null && diff > 0.005 ? 'text-amber-700' : 'text-emerald-700'}">
+            <span>Diferença de Caixa</span>
+            <span class="font-mono">${diffLabel}</span>
+          </div>
+        </div>
+      </div>
+
+      <div class="border border-slate-200 rounded-lg overflow-hidden">
+        <table class="w-full text-left border-collapse text-[11px]">
+          <thead>
+            <tr class="bg-slate-900 text-white">
+              <th class="py-2 px-2.5 font-semibold">Data / Hora</th>
+              <th class="py-2 px-2.5 font-semibold">Tipo</th>
+              <th class="py-2 px-2.5 font-semibold">Método</th>
+              <th class="py-2 px-2.5 font-semibold">Descrição / Referência</th>
+              <th class="py-2 px-2.5 font-semibold text-right">Valor</th>
+            </tr>
+          </thead>
+          <tbody class="divide-y divide-slate-200 tabular-nums">${movRowsA4}</tbody>
+        </table>
+      </div>
+
+      ${
+        session.closingNotes
+          ? `<div class="mt-4 p-3 rounded-lg bg-slate-50 border border-slate-200 text-[11px]">
+              <span class="font-bold text-slate-900">Observações / Justificação de fecho: </span>
+              <span>${escapeHtml(session.closingNotes)}</span>
+            </div>`
+          : ''
+      }
+
+      <div class="mt-8 pt-6 grid grid-cols-2 gap-8 text-center text-[11px] text-slate-600">
+        <div class="border-t border-slate-300 pt-2">Operador(a): ${escapeHtml(session.closedByOperator || session.operator)}</div>
+        <div class="border-t border-slate-300 pt-2">Conferência / Gerência</div>
+      </div>
+      ${
+        showViralFooter
+          ? `<div class="mt-4 pt-2 border-t border-slate-100 text-center text-[10px] text-slate-400">Processado por SILA-Billing · Solução institucional VITRONIS (www.vitronis.co.ao)</div>`
+          : ''
+      }
+    </div>
+  `;
+}
+

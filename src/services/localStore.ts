@@ -11,6 +11,8 @@ import {
 import {
   AppSettings,
   CartDraftItem,
+  CashMovement,
+  CashSession,
   CompanyMember,
   CompanyProfile,
   CompanyRecord,
@@ -27,7 +29,9 @@ import {
   JAIMONA_OWNER_EMAIL,
   normalizeCompanyNif,
   PaymentMethod,
+  PaymentSplit,
   Product,
+  SuspendedSale,
   SyncQueueEntry,
   validateCompanyNif,
   VITRONIS_INSTITUTIONAL,
@@ -35,13 +39,24 @@ import {
 
 export interface PosWorkspaceDraft {
   companyId?: string;
-  activeModule: 'NEW_POS' | 'NEW_A4' | 'CUSTOMERS' | 'PRODUCTS' | 'HISTORY' | 'SETTINGS' | 'SYNC';
+  activeModule:
+    | 'NEW_POS'
+    | 'NEW_A4'
+    | 'CASH'
+    | 'CUSTOMERS'
+    | 'PRODUCTS'
+    | 'HISTORY'
+    | 'SETTINGS'
+    | 'SYNC';
   previewFormat: DocumentFormat;
   cart: CartDraftItem[];
   selectedCustomerId: string;
   docType: DocumentType;
   paymentMethod: PaymentMethod;
   amountReceivedInput: string;
+  globalDiscountPct?: number;
+  transferReference?: string;
+  paymentSplits?: PaymentSplit[];
   notes: string;
   cashier: string;
   operator: string;
@@ -70,6 +85,8 @@ export interface CompanyWorkspaceBundle {
   products: Product[];
   customers: Customer[];
   invoices: InvoiceRecord[];
+  cashSessions: CashSession[];
+  cashMovements: CashMovement[];
   settings: AppSettings;
   posDraft: PosWorkspaceDraft | null;
   hasPreMigrationBackup: boolean;
@@ -135,6 +152,16 @@ const REQUIRED_SCHEMA: StoreSchemaSpec[] = [
   },
   {
     name: 'sync_queue',
+    keyPath: 'id',
+    indexes: [{ name: 'by_company', keyPath: 'companyId', unique: false }],
+  },
+  {
+    name: 'cash_sessions',
+    keyPath: 'id',
+    indexes: [{ name: 'by_company', keyPath: 'companyId', unique: false }],
+  },
+  {
+    name: 'cash_movements',
     keyPath: 'id',
     indexes: [{ name: 'by_company', keyPath: 'companyId', unique: false }],
   },
@@ -276,7 +303,13 @@ function openWithUpgrade(targetVersion: number): Promise<IDBDatabase> {
 
 async function flushFallbackStoresIfReady(db: IDBDatabase): Promise<void> {
   if (!db.objectStoreNames.contains('meta')) return;
-  const fallbackStoreNames = ['companies', 'company_members', 'sync_queue'];
+  const fallbackStoreNames = [
+    'companies',
+    'company_members',
+    'sync_queue',
+    'cash_sessions',
+    'cash_movements',
+  ];
 
   for (const storeName of fallbackStoreNames) {
     if (!db.objectStoreNames.contains(storeName)) continue;
@@ -982,6 +1015,8 @@ export async function loadCompanyWorkspace(
       products: [],
       customers: [],
       invoices: [],
+      cashSessions: [],
+      cashMovements: [],
       settings: { ...DEFAULT_SETTINGS },
       posDraft: null,
       hasPreMigrationBackup: Boolean(backupMeta?.value),
@@ -1001,24 +1036,35 @@ export async function loadCompanyWorkspace(
 
   await putInStore('meta', { key: 'active_company_id', value: activeCompany.id });
 
-  const [rawProducts, customers, invoices, members, scopedSettingsMeta, legacySettingsMeta, draftMeta] =
-    await Promise.all([
-      getAllByCompanyIndex<Product>('products', activeCompany.id),
-      getAllByCompanyIndex<Customer>('customers', activeCompany.id),
-      getAllByCompanyIndex<InvoiceRecord>('invoices', activeCompany.id),
-      getAllByCompanyIndex<CompanyMember>('company_members', activeCompany.id),
-      getFromStore<{ key: string; value: AppSettings }>(
-        'meta',
-        `app_settings:${activeCompany.id}`
-      ),
-      activeCompany.id === JAIMONA_COMPANY_ID
-        ? getFromStore<{ key: string; value: AppSettings }>('meta', 'app_settings')
-        : Promise.resolve(undefined),
-      getFromStore<{ key: string; value: PosWorkspaceDraft }>(
-        'meta',
-        `pos_draft:${activeCompany.id}`
-      ),
-    ]);
+  const [
+    rawProducts,
+    customers,
+    invoices,
+    cashSessions,
+    cashMovements,
+    members,
+    scopedSettingsMeta,
+    legacySettingsMeta,
+    draftMeta,
+  ] = await Promise.all([
+    getAllByCompanyIndex<Product>('products', activeCompany.id),
+    getAllByCompanyIndex<Customer>('customers', activeCompany.id),
+    getAllByCompanyIndex<InvoiceRecord>('invoices', activeCompany.id),
+    getAllByCompanyIndex<CashSession>('cash_sessions', activeCompany.id),
+    getAllByCompanyIndex<CashMovement>('cash_movements', activeCompany.id),
+    getAllByCompanyIndex<CompanyMember>('company_members', activeCompany.id),
+    getFromStore<{ key: string; value: AppSettings }>(
+      'meta',
+      `app_settings:${activeCompany.id}`
+    ),
+    activeCompany.id === JAIMONA_COMPANY_ID
+      ? getFromStore<{ key: string; value: AppSettings }>('meta', 'app_settings')
+      : Promise.resolve(undefined),
+    getFromStore<{ key: string; value: PosWorkspaceDraft }>(
+      'meta',
+      `pos_draft:${activeCompany.id}`
+    ),
+  ]);
 
   // Garante cliente Consumidor Final próprio da empresa
   const directCustId = getDirectCustomerIdForCompany(activeCompany.id);
@@ -1049,6 +1095,8 @@ export async function loadCompanyWorkspace(
     a.id === directCustId ? -1 : b.id === directCustId ? 1 : a.name.localeCompare(b.name, 'pt')
   );
   invoices.sort((a, b) => b.issuedAtIso.localeCompare(a.issuedAtIso));
+  cashSessions.sort((a, b) => b.openedAtIso.localeCompare(a.openedAtIso));
+  cashMovements.sort((a, b) => b.createdAtIso.localeCompare(a.createdAtIso));
 
   const fallbackSettings = createDefaultSettingsForCompany(activeCompany);
   const validLegacySettings =
@@ -1068,6 +1116,8 @@ export async function loadCompanyWorkspace(
     products,
     customers,
     invoices,
+    cashSessions,
+    cashMovements,
     settings: resolvedSettings,
     posDraft: draftMeta?.value || null,
     hasPreMigrationBackup: Boolean(backupMeta?.value),
@@ -1302,6 +1352,14 @@ export const localDb = {
     for (const m of members) {
       await deleteFromStore('company_members', m.id);
     }
+    const sessions = await getAllByCompanyIndex<CashSession>('cash_sessions', companyId);
+    for (const s of sessions) {
+      await deleteFromStore('cash_sessions', s.id);
+    }
+    const movements = await getAllByCompanyIndex<CashMovement>('cash_movements', companyId);
+    for (const mv of movements) {
+      await deleteFromStore('cash_movements', mv.id);
+    }
     await deleteFromStore('meta', `app_settings:${companyId}`);
   },
   getAllCompanies: () => getAllFromStore<CompanyRecord>('companies'),
@@ -1338,6 +1396,36 @@ export const localDb = {
       String(inv.id || '').trim() || `inv_${Date.now()}_${Math.random().toString(36).slice(2, 6)}`;
     return putInStore('invoices', { ...inv, id: resolvedId, companyId: resolvedCompanyId });
   },
+  saveCashSession: (session: CashSession, companyId: string) => {
+    const resolvedCompanyId = String(companyId || session.companyId || '').trim();
+    if (!resolvedCompanyId) {
+      return Promise.reject(new Error('Selecione ou cadastre uma empresa antes de abrir caixa.'));
+    }
+    const resolvedId =
+      String(session.id || '').trim() ||
+      `csess_${Date.now()}_${Math.random().toString(36).slice(2, 6)}`;
+    return putInStore('cash_sessions', {
+      ...session,
+      id: resolvedId,
+      companyId: resolvedCompanyId,
+    });
+  },
+  saveCashMovement: (movement: CashMovement, companyId: string) => {
+    const resolvedCompanyId = String(companyId || movement.companyId || '').trim();
+    if (!resolvedCompanyId) {
+      return Promise.reject(
+        new Error('Selecione ou cadastre uma empresa antes de registar movimentos de caixa.')
+      );
+    }
+    const resolvedId =
+      String(movement.id || '').trim() ||
+      `cmov_${Date.now()}_${Math.random().toString(36).slice(2, 6)}`;
+    return putInStore('cash_movements', {
+      ...movement,
+      id: resolvedId,
+      companyId: resolvedCompanyId,
+    });
+  },
   saveSettings: (settings: AppSettings, companyId: string) =>
     saveCompanySettingsScoped(companyId, settings),
   savePosDraft: (draft: PosWorkspaceDraft, companyId: string) => {
@@ -1346,6 +1434,23 @@ export const localDb = {
     return putInStore('meta', {
       key: `pos_draft:${resolvedCompanyId}`,
       value: { ...draft, companyId: resolvedCompanyId },
+    });
+  },
+  getSuspendedSales: async (companyId: string): Promise<SuspendedSale[]> => {
+    const resolvedId = String(companyId || '').trim();
+    if (!resolvedId) return [];
+    const entry = await getFromStore<{ key: string; value: SuspendedSale[] }>(
+      'meta',
+      `suspended_sales:${resolvedId}`
+    );
+    return Array.isArray(entry?.value) ? entry.value : [];
+  },
+  saveSuspendedSales: (sales: SuspendedSale[], companyId: string) => {
+    const resolvedId = String(companyId || '').trim();
+    if (!resolvedId) return Promise.resolve();
+    return putInStore('meta', {
+      key: `suspended_sales:${resolvedId}`,
+      value: sales.slice(0, 25),
     });
   },
   getPreMigrationSnapshot: async (): Promise<PreMulticompanySnapshot | null> => {

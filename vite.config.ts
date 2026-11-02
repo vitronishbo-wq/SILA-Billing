@@ -50,6 +50,7 @@ export default defineConfig((): UserConfig => {
           ],
         },
         workbox: {
+          maximumFileSizeToCacheInBytes: 5 * 1024 * 1024,
           skipWaiting: true,
           clientsClaim: true,
           cleanupOutdatedCaches: true,
@@ -94,8 +95,8 @@ export default defineConfig((): UserConfig => {
       }),
     ],
     build: {
-      target: ['es2018', 'chrome79', 'firefox78', 'safari13'],
-      cssTarget: ['chrome79', 'firefox78', 'safari13'],
+      target: ['es2020', 'chrome80', 'firefox78', 'safari14'],
+      cssTarget: ['chrome80', 'firefox78', 'safari14'],
       minify: 'esbuild',
       chunkSizeWarningLimit: 1000,
     },

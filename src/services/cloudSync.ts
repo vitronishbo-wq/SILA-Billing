@@ -15,16 +15,22 @@ import {
   AppSettings,
   CalculatedLineItem,
   canCompanySyncCloudData,
+  CashMovement,
+  CashMovementType,
+  CashSession,
   CompanyMember,
   CompanyRecord,
   Customer,
   DEFAULT_SETTINGS,
+  DirectPaymentMethod,
   InvoiceRecord,
   isJaimonaOwnerEmail,
   JAIMONA_COMPANY_ID,
   JAIMONA_OWNER_EMAIL,
   normalizeCompanyNif,
+  PaymentSplit,
   Product,
+  ProductPriceChange,
   validateCompanyNif,
   VITRONIS_INSTITUTIONAL,
 } from '../core/types';
@@ -215,6 +221,27 @@ export async function upsertCompanyMemberCloud(
   }
 }
 
+function sanitizePriceHistory(raw?: ProductPriceChange[]): ProductPriceChange[] {
+  if (!Array.isArray(raw) || raw.length === 0) return [];
+  return raw
+    .slice(0, 20)
+    .map((entry) => {
+      const clean: ProductPriceChange = {
+        changedAtIso: String(entry.changedAtIso || new Date().toISOString()).slice(0, 40),
+        previousPrice: Math.min(999999999, Math.max(0, Number(entry.previousPrice) || 0)),
+        newPrice: Math.min(999999999, Math.max(0, Number(entry.newPrice) || 0)),
+        changedBy: String(entry.changedBy || 'Operador').slice(0, 120) || 'Operador',
+      };
+      if (typeof entry.previousCost === 'number' && Number.isFinite(entry.previousCost) && entry.previousCost >= 0) {
+        clean.previousCost = Math.min(999999999, entry.previousCost);
+      }
+      if (typeof entry.newCost === 'number' && Number.isFinite(entry.newCost) && entry.newCost >= 0) {
+        clean.newCost = Math.min(999999999, entry.newCost);
+      }
+      return clean;
+    });
+}
+
 export async function upsertProductCloud(
   product: Product,
   isNew: boolean,
@@ -239,6 +266,22 @@ export async function upsertProductCloud(
 
   try {
     const snap = await getDoc(compProdRef);
+    const barcodeVal = String(product.barcode || '').trim().slice(0, 48);
+    const costPriceVal =
+      typeof product.costPrice === 'number' && Number.isFinite(product.costPrice) && product.costPrice > 0
+        ? Math.min(999999999, product.costPrice)
+        : 0;
+    const cleanHistory = sanitizePriceHistory(product.priceHistory);
+    const stockFields =
+      typeof product.trackStock === 'boolean'
+        ? {
+            trackStock: Boolean(product.trackStock),
+            stockQty: Number(product.stockQty) || 0,
+            minStockQty: Math.max(0, Number(product.minStockQty) || 0),
+          }
+        : {};
+    const historyField = cleanHistory.length > 0 ? { priceHistory: cleanHistory } : {};
+
     if (!snap.exists()) {
       await setDoc(compProdRef, {
         id: productId,
@@ -246,13 +289,17 @@ export async function upsertProductCloud(
         companyOwnerUid: ownerUid,
         updatedByUid: user.uid,
         code: product.code.slice(0, 32),
+        barcode: barcodeVal,
         name: product.name.slice(0, 160),
         category: (product.category || 'Geral').trim().slice(0, 48) || 'Geral',
         unit: (product.unit || 'un').slice(0, 16),
+        costPrice: costPriceVal,
         price: Number(product.price) || 0,
         ivaRate: product.ivaRate === 14 ? 14 : 0,
         exemptionReason: (product.exemptionReason || '').slice(0, 120),
         active: Boolean(product.active),
+        ...stockFields,
+        ...historyField,
         createdAt: serverTimestamp(),
         updatedAt: serverTimestamp(),
       });
@@ -260,13 +307,17 @@ export async function upsertProductCloud(
       await updateDoc(compProdRef, {
         updatedByUid: user.uid,
         code: product.code.slice(0, 32),
+        barcode: barcodeVal,
         name: product.name.slice(0, 160),
         category: (product.category || 'Geral').trim().slice(0, 48) || 'Geral',
         unit: (product.unit || 'un').slice(0, 16),
+        costPrice: costPriceVal,
         price: Number(product.price) || 0,
         ivaRate: product.ivaRate === 14 ? 14 : 0,
         exemptionReason: (product.exemptionReason || '').slice(0, 120),
         active: Boolean(product.active),
+        ...stockFields,
+        ...historyField,
         updatedAt: serverTimestamp(),
       });
     }
@@ -280,32 +331,80 @@ export async function upsertProductCloud(
           id: productId,
           ownerId: user.uid,
           code: product.code.slice(0, 32),
+          barcode: barcodeVal,
           name: product.name.slice(0, 160),
           category: (product.category || 'Geral').trim().slice(0, 48) || 'Geral',
           unit: (product.unit || 'un').slice(0, 16),
+          costPrice: costPriceVal,
           price: Number(product.price) || 0,
           ivaRate: product.ivaRate === 14 ? 14 : 0,
           exemptionReason: (product.exemptionReason || '').slice(0, 120),
           active: Boolean(product.active),
+          ...stockFields,
+          ...historyField,
           createdAt: serverTimestamp(),
           updatedAt: serverTimestamp(),
         });
       } else {
         await updateDoc(legacyRef, {
           code: product.code.slice(0, 32),
+          barcode: barcodeVal,
           name: product.name.slice(0, 160),
           category: (product.category || 'Geral').trim().slice(0, 48) || 'Geral',
           unit: (product.unit || 'un').slice(0, 16),
+          costPrice: costPriceVal,
           price: Number(product.price) || 0,
           ivaRate: product.ivaRate === 14 ? 14 : 0,
           exemptionReason: (product.exemptionReason || '').slice(0, 120),
           active: Boolean(product.active),
+          ...stockFields,
+          ...historyField,
           updatedAt: serverTimestamp(),
         });
       }
     }
   } catch (err) {
     handleFirestoreError(err, isNew ? OperationType.CREATE : OperationType.UPDATE, compProdPath);
+  }
+}
+
+export async function updateProductStockCloud(
+  productIdRaw: string,
+  stockQty: number,
+  companyIdRaw: string,
+  company?: CompanyRecord
+): Promise<void> {
+  const user = auth.currentUser;
+  if (!user || !user.emailVerified || !companyIdRaw) return;
+  if (company && !canCompanySyncCloudData(company)) return;
+  const companyId = sanitizeId(companyIdRaw);
+  const productId = sanitizeId(productIdRaw);
+  if (companyId === JAIMONA_COMPANY_ID && !company?.ownerUid && !isJaimonaOwnerEmail(user.email)) {
+    return;
+  }
+  const path = `companies/${companyId}/products/${productId}`;
+  try {
+    const compProdRef = doc(db, 'companies', companyId, 'products', productId);
+    const snap = await getDoc(compProdRef);
+    if (snap.exists()) {
+      await updateDoc(compProdRef, {
+        updatedByUid: user.uid,
+        stockQty: Number(stockQty) || 0,
+        updatedAt: serverTimestamp(),
+      });
+    }
+    if (companyId === JAIMONA_COMPANY_ID && isJaimonaOwnerEmail(user.email)) {
+      const legacyRef = doc(db, 'users', user.uid, 'products', productId);
+      const legSnap = await getDoc(legacyRef);
+      if (legSnap.exists()) {
+        await updateDoc(legacyRef, {
+          stockQty: Number(stockQty) || 0,
+          updatedAt: serverTimestamp(),
+        });
+      }
+    }
+  } catch (err) {
+    handleFirestoreError(err, OperationType.UPDATE, path);
   }
 }
 
@@ -356,6 +455,10 @@ export async function upsertCustomerCloud(
       getDoc(custRef),
       getDoc(privRef).catch(() => null),
     ]);
+    const creditLimitVal =
+      typeof customer.creditLimit === 'number' && Number.isFinite(customer.creditLimit)
+        ? Math.min(999999999, Math.max(0, customer.creditLimit))
+        : 0;
     const batch = writeBatch(db);
     if (!snap.exists()) {
       batch.set(custRef, {
@@ -366,6 +469,7 @@ export async function upsertCustomerCloud(
         name: customer.name.slice(0, 160),
         nif: (customer.nif || '').slice(0, 32),
         locality: (customer.locality || '').slice(0, 160),
+        creditLimit: creditLimitVal,
         createdAt: serverTimestamp(),
         updatedAt: serverTimestamp(),
       });
@@ -375,6 +479,7 @@ export async function upsertCustomerCloud(
         name: customer.name.slice(0, 160),
         nif: (customer.nif || '').slice(0, 32),
         locality: (customer.locality || '').slice(0, 160),
+        creditLimit: creditLimitVal,
         updatedAt: serverTimestamp(),
       });
     }
@@ -413,6 +518,7 @@ export async function upsertCustomerCloud(
           name: customer.name.slice(0, 160),
           nif: (customer.nif || '').slice(0, 32),
           locality: (customer.locality || '').slice(0, 160),
+          creditLimit: creditLimitVal,
           createdAt: serverTimestamp(),
           updatedAt: serverTimestamp(),
         });
@@ -421,6 +527,7 @@ export async function upsertCustomerCloud(
           name: customer.name.slice(0, 160),
           nif: (customer.nif || '').slice(0, 32),
           locality: (customer.locality || '').slice(0, 160),
+          creditLimit: creditLimitVal,
           updatedAt: serverTimestamp(),
         });
       }
@@ -496,16 +603,53 @@ export async function createInvoiceCloud(
   try {
     const existingSnap = await getDoc(invRef);
     if (existingSnap.exists()) {
-      if (invoice.status === 'cancelled' && existingSnap.data()?.status !== 'cancelled') {
+      const exData = existingSnap.data();
+      if (invoice.status === 'cancelled' && exData?.status !== 'cancelled') {
         await updateDoc(invRef, {
           status: 'cancelled',
           cancelReason: (invoice.cancelReason || 'Anulação operacional').slice(0, 240),
           cancelledBy: (invoice.cancelledBy || user.email || user.uid).slice(0, 120),
           updatedAt: serverTimestamp(),
         });
+      } else if (
+        invoice.status === 'issued' &&
+        exData?.status === 'issued' &&
+        (Number(exData?.amountDue) || 0) !== (Number(invoice.amountDue) || 0)
+      ) {
+        await updateDoc(invRef, {
+          amountReceived: invoice.amountReceived,
+          ...(typeof invoice.initialAmountReceived === 'number'
+            ? { initialAmountReceived: invoice.initialAmountReceived }
+            : {}),
+          amountDue: Math.max(0, Number(invoice.amountDue) || 0),
+          changeAmount: invoice.changeAmount,
+          ...(typeof invoice.initialChangeAmount === 'number'
+            ? { initialChangeAmount: invoice.initialChangeAmount }
+            : {}),
+          ...(invoice.paymentSummary ? { paymentSummary: invoice.paymentSummary.slice(0, 160) } : {}),
+          ...(invoice.transferReference ? { transferReference: invoice.transferReference.slice(0, 80) } : {}),
+          notes: (invoice.notes || '').slice(0, 300),
+          updatedAt: serverTimestamp(),
+        });
       }
       return;
     }
+
+    const cleanSplits: PaymentSplit[] = Array.isArray(invoice.paymentSplits)
+      ? invoice.paymentSplits
+          .filter(
+            (s) =>
+              s &&
+              (s.method === 'Dinheiro' || s.method === 'Multicaixa' || s.method === 'Transferência') &&
+              Number(s.amount) > 0
+          )
+          .slice(0, 5)
+          .map((s) => ({
+            method: s.method,
+            amount: Math.min(999999999, Number(s.amount)),
+            ...(s.reference ? { reference: String(s.reference).slice(0, 80) } : {}),
+          }))
+      : [];
 
     const batch = writeBatch(db);
     batch.set(invRef, {
@@ -525,6 +669,8 @@ export async function createInvoiceCloud(
       customerLocality: (invoice.customerLocality || '').slice(0, 160),
       merchandiseTotal: invoice.merchandiseTotal,
       discountTotal: invoice.discountTotal,
+      ...(invoice.globalDiscountPct ? { globalDiscountPct: invoice.globalDiscountPct } : {}),
+      ...(invoice.globalDiscountAmount ? { globalDiscountAmount: invoice.globalDiscountAmount } : {}),
       taxBase14: invoice.taxBase14,
       taxAmount14: invoice.taxAmount14,
       taxBase0: invoice.taxBase0,
@@ -532,8 +678,22 @@ export async function createInvoiceCloud(
       taxTotal: invoice.taxTotal,
       grandTotal: invoice.grandTotal,
       amountInWords: invoice.amountInWords.slice(0, 300),
+      ...(invoice.sessionId ? { sessionId: sanitizeId(invoice.sessionId) } : {}),
       amountReceived: invoice.amountReceived,
+      ...(typeof invoice.initialAmountReceived === 'number'
+        ? { initialAmountReceived: invoice.initialAmountReceived }
+        : {}),
       changeAmount: invoice.changeAmount,
+      ...(typeof invoice.initialChangeAmount === 'number'
+        ? { initialChangeAmount: invoice.initialChangeAmount }
+        : {}),
+      ...(invoice.amountDue && invoice.amountDue > 0 ? { amountDue: invoice.amountDue } : {}),
+      ...(invoice.transferReference ? { transferReference: invoice.transferReference.slice(0, 80) } : {}),
+      ...(cleanSplits.length > 0 ? { paymentSplits: cleanSplits } : {}),
+      ...(invoice.paymentSummary ? { paymentSummary: invoice.paymentSummary.slice(0, 160) } : {}),
+      ...(invoice.returnOriginInvoiceId ? { returnOriginInvoiceId: sanitizeId(invoice.returnOriginInvoiceId) } : {}),
+      ...(invoice.returnOriginNumber ? { returnOriginNumber: invoice.returnOriginNumber.slice(0, 40) } : {}),
+      ...(invoice.returnCreditApplied ? { returnCreditApplied: invoice.returnCreditApplied } : {}),
       notes: (invoice.notes || '').slice(0, 300),
       itemCount: invoice.lines.length,
       status: 'issued',
@@ -636,6 +796,7 @@ export async function upsertSettingsCloud(
     defaultNotes: (settings.defaultNotes || '').slice(0, 300),
     autoPrintOnEmit: Boolean(settings.autoPrintOnEmit),
     hidePromotionalFooter: Boolean(settings.hidePromotionalFooter ?? true),
+    allowCashierPriceEdit: Boolean(settings.allowCashierPriceEdit ?? false),
     updatedAt: serverTimestamp(),
   };
 
@@ -660,6 +821,7 @@ export async function upsertSettingsCloud(
         defaultNotes: payload.defaultNotes,
         autoPrintOnEmit: payload.autoPrintOnEmit,
         hidePromotionalFooter: payload.hidePromotionalFooter,
+        allowCashierPriceEdit: payload.allowCashierPriceEdit,
         updatedAt: serverTimestamp(),
       });
     }
@@ -668,10 +830,172 @@ export async function upsertSettingsCloud(
   }
 }
 
+export async function upsertCashSessionCloud(
+  session: CashSession,
+  company?: CompanyRecord
+): Promise<void> {
+  const user = auth.currentUser;
+  if (!user || !user.emailVerified) return;
+  if (company && !canCompanySyncCloudData(company)) return;
+
+  const rawCompanyId = company?.id || session.companyId || '';
+  if (!rawCompanyId) return;
+  const companyId = sanitizeId(rawCompanyId);
+  const sessionId = sanitizeId(session.id);
+  const ownerUid = company?.ownerUid || user.uid;
+  if (companyId === JAIMONA_COMPANY_ID && !company?.ownerUid && !isJaimonaOwnerEmail(user.email)) {
+    return;
+  }
+
+  const sessPath = `companies/${companyId}/cash_sessions/${sessionId}`;
+  const sessRef = doc(db, 'companies', companyId, 'cash_sessions', sessionId);
+
+  const optionalSummaryFields: Record<string, unknown> = {};
+  if (session.openingNotes) optionalSummaryFields.openingNotes = session.openingNotes.slice(0, 240);
+  if (session.closedAtIso) optionalSummaryFields.closedAtIso = session.closedAtIso.slice(0, 40);
+  if (session.closedByOperator) {
+    optionalSummaryFields.closedByOperator = session.closedByOperator.slice(0, 32);
+  }
+  if (session.closedByUid) {
+    optionalSummaryFields.closedByUid = sanitizeId(session.closedByUid);
+  }
+  if (typeof session.expectedCash === 'number' && Number.isFinite(session.expectedCash)) {
+    optionalSummaryFields.expectedCash = session.expectedCash;
+  }
+  if (typeof session.countedCash === 'number' && Number.isFinite(session.countedCash)) {
+    optionalSummaryFields.countedCash = Math.max(0, session.countedCash);
+  }
+  if (typeof session.differenceAmount === 'number' && Number.isFinite(session.differenceAmount)) {
+    optionalSummaryFields.differenceAmount = session.differenceAmount;
+  }
+  if (typeof session.salesCash === 'number' && session.salesCash >= 0) {
+    optionalSummaryFields.salesCash = session.salesCash;
+  }
+  if (typeof session.salesMulticaixa === 'number' && session.salesMulticaixa >= 0) {
+    optionalSummaryFields.salesMulticaixa = session.salesMulticaixa;
+  }
+  if (typeof session.salesTransfer === 'number' && session.salesTransfer >= 0) {
+    optionalSummaryFields.salesTransfer = session.salesTransfer;
+  }
+  if (typeof session.salesCredit === 'number' && session.salesCredit >= 0) {
+    optionalSummaryFields.salesCredit = session.salesCredit;
+  }
+  if (typeof session.debtCash === 'number' && session.debtCash >= 0) {
+    optionalSummaryFields.debtCash = session.debtCash;
+  }
+  if (typeof session.debtMulticaixa === 'number' && session.debtMulticaixa >= 0) {
+    optionalSummaryFields.debtMulticaixa = session.debtMulticaixa;
+  }
+  if (typeof session.debtTransfer === 'number' && session.debtTransfer >= 0) {
+    optionalSummaryFields.debtTransfer = session.debtTransfer;
+  }
+  if (typeof session.reforcosTotal === 'number' && session.reforcosTotal >= 0) {
+    optionalSummaryFields.reforcosTotal = session.reforcosTotal;
+  }
+  if (typeof session.entradasTotal === 'number' && session.entradasTotal >= 0) {
+    optionalSummaryFields.entradasTotal = session.entradasTotal;
+  }
+  if (typeof session.sangriasTotal === 'number' && session.sangriasTotal >= 0) {
+    optionalSummaryFields.sangriasTotal = session.sangriasTotal;
+  }
+  if (typeof session.saidasTotal === 'number' && session.saidasTotal >= 0) {
+    optionalSummaryFields.saidasTotal = session.saidasTotal;
+  }
+  if (typeof session.invoiceCount === 'number' && session.invoiceCount >= 0) {
+    optionalSummaryFields.invoiceCount = session.invoiceCount;
+  }
+  if (session.closingNotes) optionalSummaryFields.closingNotes = session.closingNotes.slice(0, 240);
+
+  try {
+    const snap = await getDoc(sessRef);
+    if (!snap.exists()) {
+      await setDoc(sessRef, {
+        id: sessionId,
+        companyId,
+        companyOwnerUid: ownerUid,
+        openedByUid: sanitizeId(session.openedByUid || user.uid),
+        updatedByUid: user.uid,
+        cashier: (session.cashier || '01').slice(0, 16),
+        operator: (session.operator || '001').slice(0, 32),
+        status: session.status === 'closed' ? 'closed' : 'open',
+        openingFloat: Math.min(999999999, Math.max(0, Number(session.openingFloat) || 0)),
+        openedAtIso: (session.openedAtIso || new Date().toISOString()).slice(0, 40),
+        ...optionalSummaryFields,
+        createdAt: serverTimestamp(),
+        updatedAt: serverTimestamp(),
+      });
+    } else if (snap.data()?.status === 'open') {
+      await updateDoc(sessRef, {
+        updatedByUid: user.uid,
+        status: session.status === 'closed' ? 'closed' : 'open',
+        ...optionalSummaryFields,
+        updatedAt: serverTimestamp(),
+      });
+    }
+  } catch (err) {
+    handleFirestoreError(err, OperationType.WRITE, sessPath);
+  }
+}
+
+export async function createCashMovementCloud(
+  movement: CashMovement,
+  company?: CompanyRecord
+): Promise<void> {
+  const user = auth.currentUser;
+  if (!user || !user.emailVerified) return;
+  if (company && !canCompanySyncCloudData(company)) return;
+
+  const rawCompanyId = company?.id || movement.companyId || '';
+  if (!rawCompanyId) return;
+  const companyId = sanitizeId(rawCompanyId);
+  const movementId = sanitizeId(movement.id);
+  const ownerUid = company?.ownerUid || user.uid;
+  if (companyId === JAIMONA_COMPANY_ID && !company?.ownerUid && !isJaimonaOwnerEmail(user.email)) {
+    return;
+  }
+
+  const movPath = `companies/${companyId}/cash_movements/${movementId}`;
+  const movRef = doc(db, 'companies', companyId, 'cash_movements', movementId);
+
+  try {
+    const existing = await getDoc(movRef);
+    if (existing.exists()) return;
+
+    await setDoc(movRef, {
+      id: movementId,
+      companyId,
+      companyOwnerUid: ownerUid,
+      createdByUid: user.uid,
+      sessionId: sanitizeId(movement.sessionId || 'unassigned'),
+      cashier: (movement.cashier || '01').slice(0, 16),
+      operator: (movement.operator || '001').slice(0, 32),
+      type: movement.type,
+      amount: Math.min(999999999, Math.max(0.01, Number(movement.amount) || 0.01)),
+      paymentMethod:
+        movement.paymentMethod === 'Multicaixa'
+          ? 'Multicaixa'
+          : movement.paymentMethod === 'Transferência'
+            ? 'Transferência'
+            : 'Dinheiro',
+      reason: (movement.reason || 'Movimento de caixa').trim().slice(0, 240) || 'Movimento de caixa',
+      ...(movement.reference ? { reference: movement.reference.slice(0, 80) } : {}),
+      ...(movement.invoiceId ? { invoiceId: sanitizeId(movement.invoiceId) } : {}),
+      ...(movement.invoiceNumber ? { invoiceNumber: movement.invoiceNumber.slice(0, 40) } : {}),
+      ...(movement.customerName ? { customerName: movement.customerName.slice(0, 160) } : {}),
+      createdAtIso: (movement.createdAtIso || new Date().toISOString()).slice(0, 40),
+      createdAt: serverTimestamp(),
+    });
+  } catch (err) {
+    handleFirestoreError(err, OperationType.CREATE, movPath);
+  }
+}
+
 export async function pullCompanyFromCloud(companyIdRaw: string): Promise<{
   products: Product[];
   customers: Customer[];
   invoices: InvoiceRecord[];
+  cashSessions: CashSession[];
+  cashMovements: CashMovement[];
   settings: AppSettings | null;
 } | null> {
   const user = auth.currentUser;
@@ -705,10 +1029,12 @@ export async function pullCompanyFromCloud(companyIdRaw: string): Promise<{
   const prodPath = `companies/${companyId}/products`;
   const custPath = `companies/${companyId}/customers`;
   const invPath = `companies/${companyId}/invoices`;
+  const sessPath = `companies/${companyId}/cash_sessions`;
+  const movPath = `companies/${companyId}/cash_movements`;
   const settingsRef = doc(db, 'companies', companyId, 'settings', 'general');
 
   try {
-    const [prodSnap, custSnap, invSnap, settingsSnap] = await Promise.all([
+    const [prodSnap, custSnap, invSnap, sessSnap, movSnap, settingsSnap] = await Promise.all([
       getDocs(
         query(
           collection(db, prodPath),
@@ -730,6 +1056,20 @@ export async function pullCompanyFromCloud(companyIdRaw: string): Promise<{
           where('companyOwnerUid', '==', user.uid)
         )
       ),
+      getDocs(
+        query(
+          collection(db, sessPath),
+          where('companyId', '==', companyId),
+          where('companyOwnerUid', '==', user.uid)
+        )
+      ).catch(() => null),
+      getDocs(
+        query(
+          collection(db, movPath),
+          where('companyId', '==', companyId),
+          where('companyOwnerUid', '==', user.uid)
+        )
+      ).catch(() => null),
       getDoc(settingsRef).catch(() => null),
     ]);
 
@@ -747,17 +1087,30 @@ export async function pullCompanyFromCloud(companyIdRaw: string): Promise<{
 
     const products: Product[] = prodSnap.docs.map((d) => {
       const data = d.data();
+      const history = sanitizePriceHistory(data.priceHistory as ProductPriceChange[] | undefined);
       return {
         id: data.id,
         companyId,
         code: data.code,
+        ...(data.barcode ? { barcode: String(data.barcode) } : {}),
         name: data.name,
         category: data.category || 'Geral',
         unit: data.unit,
+        ...(typeof data.costPrice === 'number' && data.costPrice > 0
+          ? { costPrice: Number(data.costPrice) }
+          : {}),
         price: data.price,
         ivaRate: data.ivaRate === 14 ? 14 : 0,
         exemptionReason: data.exemptionReason || '',
         active: Boolean(data.active),
+        ...(typeof data.trackStock === 'boolean'
+          ? {
+              trackStock: data.trackStock,
+              stockQty: Number(data.stockQty) || 0,
+              minStockQty: Math.max(0, Number(data.minStockQty) || 0),
+            }
+          : {}),
+        ...(history.length > 0 ? { priceHistory: history } : {}),
         syncState: 'synced',
         synced: true,
         createdAtIso: new Date().toISOString(),
@@ -789,6 +1142,9 @@ export async function pullCompanyFromCloud(companyIdRaw: string): Promise<{
           locality: data.locality || '',
           phone,
           address,
+          ...(typeof data.creditLimit === 'number' && data.creditLimit > 0
+            ? { creditLimit: data.creditLimit }
+            : {}),
           syncState: 'synced',
           synced: true,
           createdAtIso: new Date().toISOString(),
@@ -844,6 +1200,8 @@ export async function pullCompanyFromCloud(companyIdRaw: string): Promise<{
           customerLocality: data.customerLocality,
           merchandiseTotal: data.merchandiseTotal,
           discountTotal: data.discountTotal,
+          globalDiscountPct: typeof data.globalDiscountPct === 'number' ? data.globalDiscountPct : undefined,
+          globalDiscountAmount: typeof data.globalDiscountAmount === 'number' ? data.globalDiscountAmount : undefined,
           taxBase14: data.taxBase14,
           taxAmount14: data.taxAmount14,
           taxBase0: data.taxBase0,
@@ -851,8 +1209,35 @@ export async function pullCompanyFromCloud(companyIdRaw: string): Promise<{
           taxTotal: data.taxTotal,
           grandTotal: data.grandTotal,
           amountInWords: data.amountInWords,
+          sessionId: data.sessionId ? String(data.sessionId) : undefined,
           amountReceived: data.amountReceived,
+          initialAmountReceived:
+            typeof data.initialAmountReceived === 'number' ? data.initialAmountReceived : undefined,
           changeAmount: data.changeAmount,
+          initialChangeAmount:
+            typeof data.initialChangeAmount === 'number' ? data.initialChangeAmount : undefined,
+          amountDue: typeof data.amountDue === 'number' ? data.amountDue : undefined,
+          transferReference: data.transferReference || undefined,
+          paymentSplits: Array.isArray(data.paymentSplits)
+            ? (data.paymentSplits as Array<Record<string, unknown>>)
+                .filter(
+                  (sp) =>
+                    sp &&
+                    (sp.method === 'Dinheiro' ||
+                      sp.method === 'Multicaixa' ||
+                      sp.method === 'Transferência') &&
+                    Number(sp.amount) > 0
+                )
+                .map((sp) => ({
+                  method: sp.method as DirectPaymentMethod,
+                  amount: Number(sp.amount),
+                  ...(sp.reference ? { reference: String(sp.reference) } : {}),
+                }))
+            : undefined,
+          paymentSummary: data.paymentSummary || undefined,
+          returnOriginInvoiceId: data.returnOriginInvoiceId || undefined,
+          returnOriginNumber: data.returnOriginNumber || undefined,
+          returnCreditApplied: typeof data.returnCreditApplied === 'number' ? data.returnCreditApplied : undefined,
           notes: data.notes || '',
           status: data.status === 'cancelled' ? 'cancelled' : 'issued',
           cancelReason: data.cancelReason || undefined,
@@ -865,6 +1250,84 @@ export async function pullCompanyFromCloud(companyIdRaw: string): Promise<{
         };
       })
     );
+
+    const cashSessions: CashSession[] = (sessSnap?.docs || []).map((d) => {
+      const data = d.data();
+      const openedAtIso = String(data.openedAtIso || new Date().toISOString());
+      return {
+        id: String(data.id || d.id),
+        companyId,
+        cashier: String(data.cashier || '01'),
+        operator: String(data.operator || '001'),
+        openedByUid: data.openedByUid ? String(data.openedByUid) : undefined,
+        closedByOperator: data.closedByOperator ? String(data.closedByOperator) : undefined,
+        closedByUid: data.closedByUid ? String(data.closedByUid) : undefined,
+        status: data.status === 'closed' ? 'closed' : 'open',
+        openingFloat: Number(data.openingFloat) || 0,
+        openingNotes: data.openingNotes ? String(data.openingNotes) : undefined,
+        openedAtIso,
+        closedAtIso: data.closedAtIso ? String(data.closedAtIso) : undefined,
+        expectedCash: typeof data.expectedCash === 'number' ? data.expectedCash : undefined,
+        countedCash: typeof data.countedCash === 'number' ? data.countedCash : undefined,
+        differenceAmount:
+          typeof data.differenceAmount === 'number' ? data.differenceAmount : undefined,
+        salesCash: typeof data.salesCash === 'number' ? data.salesCash : undefined,
+        salesMulticaixa: typeof data.salesMulticaixa === 'number' ? data.salesMulticaixa : undefined,
+        salesTransfer: typeof data.salesTransfer === 'number' ? data.salesTransfer : undefined,
+        salesCredit: typeof data.salesCredit === 'number' ? data.salesCredit : undefined,
+        debtCash: typeof data.debtCash === 'number' ? data.debtCash : undefined,
+        debtMulticaixa: typeof data.debtMulticaixa === 'number' ? data.debtMulticaixa : undefined,
+        debtTransfer: typeof data.debtTransfer === 'number' ? data.debtTransfer : undefined,
+        reforcosTotal: typeof data.reforcosTotal === 'number' ? data.reforcosTotal : undefined,
+        entradasTotal: typeof data.entradasTotal === 'number' ? data.entradasTotal : undefined,
+        sangriasTotal: typeof data.sangriasTotal === 'number' ? data.sangriasTotal : undefined,
+        saidasTotal: typeof data.saidasTotal === 'number' ? data.saidasTotal : undefined,
+        invoiceCount: typeof data.invoiceCount === 'number' ? data.invoiceCount : undefined,
+        closingNotes: data.closingNotes ? String(data.closingNotes) : undefined,
+        syncState: 'synced',
+        synced: true,
+        createdAtIso: openedAtIso,
+        updatedAtIso: String(data.closedAtIso || openedAtIso),
+      };
+    });
+
+    const cashMovements: CashMovement[] = (movSnap?.docs || []).map((d) => {
+      const data = d.data();
+      const rawType = String(data.type || 'ENTRADA') as CashMovementType;
+      const validType: CashMovementType =
+        rawType === 'REFORCO' ||
+        rawType === 'SANGRIA' ||
+        rawType === 'ENTRADA' ||
+        rawType === 'SAIDA' ||
+        rawType === 'LIQUIDACAO_DIVIDA'
+          ? rawType
+          : 'ENTRADA';
+      const pm: DirectPaymentMethod =
+        data.paymentMethod === 'Multicaixa'
+          ? 'Multicaixa'
+          : data.paymentMethod === 'Transferência'
+            ? 'Transferência'
+            : 'Dinheiro';
+      return {
+        id: String(data.id || d.id),
+        companyId,
+        sessionId: String(data.sessionId || 'unassigned'),
+        cashier: String(data.cashier || '01'),
+        operator: String(data.operator || '001'),
+        type: validType,
+        amount: Number(data.amount) || 0,
+        paymentMethod: pm,
+        reason: String(data.reason || ''),
+        reference: data.reference ? String(data.reference) : undefined,
+        invoiceId: data.invoiceId ? String(data.invoiceId) : undefined,
+        invoiceNumber: data.invoiceNumber ? String(data.invoiceNumber) : undefined,
+        customerName: data.customerName ? String(data.customerName) : undefined,
+        createdByUid: data.createdByUid ? String(data.createdByUid) : undefined,
+        syncState: 'synced',
+        synced: true,
+        createdAtIso: String(data.createdAtIso || new Date().toISOString()),
+      };
+    });
 
     let settings: AppSettings | null = null;
     if (settingsSnap && settingsSnap.exists()) {
@@ -889,13 +1352,14 @@ export async function pullCompanyFromCloud(companyIdRaw: string): Promise<{
         autoPrintOnEmit: Boolean(sd.autoPrintOnEmit),
         hidePromotionalFooter:
           typeof sd.hidePromotionalFooter === 'boolean' ? sd.hidePromotionalFooter : true,
+        allowCashierPriceEdit: Boolean(sd.allowCashierPriceEdit ?? false),
         syncState: 'synced',
         synced: true,
         updatedAtIso: new Date().toISOString(),
       };
     }
 
-    return { products, customers, invoices, settings };
+    return { products, customers, invoices, cashSessions, cashMovements, settings };
   } catch (err) {
     handleFirestoreError(err, OperationType.LIST, invPath);
   }
@@ -905,6 +1369,8 @@ async function pullLegacyJaimonaFromCloud(): Promise<{
   products: Product[];
   customers: Customer[];
   invoices: InvoiceRecord[];
+  cashSessions: CashSession[];
+  cashMovements: CashMovement[];
   settings: AppSettings | null;
 } | null> {
   const user = auth.currentUser;
@@ -924,17 +1390,23 @@ async function pullLegacyJaimonaFromCloud(): Promise<{
 
   const products: Product[] = prodSnap.docs.map((d) => {
     const data = d.data();
+    const history = sanitizePriceHistory(data.priceHistory as ProductPriceChange[] | undefined);
     return {
       id: data.id,
       companyId: JAIMONA_COMPANY_ID,
       code: data.code,
+      ...(data.barcode ? { barcode: String(data.barcode) } : {}),
       name: data.name,
       category: data.category || 'Geral',
       unit: data.unit,
+      ...(typeof data.costPrice === 'number' && data.costPrice > 0
+        ? { costPrice: Number(data.costPrice) }
+        : {}),
       price: data.price,
       ivaRate: data.ivaRate === 14 ? 14 : 0,
       exemptionReason: data.exemptionReason || '',
       active: Boolean(data.active),
+      ...(history.length > 0 ? { priceHistory: history } : {}),
       syncState: 'synced',
       synced: true,
       createdAtIso: new Date().toISOString(),
@@ -966,6 +1438,9 @@ async function pullLegacyJaimonaFromCloud(): Promise<{
         locality: data.locality || '',
         phone,
         address,
+        ...(typeof data.creditLimit === 'number' && data.creditLimit > 0
+          ? { creditLimit: data.creditLimit }
+          : {}),
         syncState: 'synced',
         synced: true,
         createdAtIso: new Date().toISOString(),
@@ -1064,7 +1539,7 @@ async function pullLegacyJaimonaFromCloud(): Promise<{
     };
   }
 
-  return { products, customers, invoices, settings };
+  return { products, customers, invoices, cashSessions: [], cashMovements: [], settings };
 }
 
 /**

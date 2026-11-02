@@ -115,25 +115,50 @@ service cloud.firestore {
 
     // ==================== LEGACY VALIDATION BLUEPRINTS (JAIMONA v1 CONTINUITY) ====================
 
+    function isValidPriceHistoryEntry(entry) {
+      return entry is map
+        && entry.keys().hasAll(['changedAtIso', 'previousPrice', 'newPrice', 'changedBy'])
+        && entry.keys().hasOnly([
+          'changedAtIso', 'previousPrice', 'newPrice', 'previousCost', 'newCost', 'changedBy'
+        ])
+        && entry.changedAtIso is string && entry.changedAtIso.size() >= 10 && entry.changedAtIso.size() <= 40
+        && entry.previousPrice is number && entry.previousPrice >= 0 && entry.previousPrice <= 999999999
+        && entry.newPrice is number && entry.newPrice >= 0 && entry.newPrice <= 999999999
+        && (!('previousCost' in entry) || (entry.previousCost is number && entry.previousCost >= 0 && entry.previousCost <= 999999999))
+        && (!('newCost' in entry) || (entry.newCost is number && entry.newCost >= 0 && entry.newCost <= 999999999))
+        && entry.changedBy is string && entry.changedBy.size() >= 1 && entry.changedBy.size() <= 120;
+    }
+
     function isValidProduct(data, productId) {
       return data.keys().hasAll([
           'id', 'ownerId', 'code', 'name', 'unit', 'price',
           'ivaRate', 'exemptionReason', 'active', 'createdAt', 'updatedAt'
         ])
         && data.keys().hasOnly([
-          'id', 'ownerId', 'code', 'name', 'category', 'unit', 'price',
-          'ivaRate', 'exemptionReason', 'active', 'createdAt', 'updatedAt'
+          'id', 'ownerId', 'code', 'barcode', 'name', 'category', 'unit', 'costPrice', 'price',
+          'ivaRate', 'exemptionReason', 'active', 'trackStock', 'stockQty', 'minStockQty',
+          'priceHistory', 'createdAt', 'updatedAt'
         ])
         && data.id is string && data.id == productId && isValidId(data.id)
         && data.ownerId is string && data.ownerId == request.auth.uid && isValidId(data.ownerId)
         && data.code is string && data.code.size() >= 1 && data.code.size() <= 32
+        && (!('barcode' in data) || (data.barcode is string && data.barcode.size() <= 48))
         && data.name is string && data.name.size() >= 1 && data.name.size() <= 160
         && (!('category' in data) || (data.category is string && data.category.size() >= 1 && data.category.size() <= 48))
         && data.unit is string && data.unit.size() >= 1 && data.unit.size() <= 16
+        && (!('costPrice' in data) || (data.costPrice is number && data.costPrice >= 0 && data.costPrice <= 999999999))
         && data.price is number && data.price >= 0 && data.price <= 999999999
         && data.ivaRate is number && (data.ivaRate == 0 || data.ivaRate == 14)
         && data.exemptionReason is string && data.exemptionReason.size() <= 120
         && data.active is bool
+        && (!('trackStock' in data) || data.trackStock is bool)
+        && (!('stockQty' in data) || (data.stockQty is number && data.stockQty >= -999999 && data.stockQty <= 999999999))
+        && (!('minStockQty' in data) || (data.minStockQty is number && data.minStockQty >= 0 && data.minStockQty <= 999999999))
+        && (!('priceHistory' in data) || (
+          data.priceHistory is list
+          && data.priceHistory.size() <= 20
+          && (data.priceHistory.size() == 0 || isValidPriceHistoryEntry(data.priceHistory[0]))
+        ))
         && data.createdAt is timestamp
         && data.updatedAt is timestamp;
     }
@@ -143,13 +168,14 @@ service cloud.firestore {
           'id', 'ownerId', 'name', 'nif', 'locality', 'createdAt', 'updatedAt'
         ])
         && data.keys().hasOnly([
-          'id', 'ownerId', 'name', 'nif', 'locality', 'createdAt', 'updatedAt'
+          'id', 'ownerId', 'name', 'nif', 'locality', 'creditLimit', 'createdAt', 'updatedAt'
         ])
         && data.id is string && data.id == customerId && isValidId(data.id)
         && data.ownerId is string && data.ownerId == request.auth.uid && isValidId(data.ownerId)
         && data.name is string && data.name.size() >= 1 && data.name.size() <= 160
         && data.nif is string && data.nif.size() <= 32
         && data.locality is string && data.locality.size() <= 160
+        && (!('creditLimit' in data) || (data.creditLimit is number && data.creditLimit >= 0 && data.creditLimit <= 999999999))
         && data.createdAt is timestamp
         && data.updatedAt is timestamp;
     }
@@ -163,6 +189,16 @@ service cloud.firestore {
         && data.updatedAt is timestamp;
     }
 
+    function isValidPaymentSplitEntry(entry) {
+      return entry is map
+        && entry.keys().hasAll(['method', 'amount'])
+        && entry.keys().hasOnly(['method', 'amount', 'reference'])
+        && entry.method is string && entry.method.size() <= 24
+        && (entry.method == 'Dinheiro' || entry.method == 'Multicaixa' || entry.method == 'Transferência')
+        && entry.amount is number && entry.amount > 0 && entry.amount <= 999999999
+        && (!('reference' in entry) || (entry.reference is string && entry.reference.size() <= 80));
+    }
+
     function isValidInvoice(data, invoiceId) {
       return data.keys().hasAll([
           'id', 'ownerId', 'number', 'docType', 'issuedAtIso', 'cashier', 'operator',
@@ -174,9 +210,12 @@ service cloud.firestore {
         && data.keys().hasOnly([
           'id', 'ownerId', 'number', 'docType', 'issuedAtIso', 'cashier', 'operator',
           'paymentMethod', 'customerId', 'customerName', 'customerNif', 'customerLocality',
-          'merchandiseTotal', 'discountTotal', 'taxBase14', 'taxAmount14', 'taxBase0',
-          'taxAmount0', 'taxTotal', 'grandTotal', 'amountInWords', 'amountReceived',
-          'changeAmount', 'notes', 'itemCount', 'status', 'createdAt', 'updatedAt'
+          'merchandiseTotal', 'discountTotal', 'globalDiscountPct', 'globalDiscountAmount',
+          'taxBase14', 'taxAmount14', 'taxBase0', 'taxAmount0', 'taxTotal', 'grandTotal',
+          'amountInWords', 'sessionId', 'amountReceived', 'initialAmountReceived', 'changeAmount',
+          'initialChangeAmount', 'amountDue', 'transferReference', 'paymentSplits',
+          'paymentSummary', 'returnOriginInvoiceId', 'returnOriginNumber', 'returnCreditApplied',
+          'notes', 'itemCount', 'status', 'createdAt', 'updatedAt'
         ])
         && data.id is string && data.id == invoiceId && isValidId(data.id)
         && data.ownerId is string && data.ownerId == request.auth.uid && isValidId(data.ownerId)
@@ -186,13 +225,15 @@ service cloud.firestore {
         && data.cashier is string && data.cashier.size() >= 1 && data.cashier.size() <= 16
         && data.operator is string && data.operator.size() >= 1 && data.operator.size() <= 32
         && data.paymentMethod is string && data.paymentMethod.size() <= 24
-        && (data.paymentMethod == 'Dinheiro' || data.paymentMethod == 'Multicaixa' || data.paymentMethod == 'Transferência')
+        && (data.paymentMethod == 'Dinheiro' || data.paymentMethod == 'Multicaixa' || data.paymentMethod == 'Transferência' || data.paymentMethod == 'Crédito' || data.paymentMethod == 'Combinado')
         && data.customerId is string && data.customerId.size() >= 1 && data.customerId.size() <= 128
         && data.customerName is string && data.customerName.size() >= 1 && data.customerName.size() <= 160
         && data.customerNif is string && data.customerNif.size() <= 32
         && data.customerLocality is string && data.customerLocality.size() <= 160
         && data.merchandiseTotal is number && data.merchandiseTotal >= 0
         && data.discountTotal is number && data.discountTotal >= 0
+        && (!('globalDiscountPct' in data) || (data.globalDiscountPct is number && data.globalDiscountPct >= 0 && data.globalDiscountPct <= 100))
+        && (!('globalDiscountAmount' in data) || (data.globalDiscountAmount is number && data.globalDiscountAmount >= 0))
         && data.taxBase14 is number && data.taxBase14 >= 0
         && data.taxAmount14 is number && data.taxAmount14 >= 0
         && data.taxBase0 is number && data.taxBase0 >= 0
@@ -200,8 +241,22 @@ service cloud.firestore {
         && data.taxTotal is number && data.taxTotal >= 0
         && data.grandTotal is number && data.grandTotal >= 0
         && data.amountInWords is string && data.amountInWords.size() >= 1 && data.amountInWords.size() <= 300
+        && (!('sessionId' in data) || (data.sessionId is string && data.sessionId.size() <= 128))
         && data.amountReceived is number && data.amountReceived >= 0
+        && (!('initialAmountReceived' in data) || (data.initialAmountReceived is number && data.initialAmountReceived >= 0))
         && data.changeAmount is number && data.changeAmount >= 0
+        && (!('initialChangeAmount' in data) || (data.initialChangeAmount is number && data.initialChangeAmount >= 0))
+        && (!('amountDue' in data) || (data.amountDue is number && data.amountDue >= 0))
+        && (!('transferReference' in data) || (data.transferReference is string && data.transferReference.size() <= 80))
+        && (!('paymentSplits' in data) || (
+          data.paymentSplits is list
+          && data.paymentSplits.size() <= 5
+          && (data.paymentSplits.size() == 0 || isValidPaymentSplitEntry(data.paymentSplits[0]))
+        ))
+        && (!('paymentSummary' in data) || (data.paymentSummary is string && data.paymentSummary.size() <= 160))
+        && (!('returnOriginInvoiceId' in data) || (data.returnOriginInvoiceId is string && data.returnOriginInvoiceId.size() <= 128))
+        && (!('returnOriginNumber' in data) || (data.returnOriginNumber is string && data.returnOriginNumber.size() <= 40))
+        && (!('returnCreditApplied' in data) || (data.returnCreditApplied is number && data.returnCreditApplied >= 0))
         && data.notes is string && data.notes.size() <= 300
         && data.itemCount is number && data.itemCount >= 1 && data.itemCount <= 200
         && data.status is string && data.status.size() <= 16 && (data.status == 'issued' || data.status == 'cancelled')
@@ -368,21 +423,32 @@ service cloud.firestore {
           'category', 'unit', 'price', 'ivaRate', 'exemptionReason', 'active', 'createdAt', 'updatedAt'
         ])
         && data.keys().hasOnly([
-          'id', 'companyId', 'companyOwnerUid', 'updatedByUid', 'code', 'name',
-          'category', 'unit', 'price', 'ivaRate', 'exemptionReason', 'active', 'createdAt', 'updatedAt'
+          'id', 'companyId', 'companyOwnerUid', 'updatedByUid', 'code', 'barcode', 'name',
+          'category', 'unit', 'costPrice', 'price', 'ivaRate', 'exemptionReason', 'active',
+          'trackStock', 'stockQty', 'minStockQty', 'priceHistory', 'createdAt', 'updatedAt'
         ])
         && data.id is string && data.id == productId && isValidId(data.id)
         && data.companyId is string && data.companyId == companyId && isValidId(data.companyId)
         && data.companyOwnerUid is string && isValidId(data.companyOwnerUid)
         && data.updatedByUid is string && data.updatedByUid == request.auth.uid && isValidId(data.updatedByUid)
         && data.code is string && data.code.size() >= 1 && data.code.size() <= 32
+        && (!('barcode' in data) || (data.barcode is string && data.barcode.size() <= 48))
         && data.name is string && data.name.size() >= 1 && data.name.size() <= 160
         && data.category is string && data.category.size() >= 1 && data.category.size() <= 48
         && data.unit is string && data.unit.size() >= 1 && data.unit.size() <= 16
+        && (!('costPrice' in data) || (data.costPrice is number && data.costPrice >= 0 && data.costPrice <= 999999999))
         && data.price is number && data.price >= 0 && data.price <= 999999999
         && data.ivaRate is number && (data.ivaRate == 0 || data.ivaRate == 14)
         && data.exemptionReason is string && data.exemptionReason.size() <= 120
         && data.active is bool
+        && (!('trackStock' in data) || data.trackStock is bool)
+        && (!('stockQty' in data) || (data.stockQty is number && data.stockQty >= -999999 && data.stockQty <= 999999999))
+        && (!('minStockQty' in data) || (data.minStockQty is number && data.minStockQty >= 0 && data.minStockQty <= 999999999))
+        && (!('priceHistory' in data) || (
+          data.priceHistory is list
+          && data.priceHistory.size() <= 20
+          && (data.priceHistory.size() == 0 || isValidPriceHistoryEntry(data.priceHistory[0]))
+        ))
         && data.createdAt is timestamp
         && data.updatedAt is timestamp;
     }
@@ -392,7 +458,7 @@ service cloud.firestore {
           'id', 'companyId', 'companyOwnerUid', 'updatedByUid', 'name', 'nif', 'locality', 'createdAt', 'updatedAt'
         ])
         && data.keys().hasOnly([
-          'id', 'companyId', 'companyOwnerUid', 'updatedByUid', 'name', 'nif', 'locality', 'createdAt', 'updatedAt'
+          'id', 'companyId', 'companyOwnerUid', 'updatedByUid', 'name', 'nif', 'locality', 'creditLimit', 'createdAt', 'updatedAt'
         ])
         && data.id is string && data.id == customerId && isValidId(data.id)
         && data.companyId is string && data.companyId == companyId && isValidId(data.companyId)
@@ -401,6 +467,7 @@ service cloud.firestore {
         && data.name is string && data.name.size() >= 1 && data.name.size() <= 160
         && data.nif is string && data.nif.size() <= 32
         && data.locality is string && data.locality.size() <= 160
+        && (!('creditLimit' in data) || (data.creditLimit is number && data.creditLimit >= 0 && data.creditLimit <= 999999999))
         && data.createdAt is timestamp
         && data.updatedAt is timestamp;
     }
@@ -427,9 +494,12 @@ service cloud.firestore {
         && data.keys().hasOnly([
           'id', 'companyId', 'companyOwnerUid', 'emittedByUid', 'number', 'docType', 'issuedAtIso',
           'cashier', 'operator', 'paymentMethod', 'customerId', 'customerName', 'customerNif',
-          'customerLocality', 'merchandiseTotal', 'discountTotal', 'taxBase14', 'taxAmount14',
-          'taxBase0', 'taxAmount0', 'taxTotal', 'grandTotal', 'amountInWords', 'amountReceived',
-          'changeAmount', 'notes', 'itemCount', 'status', 'cancelReason', 'cancelledBy', 'createdAt', 'updatedAt'
+          'customerLocality', 'merchandiseTotal', 'discountTotal', 'globalDiscountPct', 'globalDiscountAmount',
+          'taxBase14', 'taxAmount14', 'taxBase0', 'taxAmount0', 'taxTotal', 'grandTotal',
+          'amountInWords', 'sessionId', 'amountReceived', 'initialAmountReceived', 'changeAmount',
+          'initialChangeAmount', 'amountDue', 'transferReference', 'paymentSplits',
+          'paymentSummary', 'returnOriginInvoiceId', 'returnOriginNumber', 'returnCreditApplied',
+          'notes', 'itemCount', 'status', 'cancelReason', 'cancelledBy', 'createdAt', 'updatedAt'
         ])
         && data.id is string && data.id == invoiceId && isValidId(data.id)
         && data.companyId is string && data.companyId == companyId && isValidId(data.companyId)
@@ -441,13 +511,15 @@ service cloud.firestore {
         && data.cashier is string && data.cashier.size() >= 1 && data.cashier.size() <= 16
         && data.operator is string && data.operator.size() >= 1 && data.operator.size() <= 32
         && data.paymentMethod is string && data.paymentMethod.size() <= 24
-        && (data.paymentMethod == 'Dinheiro' || data.paymentMethod == 'Multicaixa' || data.paymentMethod == 'Transferência')
+        && (data.paymentMethod == 'Dinheiro' || data.paymentMethod == 'Multicaixa' || data.paymentMethod == 'Transferência' || data.paymentMethod == 'Crédito' || data.paymentMethod == 'Combinado')
         && data.customerId is string && data.customerId.size() >= 1 && data.customerId.size() <= 128
         && data.customerName is string && data.customerName.size() >= 1 && data.customerName.size() <= 160
         && data.customerNif is string && data.customerNif.size() <= 32
         && data.customerLocality is string && data.customerLocality.size() <= 160
         && data.merchandiseTotal is number && data.merchandiseTotal >= 0
         && data.discountTotal is number && data.discountTotal >= 0
+        && (!('globalDiscountPct' in data) || (data.globalDiscountPct is number && data.globalDiscountPct >= 0 && data.globalDiscountPct <= 100))
+        && (!('globalDiscountAmount' in data) || (data.globalDiscountAmount is number && data.globalDiscountAmount >= 0))
         && data.taxBase14 is number && data.taxBase14 >= 0
         && data.taxAmount14 is number && data.taxAmount14 >= 0
         && data.taxBase0 is number && data.taxBase0 >= 0
@@ -455,8 +527,22 @@ service cloud.firestore {
         && data.taxTotal is number && data.taxTotal >= 0
         && data.grandTotal is number && data.grandTotal >= 0
         && data.amountInWords is string && data.amountInWords.size() >= 1 && data.amountInWords.size() <= 300
+        && (!('sessionId' in data) || (data.sessionId is string && data.sessionId.size() <= 128))
         && data.amountReceived is number && data.amountReceived >= 0
+        && (!('initialAmountReceived' in data) || (data.initialAmountReceived is number && data.initialAmountReceived >= 0))
         && data.changeAmount is number && data.changeAmount >= 0
+        && (!('initialChangeAmount' in data) || (data.initialChangeAmount is number && data.initialChangeAmount >= 0))
+        && (!('amountDue' in data) || (data.amountDue is number && data.amountDue >= 0))
+        && (!('transferReference' in data) || (data.transferReference is string && data.transferReference.size() <= 80))
+        && (!('paymentSplits' in data) || (
+          data.paymentSplits is list
+          && data.paymentSplits.size() <= 5
+          && (data.paymentSplits.size() == 0 || isValidPaymentSplitEntry(data.paymentSplits[0]))
+        ))
+        && (!('paymentSummary' in data) || (data.paymentSummary is string && data.paymentSummary.size() <= 160))
+        && (!('returnOriginInvoiceId' in data) || (data.returnOriginInvoiceId is string && data.returnOriginInvoiceId.size() <= 128))
+        && (!('returnOriginNumber' in data) || (data.returnOriginNumber is string && data.returnOriginNumber.size() <= 40))
+        && (!('returnCreditApplied' in data) || (data.returnCreditApplied is number && data.returnCreditApplied >= 0))
         && data.notes is string && data.notes.size() <= 300
         && data.itemCount is number && data.itemCount >= 1 && data.itemCount <= 200
         && data.status is string && data.status.size() <= 16 && (data.status == 'issued' || data.status == 'cancelled')
@@ -506,7 +592,7 @@ service cloud.firestore {
           'companyId', 'companyOwnerUid', 'updatedByUid', 'legalName', 'shortName', 'nif',
           'address', 'cityCountry', 'phone', 'email', 'tagline', 'defaultCashier', 'defaultOperator',
           'defaultFormat', 'defaultDocType', 'defaultNotes', 'autoPrintOnEmit',
-          'hidePromotionalFooter', 'updatedAt'
+          'hidePromotionalFooter', 'allowCashierPriceEdit', 'updatedAt'
         ])
         && data.companyId is string && data.companyId == companyId && isValidId(data.companyId)
         && data.companyOwnerUid is string && isValidId(data.companyOwnerUid)
@@ -526,7 +612,86 @@ service cloud.firestore {
         && data.defaultNotes is string && data.defaultNotes.size() <= 300
         && data.autoPrintOnEmit is bool
         && (!('hidePromotionalFooter' in data) || data.hidePromotionalFooter is bool)
+        && (!('allowCashierPriceEdit' in data) || data.allowCashierPriceEdit is bool)
         && data.updatedAt is timestamp;
+    }
+
+    function isValidCompanyCashSession(data, companyId, sessionId) {
+      return data.keys().hasAll([
+          'id', 'companyId', 'companyOwnerUid', 'openedByUid', 'updatedByUid',
+          'cashier', 'operator', 'status', 'openingFloat', 'openedAtIso', 'createdAt', 'updatedAt'
+        ])
+        && data.keys().hasOnly([
+          'id', 'companyId', 'companyOwnerUid', 'openedByUid', 'updatedByUid',
+          'cashier', 'operator', 'status', 'openingFloat', 'openingNotes', 'openedAtIso',
+          'closedAtIso', 'closedByOperator', 'closedByUid', 'expectedCash', 'countedCash',
+          'differenceAmount', 'salesCash', 'salesMulticaixa', 'salesTransfer', 'salesCredit',
+          'debtCash', 'debtMulticaixa', 'debtTransfer', 'reforcosTotal', 'entradasTotal',
+          'sangriasTotal', 'saidasTotal', 'invoiceCount', 'closingNotes', 'createdAt', 'updatedAt'
+        ])
+        && data.id is string && data.id == sessionId && isValidId(data.id)
+        && data.companyId is string && data.companyId == companyId && isValidId(data.companyId)
+        && data.companyOwnerUid is string && isValidId(data.companyOwnerUid)
+        && data.openedByUid is string && isValidId(data.openedByUid)
+        && data.updatedByUid is string && data.updatedByUid == request.auth.uid && isValidId(data.updatedByUid)
+        && data.cashier is string && data.cashier.size() >= 1 && data.cashier.size() <= 16
+        && data.operator is string && data.operator.size() >= 1 && data.operator.size() <= 32
+        && data.status is string && data.status.size() <= 16 && (data.status == 'open' || data.status == 'closed')
+        && data.openingFloat is number && data.openingFloat >= 0 && data.openingFloat <= 999999999
+        && (!('openingNotes' in data) || (data.openingNotes is string && data.openingNotes.size() <= 240))
+        && data.openedAtIso is string && data.openedAtIso.size() >= 10 && data.openedAtIso.size() <= 40
+        && (!('closedAtIso' in data) || (data.closedAtIso is string && data.closedAtIso.size() >= 10 && data.closedAtIso.size() <= 40))
+        && (!('closedByOperator' in data) || (data.closedByOperator is string && data.closedByOperator.size() <= 32))
+        && (!('closedByUid' in data) || (data.closedByUid is string && data.closedByUid.size() <= 128))
+        && (!('expectedCash' in data) || (data.expectedCash is number && data.expectedCash >= -999999999 && data.expectedCash <= 999999999))
+        && (!('countedCash' in data) || (data.countedCash is number && data.countedCash >= 0 && data.countedCash <= 999999999))
+        && (!('differenceAmount' in data) || (data.differenceAmount is number && data.differenceAmount >= -999999999 && data.differenceAmount <= 999999999))
+        && (!('salesCash' in data) || (data.salesCash is number && data.salesCash >= 0))
+        && (!('salesMulticaixa' in data) || (data.salesMulticaixa is number && data.salesMulticaixa >= 0))
+        && (!('salesTransfer' in data) || (data.salesTransfer is number && data.salesTransfer >= 0))
+        && (!('salesCredit' in data) || (data.salesCredit is number && data.salesCredit >= 0))
+        && (!('debtCash' in data) || (data.debtCash is number && data.debtCash >= 0))
+        && (!('debtMulticaixa' in data) || (data.debtMulticaixa is number && data.debtMulticaixa >= 0))
+        && (!('debtTransfer' in data) || (data.debtTransfer is number && data.debtTransfer >= 0))
+        && (!('reforcosTotal' in data) || (data.reforcosTotal is number && data.reforcosTotal >= 0))
+        && (!('entradasTotal' in data) || (data.entradasTotal is number && data.entradasTotal >= 0))
+        && (!('sangriasTotal' in data) || (data.sangriasTotal is number && data.sangriasTotal >= 0))
+        && (!('saidasTotal' in data) || (data.saidasTotal is number && data.saidasTotal >= 0))
+        && (!('invoiceCount' in data) || (data.invoiceCount is number && data.invoiceCount >= 0))
+        && (!('closingNotes' in data) || (data.closingNotes is string && data.closingNotes.size() <= 240))
+        && data.createdAt is timestamp
+        && data.updatedAt is timestamp;
+    }
+
+    function isValidCompanyCashMovement(data, companyId, movementId) {
+      return data.keys().hasAll([
+          'id', 'companyId', 'companyOwnerUid', 'createdByUid', 'sessionId',
+          'cashier', 'operator', 'type', 'amount', 'paymentMethod', 'reason', 'createdAtIso', 'createdAt'
+        ])
+        && data.keys().hasOnly([
+          'id', 'companyId', 'companyOwnerUid', 'createdByUid', 'sessionId',
+          'cashier', 'operator', 'type', 'amount', 'paymentMethod', 'reason',
+          'reference', 'invoiceId', 'invoiceNumber', 'customerName', 'createdAtIso', 'createdAt'
+        ])
+        && data.id is string && data.id == movementId && isValidId(data.id)
+        && data.companyId is string && data.companyId == companyId && isValidId(data.companyId)
+        && data.companyOwnerUid is string && isValidId(data.companyOwnerUid)
+        && data.createdByUid is string && data.createdByUid == request.auth.uid && isValidId(data.createdByUid)
+        && data.sessionId is string && isValidId(data.sessionId)
+        && data.cashier is string && data.cashier.size() >= 1 && data.cashier.size() <= 16
+        && data.operator is string && data.operator.size() >= 1 && data.operator.size() <= 32
+        && data.type is string && data.type.size() <= 24
+        && (data.type == 'REFORCO' || data.type == 'SANGRIA' || data.type == 'ENTRADA' || data.type == 'SAIDA' || data.type == 'LIQUIDACAO_DIVIDA')
+        && data.amount is number && data.amount > 0 && data.amount <= 999999999
+        && data.paymentMethod is string && data.paymentMethod.size() <= 24
+        && (data.paymentMethod == 'Dinheiro' || data.paymentMethod == 'Multicaixa' || data.paymentMethod == 'Transferência')
+        && data.reason is string && data.reason.size() >= 1 && data.reason.size() <= 240
+        && (!('reference' in data) || (data.reference is string && data.reference.size() <= 80))
+        && (!('invoiceId' in data) || (data.invoiceId is string && data.invoiceId.size() <= 128))
+        && (!('invoiceNumber' in data) || (data.invoiceNumber is string && data.invoiceNumber.size() <= 40))
+        && (!('customerName' in data) || (data.customerName is string && data.customerName.size() <= 160))
+        && data.createdAtIso is string && data.createdAtIso.size() >= 10 && data.createdAtIso.size() <= 40
+        && data.createdAt is timestamp;
     }
 
     // ==================== LEGACY COLLECTIONS (/users/{userId}/...) ====================
@@ -558,7 +723,9 @@ service cloud.firestore {
         && incoming().updatedAt == request.time
         && (
           incoming().diff(existing()).affectedKeys().hasOnly([
-            'code', 'name', 'category', 'unit', 'price', 'ivaRate', 'exemptionReason', 'active', 'updatedAt'
+            'code', 'barcode', 'name', 'category', 'unit', 'costPrice', 'price',
+            'ivaRate', 'exemptionReason', 'active', 'trackStock', 'stockQty', 'minStockQty',
+            'priceHistory', 'updatedAt'
           ])
         );
 
@@ -595,7 +762,7 @@ service cloud.firestore {
         && incoming().updatedAt == request.time
         && (
           incoming().diff(existing()).affectedKeys().hasOnly([
-            'name', 'nif', 'locality', 'updatedAt'
+            'name', 'nif', 'locality', 'creditLimit', 'updatedAt'
           ])
         );
 
@@ -992,9 +1159,15 @@ service cloud.firestore {
               canSyncCompanyCloudData(companyId)
               && isCompanyOwnerOrManager(companyId)
               && incoming().diff(existing()).affectedKeys().hasOnly([
-                'updatedByUid', 'code', 'name', 'category', 'unit', 'price',
-                'ivaRate', 'exemptionReason', 'active', 'updatedAt'
+                'updatedByUid', 'code', 'barcode', 'name', 'category', 'unit', 'costPrice', 'price',
+                'ivaRate', 'exemptionReason', 'active', 'trackStock', 'stockQty', 'minStockQty',
+                'priceHistory', 'updatedAt'
               ])
+            )
+            || (
+              canSyncCompanyCloudData(companyId)
+              && isCompanyAnyActiveRole(companyId)
+              && incoming().diff(existing()).affectedKeys().hasOnly(['updatedByUid', 'stockQty', 'updatedAt'])
             )
             || isPlatformAdmin()
           );
@@ -1043,7 +1216,7 @@ service cloud.firestore {
               canSyncCompanyCloudData(companyId)
               && isCompanyOwnerOrManager(companyId)
               && incoming().diff(existing()).affectedKeys().hasOnly([
-                'updatedByUid', 'name', 'nif', 'locality', 'updatedAt'
+                'updatedByUid', 'name', 'nif', 'locality', 'creditLimit', 'updatedAt'
               ])
             )
             || isPlatformAdmin()
@@ -1148,6 +1321,15 @@ service cloud.firestore {
                 'status', 'cancelReason', 'cancelledBy', 'updatedAt'
               ])
             )
+            || (
+              canSyncCompanyCloudData(companyId)
+              && isCompanyAnyActiveRole(companyId)
+              && incoming().status == 'issued'
+              && incoming().diff(existing()).affectedKeys().hasOnly([
+                'amountReceived', 'initialAmountReceived', 'amountDue', 'changeAmount',
+                'initialChangeAmount', 'paymentSummary', 'transferReference', 'notes', 'updatedAt'
+              ])
+            )
             || isPlatformAdmin()
           );
 
@@ -1210,7 +1392,7 @@ service cloud.firestore {
                 'updatedByUid', 'legalName', 'shortName', 'address', 'cityCountry',
                 'phone', 'email', 'tagline', 'defaultCashier', 'defaultOperator',
                 'defaultFormat', 'defaultDocType', 'defaultNotes', 'autoPrintOnEmit',
-                'hidePromotionalFooter', 'updatedAt'
+                'hidePromotionalFooter', 'allowCashierPriceEdit', 'updatedAt'
               ])
             )
             || isPlatformAdmin()
@@ -1227,6 +1409,84 @@ service cloud.firestore {
           && (isCompanyOwner(companyId) || isPlatformAdmin());
 
         allow list, create, update, delete: if false;
+      }
+
+      // Subcollection: /companies/{companyId}/cash_sessions/{sessionId}
+      match /cash_sessions/{sessionId} {
+        allow get: if isVerifiedUser()
+          && isValidId(companyId)
+          && isValidId(sessionId)
+          && (isCompanyAnyActiveRole(companyId) || isPlatformAdmin());
+
+        allow list: if isVerifiedUser()
+          && existing().companyId == companyId
+          && existing().companyOwnerUid == request.auth.uid;
+
+        allow create: if isVerifiedUser()
+          && isValidId(companyId)
+          && isValidId(sessionId)
+          && isValidCompanyCashSession(incoming(), companyId, sessionId)
+          && incoming().createdAt == request.time
+          && incoming().updatedAt == request.time
+          && canSyncCompanyCloudData(companyId)
+          && isCompanyAnyActiveRole(companyId)
+          && incoming().companyOwnerUid == companyDocData(companyId).ownerUid;
+
+        // Terminal State Locking: uma sessão fechada ('closed') torna-se imutável exceto para administração global
+        allow update: if isVerifiedUser()
+          && isValidId(companyId)
+          && isValidId(sessionId)
+          && isValidCompanyCashSession(incoming(), companyId, sessionId)
+          && incoming().id == existing().id
+          && incoming().companyId == existing().companyId
+          && incoming().companyOwnerUid == existing().companyOwnerUid
+          && incoming().openedByUid == existing().openedByUid
+          && incoming().cashier == existing().cashier
+          && incoming().operator == existing().operator
+          && incoming().openingFloat == existing().openingFloat
+          && incoming().openedAtIso == existing().openedAtIso
+          && incoming().createdAt == existing().createdAt
+          && incoming().updatedAt == request.time
+          && (
+            (
+              existing().status == 'open'
+              && canSyncCompanyCloudData(companyId)
+              && isCompanyAnyActiveRole(companyId)
+              && incoming().diff(existing()).affectedKeys().hasOnly([
+                'updatedByUid', 'status', 'openingNotes', 'closedAtIso', 'closedByOperator',
+                'closedByUid', 'expectedCash', 'countedCash', 'differenceAmount', 'salesCash',
+                'salesMulticaixa', 'salesTransfer', 'salesCredit', 'debtCash', 'debtMulticaixa',
+                'debtTransfer', 'reforcosTotal', 'entradasTotal', 'sangriasTotal', 'saidasTotal',
+                'invoiceCount', 'closingNotes', 'updatedAt'
+              ])
+            )
+            || isPlatformAdmin()
+          );
+
+        allow delete: if false;
+      }
+
+      // Subcollection (Append-Only Ledger): /companies/{companyId}/cash_movements/{movementId}
+      match /cash_movements/{movementId} {
+        allow get: if isVerifiedUser()
+          && isValidId(companyId)
+          && isValidId(movementId)
+          && (isCompanyAnyActiveRole(companyId) || isPlatformAdmin());
+
+        allow list: if isVerifiedUser()
+          && existing().companyId == companyId
+          && existing().companyOwnerUid == request.auth.uid;
+
+        allow create: if isVerifiedUser()
+          && isValidId(companyId)
+          && isValidId(movementId)
+          && isValidCompanyCashMovement(incoming(), companyId, movementId)
+          && incoming().createdAt == request.time
+          && canSyncCompanyCloudData(companyId)
+          && isCompanyAnyActiveRole(companyId)
+          && incoming().companyOwnerUid == companyDocData(companyId).ownerUid;
+
+        allow update, delete: if false;
       }
     }
   }

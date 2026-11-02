@@ -1,8 +1,15 @@
 export type TaxRate = 0 | 14;
-export type PaymentMethod = 'Dinheiro' | 'Multicaixa' | 'Transferência';
+export type DirectPaymentMethod = 'Dinheiro' | 'Multicaixa' | 'Transferência';
+export type PaymentMethod = DirectPaymentMethod | 'Crédito' | 'Combinado';
 export type DocumentType = 'FR' | 'FP';
 export type DocumentFormat = 'POS' | 'A4';
 export type InvoiceStatus = 'issued' | 'cancelled';
+
+export interface PaymentSplit {
+  method: DirectPaymentMethod;
+  amount: number;
+  reference?: string;
+}
 
 export type PlanTier = 'FREE' | 'ESSENCIAL' | 'PROFISSIONAL' | 'ENTERPRISE';
 export type CompanyOperationalStatus = 'active' | 'suspended' | 'pending';
@@ -226,7 +233,14 @@ export interface CompanyMember {
 export interface SyncQueueEntry {
   id: string;
   companyId: string;
-  entityType: 'company' | 'product' | 'customer' | 'invoice' | 'settings';
+  entityType:
+    | 'company'
+    | 'product'
+    | 'customer'
+    | 'invoice'
+    | 'settings'
+    | 'cash_session'
+    | 'cash_movement';
   entityId: string;
   operation: 'upsert' | 'delete' | 'cancel';
   status: SyncState;
@@ -245,6 +259,7 @@ export interface AppSettings {
   defaultNotes: string;
   autoPrintOnEmit: boolean;
   hidePromotionalFooter?: boolean;
+  allowCashierPriceEdit?: boolean;
   syncState?: SyncState;
   syncError?: string;
   synced?: boolean;
@@ -288,17 +303,55 @@ export const DEFAULT_PRODUCT_CATEGORIES = [
   'Geral',
 ] as const;
 
+export const DEFAULT_PRODUCT_UNITS = [
+  'un',
+  'kg',
+  'g',
+  'lt',
+  'ml',
+  'cx',
+  'pct',
+  'dz',
+  'm',
+  'm²',
+  'hr',
+  'serv',
+  'mês',
+] as const;
+
+export const DEFAULT_IVA_EXEMPTION_REASONS = [
+  'Isento nos termos da Lei do IVA (Cesta Básica)',
+  'Regime de Exclusão do IVA (Art.º 16.º do CIVA)',
+  'Isento ao abrigo do Art.º 12.º do CIVA',
+  'Não sujeito a IVA nos termos da legislação em vigor',
+] as const;
+
+export interface ProductPriceChange {
+  changedAtIso: string;
+  previousPrice: number;
+  newPrice: number;
+  previousCost?: number;
+  newCost?: number;
+  changedBy: string;
+}
+
 export interface Product {
   id: string;
   companyId?: string;
-  code: string;
+  code: string; // Código interno / SKU
+  barcode?: string; // Código de barras EAN / UPC / QR comercial
   name: string;
   category: string;
   unit: string;
-  price: number; // Preço Unitário em Kwanzas (Kz)
+  costPrice?: number; // Preço de aquisição em Kwanzas (Kz)
+  price: number; // Preço unitário de venda em Kwanzas (Kz)
   ivaRate: TaxRate;
   exemptionReason: string;
   active: boolean;
+  trackStock?: boolean;
+  stockQty?: number;
+  minStockQty?: number;
+  priceHistory?: ProductPriceChange[]; // Últimas 20 alterações de preço auditadas
   syncState?: SyncState;
   syncError?: string;
   synced?: boolean;
@@ -314,6 +367,7 @@ export interface Customer {
   locality: string;
   phone: string;
   address: string;
+  creditLimit?: number;
   syncState?: SyncState;
   syncError?: string;
   synced?: boolean;
@@ -346,6 +400,9 @@ export interface InvoiceTotals {
   lines: CalculatedLineItem[];
   merchandiseTotal: number;
   grossItemsTotal: number;
+  lineDiscountTotal: number;
+  globalDiscountPct: number;
+  globalDiscountAmount: number;
   discountTotal: number;
   taxBase14: number;
   taxAmount14: number;
@@ -371,6 +428,8 @@ export interface InvoiceRecord {
   customerLocality: string;
   merchandiseTotal: number;
   discountTotal: number;
+  globalDiscountPct?: number;
+  globalDiscountAmount?: number;
   taxBase14: number;
   taxAmount14: number;
   taxBase0: number;
@@ -378,8 +437,18 @@ export interface InvoiceRecord {
   taxTotal: number;
   grandTotal: number;
   amountInWords: string;
+  sessionId?: string;
   amountReceived: number;
+  initialAmountReceived?: number;
   changeAmount: number;
+  initialChangeAmount?: number;
+  amountDue?: number;
+  transferReference?: string;
+  paymentSplits?: PaymentSplit[];
+  paymentSummary?: string;
+  returnOriginInvoiceId?: string;
+  returnOriginNumber?: string;
+  returnCreditApplied?: number;
   notes: string;
   status: InvoiceStatus;
   cancelReason?: string;
@@ -392,3 +461,112 @@ export interface InvoiceRecord {
   createdAtIso: string;
   updatedAtIso: string;
 }
+
+export interface SuspendedSale {
+  id: string;
+  companyId: string;
+  label: string;
+  customerId: string;
+  customerName: string;
+  docType: DocumentType;
+  paymentMethod: PaymentMethod;
+  cart: CartDraftItem[];
+  globalDiscountPct: number;
+  notes: string;
+  suspendedAtIso: string;
+}
+
+export type CashMovementType =
+  | 'REFORCO'
+  | 'SANGRIA'
+  | 'ENTRADA'
+  | 'SAIDA'
+  | 'LIQUIDACAO_DIVIDA';
+
+export type CashSessionStatus = 'open' | 'closed';
+
+export interface CashMovement {
+  id: string;
+  companyId: string;
+  sessionId: string;
+  cashier: string;
+  operator: string;
+  type: CashMovementType;
+  amount: number;
+  paymentMethod: DirectPaymentMethod;
+  reason: string;
+  reference?: string;
+  invoiceId?: string;
+  invoiceNumber?: string;
+  customerName?: string;
+  createdByUid?: string;
+  syncState?: SyncState;
+  syncError?: string;
+  synced?: boolean;
+  createdAtIso: string;
+}
+
+export interface CashSession {
+  id: string;
+  companyId: string;
+  cashier: string;
+  operator: string;
+  openedByUid?: string;
+  closedByOperator?: string;
+  closedByUid?: string;
+  status: CashSessionStatus;
+  openingFloat: number;
+  openingNotes?: string;
+  openedAtIso: string;
+  closedAtIso?: string;
+  expectedCash?: number;
+  countedCash?: number;
+  differenceAmount?: number;
+  salesCash?: number;
+  salesMulticaixa?: number;
+  salesTransfer?: number;
+  salesCredit?: number;
+  debtCash?: number;
+  debtMulticaixa?: number;
+  debtTransfer?: number;
+  reforcosTotal?: number;
+  entradasTotal?: number;
+  sangriasTotal?: number;
+  saidasTotal?: number;
+  invoiceCount?: number;
+  closingNotes?: string;
+  syncState?: SyncState;
+  syncError?: string;
+  synced?: boolean;
+  createdAtIso: string;
+  updatedAtIso: string;
+}
+
+export interface CashSessionSummary {
+  openingFloat: number;
+  salesCash: number;
+  salesMulticaixa: number;
+  salesTransfer: number;
+  salesCredit: number;
+  debtCash: number;
+  debtMulticaixa: number;
+  debtTransfer: number;
+  totalByMethod: {
+    Dinheiro: number;
+    Multicaixa: number;
+    Transferência: number;
+    Crédito: number;
+  };
+  totalReceivedAllMethods: number;
+  reforcosTotal: number;
+  entradasTotal: number;
+  sangriasTotal: number;
+  saidasTotal: number;
+  expectedCash: number;
+  countedCash: number | null;
+  differenceAmount: number | null;
+  invoiceCount: number;
+  cancelledCount: number;
+  movementCount: number;
+}
+

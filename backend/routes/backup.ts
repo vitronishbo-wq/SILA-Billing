@@ -60,11 +60,13 @@ backupRouter.get('/', requireFirebaseAuth, async (req: AuthenticatedRequest, res
       ? ctx.db.collection('companies').doc(rawCompanyId)
       : ctx.db.collection('users').doc(user.uid);
 
-    const [productsSnap, customersSnap, invoicesSnap, settingsDoc, auditSnap] =
+    const [productsSnap, customersSnap, invoicesSnap, cashSessionsSnap, cashMovementsSnap, settingsDoc, auditSnap] =
       await Promise.all([
         rootRef.collection('products').get(),
         rootRef.collection('customers').get(),
         rootRef.collection('invoices').get(),
+        rootRef.collection('cash_sessions').get(),
+        rootRef.collection('cash_movements').get(),
         rootRef.collection('settings').doc('general').get(),
         rootRef.collection('audit_logs').get(),
       ]);
@@ -93,6 +95,8 @@ backupRouter.get('/', requireFirebaseAuth, async (req: AuthenticatedRequest, res
       })
     );
 
+    const cashSessions = cashSessionsSnap.docs.map((d) => ({ id: d.id, ...d.data() }));
+    const cashMovements = cashMovementsSnap.docs.map((d) => ({ id: d.id, ...d.data() }));
     const auditLogs = auditSnap.docs.map((d) => ({ id: d.id, ...d.data() }));
 
     const companySummary = membership.companyData
@@ -123,6 +127,8 @@ backupRouter.get('/', requireFirebaseAuth, async (req: AuthenticatedRequest, res
         products: products.length,
         customers: customers.length,
         invoices: invoices.length,
+        cashSessions: cashSessions.length,
+        cashMovements: cashMovements.length,
         auditLogs: auditLogs.length,
       },
       data: {
@@ -130,6 +136,8 @@ backupRouter.get('/', requireFirebaseAuth, async (req: AuthenticatedRequest, res
         products,
         customers,
         invoices,
+        cashSessions,
+        cashMovements,
         auditLogs,
       },
     };

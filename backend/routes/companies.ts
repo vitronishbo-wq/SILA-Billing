@@ -295,11 +295,13 @@ companiesRouter.get(
 
     try {
       const compRef = ctx.db.collection('companies').doc(companyId);
-      const [prodSnap, custSnap, invSnap, membersSnap, settingsDoc] = await Promise.all([
+      const [prodSnap, custSnap, invSnap, membersSnap, sessSnap, movSnap, settingsDoc] = await Promise.all([
         compRef.collection('products').get(),
         compRef.collection('customers').get(),
         compRef.collection('invoices').get(),
         compRef.collection('members').get(),
+        compRef.collection('cash_sessions').get(),
+        compRef.collection('cash_movements').get(),
         compRef.collection('settings').doc('general').get(),
       ]);
 
@@ -345,6 +347,8 @@ companiesRouter.get(
         products: prodSnap.docs.map((p) => ({ id: p.id, ...p.data() })),
         customers,
         invoices,
+        cashSessions: sessSnap.docs.map((s) => ({ id: s.id, ...s.data() })),
+        cashMovements: movSnap.docs.map((m) => ({ id: m.id, ...m.data() })),
         settings: settingsDoc.exists ? settingsDoc.data() : null,
       });
     } catch (err) {

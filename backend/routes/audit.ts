@@ -22,12 +22,18 @@ interface AuditInvoicePayload {
   issuedAtIso: string;
   cashier: string;
   operator: string;
-  paymentMethod: 'Dinheiro' | 'Multicaixa' | 'Transferência';
+  paymentMethod: 'Dinheiro' | 'Multicaixa' | 'Transferência' | 'Crédito' | 'Combinado';
   customerId: string;
   customerName: string;
   customerNif: string;
   customerLocality: string;
+  globalDiscountPct?: number;
   amountReceived: number;
+  transferReference?: string;
+  paymentSummary?: string;
+  returnOriginInvoiceId?: string;
+  returnOriginNumber?: string;
+  returnCreditApplied?: number;
   notes?: string;
   clientGrandTotal?: number;
   lines: Array<{
@@ -92,13 +98,20 @@ auditRouter.post('/invoices', requireFirebaseAuth, async (req: AuthenticatedRequ
     });
   }
 
-  // Recalcula de forma determinística no servidor os valores de IVA 14%, Isenção 0%, Mercadorias e Total
-  const serverCalc = calculateInvoiceTotals(draftItems);
-  const amountReceived = Math.max(
+  // Recalcula de forma determinística no servidor os valores de IVA 14%, Isenção 0%, Mercadorias, Desconto Global e Total
+  const globalDiscountPct = Math.min(100, Math.max(0, Number(body.globalDiscountPct) || 0));
+  const serverCalc = calculateInvoiceTotals(draftItems, globalDiscountPct);
+  const returnCredit = Math.min(
     serverCalc.grandTotal,
-    roundKz(Number(body.amountReceived) || serverCalc.grandTotal)
+    Math.max(0, roundKz(Number(body.returnCreditApplied) || 0))
   );
-  const changeAmount = Math.max(0, roundKz(amountReceived - serverCalc.grandTotal));
+  const netPayable = Math.max(0, roundKz(serverCalc.grandTotal - returnCredit));
+  const rawReceived = Number(body.amountReceived);
+  const amountReceived = Number.isFinite(rawReceived) && rawReceived >= 0
+    ? roundKz(rawReceived)
+    : netPayable;
+  const changeAmount = Math.max(0, roundKz(amountReceived - netPayable));
+  const amountDue = Math.max(0, roundKz(netPayable - amountReceived));
 
   const clientTotalDelta =
     typeof body.clientGrandTotal === 'number'
@@ -169,7 +182,10 @@ auditRouter.post('/invoices', requireFirebaseAuth, async (req: AuthenticatedRequ
           cashier: String(body.cashier || '01').slice(0, 16),
           operator: String(body.operator || '001').slice(0, 32),
           paymentMethod:
-            body.paymentMethod === 'Multicaixa' || body.paymentMethod === 'Transferência'
+            body.paymentMethod === 'Multicaixa' ||
+            body.paymentMethod === 'Transferência' ||
+            body.paymentMethod === 'Crédito' ||
+            body.paymentMethod === 'Combinado'
               ? body.paymentMethod
               : 'Dinheiro',
           customerId: String(body.customerId || 'cust_direct')
@@ -180,6 +196,8 @@ auditRouter.post('/invoices', requireFirebaseAuth, async (req: AuthenticatedRequ
           customerLocality: String(body.customerLocality || 'Angola').slice(0, 160),
           merchandiseTotal: serverCalc.merchandiseTotal,
           discountTotal: serverCalc.discountTotal,
+          ...(serverCalc.globalDiscountPct ? { globalDiscountPct: serverCalc.globalDiscountPct } : {}),
+          ...(serverCalc.globalDiscountAmount ? { globalDiscountAmount: serverCalc.globalDiscountAmount } : {}),
           taxBase14: serverCalc.taxBase14,
           taxAmount14: serverCalc.taxAmount14,
           taxBase0: serverCalc.taxBase0,
@@ -189,6 +207,12 @@ auditRouter.post('/invoices', requireFirebaseAuth, async (req: AuthenticatedRequ
           amountInWords: serverCalc.amountInWords.slice(0, 300),
           amountReceived,
           changeAmount,
+          ...(amountDue > 0 ? { amountDue } : {}),
+          ...(body.transferReference ? { transferReference: String(body.transferReference).slice(0, 80) } : {}),
+          ...(body.paymentSummary ? { paymentSummary: String(body.paymentSummary).slice(0, 160) } : {}),
+          ...(body.returnOriginInvoiceId ? { returnOriginInvoiceId: String(body.returnOriginInvoiceId).slice(0, 128) } : {}),
+          ...(body.returnOriginNumber ? { returnOriginNumber: String(body.returnOriginNumber).slice(0, 40) } : {}),
+          ...(body.returnCreditApplied ? { returnCreditApplied: Math.max(0, roundKz(Number(body.returnCreditApplied) || 0)) } : {}),
           notes: String(body.notes || '').slice(0, 300),
           itemCount: serverCalc.lines.length,
           status: 'issued',
