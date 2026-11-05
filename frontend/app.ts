@@ -14,6 +14,7 @@ import {
   canCompanyHideViralFooter,
   canCompanyManageMultiOperatorTeam,
   canCompanySyncCloudData,
+  CalculatedLineItem,
   CartDraftItem,
   CashMovement,
   CashMovementType,
@@ -26,13 +27,17 @@ import {
   CompanyRecord,
   CompanyRole,
   Customer,
+  DEFAULT_EXPENSE_CATEGORIES,
+  DEFAULT_EXTRA_REVENUE_CATEGORIES,
   DEFAULT_IVA_EXEMPTION_REASONS,
   DEFAULT_PRODUCT_CATEGORIES,
   DEFAULT_PRODUCT_UNITS,
   DEFAULT_SETTINGS,
+  DEFAULT_WAREHOUSE_ID,
   DirectPaymentMethod,
   DocumentFormat,
   DocumentType,
+  FinancialEntryKind,
   FREE_COURTESY_BUFFER,
   FREE_MONTHLY_INVOICE_LIMIT,
   FREE_SOFT_NOTICE_THRESHOLD,
@@ -50,7 +55,14 @@ import {
   PlanTier,
   Product,
   ProductPriceChange,
+  PurchaseLineItem,
+  PurchasePaymentMethod,
+  PurchaseRecord,
   shouldShowViralDocumentFooter,
+  StockMovement,
+  StockMovementDirection,
+  StockMovementType,
+  Supplier,
   SuspendedSale,
   TaxRate,
   VITRONIS_INSTITUTIONAL,
@@ -58,6 +70,8 @@ import {
 import {
   filterCustomersSmart,
   filterInvoicesSmart,
+  filterPurchasesSmart,
+  filterSuppliersSmart,
   searchProductsSmart,
   SmartProductSearchResult,
 } from '../src/core/smartSearch';
@@ -66,17 +80,21 @@ import {
   cancelInvoiceCloud,
   createCashMovementCloud,
   createInvoiceCloud,
+  createStockMovementCloud,
   ensureCompanyRegisteredCloud,
   pullCompanyFromCloud,
   pullOwnedCompaniesFromCloud,
   removeCustomerCloud,
   removeProductCloud,
+  removeSupplierCloud,
   updateProductStockCloud,
   upsertCashSessionCloud,
   upsertCompanyMemberCloud,
   upsertCustomerCloud,
   upsertProductCloud,
+  upsertPurchaseCloud,
   upsertSettingsCloud,
+  upsertSupplierCloud,
 } from '../src/services/cloudSync';
 import {
   auth,
@@ -111,9 +129,17 @@ import {
   updatePlatformCompanyAdmin,
 } from './services/backendApi';
 import {
+  buildInvoicesCsvContent,
+  buildInvoicesExcelXml,
+  classifyInvoiceControlStatus,
+  summarizeDocumentControlList,
+  triggerBrowserDownload,
+} from '../src/core/documentExport';
+import {
   generateInvoiceQrDataUrl,
   renderCashClosureReportHtml,
   renderDocumentHtml,
+  renderHistoryControlReportHtml,
 } from './ui/documentRenderer';
 import { ICONS } from './ui/icons';
 import {
@@ -133,11 +159,26 @@ type ActiveModule =
   | 'CASH'
   | 'CUSTOMERS'
   | 'PRODUCTS'
+  | 'PURCHASES'
+  | 'FINANCE'
+  | 'INDICATORS'
   | 'HISTORY'
   | 'SETTINGS'
   | 'SYNC';
 
 type SidebarState = 'EXPANDED' | 'ICONS' | 'HIDDEN';
+
+type HistoryStatusFilter =
+  | 'ALL'
+  | 'PAID'
+  | 'PENDING'
+  | 'PARTIAL'
+  | 'DEBT_ALL'
+  | 'CREDIT_NOTES'
+  | 'CANCELLED'
+  | 'PROFORMA';
+
+type HistoryPeriodFilter = 'ALL' | 'TODAY' | 'THIS_MONTH' | 'LAST_30D' | 'THIS_YEAR' | 'CUSTOM';
 
 interface BeforeInstallPromptEvent extends Event {
   prompt: () => Promise<void>;
@@ -264,9 +305,11 @@ export class SilaBillingApp {
   private lastAuditHash = '';
   private draftSaveTimer: number | null = null;
 
-  // Estado Produtos / Clientes / Histórico
+  // Estado Produtos / Stock e Movimentação / Clientes / Histórico
+  private stockMovements: StockMovement[] = [];
+  private productsSubView: 'CATALOG' | 'MOVEMENTS' | 'INVENTORY' = 'CATALOG';
   private productSearch = '';
-  private productFilter: 'ALL' | 'ACTIVE' | 'INACTIVE' | 'LOW_STOCK' = 'ALL';
+  private productFilter: 'ALL' | 'ACTIVE' | 'INACTIVE' | 'OUT_OF_STOCK' | 'LOW_STOCK' = 'ALL';
   private productCategoryFilter = 'ALL';
   private selectedProductDetailId = '';
   private editingProduct: Product | null = null;
@@ -281,6 +324,40 @@ export class SilaBillingApp {
   private quickStockProductId: string | null = null;
   private quickStockAdjustInput = '';
   private confirmDeleteProductId: string | null = null;
+  private stockMovementPanelOpen = false;
+  private stockMovementDraft: {
+    productId: string;
+    type: 'ENTRADA_MERCADORIA' | 'DEVOLUCAO_CLIENTE' | 'AJUSTE_INVENTARIO';
+    adjustMode: 'DELTA' | 'EXACT';
+    qtyInput: string;
+    unitCostInput: string;
+    reason: string;
+    reference: string;
+  } = {
+    productId: '',
+    type: 'ENTRADA_MERCADORIA',
+    adjustMode: 'DELTA',
+    qtyInput: '',
+    unitCostInput: '',
+    reason: '',
+    reference: '',
+  };
+  private stockMovementError: string | null = null;
+  private stockLedgerFilter:
+    | 'ALL'
+    | 'ENTRADA_MERCADORIA'
+    | 'SAIDA_VENDA'
+    | 'DEVOLUCAO_CLIENTE'
+    | 'AJUSTE_INVENTARIO'
+    | 'RECONCILIACAO_FISICA' = 'ALL';
+  private stockLedgerSearch = '';
+  private stockLedgerProductId = '';
+  private inventoryCountInputs: Record<string, string> = {};
+  private inventoryNotes = '';
+  private inventoryOperator = '';
+  private inventoryError: string | null = null;
+  private inventoryOnlyDifferences = false;
+  private inventoryIncludeUntracked = false;
 
   private customerSearch = '';
   private customerFilter: 'ALL' | 'WITH_DEBT' | 'WITH_LIMIT' = 'ALL';
@@ -294,8 +371,136 @@ export class SilaBillingApp {
   private quickCustomerError: string | null = null;
   private dbBootError: string | null = null;
 
+  // Estado Compras e Fornecedores (Módulo 6)
+  private suppliers: Supplier[] = [];
+  private purchases: PurchaseRecord[] = [];
+  private purchasesSubView: 'PURCHASES' | 'SUPPLIERS' = 'PURCHASES';
+  private purchaseSearch = '';
+  private purchaseFilter: 'ALL' | 'PAYABLE' | 'OVERDUE' | 'PAID' | 'CANCELLED' = 'ALL';
+  private purchaseSupplierFilterId = 'ALL';
+  private selectedPurchaseDetailId = '';
+  private purchasePanelOpen = false;
+  private purchaseCatalogSearch = '';
+  private purchaseFormDraft = {
+    supplierId: '',
+    supplierInvoiceRef: '',
+    dueDateIso: '',
+    paymentMode: 'PAID' as 'PAID' | 'CREDIT' | 'PARTIAL',
+    paymentMethod: 'Transferência' as DirectPaymentMethod,
+    amountPaidInput: '',
+    reference: '',
+    updateStock: true,
+    recordInCashSession: true,
+    notes: '',
+  };
+  private purchaseDraftLines: Array<{
+    productId: string;
+    code: string;
+    name: string;
+    unit: string;
+    qtyInput: string;
+    unitCostInput: string;
+  }> = [];
+  private purchaseFormError: string | null = null;
+  private purchasesWorkspaceNotice: string | null = null;
+  private showPurchaseQuickSupplier = false;
+  private purchaseQuickSupplierDraft = {
+    name: '',
+    nif: '',
+    phone: '',
+    locality: '',
+    paymentTermsDaysInput: '',
+  };
+  private purchaseQuickSupplierError: string | null = null;
+  private settlingPurchaseId: string | null = null;
+  private settlingSupplierAccountId: string | null = null;
+  private purchaseSettleAmountInput = '';
+  private purchaseSettleMethod: DirectPaymentMethod = 'Transferência';
+  private purchaseSettleReference = '';
+  private purchaseSettleRecordCash = true;
+  private purchaseSettleError: string | null = null;
+  private cancellingPurchaseId: string | null = null;
+  private cancelPurchaseReason = '';
+  private cancelPurchaseError: string | null = null;
+
+  private supplierSearch = '';
+  private supplierFilter: 'ALL' | 'WITH_PAYABLE' | 'ACTIVE' | 'INACTIVE' = 'ALL';
+  private selectedSupplierDetailId = '';
+  private editingSupplier: Supplier | null = null;
+  private editingSupplierTermsInput = '';
+  private isNewSupplier = false;
+  private supplierFormError: string | null = null;
+  private confirmDeleteSupplierId: string | null = null;
+
+  // Estado Gestão Financeira (Contas a Receber/Pagar, Despesas, Receitas Extra, Fluxo de Caixa, DRE e Margens)
+  private financeSubView: 'OVERVIEW' | 'ACCOUNTS' | 'CASHFLOW' | 'MARGINS' = 'OVERVIEW';
+  private financePeriod: 'THIS_MONTH' | 'TODAY' | 'LAST_30D' | 'THIS_YEAR' | 'ALL' = 'THIS_MONTH';
+  private financeAccountsSide: 'RECEIVABLES' | 'PAYABLES' = 'RECEIVABLES';
+  private financeReceivableFilter:
+    | 'OPEN_ALL'
+    | 'CREDIT_SALES'
+    | 'PARTIAL_PAYMENTS'
+    | 'BY_CUSTOMER'
+    | 'SETTLED_CREDIT' = 'OPEN_ALL';
+  private financePayableFilter: 'OPEN_ALL' | 'OVERDUE' | 'PARTIAL_PAYMENTS' | 'BY_SUPPLIER' =
+    'OPEN_ALL';
+  private financeAccountsSearch = '';
+  private financeEntryPanel: 'DESPESA_OPERACIONAL' | 'RECEITA_EXTRAORDINARIA' | null = null;
+  private financeEntryDraft = {
+    category: DEFAULT_EXPENSE_CATEGORIES[0] as string,
+    amountInput: '',
+    paymentMethod: 'Transferência' as DirectPaymentMethod,
+    reason: '',
+    reference: '',
+    affectCashDrawer: true,
+  };
+  private financeEntryError: string | null = null;
+  private financeWorkspaceNotice: string | null = null;
+  private financeCashflowFilter:
+    | 'ALL'
+    | 'INFLOWS'
+    | 'OUTFLOWS'
+    | 'EXPENSES'
+    | 'EXTRA_REVENUES'
+    | 'DEBT_COLLECTIONS'
+    | 'SUPPLIER_PAYMENTS' = 'ALL';
+  private financeCashflowSearch = '';
+  private financeMarginFilter: 'ALL' | 'SOLD_IN_PERIOD' | 'LOW_MARGIN' | 'NO_COST' = 'ALL';
+  private financeMarginSort:
+    | 'PROFIT_DESC'
+    | 'MARGIN_DESC'
+    | 'MARGIN_ASC'
+    | 'QTY_DESC'
+    | 'QTY_ASC' = 'PROFIT_DESC';
+  private financeMarginSearch = '';
+  private financeEditingProductId: string | null = null;
+  private financeEditCostInput = '';
+  private financeEditPriceInput = '';
+  private financeEditProductError: string | null = null;
+
+  // Estado Indicadores Comerciais no Backoffice (Módulo 9 — reutiliza financePeriod)
+  private indicatorsTrendMode: 'DAILY' | 'MONTHLY' = 'DAILY';
+  private indicatorsLeastSoldMode: 'ALL_ACTIVE' | 'SOLD_ONLY' = 'ALL_ACTIVE';
+  private indicatorsMarginRankMode: 'PCT' | 'REALIZED' = 'PCT';
+
   private historySearch = '';
   private historyDebtOnly = false;
+  private historyStatusFilter: HistoryStatusFilter = 'ALL';
+  private historyPeriod: HistoryPeriodFilter = 'ALL';
+  private historyDateFrom = '';
+  private historyDateTo = '';
+  private historyOperatorFilter = 'ALL';
+  private historyRightTab: 'PREVIEW' | 'AUDIT' = 'PREVIEW';
+  private historyWorkspaceNotice: string | null = null;
+  private creditNoteOriginId: string | null = null;
+  private creditNoteLineQtys: Record<string, string> = {};
+  private creditNoteReason = '';
+  private creditNoteRestoreStock = true;
+  private creditNoteRefundMode: 'CREDIT_ACCOUNT' | 'REFUND_NOW' = 'CREDIT_ACCOUNT';
+  private creditNoteRefundMethod: DirectPaymentMethod = 'Dinheiro';
+  private creditNoteRefundRef = '';
+  private creditNoteAffectCashDrawer = true;
+  private creditNoteError: string | null = null;
   private selectedHistoryId = '';
   private historyViewFormat: DocumentFormat = 'POS';
   private settlingInvoiceId: string | null = null;
@@ -358,6 +563,19 @@ export class SilaBillingApp {
   private selectedTerminalRole: CompanyRole = 'owner';
   private memberFormError: string | null = null;
 
+  // Estado Segurança e Controlo Operacional (Módulo 10)
+  private showOperatorSwitchModal = false;
+  private showSupervisorAuthModal = false;
+  private supervisorAuthAction: 'DISCOUNT_LINE' | 'DISCOUNT_GLOBAL' | 'CANCEL_INVOICE' | 'PRICE_EDIT' | null = null;
+  private supervisorAuthTargetId = '';
+  private supervisorAuthPendingVal = 0;
+  private supervisorAuthPinInput = '';
+  private supervisorAuthError: string | null = null;
+  private supervisorAuthorizedBy: string | null = null;
+  private historyActiveMainTab: 'DOCUMENTS' | 'OPERATIONAL_AUDIT' = 'DOCUMENTS';
+  private operationalAuditTypeFilter: 'ALL' | 'EMISSION' | 'CANCELLATION' | 'DISCOUNT' | 'PRICE_CHANGE' | 'CASH_SESSION' | 'CASH_MOVEMENT' | 'REPRINT' = 'ALL';
+  private operationalAuditSearch = '';
+
   private showMasterAdminModal = false;
   private isAuthenticatingAdmin = false;
   private masterAdminLoading = false;
@@ -400,11 +618,20 @@ export class SilaBillingApp {
 
   // Cache de QR Codes para renderização fluida sem flicker
   private qrCache = new Map<string, string>();
-  private printJob: { invoice: InvoiceRecord; format: DocumentFormat; qr: string } | null = null;
+  private printJob: {
+    invoice: InvoiceRecord;
+    format: DocumentFormat;
+    qr: string;
+    isReprint?: boolean;
+  } | null = null;
   private cashPrintJob: {
     session: CashSession;
     summary: CashSessionSummary;
     format: DocumentFormat;
+  } | null = null;
+  private historyReportPrintJob: {
+    invoices: InvoiceRecord[];
+    filterLabel: string;
   } | null = null;
 
   constructor(root: HTMLElement) {
@@ -569,6 +796,18 @@ export class SilaBillingApp {
     this.settlingInvoiceId = null;
     this.settlingCustomerAccountId = null;
     this.settleError = null;
+    this.historyStatusFilter = 'ALL';
+    this.historyDebtOnly = false;
+    this.historyPeriod = 'ALL';
+    this.historyDateFrom = '';
+    this.historyDateTo = '';
+    this.historyOperatorFilter = 'ALL';
+    this.historyRightTab = 'PREVIEW';
+    this.historyWorkspaceNotice = null;
+    this.creditNoteOriginId = null;
+    this.creditNoteLineQtys = {};
+    this.creditNoteReason = '';
+    this.creditNoteError = null;
     this.confirmRemoveCartProductId = null;
     this.confirmClearCart = false;
     this.returnOriginInvoice = null;
@@ -576,6 +815,52 @@ export class SilaBillingApp {
     this.suspendedSales = [];
     this.cashSessions = Array.isArray(data.cashSessions) ? data.cashSessions : [];
     this.cashMovements = Array.isArray(data.cashMovements) ? data.cashMovements : [];
+    this.stockMovements = Array.isArray(data.stockMovements) ? data.stockMovements : [];
+    this.suppliers = Array.isArray(data.suppliers) ? data.suppliers : [];
+    this.purchases = Array.isArray(data.purchases) ? data.purchases : [];
+    this.purchasesSubView = 'PURCHASES';
+    this.purchaseSearch = '';
+    this.purchaseFilter = 'ALL';
+    this.purchaseSupplierFilterId = 'ALL';
+    this.selectedPurchaseDetailId = this.purchases[0]?.id || '';
+    this.purchasePanelOpen = false;
+    this.purchaseCatalogSearch = '';
+    this.purchaseDraftLines = [];
+    this.purchaseFormError = null;
+    this.purchasesWorkspaceNotice = null;
+    this.showPurchaseQuickSupplier = false;
+    this.purchaseQuickSupplierError = null;
+    this.settlingPurchaseId = null;
+    this.settlingSupplierAccountId = null;
+    this.purchaseSettleError = null;
+    this.cancellingPurchaseId = null;
+    this.cancelPurchaseReason = '';
+    this.cancelPurchaseError = null;
+    this.supplierSearch = '';
+    this.supplierFilter = 'ALL';
+    this.selectedSupplierDetailId = this.suppliers[0]?.id || '';
+    this.editingSupplier = null;
+    this.editingSupplierTermsInput = '';
+    this.isNewSupplier = false;
+    this.supplierFormError = null;
+    this.confirmDeleteSupplierId = null;
+    this.financeEntryPanel = null;
+    this.financeEntryError = null;
+    this.financeWorkspaceNotice = null;
+    this.financeEditingProductId = null;
+    this.financeEditProductError = null;
+    this.productsSubView = 'CATALOG';
+    this.stockMovementPanelOpen = false;
+    this.stockMovementError = null;
+    this.stockLedgerFilter = 'ALL';
+    this.stockLedgerSearch = '';
+    this.stockLedgerProductId = '';
+    this.inventoryCountInputs = {};
+    this.inventoryNotes = '';
+    this.inventoryOperator = data.settings.defaultOperator || '001';
+    this.inventoryError = null;
+    this.inventoryOnlyDifferences = false;
+    this.inventoryIncludeUntracked = false;
     this.activeCashActionPanel = null;
     this.cashOpenError = null;
     this.cashMovementError = null;
@@ -767,21 +1052,27 @@ export class SilaBillingApp {
     };
   }
 
-  private getInvoiceRenderOptions(invoice: InvoiceRecord, showViralFooter: boolean): {
+  private getInvoiceRenderOptions(
+    invoice: InvoiceRecord,
+    showViralFooter: boolean,
+    isReprint = false
+  ): {
     showViralFooter: boolean;
     customerAddress?: string;
     customerPhone?: string;
+    isReprint?: boolean;
   } {
     const directCustId = getDirectCustomerIdForCompany(this.activeCompany.id);
     if (!invoice.customerId || invoice.customerId === directCustId) {
-      return { showViralFooter };
+      return { showViralFooter, ...(isReprint ? { isReprint: true } : {}) };
     }
     const cust = this.customers.find((c) => c.id === invoice.customerId);
-    if (!cust) return { showViralFooter };
+    if (!cust) return { showViralFooter, ...(isReprint ? { isReprint: true } : {}) };
     return {
       showViralFooter,
       customerAddress: cust.address || undefined,
       customerPhone: cust.phone || undefined,
+      ...(isReprint ? { isReprint: true } : {}),
     };
   }
 
@@ -912,7 +1203,13 @@ export class SilaBillingApp {
           const synced: CashMovement = { ...mov, syncState: 'synced', synced: true };
           await localDb.saveCashMovement(synced, this.activeCompany.id);
           this.cashMovements = this.cashMovements.map((m) => (m.id === synced.id ? synced : m));
-          if (this.activeModule === 'CASH' || this.activeModule === 'SYNC') this.render();
+          if (
+            this.activeModule === 'CASH' ||
+            this.activeModule === 'FINANCE' ||
+            this.activeModule === 'SYNC'
+          ) {
+            this.render();
+          }
         })
         .catch(() => null);
     }
@@ -976,6 +1273,9 @@ export class SilaBillingApp {
   private async recordCashDrawerMovement(params: {
     session: CashSession;
     type: Exclude<CashMovementType, 'LIQUIDACAO_DIVIDA'>;
+    entryKind?: FinancialEntryKind;
+    category?: string;
+    purchaseId?: string;
     amount: number;
     paymentMethod: DirectPaymentMethod;
     reason: string;
@@ -1017,6 +1317,7 @@ export class SilaBillingApp {
 
     const now = new Date().toISOString();
     const cleanRef = (params.reference || '').trim().slice(0, 80);
+    const cleanCat = (params.category || '').trim().slice(0, 64);
     const movement: CashMovement = {
       id: `cm_${Date.now()}_${Math.random().toString(36).slice(2, 6)}`,
       companyId: this.activeCompany.id,
@@ -1025,10 +1326,13 @@ export class SilaBillingApp {
       operator: this.operator || params.session.operator,
       createdByUid: this.user?.uid,
       type: params.type,
+      ...(params.entryKind ? { entryKind: params.entryKind } : {}),
+      ...(cleanCat ? { category: cleanCat } : {}),
       amount: amt,
       paymentMethod: method,
       reason: cleanReason,
       ...(cleanRef ? { reference: cleanRef } : {}),
+      ...(params.purchaseId ? { purchaseId: params.purchaseId } : {}),
       syncState: 'pending',
       synced: false,
       createdAtIso: now,
@@ -1114,6 +1418,7 @@ export class SilaBillingApp {
     this.isPrinting = true;
     document.body.setAttribute('data-print-mode', format);
     this.printJob = null;
+    this.historyReportPrintJob = null;
     this.cashPrintJob = { session, summary, format };
     this.render();
     window.setTimeout(() => {
@@ -1127,13 +1432,62 @@ export class SilaBillingApp {
     }, 100);
   }
 
+  private async persistAndSyncStockMovement(mov: StockMovement): Promise<void> {
+    if (!this.activeCompany.id) return;
+    await localDb.saveStockMovement(mov, this.activeCompany.id);
+    const exists = this.stockMovements.some((m) => m.id === mov.id);
+    this.stockMovements = exists
+      ? this.stockMovements.map((m) => (m.id === mov.id ? mov : m))
+      : [mov, ...this.stockMovements];
+    this.stockMovements.sort((a, b) => b.createdAtIso.localeCompare(a.createdAtIso));
+
+    if (this.user && this.isOnline && canCompanySyncCloudData(this.activeCompany)) {
+      void ensureCompanyRegisteredCloud(this.activeCompany)
+        .then(() => createStockMovementCloud(mov, this.activeCompany))
+        .then(async () => {
+          const synced: StockMovement = { ...mov, syncState: 'synced', synced: true };
+          await localDb.saveStockMovement(synced, this.activeCompany.id);
+          this.stockMovements = this.stockMovements.map((m) => (m.id === synced.id ? synced : m));
+          if (this.activeModule === 'PRODUCTS' || this.activeModule === 'SYNC') this.render();
+        })
+        .catch(() => null);
+    }
+  }
+
+  private getCurrentStockOperatorLabel(): string {
+    const openSess = this.getActiveOpenCashSession();
+    return (
+      openSess?.operator ||
+      this.operator ||
+      this.settings.defaultOperator ||
+      this.user?.displayName ||
+      this.user?.email ||
+      '001'
+    )
+      .trim()
+      .slice(0, 32) || '001';
+  }
+
   private async adjustCatalogStockForInvoiceLines(
     lines: ReadonlyArray<{ productId: string; code: string; qty: number }>,
-    direction: 'DEDUCT' | 'RESTORE'
+    direction: 'DEDUCT' | 'RESTORE',
+    context?: {
+      type?: StockMovementType;
+      reason?: string;
+      invoiceId?: string;
+      invoiceNumber?: string;
+      operator?: string;
+    }
   ): Promise<void> {
     if (!this.activeCompany.id) return;
     const factor = direction === 'DEDUCT' ? -1 : 1;
     const updatedProducts: Product[] = [];
+    const createdMovements: StockMovement[] = [];
+    const now = new Date().toISOString();
+    const movType: StockMovementType =
+      context?.type || (direction === 'DEDUCT' ? 'SAIDA_VENDA' : 'DEVOLUCAO_CLIENTE');
+    const movDir: StockMovementDirection = direction === 'DEDUCT' ? 'OUT' : 'IN';
+    const movOperator = (context?.operator || this.getCurrentStockOperatorLabel()).slice(0, 32);
 
     for (const line of lines) {
       const idx = this.products.findIndex(
@@ -1144,22 +1498,74 @@ export class SilaBillingApp {
       if (!target.trackStock) continue;
 
       const currentStock = Number(target.stockQty) || 0;
-      const nextStock = roundKz(currentStock + factor * line.qty);
+      const qtyAbs = Math.max(0, roundKz(Math.abs(line.qty)));
+      if (qtyAbs <= 0) continue;
+      const nextStock = roundKz(currentStock + factor * qtyAbs);
       const nextProd: Product = {
         ...target,
         stockQty: nextStock,
         syncState: 'pending',
         synced: false,
-        updatedAtIso: new Date().toISOString(),
+        updatedAtIso: now,
       };
       this.products[idx] = nextProd;
       updatedProducts.push(nextProd);
       await localDb.saveProduct(nextProd, this.activeCompany.id).catch(() => null);
+
+      const defaultReason =
+        direction === 'DEDUCT'
+          ? `Saída automática por venda${context?.invoiceNumber ? ` ${context.invoiceNumber}` : ''}`
+          : `Reposição em stock${context?.invoiceNumber ? ` ref. ${context.invoiceNumber}` : ''}`;
+
+      const mov: StockMovement = {
+        id: `sm_${Date.now()}_${Math.random().toString(36).slice(2, 6)}`,
+        companyId: this.activeCompany.id,
+        productId: nextProd.id,
+        productCode: nextProd.code,
+        productName: nextProd.name,
+        unit: nextProd.unit || 'un',
+        type: movType,
+        direction: movDir,
+        qty: qtyAbs,
+        previousStock: currentStock,
+        newStock: nextStock,
+        ...(typeof nextProd.costPrice === 'number' && nextProd.costPrice > 0
+          ? { unitCost: nextProd.costPrice }
+          : {}),
+        warehouseId: DEFAULT_WAREHOUSE_ID,
+        reason: (context?.reason || defaultReason).trim().slice(0, 240),
+        ...(context?.invoiceNumber ? { reference: context.invoiceNumber.slice(0, 80) } : {}),
+        ...(context?.invoiceId ? { invoiceId: context.invoiceId } : {}),
+        ...(context?.invoiceNumber ? { invoiceNumber: context.invoiceNumber.slice(0, 40) } : {}),
+        operator: movOperator,
+        ...(this.user?.uid ? { createdByUid: this.user.uid } : {}),
+        syncState: 'pending',
+        synced: false,
+        createdAtIso: now,
+      };
+      createdMovements.push(mov);
+      await localDb.saveStockMovement(mov, this.activeCompany.id).catch(() => null);
     }
 
-    if (updatedProducts.length > 0 && this.user && this.isOnline && canCompanySyncCloudData(this.activeCompany)) {
+    if (createdMovements.length > 0) {
+      this.stockMovements = [...createdMovements, ...this.stockMovements].sort((a, b) =>
+        b.createdAtIso.localeCompare(a.createdAtIso)
+      );
+    }
+
+    if (
+      updatedProducts.length > 0 &&
+      this.user &&
+      this.isOnline &&
+      canCompanySyncCloudData(this.activeCompany)
+    ) {
       for (const up of updatedProducts) {
-        void updateProductStockCloud(up.id, up.stockQty ?? 0, this.activeCompany.id, this.activeCompany)
+        void updateProductStockCloud(
+          up.id,
+          up.stockQty ?? 0,
+          this.activeCompany.id,
+          this.activeCompany
+        )
           .then(async () => {
             const synced: Product = { ...up, syncState: 'synced', synced: true };
             await localDb.saveProduct(synced, this.activeCompany.id).catch(() => null);
@@ -1167,7 +1573,376 @@ export class SilaBillingApp {
           })
           .catch(() => null);
       }
+      for (const sm of createdMovements) {
+        void createStockMovementCloud(sm, this.activeCompany)
+          .then(async () => {
+            const syncedMov: StockMovement = { ...sm, syncState: 'synced', synced: true };
+            await localDb.saveStockMovement(syncedMov, this.activeCompany.id).catch(() => null);
+            this.stockMovements = this.stockMovements.map((m) =>
+              m.id === syncedMov.id ? syncedMov : m
+            );
+          })
+          .catch(() => null);
+      }
     }
+  }
+
+  private openStockMovementModalForProduct(
+    productId?: string,
+    presetType: 'ENTRADA_MERCADORIA' | 'DEVOLUCAO_CLIENTE' | 'AJUSTE_INVENTARIO' = 'ENTRADA_MERCADORIA',
+    adjustMode: 'DELTA' | 'EXACT' = 'DELTA'
+  ): void {
+    const fallbackProd =
+      this.products.find((p) => p.id === productId) ||
+      this.products.find((p) => p.id === this.selectedProductDetailId) ||
+      this.products[0] ||
+      null;
+    const chosenId = fallbackProd?.id || '';
+    this.stockMovementPanelOpen = true;
+    this.stockMovementError = null;
+    this.quickStockProductId = null;
+    this.stockMovementDraft = {
+      productId: chosenId,
+      type: presetType,
+      adjustMode,
+      qtyInput:
+        presetType === 'AJUSTE_INVENTARIO' && adjustMode === 'EXACT' && fallbackProd
+          ? String(fallbackProd.stockQty ?? 0)
+          : '',
+      unitCostInput:
+        presetType === 'ENTRADA_MERCADORIA' &&
+        fallbackProd &&
+        typeof fallbackProd.costPrice === 'number' &&
+        fallbackProd.costPrice > 0
+          ? String(fallbackProd.costPrice)
+          : '',
+      reason:
+        presetType === 'ENTRADA_MERCADORIA'
+          ? 'Reposição / compra de mercadoria'
+          : presetType === 'DEVOLUCAO_CLIENTE'
+            ? 'Devolução de cliente ao stock'
+            : '',
+      reference: '',
+    };
+  }
+
+  private async executeManualStockMovement(params: {
+    productId: string;
+    type: 'ENTRADA_MERCADORIA' | 'DEVOLUCAO_CLIENTE' | 'AJUSTE_INVENTARIO';
+    adjustMode: 'DELTA' | 'EXACT';
+    rawQty: string;
+    rawUnitCost?: string;
+    reason: string;
+    reference?: string;
+  }): Promise<{ ok: boolean; error?: string; notice?: string }> {
+    if (!this.canManageCatalog() || !this.activeCompany.id) {
+      return { ok: false, error: 'Sem permissão para movimentar stock neste perfil.' };
+    }
+    const target = this.products.find((p) => p.id === params.productId);
+    if (!target) {
+      return { ok: false, error: 'Selecione um artigo válido do catálogo.' };
+    }
+
+    const parsedVal = parseDecimalInput(params.rawQty);
+    if (Number.isNaN(parsedVal)) {
+      return { ok: false, error: 'Indique uma quantidade numérica válida.' };
+    }
+
+    const previousStock = target.trackStock ? roundKz(Number(target.stockQty) || 0) : 0;
+    let newStock = previousStock;
+    let qtyMoved = 0;
+    let direction: StockMovementDirection = 'NEUTRAL';
+
+    if (params.type === 'ENTRADA_MERCADORIA' || params.type === 'DEVOLUCAO_CLIENTE') {
+      if (parsedVal <= 0) {
+        return {
+          ok: false,
+          error: 'A quantidade de entrada ou devolução deve ser superior a zero.',
+        };
+      }
+      qtyMoved = roundKz(parsedVal);
+      newStock = roundKz(previousStock + qtyMoved);
+      direction = 'IN';
+    } else {
+      if (params.adjustMode === 'EXACT') {
+        newStock = roundKz(parsedVal);
+        const diff = roundKz(newStock - previousStock);
+        qtyMoved = roundKz(Math.abs(diff));
+        direction = diff > 0 ? 'IN' : diff < 0 ? 'OUT' : 'NEUTRAL';
+      } else {
+        if (parsedVal === 0) {
+          return {
+            ok: false,
+            error: 'Indique a variação de ajuste (ex: +5 para sobra ou -2 para quebra/avaria).',
+          };
+        }
+        const delta = roundKz(parsedVal);
+        newStock = roundKz(previousStock + delta);
+        qtyMoved = roundKz(Math.abs(delta));
+        direction = delta > 0 ? 'IN' : 'OUT';
+      }
+    }
+
+    const cleanReason = (params.reason || '').trim().slice(0, 240);
+    if (cleanReason.length < 2) {
+      return {
+        ok: false,
+        error: 'Indique o motivo do movimento (mínimo 2 caracteres) para auditoria.',
+      };
+    }
+
+    let validUnitCost: number | undefined;
+    const rawCostTrim = (params.rawUnitCost || '').trim();
+    if (rawCostTrim) {
+      const parsedCost = parseDecimalInput(rawCostTrim);
+      if (Number.isNaN(parsedCost) || parsedCost < 0) {
+        return { ok: false, error: 'Indique um custo unitário de aquisição válido em Kz.' };
+      }
+      if (parsedCost > 0) {
+        validUnitCost = roundKz(parsedCost);
+      }
+    }
+
+    const now = new Date().toISOString();
+    const actorLabel = (this.user?.email || formatRoleLabelPt(this.getEffectiveRole())).slice(
+      0,
+      120
+    );
+
+    let nextPriceHistory = target.priceHistory ? [...target.priceHistory] : undefined;
+    let nextCostPrice = target.costPrice;
+
+    if (
+      params.type === 'ENTRADA_MERCADORIA' &&
+      typeof validUnitCost === 'number' &&
+      validUnitCost > 0 &&
+      roundKz(target.costPrice || 0) !== validUnitCost
+    ) {
+      const prevCost =
+        typeof target.costPrice === 'number' && target.costPrice > 0
+          ? roundKz(target.costPrice)
+          : undefined;
+      nextCostPrice = validUnitCost;
+      const histEntry: ProductPriceChange = {
+        changedAtIso: now,
+        previousPrice: roundKz(target.price),
+        newPrice: roundKz(target.price),
+        ...(typeof prevCost === 'number' ? { previousCost: prevCost } : {}),
+        newCost: validUnitCost,
+        changedBy: actorLabel,
+      };
+      nextPriceHistory = [histEntry, ...(nextPriceHistory || [])].slice(0, 20);
+    }
+
+    const updatedProd: Product = {
+      ...target,
+      trackStock: true,
+      stockQty: newStock,
+      minStockQty: target.minStockQty ?? 2,
+      ...(typeof nextCostPrice === 'number' && nextCostPrice > 0
+        ? { costPrice: nextCostPrice }
+        : {}),
+      ...(nextPriceHistory && nextPriceHistory.length > 0 ? { priceHistory: nextPriceHistory } : {}),
+      syncState: 'pending',
+      synced: false,
+      updatedAtIso: now,
+    };
+
+    await localDb.saveProduct(updatedProd, this.activeCompany.id);
+    this.products = this.products.map((p) => (p.id === updatedProd.id ? updatedProd : p));
+    this.selectedProductDetailId = updatedProd.id;
+
+    const cleanRef = (params.reference || '').trim().slice(0, 80);
+    const movement: StockMovement = {
+      id: `sm_${Date.now()}_${Math.random().toString(36).slice(2, 6)}`,
+      companyId: this.activeCompany.id,
+      productId: updatedProd.id,
+      productCode: updatedProd.code,
+      productName: updatedProd.name,
+      unit: updatedProd.unit || 'un',
+      type: params.type,
+      direction,
+      qty: qtyMoved,
+      previousStock,
+      newStock,
+      ...(typeof validUnitCost === 'number'
+        ? { unitCost: validUnitCost }
+        : typeof updatedProd.costPrice === 'number' && updatedProd.costPrice > 0
+          ? { unitCost: updatedProd.costPrice }
+          : {}),
+      warehouseId: DEFAULT_WAREHOUSE_ID,
+      reason: cleanReason,
+      ...(cleanRef ? { reference: cleanRef } : {}),
+      operator: this.getCurrentStockOperatorLabel(),
+      ...(this.user?.uid ? { createdByUid: this.user.uid } : {}),
+      syncState: 'pending',
+      synced: false,
+      createdAtIso: now,
+    };
+
+    await this.persistAndSyncStockMovement(movement);
+
+    if (this.user && this.isOnline && canCompanySyncCloudData(this.activeCompany)) {
+      void ensureCompanyRegisteredCloud(this.activeCompany)
+        .then(() => upsertProductCloud(updatedProd, false, this.activeCompany))
+        .then(async () => {
+          const synced: Product = { ...updatedProd, syncState: 'synced', synced: true };
+          await localDb.saveProduct(synced, this.activeCompany.id);
+          this.products = this.products.map((p) => (p.id === synced.id ? synced : p));
+          if (this.activeModule === 'PRODUCTS' || this.activeModule === 'SYNC') this.render();
+        })
+        .catch(() => null);
+    }
+
+    const opLabel =
+      params.type === 'ENTRADA_MERCADORIA'
+        ? 'Entrada de mercadoria'
+        : params.type === 'DEVOLUCAO_CLIENTE'
+          ? 'Devolução ao stock'
+          : 'Ajuste de inventário';
+    return {
+      ok: true,
+      notice: `${opLabel} registado em "${updatedProd.name}": ${previousStock} → ${newStock} ${updatedProd.unit}.`,
+    };
+  }
+
+  private async reconcilePhysicalInventory(params: {
+    operator: string;
+    notes: string;
+  }): Promise<{ ok: boolean; error?: string; reconciledCount?: number }> {
+    if (!this.canManageCatalog() || !this.activeCompany.id) {
+      return { ok: false, error: 'Sem permissão para reconciliar inventário físico.' };
+    }
+
+    const entriesToProcess: Array<{
+      product: Product;
+      previousStock: number;
+      countedStock: number;
+      diff: number;
+    }> = [];
+
+    for (const prod of this.products) {
+      const rawVal = (this.inventoryCountInputs[prod.id] ?? '').trim();
+      if (rawVal === '') continue;
+      const counted = parseDecimalInput(rawVal);
+      if (Number.isNaN(counted) || counted < 0) {
+        return {
+          ok: false,
+          error: `Contagem inválida no artigo "${prod.code} · ${prod.name}". Indique um valor igual ou superior a 0.`,
+        };
+      }
+      const prev = prod.trackStock ? roundKz(Number(prod.stockQty) || 0) : 0;
+      const next = roundKz(counted);
+      const diff = roundKz(next - prev);
+      if (diff !== 0 || !prod.trackStock) {
+        entriesToProcess.push({
+          product: prod,
+          previousStock: prev,
+          countedStock: next,
+          diff,
+        });
+      }
+    }
+
+    if (entriesToProcess.length === 0) {
+      const anyTyped = Object.values(this.inventoryCountInputs).some((v) => v.trim() !== '');
+      return {
+        ok: false,
+        error: anyTyped
+          ? 'Todas as contagens preenchidas coincidem exatamente com o stock atual do sistema (sem diferenças a reconciliar).'
+          : 'Preencha a contagem física em pelo menos um artigo antes de reconciliar.',
+      };
+    }
+
+    const cleanOperator =
+      (params.operator || this.getCurrentStockOperatorLabel()).trim().slice(0, 32) || '001';
+    const cleanReason =
+      (params.notes || 'Contagem e reconciliação de inventário físico').trim().slice(0, 240) ||
+      'Contagem e reconciliação de inventário físico';
+    const now = new Date().toISOString();
+    const refCode = `INV-${now.slice(0, 10).replace(/-/g, '')}`;
+
+    const updatedProducts: Product[] = [];
+    const createdMovements: StockMovement[] = [];
+
+    for (const item of entriesToProcess) {
+      const updatedProd: Product = {
+        ...item.product,
+        trackStock: true,
+        stockQty: item.countedStock,
+        minStockQty: item.product.minStockQty ?? 2,
+        syncState: 'pending',
+        synced: false,
+        updatedAtIso: now,
+      };
+      await localDb.saveProduct(updatedProd, this.activeCompany.id);
+      updatedProducts.push(updatedProd);
+
+      const direction: StockMovementDirection =
+        item.diff > 0 ? 'IN' : item.diff < 0 ? 'OUT' : 'NEUTRAL';
+      const mov: StockMovement = {
+        id: `sm_inv_${Date.now()}_${Math.random().toString(36).slice(2, 6)}`,
+        companyId: this.activeCompany.id,
+        productId: updatedProd.id,
+        productCode: updatedProd.code,
+        productName: updatedProd.name,
+        unit: updatedProd.unit || 'un',
+        type: 'RECONCILIACAO_FISICA',
+        direction,
+        qty: roundKz(Math.abs(item.diff)),
+        previousStock: item.previousStock,
+        newStock: item.countedStock,
+        ...(typeof updatedProd.costPrice === 'number' && updatedProd.costPrice > 0
+          ? { unitCost: updatedProd.costPrice }
+          : {}),
+        warehouseId: DEFAULT_WAREHOUSE_ID,
+        reason: cleanReason,
+        reference: refCode,
+        operator: cleanOperator,
+        ...(this.user?.uid ? { createdByUid: this.user.uid } : {}),
+        syncState: 'pending',
+        synced: false,
+        createdAtIso: now,
+      };
+      await localDb.saveStockMovement(mov, this.activeCompany.id);
+      createdMovements.push(mov);
+    }
+
+    const updatedMap = new Map(updatedProducts.map((p) => [p.id, p]));
+    this.products = this.products.map((p) => updatedMap.get(p.id) || p);
+    this.stockMovements = [...createdMovements, ...this.stockMovements].sort((a, b) =>
+      b.createdAtIso.localeCompare(a.createdAtIso)
+    );
+    this.inventoryCountInputs = {};
+    this.inventoryNotes = '';
+    this.inventoryError = null;
+
+    if (this.user && this.isOnline && canCompanySyncCloudData(this.activeCompany)) {
+      void ensureCompanyRegisteredCloud(this.activeCompany).then(() => {
+        for (const up of updatedProducts) {
+          void upsertProductCloud(up, false, this.activeCompany)
+            .then(async () => {
+              const synced: Product = { ...up, syncState: 'synced', synced: true };
+              await localDb.saveProduct(synced, this.activeCompany.id);
+              this.products = this.products.map((p) => (p.id === synced.id ? synced : p));
+            })
+            .catch(() => null);
+        }
+        for (const sm of createdMovements) {
+          void createStockMovementCloud(sm, this.activeCompany)
+            .then(async () => {
+              const syncedMov: StockMovement = { ...sm, syncState: 'synced', synced: true };
+              await localDb.saveStockMovement(syncedMov, this.activeCompany.id);
+              this.stockMovements = this.stockMovements.map((m) =>
+                m.id === syncedMov.id ? syncedMov : m
+              );
+            })
+            .catch(() => null);
+        }
+      });
+    }
+
+    return { ok: true, reconciledCount: entriesToProcess.length };
   }
 
   private canEditExistingCustomers(): boolean {
@@ -1196,6 +1971,656 @@ export class SilaBillingApp {
       }
     }
     return false;
+  }
+
+  // ==================== 10. SEGURANÇA E CONTROLO OPERACIONAL ====================
+
+  private verifySupervisorPin(pinInput: string): { ok: boolean; supervisorLabel: string; error?: string } {
+    const cleanPin = pinInput.trim();
+    if (!cleanPin) {
+      return { ok: false, supervisorLabel: '', error: 'Introduza o PIN de supervisor.' };
+    }
+    const configuredPin = (this.settings.supervisorPin || '').trim();
+    if (configuredPin) {
+      if (cleanPin === configuredPin) {
+        return { ok: true, supervisorLabel: `Supervisor (PIN ${cleanPin})` };
+      }
+      return { ok: false, supervisorLabel: '', error: 'Código PIN de supervisor incorreto.' };
+    }
+    if (cleanPin === '1234' || cleanPin === '0000') {
+      return { ok: true, supervisorLabel: `Supervisor Autorizado (PIN contingência ${cleanPin})` };
+    }
+    return { ok: false, supervisorLabel: '', error: 'PIN incorreto. (PIN padrão inicial: 1234)' };
+  }
+
+  private approveSupervisorAuth(supervisorLabel: string): void {
+    this.supervisorAuthorizedBy = supervisorLabel;
+    const action = this.supervisorAuthAction;
+    const targetId = this.supervisorAuthTargetId;
+    const pendingVal = this.supervisorAuthPendingVal;
+
+    if (action === 'DISCOUNT_LINE') {
+      this.cart = this.cart.map((c) =>
+        c.productId === targetId ? { ...c, discountPct: roundKz(pendingVal) } : c
+      );
+      this.scheduleDraftSave();
+    } else if (action === 'DISCOUNT_GLOBAL') {
+      this.globalDiscountPct = roundKz(pendingVal);
+      this.globalDiscountInput = String(roundKz(pendingVal));
+      this.scheduleDraftSave();
+    } else if (action === 'CANCEL_INVOICE') {
+      this.cancellingInvoiceId = targetId;
+      this.cancelInvoiceError = null;
+    } else if (action === 'PRICE_EDIT') {
+      this.cart = this.cart.map((c) =>
+        c.productId === targetId ? { ...c, unitPrice: roundKz(pendingVal) } : c
+      );
+      this.scheduleDraftSave();
+    }
+
+    this.showSupervisorAuthModal = false;
+    this.supervisorAuthAction = null;
+    this.supervisorAuthTargetId = '';
+    this.supervisorAuthPendingVal = 0;
+    this.supervisorAuthPinInput = '';
+    this.supervisorAuthError = null;
+    this.render();
+  }
+
+  private getOperationalAuditEvents(): Array<{
+    id: string;
+    type: 'EMISSION' | 'CANCELLATION' | 'DISCOUNT' | 'PRICE_CHANGE' | 'CASH_SESSION' | 'CASH_MOVEMENT' | 'REPRINT';
+    iso: string;
+    actor: string;
+    title: string;
+    detail: string;
+    badge: string;
+    badgeClass: string;
+    referenceId?: string;
+    amount?: number;
+  }> {
+    const list: Array<{
+      id: string;
+      type: 'EMISSION' | 'CANCELLATION' | 'DISCOUNT' | 'PRICE_CHANGE' | 'CASH_SESSION' | 'CASH_MOVEMENT' | 'REPRINT';
+      iso: string;
+      actor: string;
+      title: string;
+      detail: string;
+      badge: string;
+      badgeClass: string;
+      referenceId?: string;
+      amount?: number;
+    }> = [];
+
+    const maxCashierPct = this.settings.maxCashierDiscountPct ?? 5;
+
+    // 1. Emissões de faturas
+    for (const inv of this.invoices) {
+      list.push({
+        id: `aud_em_${inv.id}`,
+        type: 'EMISSION',
+        iso: inv.issuedAtIso,
+        actor: `Op. ${inv.operator || '001'} (Cx ${inv.cashier || '01'})`,
+        title: `Emissão de ${inv.docType === 'FR' ? 'Factura/Recibo' : inv.docType === 'NC' ? 'Nota de Crédito' : 'Factura Proforma'} ${inv.number}`,
+        detail: `Cliente: ${inv.customerName} · NIF: ${inv.customerNif || 'Consumidor Final'} · Pagamento: ${inv.paymentMethod}${inv.transferReference ? ` (Ref: ${inv.transferReference})` : ''}`,
+        badge: inv.docType,
+        badgeClass: inv.docType === 'NC' ? 'bg-purple-100 text-purple-700' : 'bg-emerald-100 text-emerald-800',
+        referenceId: inv.id,
+        amount: inv.grandTotal,
+      });
+
+      // 2. Anulações
+      if (inv.status === 'cancelled') {
+        list.push({
+          id: `aud_can_${inv.id}`,
+          type: 'CANCELLATION',
+          iso: inv.cancelledAtIso || inv.updatedAtIso || inv.issuedAtIso,
+          actor: inv.cancelledBy || inv.operator || 'Operador',
+          title: `Anulação de ${inv.number}`,
+          detail: `Motivo: "${inv.cancelReason || 'Sem motivo especificado'}" · Total revertido: ${formatKzNumber(inv.grandTotal)} Kz · Stock reposto automaticamente`,
+          badge: 'Anulação',
+          badgeClass: 'bg-red-100 text-red-700 font-semibold',
+          referenceId: inv.id,
+          amount: inv.grandTotal,
+        });
+      }
+
+      // 3. Descontos Especiais Autorizados
+      const hasSpecialGlobal = typeof inv.globalDiscountPct === 'number' && inv.globalDiscountPct > maxCashierPct;
+      const hasSpecialLine = inv.lines.some((l) => l.discountPct > maxCashierPct);
+      if (inv.discountAuthorizedBy || hasSpecialGlobal || hasSpecialLine) {
+        list.push({
+          id: `aud_disc_${inv.id}`,
+          type: 'DISCOUNT',
+          iso: inv.issuedAtIso,
+          actor: inv.discountAuthorizedBy || `Op. ${inv.operator}`,
+          title: `Desconto especial em ${inv.number}`,
+          detail: `Desconto total: ${formatKzNumber(inv.discountTotal)} Kz${inv.globalDiscountPct ? ` (Global ${inv.globalDiscountPct}%)` : ''} · Autorizado por: ${inv.discountAuthorizedBy || 'Concedido no terminal'}`,
+          badge: 'Desconto Especial',
+          badgeClass: 'bg-amber-100 text-amber-800',
+          referenceId: inv.id,
+          amount: inv.discountTotal,
+        });
+      }
+
+      // 4. Reimpressões
+      if (inv.reprintCount && inv.reprintCount > 0) {
+        list.push({
+          id: `aud_rep_${inv.id}`,
+          type: 'REPRINT',
+          iso: inv.lastReprintedAtIso || inv.updatedAtIso || inv.issuedAtIso,
+          actor: inv.lastReprintedBy || `Op. ${inv.operator}`,
+          title: `Reimpressão de documento ${inv.number}`,
+          detail: `Histórico de reimpressão: ${inv.reprintCount}ª via emitida · Operador: ${inv.lastReprintedBy || inv.operator}`,
+          badge: 'Reimpressão',
+          badgeClass: 'bg-slate-100 text-slate-700',
+          referenceId: inv.id,
+          amount: inv.grandTotal,
+        });
+      }
+    }
+
+    // 5. Alterações de Preço no Catálogo
+    for (const prod of this.products) {
+      if (prod.priceHistory && prod.priceHistory.length > 0) {
+        for (let i = 0; i < prod.priceHistory.length; i++) {
+          const ph = prod.priceHistory[i]!;
+          list.push({
+            id: `aud_prc_${prod.id}_${i}`,
+            type: 'PRICE_CHANGE',
+            iso: ph.changedAtIso,
+            actor: ph.changedBy || 'Gestor',
+            title: `Alteração de PVP · ${prod.name} (${prod.code})`,
+            detail: `PVP anterior: ${formatKzNumber(ph.previousPrice)} Kz → Novo PVP: ${formatKzNumber(ph.newPrice)} Kz${
+              typeof ph.newCost === 'number' && typeof ph.previousCost === 'number'
+                ? ` · Custo: ${formatKzNumber(ph.previousCost)} Kz → ${formatKzNumber(ph.newCost)} Kz`
+                : ''
+            }`,
+            badge: 'PVP / Custo',
+            badgeClass: 'bg-blue-100 text-blue-700',
+          });
+        }
+      }
+    }
+
+    // 6. Aberturas e Fechos de Caixa
+    for (const sess of this.cashSessions) {
+      list.push({
+        id: `aud_csh_open_${sess.id}`,
+        type: 'CASH_SESSION',
+        iso: sess.openedAtIso,
+        actor: `Op. ${sess.operator} (Cx ${sess.cashier})`,
+        title: `Abertura de caixa ${sess.cashier}`,
+        detail: `Fundo de maneio inicial: ${formatKzNumber(sess.openingFloat)} Kz · Turno #${sess.id.slice(-6)}`,
+        badge: 'Abertura Caixa',
+        badgeClass: 'bg-emerald-100 text-emerald-800',
+        amount: sess.openingFloat,
+      });
+
+      if (sess.status === 'closed' && sess.closedAtIso) {
+        const diff = sess.differenceAmount || 0;
+        const hasDiff = Math.abs(diff) > 0.01;
+        list.push({
+          id: `aud_csh_cls_${sess.id}`,
+          type: 'CASH_SESSION',
+          iso: sess.closedAtIso,
+          actor: `Op. ${sess.closedByOperator || sess.operator} (Cx ${sess.cashier})`,
+          title: `Fecho de caixa ${sess.cashier}`,
+          detail: `Esperado: ${formatKzNumber(sess.expectedCash || 0)} Kz · Contado: ${formatKzNumber(sess.countedCash || 0)} Kz · Saldo: ${
+            hasDiff ? `${diff > 0 ? '+' : ''}${formatKzNumber(diff)} Kz (${diff < 0 ? 'Quebra' : 'Sobra'})` : 'Conferido sem diferença'
+          }${sess.closingNotes ? ` · Observação: ${sess.closingNotes}` : ''}`,
+          badge: hasDiff ? (diff < 0 ? 'Quebra Caixa' : 'Sobra Caixa') : 'Fecho Caixa',
+          badgeClass: hasDiff ? 'bg-amber-100 text-amber-800 font-semibold' : 'bg-slate-100 text-slate-800',
+          amount: sess.countedCash || sess.expectedCash || 0,
+        });
+      }
+    }
+
+    // 7. Sangrias e Reforços de Caixa
+    for (const mov of this.cashMovements) {
+      if (mov.type === 'SANGRIA' || mov.type === 'REFORCO') {
+        list.push({
+          id: `aud_mov_${mov.id}`,
+          type: 'CASH_MOVEMENT',
+          iso: mov.createdAtIso,
+          actor: `Op. ${mov.operator} (Cx ${mov.cashier})`,
+          title: `${mov.type === 'SANGRIA' ? 'Sangria (Retirada)' : 'Reforço de Fundo'} em Caixa ${mov.cashier}`,
+          detail: `Valor: ${formatKzNumber(mov.amount)} Kz · Motivo: "${mov.reason}"${mov.reference ? ` · Ref: ${mov.reference}` : ''}`,
+          badge: mov.type === 'SANGRIA' ? 'Sangria' : 'Reforço',
+          badgeClass: mov.type === 'SANGRIA' ? 'bg-red-100 text-red-700' : 'bg-blue-100 text-blue-700',
+          amount: mov.amount,
+        });
+      }
+    }
+
+    list.sort((a, b) => b.iso.localeCompare(a.iso));
+    return list;
+  }
+
+  private getFilteredOperationalAuditEvents() {
+    const all = this.getOperationalAuditEvents();
+    const query = this.operationalAuditSearch.trim().toLowerCase();
+    const typeFilter = this.operationalAuditTypeFilter;
+
+    const filtered = all.filter((ev) => {
+      if (typeFilter !== 'ALL' && ev.type !== typeFilter) {
+        return false;
+      }
+      if (query) {
+        const text = `${ev.actor} ${ev.title} ${ev.detail} ${ev.badge}`.toLowerCase();
+        if (!text.includes(query)) return false;
+      }
+      return true;
+    });
+
+    return { all, filtered };
+  }
+
+  private exportOperationalAuditCsv(): void {
+    const { filtered } = this.getFilteredOperationalAuditEvents();
+    if (filtered.length === 0) {
+      this.showHistoryNotice('Nenhum evento de auditoria no filtro atual para exportar.');
+      this.render();
+      return;
+    }
+
+    const lines: string[] = [];
+    lines.push('Data/Hora;Tipo;Operador/Autor;Titulo;Detalhe;Valor Kz');
+
+    for (const ev of filtered) {
+      const dt = formatDateTimePt(ev.iso);
+      const safeTitle = `"${ev.title.replace(/"/g, '""')}"`;
+      const safeDetail = `"${ev.detail.replace(/"/g, '""')}"`;
+      const safeActor = `"${ev.actor.replace(/"/g, '""')}"`;
+      const valStr = typeof ev.amount === 'number' ? ev.amount.toFixed(2).replace('.', ',') : '';
+      lines.push(`${dt.slashDate} ${dt.time};${ev.badge};${safeActor};${safeTitle};${safeDetail};${valStr}`);
+    }
+
+    const csvContent = lines.join('\r\n');
+    const safeComp = (this.settings.company.shortName || 'empresa')
+      .toLowerCase()
+      .replace(/[^a-z0-9_-]+/g, '-');
+    const dateStamp = new Date().toISOString().slice(0, 10);
+    triggerBrowserDownload(
+      csvContent,
+      `auditoria-operacional-${safeComp}-${dateStamp}.csv`,
+      'text/csv;charset=utf-8'
+    );
+    this.showHistoryNotice(`Exportação de auditoria concluída (${filtered.length} evento${filtered.length === 1 ? '' : 's'}).`);
+    this.render();
+  }
+
+  private renderOperatorSwitchModal(): string {
+    const effectiveRole = this.getEffectiveRole();
+    return `
+      <div class="fixed inset-0 z-50 flex items-center justify-center p-4 bg-slate-900/60 backdrop-blur-xs">
+        <div class="bg-white rounded-xl shadow-2xl max-w-md w-full border border-slate-200 overflow-hidden">
+          <div class="p-4 border-b border-slate-200 bg-slate-900 text-white flex items-center justify-between">
+            <div class="flex items-center gap-2">
+              ${ICONS.user}
+              <h3 class="text-sm font-bold">Identificação e Troca de Operador</h3>
+            </div>
+            <button
+              type="button"
+              data-action="close-operator-switch-modal"
+              class="text-slate-400 hover:text-white transition-colors"
+            >${ICONS.close}</button>
+          </div>
+
+          <div class="p-4 space-y-4">
+            <div class="p-3 rounded-lg bg-slate-50 border border-slate-200 flex items-center justify-between">
+              <div>
+                <div class="text-[11px] text-slate-500 font-medium">Operador ativo no terminal</div>
+                <div class="text-sm font-bold text-slate-900 font-mono">Op. ${escapeHtml(this.operator)} <span class="text-xs font-normal text-slate-600">· Caixa ${escapeHtml(this.cashier)}</span></div>
+              </div>
+              <div class="px-2 py-0.5 rounded text-[11px] font-semibold bg-blue-100 text-blue-800">
+                ${escapeHtml(formatRoleLabelPt(effectiveRole))}
+              </div>
+            </div>
+
+            <div>
+              <div class="text-xs font-semibold text-slate-700 mb-2">Alternar com 1 clique (Colaboradores cadastrados):</div>
+              <div class="space-y-1.5 max-h-44 overflow-y-auto">
+                ${
+                  this.members.length === 0
+                    ? `<div class="text-xs text-slate-500 p-2.5 border border-dashed border-slate-200 rounded-lg bg-slate-50">
+                        Proprietário local ativo nesta empresa. Pode definir identificadores adicionais abaixo.
+                      </div>`
+                    : this.members
+                        .map(
+                          (m) => `
+                        <button
+                          type="button"
+                          data-action="quick-switch-operator"
+                          data-name="${escapeHtml(m.displayName)}"
+                          data-role="${m.role}"
+                          class="w-full p-2.5 rounded-lg border border-slate-200 hover:border-blue-400 hover:bg-blue-50/50 flex items-center justify-between text-left transition-colors"
+                        >
+                          <div class="min-w-0">
+                            <div class="text-xs font-semibold text-slate-900 truncate">${escapeHtml(m.displayName)}</div>
+                            <div class="text-[11px] font-mono text-slate-500 truncate">${escapeHtml(m.email)}</div>
+                          </div>
+                          <div class="text-[11px] font-medium text-slate-600 shrink-0">
+                            ${escapeHtml(formatRoleLabelPt(m.role))}
+                          </div>
+                        </button>
+                      `
+                        )
+                        .join('')
+                }
+              </div>
+            </div>
+
+            <form data-form="operator-switch-form" class="space-y-3 pt-3 border-t border-slate-200">
+              <div class="grid grid-cols-2 gap-3">
+                <div>
+                  <label class="block text-[11px] font-medium text-slate-700 mb-1">Código / Nome Operador</label>
+                  <input
+                    name="operatorName"
+                    type="text"
+                    required
+                    maxlength="32"
+                    value="${escapeHtml(this.operator)}"
+                    placeholder="Ex: 001 ou Carlos"
+                    class="w-full h-9 px-2.5 text-xs font-mono bg-slate-50 border border-slate-200 rounded-md focus:outline-none focus:border-blue-600"
+                  />
+                </div>
+                <div>
+                  <label class="block text-[11px] font-medium text-slate-700 mb-1">Caixa de Trabalho</label>
+                  <input
+                    name="cashierNumber"
+                    type="text"
+                    required
+                    maxlength="16"
+                    value="${escapeHtml(this.cashier)}"
+                    placeholder="Ex: 01"
+                    class="w-full h-9 px-2.5 text-xs font-mono bg-slate-50 border border-slate-200 rounded-md focus:outline-none focus:border-blue-600"
+                  />
+                </div>
+              </div>
+
+              <div class="flex items-center justify-end gap-2 pt-2">
+                <button
+                  type="button"
+                  data-action="close-operator-switch-modal"
+                  class="h-8 px-3 rounded-md border border-slate-200 text-xs font-medium text-slate-600 hover:bg-slate-100"
+                >Cancelar</button>
+                <button
+                  type="submit"
+                  class="h-8 px-4 rounded-md bg-blue-600 hover:bg-blue-700 text-white text-xs font-semibold"
+                >Confirmar Operador</button>
+              </div>
+            </form>
+          </div>
+        </div>
+      </div>
+    `;
+  }
+
+  private renderSupervisorAuthModal(): string {
+    const verifiedRole = this.getVerifiedMaxRole();
+    const canDirectApprove = verifiedRole === 'owner' || verifiedRole === 'manager';
+    const isLine = this.supervisorAuthAction === 'DISCOUNT_LINE';
+    const isGlobal = this.supervisorAuthAction === 'DISCOUNT_GLOBAL';
+    const isCancel = this.supervisorAuthAction === 'CANCEL_INVOICE';
+    const isPrice = this.supervisorAuthAction === 'PRICE_EDIT';
+
+    return `
+      <div class="fixed inset-0 z-50 flex items-center justify-center p-4 bg-slate-900/60 backdrop-blur-xs">
+        <div class="bg-white rounded-xl shadow-2xl max-w-sm w-full border border-slate-200 overflow-hidden">
+          <div class="p-4 border-b border-slate-200 bg-amber-50 text-amber-950 flex items-center justify-between">
+            <div class="flex items-center gap-2">
+              <span class="text-amber-600">${ICONS.lock}</span>
+              <h3 class="text-sm font-bold">Autorização de Supervisão</h3>
+            </div>
+            <button
+              type="button"
+              data-action="close-supervisor-auth-modal"
+              class="text-amber-700 hover:text-amber-950 transition-colors"
+            >${ICONS.close}</button>
+          </div>
+
+          <div class="p-4 space-y-3">
+            <div class="text-xs text-slate-600 leading-relaxed">
+              ${
+                isCancel
+                  ? 'A anulação de documentos emitidos requer perfil de Gerente/Proprietário ou validação por PIN de Supervisor.'
+                  : isPrice
+                    ? 'A alteração manual de preço unitário no POS requer autorização de Supervisor.'
+                    : `O desconto solicitado de <strong class="text-slate-900 font-mono">${this.supervisorAuthPendingVal}%</strong> excede o limite máximo permitido para operador de caixa (${this.settings.maxCashierDiscountPct ?? 5}%).`
+              }
+            </div>
+
+            ${
+              this.supervisorAuthError
+                ? `<div class="p-2 rounded bg-red-50 border border-red-200 text-xs text-red-700">${escapeHtml(
+                    this.supervisorAuthError
+                  )}</div>`
+                : ''
+            }
+
+            <form data-form="supervisor-auth-form" class="space-y-3">
+              <div>
+                <label class="block text-[11px] font-medium text-slate-700 mb-1">PIN do Supervisor</label>
+                <input
+                  name="supervisorPin"
+                  type="password"
+                  inputmode="numeric"
+                  autofocus
+                  required
+                  maxlength="16"
+                  placeholder="••••"
+                  class="w-full h-10 px-3 text-center text-lg tracking-widest font-mono bg-slate-50 border border-slate-200 rounded-md focus:outline-none focus:border-blue-600"
+                />
+                <div class="text-[10px] text-slate-400 mt-1">
+                  ${
+                    this.settings.supervisorPin
+                      ? 'Introduza o PIN configurado nas Definições.'
+                      : 'PIN não personalizado em Definições (código padrão de contingência: 1234).'
+                  }
+                </div>
+              </div>
+
+              ${
+                canDirectApprove
+                  ? `<div class="pt-1">
+                      <button
+                        type="button"
+                        data-action="supervisor-direct-approve"
+                        class="w-full py-2 px-2.5 rounded border border-blue-200 bg-blue-50 hover:bg-blue-100 text-blue-800 text-[11px] font-semibold transition-colors"
+                      >
+                        Aprovar como ${escapeHtml(formatRoleLabelPt(verifiedRole))} (${escapeHtml(this.user?.displayName || this.operator)})
+                      </button>
+                    </div>`
+                  : ''
+              }
+
+              <div class="flex items-center justify-end gap-2 pt-2 border-t border-slate-200">
+                <button
+                  type="button"
+                  data-action="close-supervisor-auth-modal"
+                  class="h-8 px-3 rounded-md border border-slate-200 text-xs font-medium text-slate-600 hover:bg-slate-100"
+                >Cancelar</button>
+                <button
+                  type="submit"
+                  class="h-8 px-4 rounded-md bg-amber-600 hover:bg-amber-700 text-white text-xs font-semibold"
+                >Autorizar Operação</button>
+              </div>
+            </form>
+          </div>
+        </div>
+      </div>
+    `;
+  }
+
+  private renderOperationalAuditWorkspace(): string {
+    const { all, filtered } = this.getFilteredOperationalAuditEvents();
+
+    const counts = {
+      all: all.length,
+      emissions: all.filter((e) => e.type === 'EMISSION').length,
+      cancellations: all.filter((e) => e.type === 'CANCELLATION').length,
+      discounts: all.filter((e) => e.type === 'DISCOUNT').length,
+      priceChanges: all.filter((e) => e.type === 'PRICE_CHANGE').length,
+      cashSessions: all.filter((e) => e.type === 'CASH_SESSION').length,
+      cashMovements: all.filter((e) => e.type === 'CASH_MOVEMENT').length,
+      reprints: all.filter((e) => e.type === 'REPRINT').length,
+    };
+
+    const typeTabs: Array<{
+      id:
+        | 'ALL'
+        | 'EMISSION'
+        | 'CANCELLATION'
+        | 'DISCOUNT'
+        | 'PRICE_CHANGE'
+        | 'CASH_SESSION'
+        | 'CASH_MOVEMENT'
+        | 'REPRINT';
+      label: string;
+      count: number;
+    }> = [
+      { id: 'ALL', label: 'Todos', count: counts.all },
+      { id: 'EMISSION', label: 'Emissões', count: counts.emissions },
+      { id: 'CANCELLATION', label: 'Anulações', count: counts.cancellations },
+      { id: 'DISCOUNT', label: 'Descontos Especiais', count: counts.discounts },
+      { id: 'PRICE_CHANGE', label: 'Alt. Preços', count: counts.priceChanges },
+      { id: 'CASH_SESSION', label: 'Abertura/Fecho Caixa', count: counts.cashSessions },
+      { id: 'CASH_MOVEMENT', label: 'Sangrias / Reforços', count: counts.cashMovements },
+      { id: 'REPRINT', label: 'Reimpressões', count: counts.reprints },
+    ];
+
+    return `
+      <div class="flex-1 flex flex-col overflow-hidden bg-slate-50">
+        <!-- Barra de Filtros e Pesquisa -->
+        <div class="p-3 bg-white border-b border-slate-200 space-y-2.5 shrink-0">
+          <div class="flex flex-col sm:flex-row sm:items-center justify-between gap-2.5">
+            <div class="relative flex-1 max-w-md">
+              <span class="text-slate-400 absolute left-3 top-1/2 -translate-y-1/2 pointer-events-none">${ICONS.search}</span>
+              <input
+                id="operational-audit-search-input"
+                type="text"
+                data-action="operational-audit-search"
+                value="${escapeHtml(this.operationalAuditSearch)}"
+                placeholder="Pesquisar por operador, documento, produto, motivo..."
+                class="w-full h-9 pl-9 pr-8 text-xs bg-slate-50 border border-slate-200 rounded-md focus:outline-none focus:border-blue-600 focus:bg-white transition-colors"
+              />
+              ${
+                this.operationalAuditSearch
+                  ? `<button
+                      type="button"
+                      data-action="clear-audit-search"
+                      class="absolute right-2.5 top-1/2 -translate-y-1/2 text-slate-400 hover:text-slate-600 p-0.5"
+                    >${ICONS.close}</button>`
+                  : ''
+              }
+            </div>
+
+            <div class="flex items-center gap-2 shrink-0">
+              <button
+                type="button"
+                data-action="export-audit-csv"
+                class="h-9 px-3 rounded-md border border-slate-200 bg-white hover:bg-slate-50 text-slate-700 text-xs font-semibold flex items-center gap-1.5 transition-colors whitespace-nowrap shadow-xs"
+              >
+                ${ICONS.download}
+                <span>Exportar CSV</span>
+              </button>
+            </div>
+          </div>
+
+          <!-- Pílulas de filtro de tipo de evento -->
+          <div class="flex items-center gap-1 overflow-x-auto pb-0.5 scrollbar-none text-xs">
+            ${typeTabs
+              .map((tab) => {
+                const active = this.operationalAuditTypeFilter === tab.id;
+                return `
+                  <button
+                    type="button"
+                    data-action="set-audit-type-filter"
+                    data-value="${tab.id}"
+                    class="h-7 px-2.5 rounded text-[11px] font-medium whitespace-nowrap transition-colors flex items-center gap-1.5 ${
+                      active
+                        ? 'bg-slate-900 text-white'
+                        : 'bg-slate-100 text-slate-600 hover:bg-slate-200 hover:text-slate-900'
+                    }"
+                  >
+                    <span>${escapeHtml(tab.label)}</span>
+                    <span class="font-mono tabular-nums text-[10px] ${active ? 'text-slate-300' : 'text-slate-400'}">(${tab.count})</span>
+                  </button>
+                `;
+              })
+              .join('')}
+          </div>
+        </div>
+
+        <!-- Tabela / Lista de Eventos de Auditoria -->
+        <div class="flex-1 overflow-y-auto p-3">
+          ${
+            filtered.length === 0
+              ? `<div class="p-12 text-center text-xs text-slate-500 bg-white rounded-lg border border-slate-200">
+                  Nenhum evento de auditoria encontrado para os critérios selecionados.
+                </div>`
+              : `
+              <div class="bg-white rounded-lg border border-slate-200 overflow-hidden shadow-xs">
+                <table class="w-full text-left border-collapse text-xs">
+                  <thead class="bg-slate-50 border-b border-slate-200 text-[11px] text-slate-500">
+                    <tr>
+                      <th class="py-2.5 px-3 font-medium w-36">Data / Hora</th>
+                      <th class="py-2.5 px-3 font-medium w-40">Operador / Autor</th>
+                      <th class="py-2.5 px-3 font-medium w-32">Operação</th>
+                      <th class="py-2.5 px-3 font-medium">Detalhes e Rastreabilidade</th>
+                      <th class="py-2.5 px-3 font-medium text-right w-28">Valor (Kz)</th>
+                      <th class="py-2.5 px-3 font-medium text-right w-20">Ação</th>
+                    </tr>
+                  </thead>
+                  <tbody class="divide-y divide-slate-100">
+                    ${filtered
+                      .map((ev) => {
+                        const dt = formatDateTimePt(ev.iso);
+                        return `
+                          <tr class="hover:bg-slate-50/80 transition-colors">
+                            <td class="py-2.5 px-3 font-mono text-[11px] text-slate-500 tabular-nums whitespace-nowrap">
+                              ${dt.slashDate} <span class="text-slate-400">${dt.time}</span>
+                            </td>
+                            <td class="py-2.5 px-3 font-medium text-slate-900 truncate max-w-[160px]">
+                              ${escapeHtml(ev.actor)}
+                            </td>
+                            <td class="py-2.5 px-3 whitespace-nowrap">
+                              <span class="inline-flex items-center px-2 py-0.5 rounded text-[10px] font-semibold ${ev.badgeClass}">
+                                ${escapeHtml(ev.badge)}
+                              </span>
+                            </td>
+                            <td class="py-2.5 px-3 min-w-0">
+                              <div class="font-medium text-slate-800">${escapeHtml(ev.title)}</div>
+                              <div class="text-[11px] text-slate-500 mt-0.5 line-clamp-2">${escapeHtml(ev.detail)}</div>
+                            </td>
+                            <td class="py-2.5 px-3 text-right font-mono tabular-nums text-slate-800 font-medium whitespace-nowrap">
+                              ${typeof ev.amount === 'number' ? `${formatKzNumber(ev.amount)}` : '—'}
+                            </td>
+                            <td class="py-2.5 px-3 text-right whitespace-nowrap">
+                              ${
+                                ev.referenceId
+                                  ? `<button
+                                      type="button"
+                                      data-action="open-audit-doc"
+                                      data-id="${escapeHtml(ev.referenceId)}"
+                                      class="h-6 px-2 rounded border border-slate-200 bg-white text-[10px] font-medium text-slate-700 hover:bg-slate-100 hover:text-blue-700 transition-colors"
+                                    >Ver Doc</button>`
+                                  : `<span class="text-[11px] text-slate-300">—</span>`
+                              }
+                            </td>
+                          </tr>
+                        `;
+                      })
+                      .join('')}
+                  </tbody>
+                </table>
+              </div>
+            `
+          }
+        </div>
+      </div>
+    `;
   }
 
   private async switchActiveCompany(companyId: string): Promise<void> {
@@ -1288,6 +2713,8 @@ export class SilaBillingApp {
       this.isPrinting ||
       this.editingProduct !== null ||
       this.editingCustomer !== null ||
+      this.editingSupplier !== null ||
+      this.purchasePanelOpen ||
       this.showQuickCustomerForm ||
       this.showNewCompanyModal ||
       this.cart.length > 0
@@ -1394,6 +2821,9 @@ export class SilaBillingApp {
       this.customers.some((c) => !c.synced) ||
       this.cashSessions.some((s) => !s.synced) ||
       this.cashMovements.some((m) => !m.synced) ||
+      this.stockMovements.some((m) => !m.synced) ||
+      this.suppliers.some((s) => !s.synced) ||
+      this.purchases.some((p) => !p.synced) ||
       this.settings.synced === false
     );
   }
@@ -1892,6 +3322,15 @@ export class SilaBillingApp {
               }
               for (const cm of cloudData.cashMovements || []) {
                 await localDb.saveCashMovement(cm, id);
+              }
+              for (const sm of cloudData.stockMovements || []) {
+                await localDb.saveStockMovement(sm, id);
+              }
+              for (const sup of cloudData.suppliers || []) {
+                await localDb.saveSupplier(sup, id);
+              }
+              for (const pur of cloudData.purchases || []) {
+                await localDb.savePurchase(pur, id);
               }
               if (cloudData.settings) {
                 await localDb.saveSettings(cloudData.settings, id).catch(() => null);
@@ -2490,16 +3929,164 @@ export class SilaBillingApp {
         }
         break;
       }
+      case 'set-products-subview': {
+        if (value === 'CATALOG' || value === 'MOVEMENTS' || value === 'INVENTORY') {
+          this.productsSubView = value;
+          this.inventoryError = null;
+          this.stockMovementError = null;
+          if (value === 'INVENTORY' && !this.inventoryOperator) {
+            this.inventoryOperator = this.getCurrentStockOperatorLabel();
+          }
+          this.render();
+        }
+        break;
+      }
       case 'set-product-filter': {
         if (
           value === 'ALL' ||
           value === 'ACTIVE' ||
           value === 'INACTIVE' ||
+          value === 'OUT_OF_STOCK' ||
           value === 'LOW_STOCK'
         ) {
           this.productFilter = value;
+          this.productsSubView = 'CATALOG';
           this.render();
         }
+        break;
+      }
+      case 'open-stock-movement-panel': {
+        if (!this.canManageCatalog()) return;
+        const rawType = value || 'ENTRADA_MERCADORIA';
+        const presetType: 'ENTRADA_MERCADORIA' | 'DEVOLUCAO_CLIENTE' | 'AJUSTE_INVENTARIO' =
+          rawType === 'DEVOLUCAO_CLIENTE'
+            ? 'DEVOLUCAO_CLIENTE'
+            : rawType === 'AJUSTE_INVENTARIO' || rawType === 'AJUSTE_EXATO'
+              ? 'AJUSTE_INVENTARIO'
+              : 'ENTRADA_MERCADORIA';
+        const adjustMode: 'DELTA' | 'EXACT' = rawType === 'AJUSTE_EXATO' ? 'EXACT' : 'DELTA';
+        this.editingProduct = null;
+        if (this.productsSubView === 'INVENTORY') {
+          this.productsSubView = 'CATALOG';
+        }
+        this.openStockMovementModalForProduct(id || undefined, presetType, adjustMode);
+        this.render();
+        const qtyEl = document.getElementById('stock-movement-qty-input') as HTMLInputElement | null;
+        qtyEl?.focus();
+        qtyEl?.select();
+        break;
+      }
+      case 'close-stock-movement-panel': {
+        this.stockMovementPanelOpen = false;
+        this.stockMovementError = null;
+        this.render();
+        break;
+      }
+      case 'set-stock-movement-type': {
+        if (
+          value === 'ENTRADA_MERCADORIA' ||
+          value === 'DEVOLUCAO_CLIENTE' ||
+          value === 'AJUSTE_INVENTARIO'
+        ) {
+          const prod = this.products.find((p) => p.id === this.stockMovementDraft.productId);
+          this.stockMovementDraft.type = value;
+          this.stockMovementError = null;
+          if (value === 'ENTRADA_MERCADORIA') {
+            this.stockMovementDraft.qtyInput = '';
+            if (!this.stockMovementDraft.reason || this.stockMovementDraft.reason === 'Devolução de cliente ao stock') {
+              this.stockMovementDraft.reason = 'Reposição / compra de mercadoria';
+            }
+            if (!this.stockMovementDraft.unitCostInput && prod?.costPrice && prod.costPrice > 0) {
+              this.stockMovementDraft.unitCostInput = String(prod.costPrice);
+            }
+          } else if (value === 'DEVOLUCAO_CLIENTE') {
+            this.stockMovementDraft.qtyInput = '';
+            this.stockMovementDraft.reason = 'Devolução de cliente ao stock';
+          } else {
+            this.stockMovementDraft.qtyInput =
+              this.stockMovementDraft.adjustMode === 'EXACT' && prod
+                ? String(prod.stockQty ?? 0)
+                : '';
+            if (
+              this.stockMovementDraft.reason === 'Reposição / compra de mercadoria' ||
+              this.stockMovementDraft.reason === 'Devolução de cliente ao stock'
+            ) {
+              this.stockMovementDraft.reason = '';
+            }
+          }
+          this.render();
+          const qtyEl = document.getElementById('stock-movement-qty-input') as HTMLInputElement | null;
+          qtyEl?.focus();
+        }
+        break;
+      }
+      case 'set-stock-adjust-mode': {
+        if (value === 'DELTA' || value === 'EXACT') {
+          this.stockMovementDraft.adjustMode = value;
+          const prod = this.products.find((p) => p.id === this.stockMovementDraft.productId);
+          this.stockMovementDraft.qtyInput =
+            value === 'EXACT' && prod ? String(prod.stockQty ?? 0) : '';
+          this.stockMovementError = null;
+          this.render();
+          const qtyEl = document.getElementById('stock-movement-qty-input') as HTMLInputElement | null;
+          qtyEl?.focus();
+          qtyEl?.select();
+        }
+        break;
+      }
+      case 'set-stock-ledger-filter': {
+        if (
+          value === 'ALL' ||
+          value === 'ENTRADA_MERCADORIA' ||
+          value === 'SAIDA_VENDA' ||
+          value === 'DEVOLUCAO_CLIENTE' ||
+          value === 'AJUSTE_INVENTARIO' ||
+          value === 'RECONCILIACAO_FISICA'
+        ) {
+          this.stockLedgerFilter = value;
+          this.render();
+        }
+        break;
+      }
+      case 'view-product-stock-history': {
+        this.stockLedgerProductId = id || '';
+        this.stockLedgerFilter = 'ALL';
+        this.productsSubView = 'MOVEMENTS';
+        this.render();
+        break;
+      }
+      case 'clear-stock-ledger-product': {
+        this.stockLedgerProductId = '';
+        this.render();
+        break;
+      }
+      case 'prefill-inventory-system-stock': {
+        if (!this.canManageCatalog()) return;
+        for (const p of this.products) {
+          if (p.active === false) continue;
+          if (!this.inventoryIncludeUntracked && !p.trackStock) continue;
+          if ((this.inventoryCountInputs[p.id] ?? '').trim() === '') {
+            this.inventoryCountInputs[p.id] = String(p.trackStock ? (p.stockQty ?? 0) : 0);
+          }
+        }
+        this.inventoryError = null;
+        this.render();
+        break;
+      }
+      case 'clear-inventory-counts': {
+        this.inventoryCountInputs = {};
+        this.inventoryError = null;
+        this.render();
+        break;
+      }
+      case 'toggle-inventory-only-diff': {
+        this.inventoryOnlyDifferences = !this.inventoryOnlyDifferences;
+        this.render();
+        break;
+      }
+      case 'toggle-inventory-untracked': {
+        this.inventoryIncludeUntracked = !this.inventoryIncludeUntracked;
+        this.render();
         break;
       }
       case 'toggle-product-active': {
@@ -2552,18 +4139,18 @@ export class SilaBillingApp {
         if (!this.canManageCatalog()) return;
         const prod = this.products.find((p) => p.id === id);
         if (!prod) return;
-        this.quickStockProductId = prod.id;
-        this.quickStockAdjustInput = String(prod.stockQty ?? 0);
         this.selectedProductDetailId = prod.id;
+        this.openStockMovementModalForProduct(prod.id, 'AJUSTE_INVENTARIO', 'EXACT');
         this.render();
-        const stockEl = document.getElementById('quick-stock-qty-input') as HTMLInputElement | null;
-        stockEl?.focus();
-        stockEl?.select();
+        const qtyEl = document.getElementById('stock-movement-qty-input') as HTMLInputElement | null;
+        qtyEl?.focus();
+        qtyEl?.select();
         break;
       }
       case 'cancel-quick-stock': {
         this.quickStockProductId = null;
         this.quickStockAdjustInput = '';
+        this.stockMovementPanelOpen = false;
         this.render();
         break;
       }
@@ -2754,7 +4341,11 @@ export class SilaBillingApp {
         if (inv) {
           this.historySearch = '';
           this.historyDebtOnly = false;
+          this.historyStatusFilter = 'ALL';
+          this.historyPeriod = 'ALL';
+          this.historyOperatorFilter = 'ALL';
           this.selectedHistoryId = inv.id;
+          this.creditNoteOriginId = null;
           this.activeModule = 'HISTORY';
           this.render();
         }
@@ -2764,7 +4355,7 @@ export class SilaBillingApp {
         const inv = this.invoices.find((i) => i.id === id);
         if (inv) {
           const fmt: DocumentFormat = value === 'A4' ? 'A4' : 'POS';
-          await this.triggerPrint(inv, fmt);
+          await this.reprintHistoryInvoice(inv.id, fmt);
         }
         break;
       }
@@ -2772,12 +4363,147 @@ export class SilaBillingApp {
         this.selectedHistoryId = id;
         this.settlingInvoiceId = null;
         this.settleError = null;
+        if (this.creditNoteOriginId && this.creditNoteOriginId !== id) {
+          this.creditNoteOriginId = null;
+          this.creditNoteError = null;
+        }
         this.render();
         break;
       }
       case 'toggle-history-debt-filter': {
         this.historyDebtOnly = !this.historyDebtOnly;
+        this.historyStatusFilter = this.historyDebtOnly ? 'DEBT_ALL' : 'ALL';
         this.render();
+        break;
+      }
+      case 'set-history-status-filter': {
+        if (
+          value === 'ALL' ||
+          value === 'PAID' ||
+          value === 'PENDING' ||
+          value === 'PARTIAL' ||
+          value === 'DEBT_ALL' ||
+          value === 'CREDIT_NOTES' ||
+          value === 'CANCELLED' ||
+          value === 'PROFORMA'
+        ) {
+          this.historyStatusFilter = value;
+          this.historyDebtOnly = value === 'DEBT_ALL';
+          this.render();
+        }
+        break;
+      }
+      case 'set-history-period': {
+        if (
+          value === 'ALL' ||
+          value === 'TODAY' ||
+          value === 'THIS_MONTH' ||
+          value === 'LAST_30D' ||
+          value === 'THIS_YEAR' ||
+          value === 'CUSTOM'
+        ) {
+          this.historyPeriod = value;
+          if (value === 'CUSTOM' && !this.historyDateFrom && !this.historyDateTo) {
+            const today = new Date().toISOString().slice(0, 10);
+            this.historyDateFrom = `${today.slice(0, 8)}01`;
+            this.historyDateTo = today;
+          }
+          this.render();
+        }
+        break;
+      }
+      case 'reset-history-filters': {
+        this.historySearch = '';
+        this.historyDebtOnly = false;
+        this.historyStatusFilter = 'ALL';
+        this.historyPeriod = 'ALL';
+        this.historyDateFrom = '';
+        this.historyDateTo = '';
+        this.historyOperatorFilter = 'ALL';
+        this.render();
+        break;
+      }
+      case 'set-history-right-tab': {
+        if (value === 'PREVIEW' || value === 'AUDIT') {
+          this.historyRightTab = value;
+          this.render();
+        }
+        break;
+      }
+      case 'open-credit-note-panel': {
+        if (this.isCompanySuspended()) return;
+        const originInv = this.invoices.find((i) => i.id === id);
+        if (!originInv || originInv.status === 'cancelled' || originInv.docType !== 'FR') return;
+        this.openCreditNoteDrawer(originInv);
+        this.render();
+        break;
+      }
+      case 'close-credit-note-panel': {
+        this.creditNoteOriginId = null;
+        this.creditNoteError = null;
+        this.render();
+        break;
+      }
+      case 'fill-credit-note-all': {
+        const originInv = this.invoices.find((i) => i.id === this.creditNoteOriginId);
+        if (!originInv) break;
+        const remLines = this.getRemainingCreditableLines(originInv);
+        for (const item of remLines) {
+          this.creditNoteLineQtys[item.line.id] =
+            item.maxReturnableQty > 0 ? String(item.maxReturnableQty) : '0';
+        }
+        this.creditNoteError = null;
+        this.render();
+        break;
+      }
+      case 'clear-credit-note-qtys': {
+        for (const k of Object.keys(this.creditNoteLineQtys)) {
+          this.creditNoteLineQtys[k] = '0';
+        }
+        this.creditNoteError = null;
+        this.render();
+        break;
+      }
+      case 'convert-proforma-to-invoice': {
+        if (this.isCompanySuspended()) return;
+        const fp = this.invoices.find((i) => i.id === id);
+        if (!fp || fp.docType !== 'FP' || fp.status === 'cancelled') return;
+        const directCustId = getDirectCustomerIdForCompany(this.activeCompany.id);
+        this.cart = fp.lines.map((l) => ({
+          productId: l.productId,
+          code: l.code,
+          description: l.description,
+          unit: l.unit,
+          qty: l.qty,
+          unitPrice: l.unitPrice,
+          discountPct: l.discountPct,
+          ivaRate: l.ivaRate,
+        }));
+        this.globalDiscountPct = fp.globalDiscountPct || 0;
+        this.globalDiscountInput = this.globalDiscountPct > 0 ? String(this.globalDiscountPct) : '';
+        this.selectedCustomerId =
+          fp.customerId && this.customers.some((c) => c.id === fp.customerId)
+            ? fp.customerId
+            : directCustId;
+        this.docType = 'FR';
+        this.notes = `Conversão da Proforma ${fp.number}.`;
+        this.amountReceivedInput = '';
+        this.returnOriginInvoice = null;
+        this.activeModule = this.historyViewFormat === 'A4' ? 'NEW_A4' : 'NEW_POS';
+        this.previewFormat = this.historyViewFormat;
+        this.mobilePane = 'CART';
+        this.scheduleDraftSave();
+        this.showScannerFeedback(
+          `Proforma ${fp.number} carregada para emissão de Fatura/Recibo.`,
+          false
+        );
+        this.render();
+        break;
+      }
+      case 'export-history-control': {
+        if (value === 'PDF' || value === 'EXCEL' || value === 'CSV') {
+          this.exportHistoryControl(value);
+        }
         break;
       }
       case 'open-settle-debt': {
@@ -2785,6 +4511,7 @@ export class SilaBillingApp {
         const inv = this.invoices.find((i) => i.id === id);
         if (!inv || inv.status === 'cancelled' || !(inv.amountDue && inv.amountDue > 0)) return;
         this.settlingCustomerAccountId = null;
+        this.creditNoteOriginId = null;
         this.settlingInvoiceId = inv.id;
         this.settleAmountInput = String(inv.amountDue);
         this.settleMethod = 'Dinheiro';
@@ -2803,26 +4530,38 @@ export class SilaBillingApp {
         const cust = this.customers.find((c) => c.id === id);
         this.historySearch = cust ? cust.name : '';
         this.historyDebtOnly = true;
+        this.historyStatusFilter = 'DEBT_ALL';
+        this.historyPeriod = 'ALL';
+        this.historyOperatorFilter = 'ALL';
         this.activeModule = 'HISTORY';
         this.render();
         break;
       }
       case 'set-history-format': {
         this.historyViewFormat = value as DocumentFormat;
+        this.historyRightTab = 'PREVIEW';
         this.render();
         break;
       }
       case 'print-history': {
-        const inv = this.invoices.find((i) => i.id === id);
-        if (inv) {
-          await this.triggerPrint(inv, this.historyViewFormat);
-        }
+        const fmtOverride: DocumentFormat | undefined =
+          value === 'A4' ? 'A4' : value === 'POS' ? 'POS' : undefined;
+        await this.reprintHistoryInvoice(id, fmtOverride);
         break;
       }
       case 'cancel-invoice': {
-        if (!this.canCancelInvoices()) return;
         const inv = this.invoices.find((i) => i.id === id);
         if (!inv || inv.status === 'cancelled') return;
+        if (!this.canCancelInvoices()) {
+          this.showSupervisorAuthModal = true;
+          this.supervisorAuthAction = 'CANCEL_INVOICE';
+          this.supervisorAuthTargetId = id;
+          this.supervisorAuthPendingVal = 0;
+          this.supervisorAuthPinInput = '';
+          this.supervisorAuthError = null;
+          this.render();
+          return;
+        }
         this.cancellingInvoiceId = id;
         this.cancelInvoiceError = null;
         this.render();
@@ -2831,6 +4570,89 @@ export class SilaBillingApp {
       case 'close-cancel-invoice-modal': {
         this.cancellingInvoiceId = null;
         this.cancelInvoiceError = null;
+        this.render();
+        break;
+      }
+      case 'open-operator-switch-modal': {
+        this.showOperatorSwitchModal = true;
+        this.render();
+        break;
+      }
+      case 'close-operator-switch-modal': {
+        this.showOperatorSwitchModal = false;
+        this.render();
+        break;
+      }
+      case 'quick-switch-operator': {
+        const opName = (target.dataset.name || '001').trim();
+        const role = (target.dataset.role || 'cashier') as CompanyRole;
+        this.operator = opName.slice(0, 32);
+        this.selectedTerminalRole = role;
+        this.showOperatorSwitchModal = false;
+        this.scheduleDraftSave();
+        this.render();
+        break;
+      }
+      case 'close-supervisor-auth-modal': {
+        const maxAllowed = this.settings.maxCashierDiscountPct ?? 5;
+        if (this.supervisorAuthAction === 'DISCOUNT_LINE') {
+          this.cart = this.cart.map((c) =>
+            c.productId === this.supervisorAuthTargetId ? { ...c, discountPct: maxAllowed } : c
+          );
+          this.scheduleDraftSave();
+        } else if (this.supervisorAuthAction === 'DISCOUNT_GLOBAL') {
+          this.globalDiscountPct = maxAllowed;
+          this.globalDiscountInput = maxAllowed > 0 ? String(maxAllowed) : '';
+          this.scheduleDraftSave();
+        }
+        this.showSupervisorAuthModal = false;
+        this.supervisorAuthAction = null;
+        this.supervisorAuthTargetId = '';
+        this.supervisorAuthPendingVal = 0;
+        this.supervisorAuthPinInput = '';
+        this.supervisorAuthError = null;
+        this.render();
+        break;
+      }
+      case 'supervisor-direct-approve': {
+        const verifiedRole = this.getVerifiedMaxRole();
+        if (verifiedRole === 'owner' || verifiedRole === 'manager') {
+          const supervisorLabel = `${this.user?.displayName || this.user?.email || this.operator} (${formatRoleLabelPt(verifiedRole)})`;
+          this.approveSupervisorAuth(supervisorLabel);
+        }
+        break;
+      }
+      case 'set-history-main-tab': {
+        this.historyActiveMainTab = (value || 'DOCUMENTS') as any;
+        this.render();
+        break;
+      }
+      case 'set-audit-type-filter': {
+        this.operationalAuditTypeFilter = (value || 'ALL') as any;
+        this.render();
+        break;
+      }
+      case 'export-audit-csv': {
+        this.exportOperationalAuditCsv();
+        break;
+      }
+      case 'clear-audit-search': {
+        this.operationalAuditSearch = '';
+        this.render();
+        break;
+      }
+      case 'open-audit-doc': {
+        const targetInv = this.invoices.find((i) => i.id === id);
+        if (targetInv) {
+          this.selectedHistoryId = targetInv.id;
+          this.historyActiveMainTab = 'DOCUMENTS';
+          this.render();
+        }
+        break;
+      }
+      case 'open-operational-audit-from-settings': {
+        this.activeModule = 'HISTORY';
+        this.historyActiveMainTab = 'OPERATIONAL_AUDIT';
         this.render();
         break;
       }
@@ -3182,6 +5004,694 @@ export class SilaBillingApp {
         this.render();
         break;
       }
+      case 'set-purchases-subview': {
+        if (value === 'PURCHASES' || value === 'SUPPLIERS') {
+          this.purchasesSubView = value;
+          this.purchasesWorkspaceNotice = null;
+          this.render();
+        }
+        break;
+      }
+      case 'open-new-purchase': {
+        if (!this.canManageCatalog()) break;
+        const activeSups = this.suppliers.filter((s) => s.active !== false);
+        const defaultSup =
+          activeSups.find((s) => s.id === this.selectedSupplierDetailId) || activeSups[0] || null;
+        let dueIso = '';
+        if (defaultSup?.paymentTermsDays && defaultSup.paymentTermsDays > 0) {
+          const dt = new Date(Date.now() + defaultSup.paymentTermsDays * 86400000);
+          dueIso = dt.toISOString().slice(0, 10);
+        }
+        this.purchasePanelOpen = true;
+        this.purchaseFormError = null;
+        this.purchasesWorkspaceNotice = null;
+        this.showPurchaseQuickSupplier = activeSups.length === 0;
+        this.purchaseQuickSupplierError = null;
+        this.purchaseCatalogSearch = '';
+        this.purchaseFormDraft = {
+          supplierId: defaultSup?.id || '',
+          supplierInvoiceRef: '',
+          dueDateIso: dueIso,
+          paymentMode: 'PAID',
+          paymentMethod: 'Transferência',
+          amountPaidInput: '',
+          reference: '',
+          updateStock: true,
+          recordInCashSession: true,
+          notes: '',
+        };
+        if (this.purchaseDraftLines.length === 0 && id) {
+          const preProd = this.products.find((p) => p.id === id);
+          if (preProd) {
+            this.purchaseDraftLines = [
+              {
+                productId: preProd.id,
+                code: preProd.code,
+                name: preProd.name,
+                unit: preProd.unit || 'un',
+                qtyInput: '1',
+                unitCostInput:
+                  typeof preProd.costPrice === 'number' && preProd.costPrice > 0
+                    ? String(preProd.costPrice)
+                    : String(preProd.price || 0),
+              },
+            ];
+          }
+        }
+        this.render();
+        break;
+      }
+      case 'close-new-purchase': {
+        this.purchasePanelOpen = false;
+        this.purchaseFormError = null;
+        this.showPurchaseQuickSupplier = false;
+        this.purchaseQuickSupplierError = null;
+        this.render();
+        break;
+      }
+      case 'toggle-purchase-quick-supplier': {
+        this.showPurchaseQuickSupplier = !this.showPurchaseQuickSupplier;
+        this.purchaseQuickSupplierError = null;
+        if (this.showPurchaseQuickSupplier) {
+          this.purchaseQuickSupplierDraft = {
+            name: '',
+            nif: '',
+            phone: '',
+            locality: 'Luanda',
+            paymentTermsDaysInput: '30',
+          };
+        }
+        this.render();
+        break;
+      }
+      case 'purchase-add-product': {
+        const prod = this.products.find((p) => p.id === id);
+        if (!prod) break;
+        this.addProductToPurchaseDraft(prod);
+        this.purchaseCatalogSearch = '';
+        this.purchaseFormError = null;
+        this.renderPreservingFocus('purchase-catalog-search-input', 0);
+        break;
+      }
+      case 'purchase-remove-line': {
+        this.purchaseDraftLines = this.purchaseDraftLines.filter((l) => l.productId !== id);
+        this.render();
+        break;
+      }
+      case 'purchase-step-qty': {
+        const delta = value === 'inc' ? 1 : -1;
+        this.purchaseDraftLines = this.purchaseDraftLines.map((l) => {
+          if (l.productId !== id) return l;
+          const cur = parseDecimalInput(l.qtyInput);
+          const next = Math.max(1, roundKz((Number.isNaN(cur) ? 1 : cur) + delta));
+          return { ...l, qtyInput: String(next) };
+        });
+        this.render();
+        break;
+      }
+      case 'purchase-payment-mode': {
+        if (value === 'PAID' || value === 'CREDIT' || value === 'PARTIAL') {
+          this.purchaseFormDraft.paymentMode = value;
+          if (value === 'CREDIT' && !this.purchaseFormDraft.dueDateIso) {
+            const sup = this.suppliers.find((s) => s.id === this.purchaseFormDraft.supplierId);
+            const days = sup?.paymentTermsDays && sup.paymentTermsDays > 0 ? sup.paymentTermsDays : 30;
+            this.purchaseFormDraft.dueDateIso = new Date(Date.now() + days * 86400000)
+              .toISOString()
+              .slice(0, 10);
+          }
+          this.render();
+        }
+        break;
+      }
+      case 'select-purchase-detail': {
+        this.selectedPurchaseDetailId = id;
+        this.settlingPurchaseId = null;
+        this.cancellingPurchaseId = null;
+        this.purchaseSettleError = null;
+        this.cancelPurchaseError = null;
+        this.render();
+        break;
+      }
+      case 'set-purchase-filter': {
+        if (
+          value === 'ALL' ||
+          value === 'PAYABLE' ||
+          value === 'OVERDUE' ||
+          value === 'PAID' ||
+          value === 'CANCELLED'
+        ) {
+          this.purchaseFilter = value;
+          this.render();
+        }
+        break;
+      }
+      case 'filter-purchases-by-supplier': {
+        this.purchasesSubView = 'PURCHASES';
+        this.purchaseSupplierFilterId = id || 'ALL';
+        this.purchaseFilter = value === 'PAYABLE' ? 'PAYABLE' : 'ALL';
+        const firstMatch = this.purchases.find(
+          (p) =>
+            p.supplierId === id &&
+            (this.purchaseFilter !== 'PAYABLE' || (p.status === 'recorded' && p.amountDue > 0))
+        );
+        if (firstMatch) this.selectedPurchaseDetailId = firstMatch.id;
+        this.render();
+        break;
+      }
+      case 'open-settle-purchase': {
+        const pur = this.purchases.find((p) => p.id === id);
+        if (!pur || pur.status === 'cancelled' || pur.amountDue <= 0) break;
+        this.selectedPurchaseDetailId = pur.id;
+        this.settlingPurchaseId = pur.id;
+        this.cancellingPurchaseId = null;
+        this.purchaseSettleAmountInput = String(roundKz(pur.amountDue));
+        this.purchaseSettleMethod = 'Transferência';
+        this.purchaseSettleReference = '';
+        this.purchaseSettleRecordCash = true;
+        this.purchaseSettleError = null;
+        this.render();
+        break;
+      }
+      case 'close-settle-purchase': {
+        this.settlingPurchaseId = null;
+        this.purchaseSettleError = null;
+        this.render();
+        break;
+      }
+      case 'open-cancel-purchase': {
+        if (!this.canManageCatalog()) break;
+        const pur = this.purchases.find((p) => p.id === id);
+        if (!pur || pur.status === 'cancelled') break;
+        this.selectedPurchaseDetailId = pur.id;
+        this.cancellingPurchaseId = pur.id;
+        this.settlingPurchaseId = null;
+        this.cancelPurchaseReason = '';
+        this.cancelPurchaseError = null;
+        this.render();
+        break;
+      }
+      case 'close-cancel-purchase': {
+        this.cancellingPurchaseId = null;
+        this.cancelPurchaseReason = '';
+        this.cancelPurchaseError = null;
+        this.render();
+        break;
+      }
+      case 'new-supplier': {
+        if (!this.canManageCatalog()) break;
+        this.purchasesSubView = 'SUPPLIERS';
+        this.isNewSupplier = true;
+        this.supplierFormError = null;
+        this.purchasesWorkspaceNotice = null;
+        this.editingSupplierTermsInput = '30';
+        this.editingSupplier = {
+          id: `sup_${Date.now()}_${Math.random().toString(36).slice(2, 6)}`,
+          companyId: this.activeCompany.id,
+          name: '',
+          nif: '',
+          phone: '',
+          email: '',
+          address: '',
+          locality: 'Luanda',
+          contactPerson: '',
+          iban: '',
+          paymentTermsDays: 30,
+          notes: '',
+          active: true,
+        };
+        this.render();
+        break;
+      }
+      case 'edit-supplier': {
+        if (!this.canManageCatalog()) break;
+        const sup = this.suppliers.find((s) => s.id === id);
+        if (!sup) break;
+        this.purchasesSubView = 'SUPPLIERS';
+        this.isNewSupplier = false;
+        this.supplierFormError = null;
+        this.editingSupplier = { ...sup };
+        this.editingSupplierTermsInput =
+          typeof sup.paymentTermsDays === 'number' && sup.paymentTermsDays >= 0
+            ? String(sup.paymentTermsDays)
+            : '';
+        this.render();
+        break;
+      }
+      case 'cancel-supplier-form': {
+        this.editingSupplier = null;
+        this.supplierFormError = null;
+        this.render();
+        break;
+      }
+      case 'select-supplier-detail': {
+        this.selectedSupplierDetailId = id;
+        this.confirmDeleteSupplierId = null;
+        this.settlingSupplierAccountId = null;
+        this.purchaseSettleError = null;
+        this.render();
+        break;
+      }
+      case 'set-supplier-filter': {
+        if (value === 'ALL' || value === 'WITH_PAYABLE' || value === 'ACTIVE' || value === 'INACTIVE') {
+          this.supplierFilter = value;
+          this.render();
+        }
+        break;
+      }
+      case 'toggle-supplier-active': {
+        if (!this.canManageCatalog()) break;
+        const sup = this.suppliers.find((s) => s.id === id);
+        if (!sup) break;
+        const updated: Supplier = {
+          ...sup,
+          active: sup.active === false ? true : false,
+          syncState: 'pending',
+          synced: false,
+          updatedAtIso: new Date().toISOString(),
+        };
+        void this.persistAndSyncSupplier(updated).then(() => {
+          this.purchasesWorkspaceNotice = `Fornecedor "${updated.name}" marcado como ${updated.active ? 'ativo' : 'inativo'}.`;
+          this.render();
+        });
+        break;
+      }
+      case 'ask-delete-supplier': {
+        if (!this.canManageCatalog()) break;
+        this.confirmDeleteSupplierId = id;
+        this.render();
+        break;
+      }
+      case 'cancel-delete-supplier': {
+        this.confirmDeleteSupplierId = null;
+        this.render();
+        break;
+      }
+      case 'confirm-delete-supplier': {
+        if (!this.canManageCatalog()) break;
+        const sup = this.suppliers.find((s) => s.id === id);
+        if (!sup) break;
+        const hasPurchases = this.purchases.some((p) => p.supplierId === sup.id);
+        this.confirmDeleteSupplierId = null;
+        if (hasPurchases) {
+          const deactivated: Supplier = {
+            ...sup,
+            active: false,
+            syncState: 'pending',
+            synced: false,
+            updatedAtIso: new Date().toISOString(),
+          };
+          void this.persistAndSyncSupplier(deactivated).then(() => {
+            this.purchasesWorkspaceNotice = `O fornecedor "${sup.name}" possui compras registadas e foi inativado para preservar o histórico fiscal.`;
+            this.render();
+          });
+        } else {
+          void localDb.deleteSupplier(sup.id).then(() => {
+            this.suppliers = this.suppliers.filter((s) => s.id !== sup.id);
+            if (this.selectedSupplierDetailId === sup.id) {
+              this.selectedSupplierDetailId = this.suppliers[0]?.id || '';
+            }
+            this.purchasesWorkspaceNotice = `Fornecedor "${sup.name}" removido.`;
+            if (this.user && this.isOnline && canCompanySyncCloudData(this.activeCompany)) {
+              void removeSupplierCloud(sup.id, this.activeCompany.id).catch(() => null);
+            }
+            this.render();
+          });
+        }
+        break;
+      }
+      case 'open-settle-supplier-account': {
+        const due = this.getSupplierOpenPayable(id);
+        if (due <= 0) break;
+        this.selectedSupplierDetailId = id;
+        this.settlingSupplierAccountId = id;
+        this.purchaseSettleAmountInput = String(roundKz(due));
+        this.purchaseSettleMethod = 'Transferência';
+        this.purchaseSettleReference = '';
+        this.purchaseSettleRecordCash = true;
+        this.purchaseSettleError = null;
+        this.render();
+        break;
+      }
+      case 'close-settle-supplier-account': {
+        this.settlingSupplierAccountId = null;
+        this.purchaseSettleError = null;
+        this.render();
+        break;
+      }
+      case 'set-finance-subview': {
+        if (
+          value === 'OVERVIEW' ||
+          value === 'ACCOUNTS' ||
+          value === 'CASHFLOW' ||
+          value === 'MARGINS'
+        ) {
+          this.financeSubView = value;
+          this.financeWorkspaceNotice = null;
+          this.render();
+        }
+        break;
+      }
+      case 'set-finance-period': {
+        if (
+          value === 'TODAY' ||
+          value === 'THIS_MONTH' ||
+          value === 'LAST_30D' ||
+          value === 'THIS_YEAR' ||
+          value === 'ALL'
+        ) {
+          this.financePeriod = value;
+          this.render();
+        }
+        break;
+      }
+      case 'set-finance-accounts-side': {
+        if (value === 'RECEIVABLES' || value === 'PAYABLES') {
+          this.financeAccountsSide = value;
+          this.financeSubView = 'ACCOUNTS';
+          this.settlingInvoiceId = null;
+          this.settlingCustomerAccountId = null;
+          this.settlingPurchaseId = null;
+          this.settlingSupplierAccountId = null;
+          this.settleError = null;
+          this.purchaseSettleError = null;
+          this.render();
+        }
+        break;
+      }
+      case 'set-finance-receivable-filter': {
+        if (
+          value === 'OPEN_ALL' ||
+          value === 'CREDIT_SALES' ||
+          value === 'PARTIAL_PAYMENTS' ||
+          value === 'BY_CUSTOMER' ||
+          value === 'SETTLED_CREDIT'
+        ) {
+          this.financeSubView = 'ACCOUNTS';
+          this.financeAccountsSide = 'RECEIVABLES';
+          this.financeReceivableFilter = value;
+          this.render();
+        }
+        break;
+      }
+      case 'set-finance-payable-filter': {
+        if (
+          value === 'OPEN_ALL' ||
+          value === 'OVERDUE' ||
+          value === 'PARTIAL_PAYMENTS' ||
+          value === 'BY_SUPPLIER'
+        ) {
+          this.financeSubView = 'ACCOUNTS';
+          this.financeAccountsSide = 'PAYABLES';
+          this.financePayableFilter = value;
+          this.render();
+        }
+        break;
+      }
+      case 'clear-finance-accounts-search': {
+        this.financeAccountsSearch = '';
+        this.renderPreservingFocus('finance-accounts-search-input', 0);
+        break;
+      }
+      case 'open-finance-entry': {
+        if (this.isCompanySuspended()) break;
+        const kind =
+          value === 'RECEITA_EXTRAORDINARIA' ? 'RECEITA_EXTRAORDINARIA' : 'DESPESA_OPERACIONAL';
+        if (this.financeEntryPanel === kind) {
+          this.financeEntryPanel = null;
+          this.financeEntryError = null;
+          this.render();
+          break;
+        }
+        this.financeEntryPanel = kind;
+        this.financeEntryError = null;
+        this.financeWorkspaceNotice = null;
+        this.financeEntryDraft = {
+          category:
+            kind === 'DESPESA_OPERACIONAL'
+              ? DEFAULT_EXPENSE_CATEGORIES[0]
+              : DEFAULT_EXTRA_REVENUE_CATEGORIES[0],
+          amountInput: '',
+          paymentMethod: 'Transferência',
+          reason: '',
+          reference: '',
+          affectCashDrawer: true,
+        };
+        this.render();
+        const amtEl = document.getElementById('finance-entry-amount-input') as HTMLInputElement | null;
+        amtEl?.focus();
+        break;
+      }
+      case 'close-finance-entry': {
+        this.financeEntryPanel = null;
+        this.financeEntryError = null;
+        this.render();
+        break;
+      }
+      case 'set-finance-cashflow-filter': {
+        if (
+          value === 'ALL' ||
+          value === 'INFLOWS' ||
+          value === 'OUTFLOWS' ||
+          value === 'EXPENSES' ||
+          value === 'EXTRA_REVENUES' ||
+          value === 'DEBT_COLLECTIONS' ||
+          value === 'SUPPLIER_PAYMENTS'
+        ) {
+          this.financeSubView = 'CASHFLOW';
+          this.financeCashflowFilter = value;
+          this.render();
+        }
+        break;
+      }
+      case 'clear-finance-cashflow-search': {
+        this.financeCashflowSearch = '';
+        this.renderPreservingFocus('finance-cashflow-search-input', 0);
+        break;
+      }
+      case 'set-finance-margin-filter': {
+        if (
+          value === 'ALL' ||
+          value === 'SOLD_IN_PERIOD' ||
+          value === 'LOW_MARGIN' ||
+          value === 'NO_COST'
+        ) {
+          this.financeSubView = 'MARGINS';
+          this.financeMarginFilter = value;
+          this.render();
+        }
+        break;
+      }
+      case 'set-finance-margin-sort': {
+        if (
+          value === 'PROFIT_DESC' ||
+          value === 'MARGIN_DESC' ||
+          value === 'MARGIN_ASC' ||
+          value === 'QTY_DESC' ||
+          value === 'QTY_ASC'
+        ) {
+          this.financeMarginSort = value;
+          this.render();
+        }
+        break;
+      }
+      case 'clear-finance-margin-search': {
+        this.financeMarginSearch = '';
+        this.renderPreservingFocus('finance-margin-search-input', 0);
+        break;
+      }
+      case 'set-indicators-trend-mode': {
+        if (value === 'DAILY' || value === 'MONTHLY') {
+          this.indicatorsTrendMode = value;
+          this.render();
+        }
+        break;
+      }
+      case 'set-indicators-least-mode': {
+        if (value === 'ALL_ACTIVE' || value === 'SOLD_ONLY') {
+          this.indicatorsLeastSoldMode = value;
+          this.render();
+        }
+        break;
+      }
+      case 'set-indicators-margin-mode': {
+        if (value === 'PCT' || value === 'REALIZED') {
+          this.indicatorsMarginRankMode = value;
+          this.render();
+        }
+        break;
+      }
+      case 'indicators-drill-day': {
+        if (id && /^\d{4}-\d{2}-\d{2}$/.test(id)) {
+          this.activeModule = 'HISTORY';
+          this.historyPeriod = 'CUSTOM';
+          this.historyDateFrom = id;
+          this.historyDateTo = id;
+          this.historyStatusFilter = 'ALL';
+          this.historyDebtOnly = false;
+          this.historySearch = '';
+          this.historyOperatorFilter = 'ALL';
+          this.scheduleDraftSave();
+          this.render();
+        }
+        break;
+      }
+      case 'indicators-drill-month': {
+        if (id && /^\d{4}-\d{2}$/.test(id)) {
+          const [yStr, mStr] = id.split('-');
+          const lastDay = String(new Date(Number(yStr), Number(mStr), 0).getDate()).padStart(
+            2,
+            '0'
+          );
+          this.activeModule = 'HISTORY';
+          this.historyPeriod = 'CUSTOM';
+          this.historyDateFrom = `${id}-01`;
+          this.historyDateTo = `${id}-${lastDay}`;
+          this.historyStatusFilter = 'ALL';
+          this.historyDebtOnly = false;
+          this.historySearch = '';
+          this.historyOperatorFilter = 'ALL';
+          this.scheduleDraftSave();
+          this.render();
+        }
+        break;
+      }
+      case 'indicators-go-stock-filter': {
+        if (
+          value === 'ALL' ||
+          value === 'ACTIVE' ||
+          value === 'OUT_OF_STOCK' ||
+          value === 'LOW_STOCK'
+        ) {
+          this.activeModule = 'PRODUCTS';
+          this.productsSubView = 'CATALOG';
+          this.productFilter = value;
+          this.productCategoryFilter = 'ALL';
+          this.productSearch = '';
+          this.scheduleDraftSave();
+          this.render();
+        }
+        break;
+      }
+      case 'indicators-restock-product': {
+        if (!id) break;
+        this.activeModule = 'PRODUCTS';
+        this.productsSubView = 'CATALOG';
+        this.selectedProductDetailId = id;
+        if (this.canManageCatalog() && !this.isCompanySuspended()) {
+          this.openStockMovementModalForProduct(id, 'ENTRADA_MERCADORIA');
+        }
+        this.scheduleDraftSave();
+        this.render();
+        break;
+      }
+      case 'indicators-open-margins': {
+        this.activeModule = 'FINANCE';
+        this.financeSubView = 'MARGINS';
+        this.financeMarginFilter = 'ALL';
+        if (
+          value === 'PROFIT_DESC' ||
+          value === 'MARGIN_DESC' ||
+          value === 'MARGIN_ASC' ||
+          value === 'QTY_DESC' ||
+          value === 'QTY_ASC'
+        ) {
+          this.financeMarginSort = value;
+        }
+        this.scheduleDraftSave();
+        this.render();
+        break;
+      }
+      case 'indicators-open-receivables': {
+        this.activeModule = 'FINANCE';
+        this.financeSubView = 'ACCOUNTS';
+        this.financeAccountsSide = 'RECEIVABLES';
+        this.financeReceivableFilter = value === 'OPEN_ALL' ? 'OPEN_ALL' : 'BY_CUSTOMER';
+        this.scheduleDraftSave();
+        this.render();
+        break;
+      }
+      case 'indicators-open-dre': {
+        this.activeModule = 'FINANCE';
+        this.financeSubView = 'OVERVIEW';
+        if (value === 'EXPENSE' && !this.isCompanySuspended()) {
+          this.financeEntryPanel = 'DESPESA_OPERACIONAL';
+          this.financeEntryError = null;
+          this.financeEntryDraft = {
+            category: DEFAULT_EXPENSE_CATEGORIES[0],
+            amountInput: '',
+            paymentMethod: 'Transferência',
+            reason: '',
+            reference: '',
+            affectCashDrawer: Boolean(this.getActiveOpenCashSession()),
+          };
+        }
+        this.scheduleDraftSave();
+        this.render();
+        break;
+      }
+      case 'open-finance-product-cost': {
+        if (!this.canManageCatalog()) break;
+        const prod = this.products.find((p) => p.id === id);
+        if (!prod) break;
+        if (this.financeEditingProductId === prod.id) {
+          this.financeEditingProductId = null;
+          this.financeEditProductError = null;
+          this.render();
+          break;
+        }
+        this.financeEditingProductId = prod.id;
+        this.financeEditCostInput =
+          typeof prod.costPrice === 'number' && prod.costPrice > 0 ? String(prod.costPrice) : '';
+        this.financeEditPriceInput = String(prod.price);
+        this.financeEditProductError = null;
+        this.render();
+        const costEl = document.getElementById(
+          `finance-edit-cost-${prod.id}`
+        ) as HTMLInputElement | null;
+        costEl?.focus();
+        costEl?.select();
+        break;
+      }
+      case 'close-finance-product-cost': {
+        this.financeEditingProductId = null;
+        this.financeEditProductError = null;
+        this.render();
+        break;
+      }
+      case 'finance-go-new-purchase': {
+        this.activeModule = 'PURCHASES';
+        this.purchasesSubView = 'PURCHASES';
+        if (this.canManageCatalog()) {
+          const activeSups = this.suppliers.filter((s) => s.active !== false);
+          const defaultSup = activeSups[0] || null;
+          this.purchasePanelOpen = true;
+          this.purchaseFormError = null;
+          this.showPurchaseQuickSupplier = activeSups.length === 0;
+          this.purchaseFormDraft = {
+            ...this.purchaseFormDraft,
+            supplierId: defaultSup?.id || '',
+          };
+        }
+        this.render();
+        break;
+      }
+      case 'finance-open-customer-detail': {
+        if (id && this.customers.some((c) => c.id === id)) {
+          this.selectedCustomerDetailId = id;
+          this.activeModule = 'CUSTOMERS';
+          this.render();
+        }
+        break;
+      }
+      case 'finance-open-supplier-detail': {
+        if (id && this.suppliers.some((s) => s.id === id)) {
+          this.selectedSupplierDetailId = id;
+          this.purchasesSubView = 'SUPPLIERS';
+          this.activeModule = 'PURCHASES';
+          this.render();
+        }
+        break;
+      }
     }
   }
 
@@ -3198,7 +5708,25 @@ export class SilaBillingApp {
     } else if (this.activeModule === 'CUSTOMERS') {
       targetInputId = 'customer-search-input';
     } else if (this.activeModule === 'PRODUCTS') {
-      targetInputId = 'product-search-input';
+      targetInputId =
+        this.productsSubView === 'MOVEMENTS'
+          ? 'stock-ledger-search-input'
+          : 'product-search-input';
+    } else if (this.activeModule === 'PURCHASES') {
+      targetInputId = this.purchasePanelOpen
+        ? 'purchase-catalog-search-input'
+        : this.purchasesSubView === 'SUPPLIERS'
+          ? 'supplier-search-input'
+          : 'purchase-search-input';
+    } else if (this.activeModule === 'FINANCE') {
+      targetInputId =
+        this.financeSubView === 'ACCOUNTS'
+          ? 'finance-accounts-search-input'
+          : this.financeSubView === 'CASHFLOW'
+            ? 'finance-cashflow-search-input'
+            : this.financeSubView === 'MARGINS'
+              ? 'finance-margin-search-input'
+              : '';
     } else if (this.activeModule === 'HISTORY') {
       targetInputId = 'history-search-input';
     }
@@ -3253,6 +5781,20 @@ export class SilaBillingApp {
       return;
     }
 
+    if (inputTarget?.dataset?.field === 'purchase-catalog-search' && e.key === 'Enter') {
+      e.preventDefault();
+      if (this.isCompanySuspended()) return;
+      const res = searchProductsSmart(this.products, this.purchaseCatalogSearch);
+      const chosen = res.exactCodeMatch || res.matches[0] || null;
+      if (chosen) {
+        this.addProductToPurchaseDraft(chosen);
+        this.purchaseCatalogSearch = '';
+        this.purchaseFormError = null;
+        this.renderPreservingFocus('purchase-catalog-search-input', 0);
+      }
+      return;
+    }
+
     const hasBlockingModal =
       this.showIOSGuide ||
       Boolean(this.growthModalReason) ||
@@ -3303,10 +5845,25 @@ export class SilaBillingApp {
         this.settlingInvoiceId ||
         this.settlingCustomerAccountId ||
         this.quickStockProductId ||
+        this.stockMovementPanelOpen ||
         this.confirmDeleteProductId ||
         this.activeCashActionPanel ||
-        this.posQuickCashPanel
+        this.posQuickCashPanel ||
+        this.showPurchaseQuickSupplier ||
+        this.purchasePanelOpen ||
+        this.settlingPurchaseId ||
+        this.settlingSupplierAccountId ||
+        this.cancellingPurchaseId ||
+        this.confirmDeleteSupplierId ||
+        this.financeEntryPanel ||
+        this.financeEditingProductId
       ) {
+        if (this.showPurchaseQuickSupplier) {
+          this.showPurchaseQuickSupplier = false;
+          this.purchaseQuickSupplierError = null;
+          this.render();
+          return;
+        }
         this.showCompanyDropdown = false;
         this.showCustomerPicker = false;
         this.showQuickCustomerForm = false;
@@ -3318,15 +5875,30 @@ export class SilaBillingApp {
         this.settlingInvoiceId = null;
         this.settlingCustomerAccountId = null;
         this.quickStockProductId = null;
+        this.stockMovementPanelOpen = false;
+        this.stockMovementError = null;
         this.confirmDeleteProductId = null;
         this.activeCashActionPanel = null;
         this.posQuickCashPanel = null;
+        this.purchasePanelOpen = false;
+        this.purchaseFormError = null;
+        this.settlingPurchaseId = null;
+        this.settlingSupplierAccountId = null;
+        this.purchaseSettleError = null;
+        this.cancellingPurchaseId = null;
+        this.cancelPurchaseError = null;
+        this.confirmDeleteSupplierId = null;
+        this.financeEntryPanel = null;
+        this.financeEntryError = null;
+        this.financeEditingProductId = null;
+        this.financeEditProductError = null;
         this.render();
         return;
       }
-      if (this.editingProduct || this.editingCustomer) {
+      if (this.editingProduct || this.editingCustomer || this.editingSupplier) {
         this.editingProduct = null;
         this.editingCustomer = null;
+        this.editingSupplier = null;
         this.render();
         return;
       }
@@ -3340,9 +5912,59 @@ export class SilaBillingApp {
         this.renderPreservingFocus('cash-ledger-search-input', 0);
         return;
       }
+      if (
+        this.activeModule === 'PRODUCTS' &&
+        this.productsSubView === 'MOVEMENTS' &&
+        this.stockLedgerSearch
+      ) {
+        this.stockLedgerSearch = '';
+        this.renderPreservingFocus('stock-ledger-search-input', 0);
+        return;
+      }
       if (this.activeModule === 'PRODUCTS' && this.productSearch) {
         this.productSearch = '';
         this.renderPreservingFocus('product-search-input', 0);
+        return;
+      }
+      if (
+        this.activeModule === 'PURCHASES' &&
+        this.purchasesSubView === 'SUPPLIERS' &&
+        this.supplierSearch
+      ) {
+        this.supplierSearch = '';
+        this.renderPreservingFocus('supplier-search-input', 0);
+        return;
+      }
+      if (this.activeModule === 'PURCHASES' && this.purchaseSearch) {
+        this.purchaseSearch = '';
+        this.renderPreservingFocus('purchase-search-input', 0);
+        return;
+      }
+      if (
+        this.activeModule === 'FINANCE' &&
+        this.financeSubView === 'ACCOUNTS' &&
+        this.financeAccountsSearch
+      ) {
+        this.financeAccountsSearch = '';
+        this.renderPreservingFocus('finance-accounts-search-input', 0);
+        return;
+      }
+      if (
+        this.activeModule === 'FINANCE' &&
+        this.financeSubView === 'CASHFLOW' &&
+        this.financeCashflowSearch
+      ) {
+        this.financeCashflowSearch = '';
+        this.renderPreservingFocus('finance-cashflow-search-input', 0);
+        return;
+      }
+      if (
+        this.activeModule === 'FINANCE' &&
+        this.financeSubView === 'MARGINS' &&
+        this.financeMarginSearch
+      ) {
+        this.financeMarginSearch = '';
+        this.renderPreservingFocus('finance-margin-search-input', 0);
         return;
       }
       if (this.activeModule === 'CUSTOMERS' && this.customerSearch) {
@@ -3556,6 +6178,62 @@ export class SilaBillingApp {
       } else if (fName === 'close-cash-session-form') {
         if (inputName === 'closedByOperator') this.cashCloseOperator = el.value;
         else if (inputName === 'closingNotes') this.cashCloseNotes = el.value;
+      } else if (fName === 'stock-movement-form') {
+        if (inputName === 'qtyInput') this.stockMovementDraft.qtyInput = el.value;
+        else if (inputName === 'unitCostInput') this.stockMovementDraft.unitCostInput = el.value;
+        else if (inputName === 'reason') this.stockMovementDraft.reason = el.value;
+        else if (inputName === 'reference') this.stockMovementDraft.reference = el.value;
+      } else if (fName === 'inventory-reconcile-form') {
+        if (inputName === 'inventoryOperator') this.inventoryOperator = el.value;
+        else if (inputName === 'inventoryNotes') this.inventoryNotes = el.value;
+      } else if (fName === 'supplier-form' && this.editingSupplier) {
+        if (inputName === 'name') this.editingSupplier.name = el.value;
+        else if (inputName === 'nif') this.editingSupplier.nif = el.value;
+        else if (inputName === 'phone') this.editingSupplier.phone = el.value;
+        else if (inputName === 'email') this.editingSupplier.email = el.value;
+        else if (inputName === 'address') this.editingSupplier.address = el.value;
+        else if (inputName === 'locality') this.editingSupplier.locality = el.value;
+        else if (inputName === 'contactPerson') this.editingSupplier.contactPerson = el.value;
+        else if (inputName === 'iban') this.editingSupplier.iban = el.value;
+        else if (inputName === 'notes') this.editingSupplier.notes = el.value;
+        else if (inputName === 'paymentTermsDays') {
+          this.editingSupplierTermsInput = el.value;
+          const days = parseInt(el.value.trim(), 10);
+          this.editingSupplier.paymentTermsDays =
+            !Number.isNaN(days) && days >= 0 ? Math.min(3650, days) : undefined;
+        }
+      } else if (fName === 'purchase-quick-supplier-form') {
+        if (inputName === 'name') this.purchaseQuickSupplierDraft.name = el.value;
+        else if (inputName === 'nif') this.purchaseQuickSupplierDraft.nif = el.value;
+        else if (inputName === 'phone') this.purchaseQuickSupplierDraft.phone = el.value;
+        else if (inputName === 'locality') this.purchaseQuickSupplierDraft.locality = el.value;
+        else if (inputName === 'paymentTermsDays') {
+          this.purchaseQuickSupplierDraft.paymentTermsDaysInput = el.value;
+        }
+      } else if (fName === 'purchase-form') {
+        if (inputName === 'supplierInvoiceRef') this.purchaseFormDraft.supplierInvoiceRef = el.value;
+        else if (inputName === 'dueDateIso') this.purchaseFormDraft.dueDateIso = el.value;
+        else if (inputName === 'reference') this.purchaseFormDraft.reference = el.value;
+        else if (inputName === 'notes') this.purchaseFormDraft.notes = el.value;
+      } else if (
+        fName === 'settle-purchase-form' ||
+        fName === 'settle-supplier-account-form'
+      ) {
+        if (inputName === 'settleAmount') this.purchaseSettleAmountInput = el.value;
+        else if (inputName === 'settleReference') this.purchaseSettleReference = el.value;
+      } else if (fName === 'cancel-purchase-form') {
+        if (inputName === 'cancelReason') this.cancelPurchaseReason = el.value;
+      } else if (fName === 'finance-entry-form') {
+        if (inputName === 'category') this.financeEntryDraft.category = el.value;
+        else if (inputName === 'amount') this.financeEntryDraft.amountInput = el.value;
+        else if (inputName === 'reason') this.financeEntryDraft.reason = el.value;
+        else if (inputName === 'reference') this.financeEntryDraft.reference = el.value;
+      } else if (fName === 'finance-product-cost-form') {
+        if (inputName === 'costPrice') this.financeEditCostInput = el.value;
+        else if (inputName === 'price') this.financeEditPriceInput = el.value;
+      } else if (fName === 'credit-note-form') {
+        if (inputName === 'creditNoteReason') this.creditNoteReason = el.value;
+        else if (inputName === 'creditNoteRefundRef') this.creditNoteRefundRef = el.value;
       }
     }
 
@@ -3687,6 +6365,73 @@ export class SilaBillingApp {
         }
         break;
       }
+      case 'stock-ledger-search':
+        this.stockLedgerSearch = rawVal;
+        this.renderPreservingFocus(activeId, selStart);
+        break;
+      case 'inventory-count-live': {
+        if (id) {
+          this.inventoryCountInputs[id] = rawVal;
+          this.inventoryError = null;
+          this.renderPreservingInputValue(activeId, rawVal, selStart);
+        }
+        break;
+      }
+      case 'purchase-search':
+        this.purchaseSearch = rawVal;
+        this.renderPreservingFocus(activeId, selStart);
+        break;
+      case 'supplier-search':
+        this.supplierSearch = rawVal;
+        this.renderPreservingFocus(activeId, selStart);
+        break;
+      case 'purchase-catalog-search':
+        this.purchaseCatalogSearch = rawVal;
+        this.renderPreservingFocus(activeId, selStart);
+        break;
+      case 'purchase-line-qty': {
+        this.purchaseDraftLines = this.purchaseDraftLines.map((l) =>
+          l.productId === id ? { ...l, qtyInput: rawVal } : l
+        );
+        this.renderPreservingInputValue(activeId, rawVal, selStart);
+        break;
+      }
+      case 'purchase-line-cost': {
+        this.purchaseDraftLines = this.purchaseDraftLines.map((l) =>
+          l.productId === id ? { ...l, unitCostInput: rawVal } : l
+        );
+        this.renderPreservingInputValue(activeId, rawVal, selStart);
+        break;
+      }
+      case 'purchase-amount-paid-live': {
+        this.purchaseFormDraft.amountPaidInput = rawVal;
+        this.renderPreservingInputValue(activeId, rawVal, selStart);
+        break;
+      }
+      case 'finance-accounts-search':
+        this.financeAccountsSearch = rawVal;
+        this.renderPreservingFocus(activeId, selStart);
+        break;
+      case 'finance-cashflow-search':
+        this.financeCashflowSearch = rawVal;
+        this.renderPreservingFocus(activeId, selStart);
+        break;
+      case 'finance-margin-search':
+        this.financeMarginSearch = rawVal;
+        this.renderPreservingFocus(activeId, selStart);
+        break;
+      case 'credit-note-line-qty': {
+        if (id) {
+          this.creditNoteLineQtys[id] = rawVal;
+          this.creditNoteError = null;
+          this.renderPreservingInputValue(activeId, rawVal, selStart);
+        }
+        break;
+      }
+      case 'operational-audit-search':
+        this.operationalAuditSearch = rawVal;
+        this.renderPreservingFocus(activeId, selStart);
+        break;
     }
   }
 
@@ -3706,6 +6451,57 @@ export class SilaBillingApp {
         return;
       } else if (el.name === 'active') {
         this.editingProduct.active = (el as HTMLInputElement).checked;
+      }
+    }
+    if (el && this.editingSupplier && el.closest('form[data-form="supplier-form"]')) {
+      if (el.name === 'active') {
+        this.editingSupplier.active = (el as HTMLInputElement).checked;
+      }
+    }
+    if (el && el.closest('form[data-form="purchase-form"]')) {
+      if (el.name === 'supplierId') {
+        this.purchaseFormDraft.supplierId = el.value;
+        const chosenSup = this.suppliers.find((s) => s.id === el.value);
+        if (chosenSup?.paymentTermsDays && chosenSup.paymentTermsDays > 0) {
+          this.purchaseFormDraft.dueDateIso = new Date(
+            Date.now() + chosenSup.paymentTermsDays * 86400000
+          )
+            .toISOString()
+            .slice(0, 10);
+        }
+        this.render();
+        return;
+      } else if (el.name === 'paymentMethod') {
+        const m = el.value as DirectPaymentMethod;
+        if (m === 'Dinheiro' || m === 'Multicaixa' || m === 'Transferência') {
+          this.purchaseFormDraft.paymentMethod = m;
+          this.render();
+          return;
+        }
+      } else if (el.name === 'updateStock') {
+        this.purchaseFormDraft.updateStock = (el as HTMLInputElement).checked;
+        this.render();
+        return;
+      } else if (el.name === 'recordInCashSession') {
+        this.purchaseFormDraft.recordInCashSession = (el as HTMLInputElement).checked;
+        return;
+      }
+    }
+    if (
+      el &&
+      (el.closest('form[data-form="settle-purchase-form"]') ||
+        el.closest('form[data-form="settle-supplier-account-form"]'))
+    ) {
+      if (el.name === 'settleMethod') {
+        const m = el.value as DirectPaymentMethod;
+        if (m === 'Dinheiro' || m === 'Multicaixa' || m === 'Transferência') {
+          this.purchaseSettleMethod = m;
+          this.render();
+          return;
+        }
+      } else if (el.name === 'recordCash') {
+        this.purchaseSettleRecordCash = (el as HTMLInputElement).checked;
+        return;
       }
     }
     if (el && el.closest('form[data-form="pos-quick-product-form"]')) {
@@ -3738,13 +6534,94 @@ export class SilaBillingApp {
         return;
       }
     }
+    if (el && el.closest('form[data-form="finance-entry-form"]')) {
+      if (el.name === 'paymentMethod') {
+        const m = el.value as DirectPaymentMethod;
+        if (m === 'Dinheiro' || m === 'Multicaixa' || m === 'Transferência') {
+          this.financeEntryDraft.paymentMethod = m;
+          this.render();
+          return;
+        }
+      } else if (el.name === 'category') {
+        this.financeEntryDraft.category = el.value;
+        return;
+      } else if (el.name === 'affectCashDrawer') {
+        this.financeEntryDraft.affectCashDrawer = (el as HTMLInputElement).checked;
+        return;
+      }
+    }
+    if (el && el.name === 'productId' && el.closest('form[data-form="stock-movement-form"]')) {
+      const nextProd = this.products.find((p) => p.id === el.value);
+      this.stockMovementDraft.productId = el.value;
+      if (nextProd) {
+        this.selectedProductDetailId = nextProd.id;
+        if (
+          this.stockMovementDraft.type === 'AJUSTE_INVENTARIO' &&
+          this.stockMovementDraft.adjustMode === 'EXACT'
+        ) {
+          this.stockMovementDraft.qtyInput = String(nextProd.stockQty ?? 0);
+        }
+        if (this.stockMovementDraft.type === 'ENTRADA_MERCADORIA') {
+          this.stockMovementDraft.unitCostInput =
+            typeof nextProd.costPrice === 'number' && nextProd.costPrice > 0
+              ? String(nextProd.costPrice)
+              : '';
+        }
+      }
+      this.render();
+      return;
+    }
+    if (el && el.closest('form[data-form="credit-note-form"]')) {
+      if (el.name === 'restoreStock') {
+        this.creditNoteRestoreStock = (el as HTMLInputElement).checked;
+        return;
+      } else if (el.name === 'refundMode') {
+        if (el.value === 'CREDIT_ACCOUNT' || el.value === 'REFUND_NOW') {
+          this.creditNoteRefundMode = el.value;
+          this.render();
+          return;
+        }
+      } else if (el.name === 'refundMethod') {
+        const m = el.value as DirectPaymentMethod;
+        if (m === 'Dinheiro' || m === 'Multicaixa' || m === 'Transferência') {
+          this.creditNoteRefundMethod = m;
+          this.render();
+          return;
+        }
+      } else if (el.name === 'affectCashDrawer') {
+        this.creditNoteAffectCashDrawer = (el as HTMLInputElement).checked;
+        return;
+      }
+    }
     const field = el.dataset.field;
     const id = el.dataset.id || '';
     if (!field) return;
 
     switch (field) {
+      case 'history-operator-filter': {
+        this.historyOperatorFilter = el.value || 'ALL';
+        this.render();
+        break;
+      }
+      case 'history-date-from': {
+        this.historyDateFrom = el.value || '';
+        this.historyPeriod = 'CUSTOM';
+        this.render();
+        break;
+      }
+      case 'history-date-to': {
+        this.historyDateTo = el.value || '';
+        this.historyPeriod = 'CUSTOM';
+        this.render();
+        break;
+      }
       case 'product-category-filter': {
         this.productCategoryFilter = el.value || 'ALL';
+        this.render();
+        break;
+      }
+      case 'purchase-supplier-filter': {
+        this.purchaseSupplierFilterId = el.value || 'ALL';
         this.render();
         break;
       }
@@ -3754,6 +6631,7 @@ export class SilaBillingApp {
           this.selectedTerminalRole = nextRole;
           this.editingProduct = null;
           this.editingCustomer = null;
+          this.editingSupplier = null;
           this.render();
         }
         break;
@@ -3863,6 +6741,22 @@ export class SilaBillingApp {
       }
       case 'cart-discount-live': {
         const disc = Math.min(100, Math.max(0, parseFloat(el.value.replace(',', '.')) || 0));
+        const maxAllowed = this.settings.maxCashierDiscountPct ?? 5;
+        const effectiveRole = this.getEffectiveRole();
+        if (effectiveRole === 'cashier' && disc > maxAllowed && !this.supervisorAuthorizedBy) {
+          this.showSupervisorAuthModal = true;
+          this.supervisorAuthAction = 'DISCOUNT_LINE';
+          this.supervisorAuthTargetId = id;
+          this.supervisorAuthPendingVal = roundKz(disc);
+          this.supervisorAuthPinInput = '';
+          this.supervisorAuthError = null;
+          this.cart = this.cart.map((c) =>
+            c.productId === id ? { ...c, discountPct: maxAllowed } : c
+          );
+          this.scheduleDraftSave();
+          this.render();
+          break;
+        }
         this.cart = this.cart.map((c) =>
           c.productId === id ? { ...c, discountPct: roundKz(disc) } : c
         );
@@ -3872,6 +6766,21 @@ export class SilaBillingApp {
       }
       case 'global-discount-live': {
         const disc = Math.min(100, Math.max(0, parseFloat(el.value.replace(',', '.')) || 0));
+        const maxAllowed = this.settings.maxCashierDiscountPct ?? 5;
+        const effectiveRole = this.getEffectiveRole();
+        if (effectiveRole === 'cashier' && disc > maxAllowed && !this.supervisorAuthorizedBy) {
+          this.showSupervisorAuthModal = true;
+          this.supervisorAuthAction = 'DISCOUNT_GLOBAL';
+          this.supervisorAuthTargetId = '';
+          this.supervisorAuthPendingVal = roundKz(disc);
+          this.supervisorAuthPinInput = '';
+          this.supervisorAuthError = null;
+          this.globalDiscountPct = maxAllowed;
+          this.globalDiscountInput = maxAllowed > 0 ? String(maxAllowed) : '';
+          this.scheduleDraftSave();
+          this.render();
+          break;
+        }
         this.globalDiscountPct = roundKz(disc);
         this.globalDiscountInput = this.globalDiscountPct > 0 ? String(this.globalDiscountPct) : '';
         this.scheduleDraftSave();
@@ -3971,9 +6880,32 @@ export class SilaBillingApp {
       return;
     }
 
+    if (formName === 'operator-switch-form') {
+      const opName = String(fd.get('operatorName') || '').trim();
+      const cashierNum = String(fd.get('cashierNumber') || '').trim();
+      if (opName) this.operator = opName.slice(0, 32);
+      if (cashierNum) this.cashier = cashierNum.slice(0, 16);
+      this.showOperatorSwitchModal = false;
+      this.scheduleDraftSave();
+      this.render();
+      return;
+    }
+
+    if (formName === 'supervisor-auth-form') {
+      const pin = String(fd.get('supervisorPin') || '').trim();
+      const verification = this.verifySupervisorPin(pin);
+      if (!verification.ok) {
+        this.supervisorAuthError = verification.error || 'PIN de supervisor incorreto.';
+        this.render();
+        return;
+      }
+      this.approveSupervisorAuth(verification.supervisorLabel);
+      return;
+    }
+
     if (formName === 'cancel-invoice-form') {
-      if (!this.canCancelInvoices()) {
-        this.cancelInvoiceError = 'O seu perfil atual não tem permissão para anular faturas.';
+      if (!this.canCancelInvoices() && !this.supervisorAuthorizedBy) {
+        this.cancelInvoiceError = 'O seu perfil atual não tem permissão para anular faturas. Requer autorização de Supervisor.';
         this.render();
         return;
       }
@@ -3993,25 +6925,46 @@ export class SilaBillingApp {
         return;
       }
 
-      const actorLabel = this.user?.email || formatRoleLabelPt(this.getEffectiveRole());
+      const supervisorNote = this.supervisorAuthorizedBy ? ` (Autorizado por ${this.supervisorAuthorizedBy})` : '';
+      const actorLabel = `${this.user?.email || this.operator || formatRoleLabelPt(this.getEffectiveRole())}${supervisorNote}`;
+      this.supervisorAuthorizedBy = null;
+      const nowCancelIso = new Date().toISOString();
       const cancelled: InvoiceRecord = {
         ...inv,
         companyId: this.activeCompany.id,
         status: 'cancelled',
         cancelReason,
         cancelledBy: actorLabel,
+        cancelledAtIso: nowCancelIso,
         syncState: 'pending',
         synced: false,
-        updatedAtIso: new Date().toISOString(),
+        updatedAtIso: nowCancelIso,
       };
 
       await localDb.saveInvoice(cancelled, this.activeCompany.id);
       if (inv.docType === 'FR') {
-        await this.adjustCatalogStockForInvoiceLines(inv.lines, 'RESTORE');
+        await this.adjustCatalogStockForInvoiceLines(inv.lines, 'RESTORE', {
+          type: 'DEVOLUCAO_CLIENTE',
+          reason: `Devolução por anulação de ${inv.number}: ${cancelReason}`,
+          invoiceId: inv.id,
+          invoiceNumber: inv.number,
+          operator: this.getCurrentStockOperatorLabel(),
+        });
+      } else if (inv.docType === 'NC') {
+        await this.adjustCatalogStockForInvoiceLines(inv.lines, 'DEDUCT', {
+          type: 'AJUSTE_INVENTARIO',
+          reason: `Reversão de Nota de Crédito anulada ${inv.number}: ${cancelReason}`,
+          invoiceId: inv.id,
+          invoiceNumber: inv.number,
+          operator: this.getCurrentStockOperatorLabel(),
+        });
       }
       this.invoices = this.invoices.map((x) => (x.id === invoiceId ? cancelled : x));
       this.cancellingInvoiceId = null;
       this.cancelInvoiceError = null;
+      if (this.activeModule === 'HISTORY') {
+        this.showHistoryNotice(`Documento ${inv.number} anulado com registo de auditoria.`);
+      }
       this.render();
 
       if (this.user && this.isOnline) {
@@ -4089,14 +7042,23 @@ export class SilaBillingApp {
 
       this.settlingInvoiceId = null;
       this.settleError = null;
+      const remDue = roundKz(updatedInv.amountDue || 0);
+      const noticeMsg =
+        remDue > 0
+          ? `Recebimento parcial de ${formatKzNumber(applied)} Kz registado na fatura ${inv.number}. Saldo pendente: ${formatKzNumber(remDue)} Kz.`
+          : `Fatura ${inv.number} liquidada na totalidade (${formatKzNumber(applied)} Kz).`;
       if (this.activeModule === 'CUSTOMERS') {
-        this.customerSavedNotice = `Pagamento de ${formatKzNumber(applied)} Kz registado na fatura ${inv.number}.`;
+        this.customerSavedNotice = noticeMsg;
         window.setTimeout(() => {
           if (this.customerSavedNotice) {
             this.customerSavedNotice = null;
             if (this.activeModule === 'CUSTOMERS') this.render();
           }
         }, 2800);
+      } else if (this.activeModule === 'FINANCE') {
+        this.financeWorkspaceNotice = noticeMsg;
+      } else if (this.activeModule === 'HISTORY') {
+        this.showHistoryNotice(noticeMsg);
       }
       this.render();
 
@@ -4199,7 +7161,11 @@ export class SilaBillingApp {
       this.invoices = this.invoices.map((x) => updatedMap.get(x.id) || x);
       this.settlingCustomerAccountId = null;
       this.settleError = null;
-      this.customerSavedNotice = `Pagamento de ${formatKzNumber(totalApplied)} Kz registado (${updatedMap.size} ${updatedMap.size === 1 ? 'fatura amortizada' : 'faturas amortizadas'}).`;
+      const acctNotice = `Recebimento de ${formatKzNumber(totalApplied)} Kz registado (${updatedMap.size} ${updatedMap.size === 1 ? 'fatura amortizada' : 'faturas amortizadas'}).`;
+      this.customerSavedNotice = acctNotice;
+      if (this.activeModule === 'FINANCE') {
+        this.financeWorkspaceNotice = acctNotice;
+      }
       this.render();
 
       window.setTimeout(() => {
@@ -4516,6 +7482,32 @@ export class SilaBillingApp {
       }
 
       this.products = [...this.products, created].sort((a, b) => a.code.localeCompare(b.code));
+      if (created.trackStock && (created.stockQty ?? 0) > 0) {
+        const initMov: StockMovement = {
+          id: `sm_init_${Date.now()}_${Math.random().toString(36).slice(2, 6)}`,
+          companyId: this.activeCompany.id,
+          productId: created.id,
+          productCode: created.code,
+          productName: created.name,
+          unit: created.unit || 'un',
+          type: 'ENTRADA_MERCADORIA',
+          direction: 'IN',
+          qty: roundKz(created.stockQty ?? 0),
+          previousStock: 0,
+          newStock: roundKz(created.stockQty ?? 0),
+          ...(typeof created.costPrice === 'number' && created.costPrice > 0
+            ? { unitCost: created.costPrice }
+            : {}),
+          warehouseId: DEFAULT_WAREHOUSE_ID,
+          reason: 'Saldo inicial de stock no cadastro rápido',
+          operator: this.getCurrentStockOperatorLabel(),
+          ...(this.user?.uid ? { createdByUid: this.user.uid } : {}),
+          syncState: 'pending',
+          synced: false,
+          createdAtIso: now,
+        };
+        await this.persistAndSyncStockMovement(initMov);
+      }
       this.selectedProductDetailId = created.id;
       this.showQuickProductForm = false;
       this.posSearch = '';
@@ -4538,57 +7530,94 @@ export class SilaBillingApp {
       return;
     }
 
+    if (formName === 'stock-movement-form') {
+      const productId = String(fd.get('productId') || this.stockMovementDraft.productId || '');
+      const rawQty = String(fd.get('qtyInput') ?? this.stockMovementDraft.qtyInput ?? '');
+      const rawUnitCost = String(
+        fd.get('unitCostInput') ?? this.stockMovementDraft.unitCostInput ?? ''
+      );
+      const reason = String(fd.get('reason') ?? this.stockMovementDraft.reason ?? '');
+      const reference = String(fd.get('reference') ?? this.stockMovementDraft.reference ?? '');
+
+      const res = await this.executeManualStockMovement({
+        productId,
+        type: this.stockMovementDraft.type,
+        adjustMode: this.stockMovementDraft.adjustMode,
+        rawQty,
+        rawUnitCost,
+        reason,
+        reference,
+      });
+
+      if (!res.ok) {
+        this.stockMovementError = res.error || 'Não foi possível registar o movimento de stock.';
+        this.render();
+        return;
+      }
+
+      this.stockMovementPanelOpen = false;
+      this.stockMovementError = null;
+      this.productSavedNotice = res.notice || 'Movimento de stock registado com sucesso.';
+      this.render();
+      window.setTimeout(() => {
+        if (this.productSavedNotice) {
+          this.productSavedNotice = null;
+          if (this.activeModule === 'PRODUCTS') this.render();
+        }
+      }, 3200);
+      return;
+    }
+
+    if (formName === 'inventory-reconcile-form') {
+      const operator = String(
+        fd.get('inventoryOperator') ?? this.inventoryOperator ?? ''
+      ).trim();
+      const notes = String(fd.get('inventoryNotes') ?? this.inventoryNotes ?? '').trim();
+      const res = await this.reconcilePhysicalInventory({ operator, notes });
+      if (!res.ok) {
+        this.inventoryError = res.error || 'Não foi possível reconciliar o inventário físico.';
+        this.render();
+        return;
+      }
+
+      this.productSavedNotice = `Inventário físico reconciliado em ${res.reconciledCount} ${
+        res.reconciledCount === 1 ? 'artigo' : 'artigos'
+      }. Movimentos gravados no histórico.`;
+      this.render();
+      window.setTimeout(() => {
+        if (this.productSavedNotice) {
+          this.productSavedNotice = null;
+          if (this.activeModule === 'PRODUCTS') this.render();
+        }
+      }, 3600);
+      return;
+    }
+
     if (formName === 'quick-stock-form' && this.quickStockProductId) {
       if (!this.canManageCatalog()) return;
-      const target = this.products.find((p) => p.id === this.quickStockProductId);
-      if (!target) {
-        this.quickStockProductId = null;
-        this.render();
-        return;
-      }
       const rawStock = String(fd.get('stockQty') ?? this.quickStockAdjustInput ?? '0');
-      const parsedStock = parseDecimalInput(rawStock);
-      if (Number.isNaN(parsedStock)) {
-        this.productFormError = 'Indique uma quantidade de stock válida.';
+      const res = await this.executeManualStockMovement({
+        productId: this.quickStockProductId,
+        type: 'AJUSTE_INVENTARIO',
+        adjustMode: 'EXACT',
+        rawQty: rawStock,
+        reason: 'Ajuste direto de disponibilidade em stock',
+      });
+      if (!res.ok) {
+        this.productFormError = res.error || 'Indique uma quantidade de stock válida.';
         this.render();
         return;
       }
-      const now = new Date().toISOString();
-      const updatedProd: Product = {
-        ...target,
-        trackStock: true,
-        stockQty: roundKz(parsedStock),
-        minStockQty: target.minStockQty ?? 2,
-        syncState: 'pending',
-        synced: false,
-        updatedAtIso: now,
-      };
-      await localDb.saveProduct(updatedProd, this.activeCompany.id);
-      this.products = this.products.map((p) => (p.id === updatedProd.id ? updatedProd : p));
       this.quickStockProductId = null;
       this.quickStockAdjustInput = '';
-      this.productSavedNotice = `Stock de "${updatedProd.name}" atualizado para ${updatedProd.stockQty} ${updatedProd.unit}.`;
+      this.productSavedNotice = res.notice || 'Stock atualizado.';
       this.render();
-
       window.setTimeout(() => {
         if (this.productSavedNotice) {
           this.productSavedNotice = null;
           if (this.activeModule === 'PRODUCTS') this.render();
         }
       }, 2500);
-
-      if (this.user && this.isOnline && canCompanySyncCloudData(this.activeCompany)) {
-        try {
-          await ensureCompanyRegisteredCloud(this.activeCompany);
-          await upsertProductCloud(updatedProd, false, this.activeCompany);
-          const synced: Product = { ...updatedProd, syncState: 'synced', synced: true };
-          await localDb.saveProduct(synced, this.activeCompany.id);
-          this.products = this.products.map((p) => (p.id === synced.id ? synced : p));
-          this.render();
-        } catch {
-          // Mantém pendente localmente
-        }
-      }
       return;
     }
 
@@ -4896,6 +7925,42 @@ export class SilaBillingApp {
         ...this.products.filter((p) => p.id !== updated.id),
         updated,
       ].sort((a, b) => a.code.localeCompare(b.code));
+
+      if (updated.trackStock) {
+        const prevStock =
+          !wasNew && existingProd?.trackStock ? roundKz(Number(existingProd.stockQty) || 0) : 0;
+        const nextStockVal = roundKz(Number(updated.stockQty) || 0);
+        const stockDelta = roundKz(nextStockVal - prevStock);
+        if ((wasNew && nextStockVal > 0) || (!wasNew && stockDelta !== 0)) {
+          const formMov: StockMovement = {
+            id: `sm_cat_${Date.now()}_${Math.random().toString(36).slice(2, 6)}`,
+            companyId: this.activeCompany.id,
+            productId: updated.id,
+            productCode: updated.code,
+            productName: updated.name,
+            unit: updated.unit || 'un',
+            type: wasNew ? 'ENTRADA_MERCADORIA' : 'AJUSTE_INVENTARIO',
+            direction: stockDelta > 0 ? 'IN' : 'OUT',
+            qty: roundKz(Math.abs(stockDelta)),
+            previousStock: prevStock,
+            newStock: nextStockVal,
+            ...(typeof updated.costPrice === 'number' && updated.costPrice > 0
+              ? { unitCost: updated.costPrice }
+              : {}),
+            warehouseId: DEFAULT_WAREHOUSE_ID,
+            reason: wasNew
+              ? 'Saldo inicial de stock na criação do artigo'
+              : 'Ajuste direto de stock na ficha do artigo',
+            operator: this.getCurrentStockOperatorLabel(),
+            ...(this.user?.uid ? { createdByUid: this.user.uid } : {}),
+            syncState: 'pending',
+            synced: false,
+            createdAtIso: now,
+          };
+          await this.persistAndSyncStockMovement(formMov);
+        }
+      }
+
       this.selectedProductDetailId = updated.id;
       this.editingProduct = null;
       this.editingProductCostInput = '';
@@ -5041,6 +8106,164 @@ export class SilaBillingApp {
       return;
     }
 
+    if (formName === 'supplier-form' && this.editingSupplier) {
+      if (!this.canManageCatalog()) return;
+      const cleanName = String(fd.get('name') || this.editingSupplier.name || '').trim();
+      if (cleanName.length < 2) {
+        this.supplierFormError = 'Indique a designação comercial do fornecedor (mín. 2 caracteres).';
+        this.render();
+        return;
+      }
+      const cleanNif = String(fd.get('nif') || this.editingSupplier.nif || '').trim().slice(0, 32);
+      if (cleanNif) {
+        const normNif = normalizeCompanyNif(cleanNif);
+        const dup = this.suppliers.find(
+          (s) => s.id !== this.editingSupplier!.id && s.nif && normalizeCompanyNif(s.nif) === normNif
+        );
+        if (dup) {
+          this.supplierFormError = `Já existe um fornecedor registado com o NIF ${cleanNif} (${dup.name}).`;
+          this.render();
+          return;
+        }
+      }
+      const rawTerms = String(fd.get('paymentTermsDays') ?? this.editingSupplierTermsInput ?? '').trim();
+      const parsedTerms = rawTerms !== '' ? parseInt(rawTerms, 10) : NaN;
+      const termsDays =
+        !Number.isNaN(parsedTerms) && parsedTerms >= 0 ? Math.min(3650, parsedTerms) : undefined;
+
+      const now = new Date().toISOString();
+      const nextSupplier: Supplier = {
+        id: this.editingSupplier.id,
+        companyId: this.activeCompany.id,
+        name: cleanName.slice(0, 160),
+        nif: cleanNif,
+        phone: String(fd.get('phone') || this.editingSupplier.phone || '').trim().slice(0, 40),
+        ...(String(fd.get('email') || this.editingSupplier.email || '').trim()
+          ? { email: String(fd.get('email') || this.editingSupplier.email || '').trim().slice(0, 120) }
+          : {}),
+        address: String(fd.get('address') || this.editingSupplier.address || '').trim().slice(0, 200),
+        locality:
+          String(fd.get('locality') || this.editingSupplier.locality || '').trim().slice(0, 160) ||
+          'Luanda',
+        ...(String(fd.get('contactPerson') || this.editingSupplier.contactPerson || '').trim()
+          ? {
+              contactPerson: String(
+                fd.get('contactPerson') || this.editingSupplier.contactPerson || ''
+              )
+                .trim()
+                .slice(0, 120),
+            }
+          : {}),
+        ...(String(fd.get('iban') || this.editingSupplier.iban || '').trim()
+          ? { iban: String(fd.get('iban') || this.editingSupplier.iban || '').trim().slice(0, 48) }
+          : {}),
+        ...(typeof termsDays === 'number' ? { paymentTermsDays: termsDays } : {}),
+        ...(String(fd.get('notes') || this.editingSupplier.notes || '').trim()
+          ? { notes: String(fd.get('notes') || this.editingSupplier.notes || '').trim().slice(0, 300) }
+          : {}),
+        active: fd.get('active') ? fd.get('active') === 'on' : this.editingSupplier.active !== false,
+        syncState: 'pending',
+        synced: false,
+        updatedAtIso: now,
+      };
+
+      await this.persistAndSyncSupplier(nextSupplier);
+      this.selectedSupplierDetailId = nextSupplier.id;
+      this.editingSupplier = null;
+      this.supplierFormError = null;
+      this.purchasesWorkspaceNotice = this.isNewSupplier
+        ? `Fornecedor "${nextSupplier.name}" registado.`
+        : `Ficha do fornecedor "${nextSupplier.name}" atualizada.`;
+      this.render();
+      return;
+    }
+
+    if (formName === 'purchase-quick-supplier-form') {
+      if (!this.canManageCatalog()) return;
+      const cleanName = String(fd.get('name') || this.purchaseQuickSupplierDraft.name || '').trim();
+      if (cleanName.length < 2) {
+        this.purchaseQuickSupplierError = 'Indique o nome do fornecedor.';
+        this.render();
+        return;
+      }
+      const cleanNif = String(fd.get('nif') || this.purchaseQuickSupplierDraft.nif || '')
+        .trim()
+        .slice(0, 32);
+      const rawTerms = String(
+        fd.get('paymentTermsDays') || this.purchaseQuickSupplierDraft.paymentTermsDaysInput || ''
+      ).trim();
+      const parsedTerms = rawTerms ? parseInt(rawTerms, 10) : NaN;
+      const termsDays =
+        !Number.isNaN(parsedTerms) && parsedTerms >= 0 ? Math.min(3650, parsedTerms) : 30;
+      const now = new Date().toISOString();
+      const quickSup: Supplier = {
+        id: `sup_${Date.now()}_${Math.random().toString(36).slice(2, 6)}`,
+        companyId: this.activeCompany.id,
+        name: cleanName.slice(0, 160),
+        nif: cleanNif,
+        phone: String(fd.get('phone') || this.purchaseQuickSupplierDraft.phone || '')
+          .trim()
+          .slice(0, 40),
+        address: '',
+        locality:
+          String(fd.get('locality') || this.purchaseQuickSupplierDraft.locality || '')
+            .trim()
+            .slice(0, 160) || 'Luanda',
+        paymentTermsDays: termsDays,
+        active: true,
+        syncState: 'pending',
+        synced: false,
+        updatedAtIso: now,
+      };
+      await this.persistAndSyncSupplier(quickSup);
+      this.purchaseFormDraft.supplierId = quickSup.id;
+      if (termsDays > 0) {
+        this.purchaseFormDraft.dueDateIso = new Date(Date.now() + termsDays * 86400000)
+          .toISOString()
+          .slice(0, 10);
+      }
+      this.showPurchaseQuickSupplier = false;
+      this.purchaseQuickSupplierError = null;
+      this.selectedSupplierDetailId = quickSup.id;
+      this.render();
+      return;
+    }
+
+    if (formName === 'purchase-form') {
+      await this.submitNewPurchase(fd);
+      return;
+    }
+
+    if (formName === 'settle-purchase-form' && this.settlingPurchaseId) {
+      await this.settleSinglePurchaseDebt(this.settlingPurchaseId);
+      return;
+    }
+
+    if (formName === 'settle-supplier-account-form' && this.settlingSupplierAccountId) {
+      await this.settleSupplierAccountDebt(this.settlingSupplierAccountId);
+      return;
+    }
+
+    if (formName === 'cancel-purchase-form' && this.cancellingPurchaseId) {
+      await this.cancelExistingPurchase(this.cancellingPurchaseId, fd);
+      return;
+    }
+
+    if (formName === 'finance-entry-form' && this.financeEntryPanel) {
+      await this.submitFinanceEntry(fd);
+      return;
+    }
+
+    if (formName === 'finance-product-cost-form' && this.financeEditingProductId) {
+      await this.submitFinanceProductCostEdit(this.financeEditingProductId, fd);
+      return;
+    }
+
+    if (formName === 'credit-note-form' && this.creditNoteOriginId) {
+      await this.submitCreditNoteForm(fd);
+      return;
+    }
+
     if (formName === 'settings-form') {
       if (!this.canManageCompanySettings()) return;
       const canCleanFooter = canCompanyHideViralFooter(this.activeCompany);
@@ -5067,6 +8290,14 @@ export class SilaBillingApp {
         autoPrintOnEmit: fd.get('autoPrintOnEmit') === 'on',
         hidePromotionalFooter: canCleanFooter ? fd.get('hidePromotionalFooter') === 'on' : false,
         allowCashierPriceEdit: fd.get('allowCashierPriceEdit') === 'on',
+        maxCashierDiscountPct: Math.min(
+          100,
+          Math.max(
+            0,
+            parseFloat(String(fd.get('maxCashierDiscountPct') || '5').replace(',', '.')) || 5
+          )
+        ),
+        supervisorPin: String(fd.get('supervisorPin') || '').trim().slice(0, 16),
         syncState: 'pending',
         synced: false,
         updatedAtIso: new Date().toISOString(),
@@ -5186,13 +8417,24 @@ export class SilaBillingApp {
       const draft = previewDraft;
       const now = new Date().toISOString();
       const originReturnId = this.returnOriginInvoice?.id || null;
-      const openSession = this.getActiveOpenCashSession();
+      const maxCashierPct = this.settings.maxCashierDiscountPct ?? 5;
+      const hasExcessDiscount =
+        (draft.globalDiscountPct && draft.globalDiscountPct > maxCashierPct) ||
+        draft.lines.some((l) => l.discountPct > maxCashierPct);
+      const discountAuth = this.supervisorAuthorizedBy
+        ? this.supervisorAuthorizedBy
+        : hasExcessDiscount &&
+          (this.getEffectiveRole() === 'owner' || this.getEffectiveRole() === 'manager')
+        ? `${formatRoleLabelPt(this.getEffectiveRole())} (${openSession ? openSession.operator : draft.operator})`
+        : undefined;
+
       const invoice: InvoiceRecord = {
         ...draft,
         id: `inv_${Date.now()}`,
         companyId: this.activeCompany.id,
         cashier: openSession ? openSession.cashier : draft.cashier,
         operator: openSession ? openSession.operator : draft.operator,
+        ...(discountAuth ? { discountAuthorizedBy: discountAuth } : {}),
         ...(draft.docType === 'FR'
           ? {
               ...(openSession ? { sessionId: openSession.id } : {}),
@@ -5212,10 +8454,22 @@ export class SilaBillingApp {
         if (originReturnId) {
           const originInv = this.invoices.find((i) => i.id === originReturnId);
           if (originInv && originInv.docType === 'FR') {
-            await this.adjustCatalogStockForInvoiceLines(originInv.lines, 'RESTORE');
+            await this.adjustCatalogStockForInvoiceLines(originInv.lines, 'RESTORE', {
+              type: 'DEVOLUCAO_CLIENTE',
+              reason: `Devolução / troca em caixa ref. ${originInv.number} (nova emissão ${invoice.number})`,
+              invoiceId: originInv.id,
+              invoiceNumber: originInv.number,
+              operator: invoice.operator,
+            });
           }
         }
-        await this.adjustCatalogStockForInvoiceLines(invoice.lines, 'DEDUCT');
+        await this.adjustCatalogStockForInvoiceLines(invoice.lines, 'DEDUCT', {
+          type: 'SAIDA_VENDA',
+          reason: `Saída automática por venda ${invoice.number}`,
+          invoiceId: invoice.id,
+          invoiceNumber: invoice.number,
+          operator: invoice.operator,
+        });
       }
 
       if (!this.activeCompany.maxObservedIso || now > this.activeCompany.maxObservedIso) {
@@ -5243,6 +8497,7 @@ export class SilaBillingApp {
       this.returnOriginInvoice = null;
       this.confirmClearCart = false;
       this.confirmRemoveCartProductId = null;
+      this.supervisorAuthorizedBy = null;
       this.notes = this.settings.defaultNotes || 'Venda directa a retalho.';
       this.mobilePane = 'PREVIEW';
       await this.flushDraftNow();
@@ -5487,6 +8742,69 @@ export class SilaBillingApp {
           }
         }
 
+        const unsyncedStockMovements = this.stockMovements.filter((m) => !m.synced);
+        for (const smov of unsyncedStockMovements) {
+          try {
+            await createStockMovementCloud(smov, this.activeCompany);
+            await localDb.saveStockMovement(
+              { ...smov, syncState: 'synced', synced: true, syncError: undefined },
+              this.activeCompany.id
+            );
+          } catch (itemErr) {
+            await localDb.saveStockMovement(
+              {
+                ...smov,
+                syncState: 'error',
+                synced: false,
+                syncError: itemErr instanceof Error ? itemErr.message : 'Erro de sincronização',
+              },
+              this.activeCompany.id
+            );
+          }
+        }
+
+        const unsyncedSuppliers = this.suppliers.filter((s) => !s.synced);
+        for (const sup of unsyncedSuppliers) {
+          try {
+            await upsertSupplierCloud(sup, this.activeCompany);
+            await localDb.saveSupplier(
+              { ...sup, syncState: 'synced', synced: true, syncError: undefined },
+              this.activeCompany.id
+            );
+          } catch (itemErr) {
+            await localDb.saveSupplier(
+              {
+                ...sup,
+                syncState: 'error',
+                synced: false,
+                syncError: itemErr instanceof Error ? itemErr.message : 'Erro de sincronização',
+              },
+              this.activeCompany.id
+            );
+          }
+        }
+
+        const unsyncedPurchases = this.purchases.filter((pr) => !pr.synced);
+        for (const pur of unsyncedPurchases) {
+          try {
+            await upsertPurchaseCloud(pur, this.activeCompany);
+            await localDb.savePurchase(
+              { ...pur, syncState: 'synced', synced: true, syncError: undefined },
+              this.activeCompany.id
+            );
+          } catch (itemErr) {
+            await localDb.savePurchase(
+              {
+                ...pur,
+                syncState: 'error',
+                synced: false,
+                syncError: itemErr instanceof Error ? itemErr.message : 'Erro de sincronização',
+              },
+              this.activeCompany.id
+            );
+          }
+        }
+
         if (!this.settings.synced && this.canManageCompanySettings()) {
           await upsertSettingsCloud(this.settings, this.activeCompany);
           const syncedSettings: AppSettings = {
@@ -5524,6 +8842,15 @@ export class SilaBillingApp {
         const pendingMovIds = new Set(
           preMergeLocal.cashMovements.filter((m) => !m.synced).map((m) => m.id)
         );
+        const pendingStockMovIds = new Set(
+          preMergeLocal.stockMovements.filter((m) => !m.synced).map((m) => m.id)
+        );
+        const pendingSupIds = new Set(
+          preMergeLocal.suppliers.filter((s) => !s.synced).map((s) => s.id)
+        );
+        const pendingPurIds = new Set(
+          preMergeLocal.purchases.filter((p) => !p.synced).map((p) => p.id)
+        );
 
         for (const cp of cloudData.products) {
           if (!pendingProdIds.has(cp.id)) {
@@ -5550,6 +8877,21 @@ export class SilaBillingApp {
             await localDb.saveCashMovement(cm, this.activeCompany.id);
           }
         }
+        for (const sm of cloudData.stockMovements || []) {
+          if (!pendingStockMovIds.has(sm.id)) {
+            await localDb.saveStockMovement(sm, this.activeCompany.id);
+          }
+        }
+        for (const csup of cloudData.suppliers || []) {
+          if (!pendingSupIds.has(csup.id)) {
+            await localDb.saveSupplier(csup, this.activeCompany.id);
+          }
+        }
+        for (const cpur of cloudData.purchases || []) {
+          if (!pendingPurIds.has(cpur.id)) {
+            await localDb.savePurchase(cpur, this.activeCompany.id);
+          }
+        }
         if (cloudData.settings && preMergeLocal.settings.synced !== false) {
           await localDb.saveSettings(cloudData.settings, this.activeCompany.id).catch(() => null);
         }
@@ -5564,6 +8906,9 @@ export class SilaBillingApp {
       this.invoices = refreshed.invoices;
       this.cashSessions = refreshed.cashSessions;
       this.cashMovements = refreshed.cashMovements;
+      this.stockMovements = refreshed.stockMovements;
+      this.suppliers = refreshed.suppliers;
+      this.purchases = refreshed.purchases;
       this.settings = refreshed.settings;
       this.activeCompany = refreshed.activeCompany;
       this.companies = refreshed.companies;
@@ -5585,7 +8930,7 @@ export class SilaBillingApp {
 
   private exportLocalJsonBackup(): void {
     const bundle = {
-      schemaVersion: '2.0.0-multicompany',
+      schemaVersion: '2.2.0-multicompany',
       source: 'indexeddb-local',
       exportedAtIso: new Date().toISOString(),
       companyId: this.activeCompany.id,
@@ -5596,6 +8941,9 @@ export class SilaBillingApp {
         invoices: this.invoices.length,
         cashSessions: this.cashSessions.length,
         cashMovements: this.cashMovements.length,
+        stockMovements: this.stockMovements.length,
+        suppliers: this.suppliers.length,
+        purchases: this.purchases.length,
       },
       data: {
         companyRecord: this.activeCompany,
@@ -5606,6 +8954,9 @@ export class SilaBillingApp {
         invoices: this.invoices,
         cashSessions: this.cashSessions,
         cashMovements: this.cashMovements,
+        stockMovements: this.stockMovements,
+        suppliers: this.suppliers,
+        purchases: this.purchases,
       },
     };
 
@@ -5622,18 +8973,44 @@ export class SilaBillingApp {
     URL.revokeObjectURL(url);
   }
 
-  private async triggerPrint(invoice: InvoiceRecord, format: DocumentFormat): Promise<void> {
+  private async triggerPrint(
+    invoice: InvoiceRecord,
+    format: DocumentFormat,
+    isReprint = false
+  ): Promise<void> {
     this.isPrinting = true;
     const qr = await this.ensureQrForInvoice(invoice);
     document.body.setAttribute('data-print-mode', format);
     this.cashPrintJob = null;
-    this.printJob = { invoice, format, qr };
+    this.historyReportPrintJob = null;
+    this.printJob = { invoice, format, qr, isReprint };
     this.render();
     setTimeout(() => {
       try {
         window.print();
       } finally {
         setTimeout(() => {
+          this.isPrinting = false;
+        }, 1200);
+      }
+    }, 100);
+  }
+
+  private triggerHistoryControlReportPrint(
+    invoices: InvoiceRecord[],
+    filterLabel: string
+  ): void {
+    this.isPrinting = true;
+    document.body.setAttribute('data-print-mode', 'A4');
+    this.printJob = null;
+    this.cashPrintJob = null;
+    this.historyReportPrintJob = { invoices, filterLabel };
+    this.render();
+    window.setTimeout(() => {
+      try {
+        window.print();
+      } finally {
+        window.setTimeout(() => {
           this.isPrinting = false;
         }, 1200);
       }
@@ -5689,6 +9066,9 @@ export class SilaBillingApp {
         this.invoices.filter((i) => !i.synced).length +
         this.cashSessions.filter((s) => !s.synced).length +
         this.cashMovements.filter((m) => !m.synced).length +
+        this.stockMovements.filter((m) => !m.synced).length +
+        this.suppliers.filter((s) => !s.synced).length +
+        this.purchases.filter((pr) => !pr.synced).length +
         (this.settings.synced ? 0 : 1);
 
     const canInstall = !this.isInstalled && (Boolean(this.deferredPrompt) || this.isIOS);
@@ -5761,6 +9141,16 @@ export class SilaBillingApp {
           </div>
 
           <div class="flex items-center gap-2 shrink-0">
+            <button
+              type="button"
+              data-action="open-operator-switch-modal"
+              title="Trocar operador ativo / identificar caixa"
+              class="h-8 px-2.5 rounded-md bg-slate-800 hover:bg-slate-700 text-xs text-slate-200 flex items-center gap-1.5 transition-colors whitespace-nowrap"
+            >
+              ${ICONS.user}
+              <span class="font-mono tabular-nums">Op. ${escapeHtml(this.operator)}</span>
+              <span class="text-slate-400 hidden sm:inline text-[10px]">(${escapeHtml(formatRoleLabelPt(effectiveRole))})</span>
+            </button>
             ${
               canInstall
                 ? `<button
@@ -5811,6 +9201,16 @@ export class SilaBillingApp {
         </div>
 
         ${this.showIOSGuide ? this.renderIOSModal() : ''}
+        ${
+          this.showOperatorSwitchModal
+            ? this.renderOperatorSwitchModal()
+            : ''
+        }
+        ${
+          this.showSupervisorAuthModal
+            ? this.renderSupervisorAuthModal()
+            : ''
+        }
         ${
           this.showNewCompanyModal
             ? renderNewCompanyModal({
@@ -5870,7 +9270,11 @@ export class SilaBillingApp {
                 this.printJob.format,
                 this.settings.company,
                 this.printJob.qr,
-                this.getInvoiceRenderOptions(this.printJob.invoice, showViralFooter)
+                this.getInvoiceRenderOptions(
+                  this.printJob.invoice,
+                  showViralFooter,
+                  Boolean(this.printJob.isReprint)
+                )
               )}
             </div>`
           : this.cashPrintJob
@@ -5884,7 +9288,16 @@ export class SilaBillingApp {
                   showViralFooter
                 )}
               </div>`
-            : ''
+            : this.historyReportPrintJob
+              ? `<div class="hidden print-only-container">
+                  ${renderHistoryControlReportHtml(
+                    this.historyReportPrintJob.invoices,
+                    this.historyReportPrintJob.filterLabel,
+                    this.settings.company,
+                    showViralFooter
+                  )}
+                </div>`
+              : ''
       }
     `;
   }
@@ -5907,7 +9320,10 @@ export class SilaBillingApp {
       { id: 'NEW_A4', label: 'Nova fatura A4', icon: ICONS.fileA4 },
       { id: 'CASH', label: 'Caixa e pagamentos', icon: ICONS.wallet },
       { id: 'CUSTOMERS', label: 'Clientes', icon: ICONS.users },
-      { id: 'PRODUCTS', label: 'Produtos e serviços', icon: ICONS.package },
+      { id: 'PRODUCTS', label: 'Produtos e stock', icon: ICONS.package },
+      { id: 'PURCHASES', label: 'Compras e fornecedores', icon: ICONS.truck },
+      { id: 'FINANCE', label: 'Gestão financeira', icon: ICONS.chartBar },
+      { id: 'INDICATORS', label: 'Indicadores comerciais', icon: ICONS.trendingUp },
       { id: 'HISTORY', label: 'Histórico de faturas', icon: ICONS.history },
     ];
 
@@ -6033,6 +9449,12 @@ export class SilaBillingApp {
         return this.renderCustomersWorkspace();
       case 'PRODUCTS':
         return this.renderProductsWorkspace();
+      case 'PURCHASES':
+        return this.renderPurchasesWorkspace();
+      case 'FINANCE':
+        return this.renderFinanceWorkspace();
+      case 'INDICATORS':
+        return this.renderIndicatorsWorkspace();
       case 'HISTORY':
         return this.renderHistoryWorkspace();
       case 'SETTINGS':
@@ -8306,15 +11728,970 @@ export class SilaBillingApp {
     }
   }
 
+  private formatStockMovementTypePt(type: StockMovementType): string {
+    switch (type) {
+      case 'ENTRADA_MERCADORIA':
+        return 'Entrada de mercadoria';
+      case 'SAIDA_VENDA':
+        return 'Saída por venda';
+      case 'DEVOLUCAO_CLIENTE':
+        return 'Devolução ao stock';
+      case 'AJUSTE_INVENTARIO':
+        return 'Ajuste de inventário';
+      case 'RECONCILIACAO_FISICA':
+        return 'Inventário físico';
+      case 'TRANSFERENCIA_ARMAZEM':
+        return 'Transf. armazém';
+    }
+  }
+
+  private renderStockMovementPanel(canManageCat: boolean): string {
+    if (!this.stockMovementPanelOpen || !canManageCat) return '';
+
+    const draftProd =
+      this.products.find((p) => p.id === this.stockMovementDraft.productId) ||
+      this.products[0] ||
+      null;
+    const curStock = draftProd?.trackStock ? roundKz(Number(draftProd.stockQty) || 0) : 0;
+    const curUnit = draftProd?.unit || 'un';
+    const isEntrada = this.stockMovementDraft.type === 'ENTRADA_MERCADORIA';
+    const isDevolucao = this.stockMovementDraft.type === 'DEVOLUCAO_CLIENTE';
+    const isAjuste = this.stockMovementDraft.type === 'AJUSTE_INVENTARIO';
+
+    return `
+      <form
+        data-form="stock-movement-form"
+        class="p-3.5 border-b border-slate-200 bg-slate-50 space-y-2.5 shrink-0"
+      >
+        <div class="flex flex-wrap items-center justify-between gap-2">
+          <div class="flex flex-wrap items-center gap-2">
+            <span class="text-xs font-semibold text-slate-900">Movimentação de Stock</span>
+            <span aria-hidden="true" class="text-slate-300">·</span>
+            <span class="text-[11px] text-slate-500">Armazém Principal · Multi-armazém preparado</span>
+          </div>
+
+          <div class="flex items-center gap-1 p-0.5 bg-slate-200/70 rounded-lg">
+            <button
+              type="button"
+              data-action="set-stock-movement-type"
+              data-value="ENTRADA_MERCADORIA"
+              class="h-8 px-2.5 rounded-md text-xs font-medium transition-colors whitespace-nowrap ${
+                isEntrada
+                  ? 'bg-white text-slate-900 shadow-xs'
+                  : 'text-slate-600 hover:text-slate-900'
+              }"
+            >Entrada de mercadoria</button>
+            <button
+              type="button"
+              data-action="set-stock-movement-type"
+              data-value="DEVOLUCAO_CLIENTE"
+              class="h-8 px-2.5 rounded-md text-xs font-medium transition-colors whitespace-nowrap ${
+                isDevolucao
+                  ? 'bg-white text-slate-900 shadow-xs'
+                  : 'text-slate-600 hover:text-slate-900'
+              }"
+            >Devolução ao stock</button>
+            <button
+              type="button"
+              data-action="set-stock-movement-type"
+              data-value="AJUSTE_INVENTARIO"
+              class="h-8 px-2.5 rounded-md text-xs font-medium transition-colors whitespace-nowrap ${
+                isAjuste
+                  ? 'bg-white text-slate-900 shadow-xs'
+                  : 'text-slate-600 hover:text-slate-900'
+              }"
+            >Ajuste de inventário</button>
+          </div>
+        </div>
+
+        ${
+          this.stockMovementError
+            ? `<div class="p-2 rounded-md bg-red-50 border border-red-200 text-xs text-red-700">${escapeHtml(
+                this.stockMovementError
+              )}</div>`
+            : ''
+        }
+
+        <div class="grid grid-cols-1 sm:grid-cols-12 gap-2.5 items-end">
+          <div class="sm:col-span-4">
+            <label class="block text-[10px] font-medium text-slate-600 mb-1">
+              Artigo (${draftProd ? `Saldo atual: ${curStock} ${escapeHtml(curUnit)}` : 'Selecione'}) *
+            </label>
+            <select
+              name="productId"
+              required
+              class="w-full h-9 px-2.5 text-xs bg-white border border-slate-200 rounded-md focus:outline-none focus:border-blue-600"
+            >
+              ${this.products
+                .map(
+                  (p) =>
+                    `<option value="${escapeHtml(p.id)}" ${
+                      draftProd?.id === p.id ? 'selected' : ''
+                    }>${escapeHtml(p.code)} — ${escapeHtml(p.name)} (${
+                      p.trackStock ? `${p.stockQty ?? 0} ${escapeHtml(p.unit)}` : 's/ stock'
+                    })</option>`
+                )
+                .join('')}
+            </select>
+          </div>
+
+          ${
+            isAjuste
+              ? `<div class="sm:col-span-2">
+                  <label class="block text-[10px] font-medium text-slate-600 mb-1">Modo de ajuste</label>
+                  <div class="flex items-center gap-0.5 p-0.5 bg-slate-200/70 rounded-md h-9">
+                    <button
+                      type="button"
+                      data-action="set-stock-adjust-mode"
+                      data-value="DELTA"
+                      class="flex-1 h-8 rounded text-[11px] font-medium transition-colors whitespace-nowrap ${
+                        this.stockMovementDraft.adjustMode === 'DELTA'
+                          ? 'bg-white text-slate-900 shadow-xs'
+                          : 'text-slate-600 hover:text-slate-900'
+                      }"
+                    >+ / - Qtd.</button>
+                    <button
+                      type="button"
+                      data-action="set-stock-adjust-mode"
+                      data-value="EXACT"
+                      class="flex-1 h-8 rounded text-[11px] font-medium transition-colors whitespace-nowrap ${
+                        this.stockMovementDraft.adjustMode === 'EXACT'
+                          ? 'bg-white text-slate-900 shadow-xs'
+                          : 'text-slate-600 hover:text-slate-900'
+                      }"
+                    >Saldo exato</button>
+                  </div>
+                </div>`
+              : ''
+          }
+
+          <div class="sm:col-span-2">
+            <label class="block text-[10px] font-medium text-slate-600 mb-1">
+              ${
+                isEntrada
+                  ? `Qtd. Entrada (${escapeHtml(curUnit)}) *`
+                  : isDevolucao
+                    ? `Qtd. Devolvida (${escapeHtml(curUnit)}) *`
+                    : this.stockMovementDraft.adjustMode === 'EXACT'
+                      ? `Novo Saldo (${escapeHtml(curUnit)}) *`
+                      : `Variação +/- (${escapeHtml(curUnit)}) *`
+              }
+            </label>
+            <input
+              id="stock-movement-qty-input"
+              name="qtyInput"
+              type="text"
+              inputmode="decimal"
+              required
+              autocomplete="off"
+              value="${escapeHtml(this.stockMovementDraft.qtyInput)}"
+              placeholder="${
+                isAjuste && this.stockMovementDraft.adjustMode === 'DELTA'
+                  ? 'Ex: -2 ou +5'
+                  : 'Ex: 10'
+              }"
+              class="w-full h-9 px-2.5 text-xs font-mono tabular-nums font-semibold bg-white border border-slate-200 rounded-md focus:outline-none focus:border-blue-600"
+            />
+          </div>
+
+          ${
+            isEntrada
+              ? `<div class="sm:col-span-2">
+                  <label class="block text-[10px] font-medium text-slate-600 mb-1">Custo Aquisição (Kz)</label>
+                  <input
+                    name="unitCostInput"
+                    type="text"
+                    inputmode="decimal"
+                    autocomplete="off"
+                    value="${escapeHtml(this.stockMovementDraft.unitCostInput)}"
+                    placeholder="Opcional"
+                    class="w-full h-9 px-2.5 text-xs font-mono tabular-nums bg-white border border-slate-200 rounded-md focus:outline-none focus:border-blue-600"
+                  />
+                </div>`
+              : ''
+          }
+
+          <div class="${isEntrada || isAjuste ? 'sm:col-span-2' : 'sm:col-span-3'}">
+            <label class="block text-[10px] font-medium text-slate-600 mb-1">
+              ${isEntrada ? 'Guia / Fatura Fornecedor' : 'Doc. / Referência'}
+            </label>
+            <input
+              name="reference"
+              type="text"
+              maxlength="80"
+              value="${escapeHtml(this.stockMovementDraft.reference)}"
+              placeholder="${isEntrada ? 'Ex: FT Forn. 104' : 'Ex: FR 2026/0012'}"
+              class="w-full h-9 px-2.5 text-xs bg-white border border-slate-200 rounded-md focus:outline-none focus:border-blue-600"
+            />
+          </div>
+
+          <div class="${isEntrada || isAjuste ? 'sm:col-span-10' : 'sm:col-span-2'}">
+            <label class="block text-[10px] font-medium text-slate-600 mb-1">Motivo / Observação *</label>
+            <input
+              name="reason"
+              type="text"
+              required
+              maxlength="240"
+              value="${escapeHtml(this.stockMovementDraft.reason)}"
+              placeholder="${
+                isAjuste
+                  ? 'Ex: Quebra, avaria, consumo interno ou acerto de prateleira'
+                  : 'Motivo da movimentação'
+              }"
+              class="w-full h-9 px-2.5 text-xs bg-white border border-slate-200 rounded-md focus:outline-none focus:border-blue-600"
+            />
+          </div>
+
+          <div class="${isEntrada || isAjuste ? 'sm:col-span-2' : 'sm:col-span-1'} flex items-center gap-1.5">
+            <button
+              type="submit"
+              class="flex-1 h-9 px-3 rounded-md bg-blue-600 text-white text-xs font-semibold hover:bg-blue-700 whitespace-nowrap"
+            >Registar</button>
+            <button
+              type="button"
+              data-action="close-stock-movement-panel"
+              title="Fechar painel"
+              class="h-9 w-9 flex items-center justify-center rounded-md border border-slate-200 bg-white text-slate-600 hover:bg-slate-100 shrink-0"
+            >${ICONS.close}</button>
+          </div>
+        </div>
+      </form>
+    `;
+  }
+
+  private renderStockMovementsSubView(): string {
+    const searchNorm = this.stockLedgerSearch.trim().toLowerCase();
+    const filterProd = this.stockLedgerProductId
+      ? this.products.find((p) => p.id === this.stockLedgerProductId) || null
+      : null;
+
+    let entradasQty = 0;
+    let saidasVendaQty = 0;
+    let devolucoesQty = 0;
+    let ajustesCount = 0;
+
+    for (const m of this.stockMovements) {
+      if (this.stockLedgerProductId && m.productId !== this.stockLedgerProductId) continue;
+      if (m.type === 'ENTRADA_MERCADORIA') entradasQty = roundKz(entradasQty + m.qty);
+      else if (m.type === 'SAIDA_VENDA') saidasVendaQty = roundKz(saidasVendaQty + m.qty);
+      else if (m.type === 'DEVOLUCAO_CLIENTE') devolucoesQty = roundKz(devolucoesQty + m.qty);
+      else ajustesCount += 1;
+    }
+
+    const filteredMovements = this.stockMovements.filter((m) => {
+      if (this.stockLedgerProductId && m.productId !== this.stockLedgerProductId) return false;
+      if (this.stockLedgerFilter !== 'ALL' && m.type !== this.stockLedgerFilter) return false;
+      if (searchNorm) {
+        const hay = `${m.productCode} ${m.productName} ${m.reason} ${m.reference || ''} ${
+          m.invoiceNumber || ''
+        } ${m.operator}`.toLowerCase();
+        if (!hay.includes(searchNorm)) return false;
+      }
+      return true;
+    });
+
+    return `
+      <div class="flex-1 flex flex-col overflow-hidden bg-white">
+        <!-- Resumo Quantitativo de Entradas e Saídas -->
+        <div class="grid grid-cols-2 sm:grid-cols-5 divide-y sm:divide-y-0 sm:divide-x divide-slate-200 border-b border-slate-200 bg-slate-50/60 shrink-0">
+          <div class="p-3">
+            <div class="text-[11px] text-slate-500">Movimentos registados</div>
+            <div class="text-sm font-mono font-bold tabular-nums text-slate-900 mt-0.5">${filteredMovements.length}</div>
+          </div>
+          <div class="p-3">
+            <div class="text-[11px] text-slate-500">Entradas de mercadoria</div>
+            <div class="text-sm font-mono font-bold tabular-nums text-emerald-700 mt-0.5">+${entradasQty}</div>
+          </div>
+          <div class="p-3">
+            <div class="text-[11px] text-slate-500">Saídas automáticas (venda)</div>
+            <div class="text-sm font-mono font-bold tabular-nums text-slate-900 mt-0.5">-${saidasVendaQty}</div>
+          </div>
+          <div class="p-3">
+            <div class="text-[11px] text-slate-500">Devoluções ao stock</div>
+            <div class="text-sm font-mono font-bold tabular-nums text-blue-700 mt-0.5">+${devolucoesQty}</div>
+          </div>
+          <div class="p-3 col-span-2 sm:col-span-1">
+            <div class="text-[11px] text-slate-500">Ajustes / Reconciliações</div>
+            <div class="text-sm font-mono font-bold tabular-nums text-slate-800 mt-0.5">${ajustesCount} reg.</div>
+          </div>
+        </div>
+
+        <!-- Barra de Pesquisa e Filtros do Histórico de Stock -->
+        <div class="p-3 border-b border-slate-200 flex flex-wrap items-center justify-between gap-2 shrink-0">
+          <div class="flex flex-wrap items-center gap-2 flex-1 min-w-[240px]">
+            <div class="relative flex-1 min-w-[200px] max-w-md">
+              <span class="text-slate-400 absolute left-3 top-1/2 -translate-y-1/2 pointer-events-none">${ICONS.search}</span>
+              <input
+                id="stock-ledger-search-input"
+                type="text"
+                data-field="stock-ledger-search"
+                value="${escapeHtml(this.stockLedgerSearch)}"
+                placeholder="Pesquisar SKU, artigo, fatura, guia, motivo ou operador (F2)..."
+                class="w-full h-9 pl-9 pr-3 text-xs bg-slate-50 border border-slate-200 rounded-lg focus:outline-none focus:border-blue-600"
+              />
+            </div>
+
+            ${
+              filterProd
+                ? `<div class="flex items-center gap-1.5 text-xs text-slate-700 bg-slate-100 px-2.5 h-9 rounded-lg">
+                    <span class="font-mono tabular-nums">${escapeHtml(filterProd.code)}</span>
+                    <span>·</span>
+                    <span class="truncate max-w-[160px] font-medium">${escapeHtml(filterProd.name)}</span>
+                    <button
+                      type="button"
+                      data-action="clear-stock-ledger-product"
+                      class="text-slate-500 hover:text-slate-900 ml-1"
+                      title="Mostrar todos os artigos"
+                    >${ICONS.close}</button>
+                  </div>`
+                : ''
+            }
+          </div>
+
+          <div class="flex flex-wrap items-center gap-0.5 p-0.5 bg-slate-100 rounded-lg">
+            ${(
+              [
+                ['ALL', 'Todos'],
+                ['ENTRADA_MERCADORIA', 'Entradas'],
+                ['SAIDA_VENDA', 'Saídas venda'],
+                ['DEVOLUCAO_CLIENTE', 'Devoluções'],
+                ['AJUSTE_INVENTARIO', 'Ajustes'],
+                ['RECONCILIACAO_FISICA', 'Inventário'],
+              ] as const
+            )
+              .map(
+                ([val, label]) => `
+                <button
+                  type="button"
+                  data-action="set-stock-ledger-filter"
+                  data-value="${val}"
+                  class="h-8 px-2.5 rounded-md text-xs font-medium transition-colors whitespace-nowrap ${
+                    this.stockLedgerFilter === val
+                      ? 'bg-white text-slate-900 shadow-xs'
+                      : 'text-slate-600 hover:text-slate-900'
+                  }"
+                >${label}</button>
+              `
+              )
+              .join('')}
+          </div>
+        </div>
+
+        <!-- Tabela Kardex de Movimentação -->
+        <div class="flex-1 overflow-y-auto">
+          <table class="w-full text-left border-collapse">
+            <thead class="sticky top-0 bg-slate-50 border-b border-slate-200 text-[11px] text-slate-500 z-10">
+              <tr>
+                <th class="py-2.5 px-3 font-medium">Data / Hora</th>
+                <th class="py-2.5 px-3 font-medium">SKU / Artigo</th>
+                <th class="py-2.5 px-3 font-medium">Tipo de Movimento</th>
+                <th class="py-2.5 px-3 font-medium text-right">Qtd. Mov.</th>
+                <th class="py-2.5 px-3 font-medium text-right">Saldo (Ant. → Novo)</th>
+                <th class="py-2.5 px-3 font-medium hidden md:table-cell">Documento / Motivo</th>
+                <th class="py-2.5 px-3 font-medium text-right hidden sm:table-cell">Operador</th>
+              </tr>
+            </thead>
+            <tbody class="divide-y divide-slate-100 text-xs">
+              ${
+                filteredMovements.length === 0
+                  ? `<tr>
+                      <td colspan="7" class="py-12 px-4 text-center text-xs text-slate-500">
+                        <div class="space-y-2">
+                          <div>Nenhum movimento de stock encontrado para os critérios selecionados.</div>
+                          ${
+                            this.canManageCatalog()
+                              ? `<div>
+                                  <button
+                                    type="button"
+                                    data-action="open-stock-movement-panel"
+                                    data-value="ENTRADA_MERCADORIA"
+                                    class="h-8 px-3 rounded-md bg-slate-900 text-white text-xs font-semibold hover:bg-slate-800 inline-flex items-center gap-1.5"
+                                  >${ICONS.plus}<span>Registar primeira entrada de mercadoria</span></button>
+                                </div>`
+                              : ''
+                          }
+                        </div>
+                      </td>
+                    </tr>`
+                  : filteredMovements
+                      .map((m) => {
+                        const dt = formatDateTimePt(m.createdAtIso);
+                        const sign = m.direction === 'IN' ? '+' : m.direction === 'OUT' ? '-' : '';
+                        const qtyColor =
+                          m.direction === 'IN'
+                            ? 'text-emerald-700 font-semibold'
+                            : m.direction === 'OUT'
+                              ? 'text-red-600 font-semibold'
+                              : 'text-slate-600';
+                        const docMeta = m.invoiceNumber || m.reference || '';
+                        return `
+                          <tr class="hover:bg-slate-50/80">
+                            <td class="py-2.5 px-3 font-mono tabular-nums text-[11px] text-slate-600 whitespace-nowrap">
+                              ${dt.date} · ${dt.time}
+                            </td>
+                            <td class="py-2.5 px-3">
+                              <div class="font-medium text-slate-900">${escapeHtml(m.productName)}</div>
+                              <div class="text-[11px] font-mono tabular-nums text-slate-500">SKU ${escapeHtml(
+                                m.productCode
+                              )} · Armazém Principal</div>
+                            </td>
+                            <td class="py-2.5 px-3 text-slate-700 whitespace-nowrap">
+                              <div>${escapeHtml(this.formatStockMovementTypePt(m.type))}</div>
+                              <div class="text-[11px] text-slate-500 md:hidden truncate max-w-[180px]">${escapeHtml(
+                                docMeta ? `${docMeta} · ${m.reason}` : m.reason
+                              )}</div>
+                            </td>
+                            <td class="py-2.5 px-3 text-right font-mono tabular-nums ${qtyColor} whitespace-nowrap">
+                              ${sign}${m.qty} ${escapeHtml(m.unit)}
+                            </td>
+                            <td class="py-2.5 px-3 text-right font-mono tabular-nums text-slate-700 whitespace-nowrap">
+                              <span class="text-slate-400">${m.previousStock}</span> → <span class="font-semibold text-slate-900">${m.newStock}</span> ${escapeHtml(
+                                m.unit
+                              )}
+                            </td>
+                            <td class="py-2.5 px-3 text-slate-600 hidden md:table-cell">
+                              <div class="truncate max-w-xs" title="${escapeHtml(m.reason)}">
+                                ${
+                                  docMeta
+                                    ? `<span class="font-mono text-slate-800">${escapeHtml(docMeta)}</span> · `
+                                    : ''
+                                }${escapeHtml(m.reason)}
+                              </div>
+                              ${
+                                typeof m.unitCost === 'number' && m.unitCost > 0 && m.type === 'ENTRADA_MERCADORIA'
+                                  ? `<div class="text-[10px] font-mono tabular-nums text-slate-400">Custo un.: ${formatKzNumber(
+                                      m.unitCost
+                                    )} Kz</div>`
+                                  : ''
+                              }
+                            </td>
+                            <td class="py-2.5 px-3 text-right font-mono text-[11px] text-slate-500 hidden sm:table-cell whitespace-nowrap">
+                              ${escapeHtml(m.operator)}
+                            </td>
+                          </tr>
+                        `;
+                      })
+                      .join('')
+              }
+            </tbody>
+          </table>
+        </div>
+      </div>
+    `;
+  }
+
+  private renderPhysicalInventorySubView(
+    canManageCat: boolean,
+    usedCategories: string[]
+  ): string {
+    const untrackedActiveCount = this.products.filter(
+      (p) => p.active !== false && !p.trackStock
+    ).length;
+
+    const prodResult = searchProductsSmart(this.products, this.productSearch);
+    const baseCandidates =
+      prodResult.matches.length === 0 && prodResult.suggestions.length > 0
+        ? prodResult.suggestions
+        : prodResult.matches;
+
+    const allEligible = this.products.filter(
+      (p) => p.active !== false && (p.trackStock || this.inventoryIncludeUntracked)
+    );
+
+    let countedItemsCount = 0;
+    let diffItemsCount = 0;
+    let netRetailImpact = 0;
+    let netCostImpact = 0;
+
+    for (const p of allEligible) {
+      const raw = (this.inventoryCountInputs[p.id] ?? '').trim();
+      if (raw === '') continue;
+      const parsed = parseDecimalInput(raw);
+      if (Number.isNaN(parsed) || parsed < 0) continue;
+      countedItemsCount += 1;
+      const sys = p.trackStock ? roundKz(Number(p.stockQty) || 0) : 0;
+      const diff = roundKz(parsed - sys);
+      if (diff !== 0) {
+        diffItemsCount += 1;
+        netRetailImpact = roundKz(netRetailImpact + diff * p.price);
+        if (typeof p.costPrice === 'number' && p.costPrice > 0) {
+          netCostImpact = roundKz(netCostImpact + diff * p.costPrice);
+        }
+      }
+    }
+
+    const visibleRows = baseCandidates.filter((p) => {
+      if (p.active === false) return false;
+      if (!this.inventoryIncludeUntracked && !p.trackStock) return false;
+      if (this.productCategoryFilter !== 'ALL') {
+        const cat = (p.category || 'Geral').trim();
+        if (cat !== this.productCategoryFilter) return false;
+      }
+      if (this.inventoryOnlyDifferences) {
+        const raw = (this.inventoryCountInputs[p.id] ?? '').trim();
+        if (raw === '') return false;
+        const parsed = parseDecimalInput(raw);
+        if (Number.isNaN(parsed)) return true;
+        const sys = p.trackStock ? roundKz(Number(p.stockQty) || 0) : 0;
+        return roundKz(parsed - sys) !== 0;
+      }
+      return true;
+    });
+
+    const retailSign = netRetailImpact > 0 ? '+' : '';
+    const costSign = netCostImpact > 0 ? '+' : '';
+
+    return `
+      <div class="flex-1 flex flex-col overflow-hidden bg-white">
+        <!-- Painel de Resumo de Contagem e Reconciliação -->
+        <div class="grid grid-cols-2 sm:grid-cols-4 divide-y sm:divide-y-0 sm:divide-x divide-slate-200 border-b border-slate-200 bg-slate-50/60 shrink-0">
+          <div class="p-3">
+            <div class="text-[11px] text-slate-500">Artigos em inventário</div>
+            <div class="text-sm font-mono font-bold tabular-nums text-slate-900 mt-0.5">${allEligible.length} <span class="text-[11px] font-normal text-slate-500">· Armazém Principal</span></div>
+          </div>
+          <div class="p-3">
+            <div class="text-[11px] text-slate-500">Contagens preenchidas</div>
+            <div class="text-sm font-mono font-bold tabular-nums text-slate-900 mt-0.5">${countedItemsCount} / ${allEligible.length}</div>
+          </div>
+          <div class="p-3">
+            <div class="text-[11px] text-slate-500">Artigos c/ divergência</div>
+            <div class="text-sm font-mono font-bold tabular-nums ${
+              diffItemsCount > 0 ? 'text-amber-700' : 'text-slate-900'
+            } mt-0.5">${diffItemsCount}</div>
+          </div>
+          <div class="p-3">
+            <div class="text-[11px] text-slate-500">Impacto líquido (Venda / Custo)</div>
+            <div class="text-sm font-mono font-bold tabular-nums ${
+              netRetailImpact < 0
+                ? 'text-red-600'
+                : netRetailImpact > 0
+                  ? 'text-emerald-700'
+                  : 'text-slate-900'
+            } mt-0.5">
+              ${retailSign}${formatKzNumber(netRetailImpact)} Kz
+              ${
+                netCostImpact !== 0
+                  ? `<span class="text-[11px] font-normal text-slate-500">(${costSign}${formatKzNumber(
+                      netCostImpact
+                    )} Kz custo)</span>`
+                  : ''
+              }
+            </div>
+          </div>
+        </div>
+
+        <!-- Filtros e Ações Auxiliares da Contagem Física -->
+        <div class="p-3 border-b border-slate-200 flex flex-wrap items-center justify-between gap-2 shrink-0">
+          <div class="flex flex-wrap items-center gap-2 flex-1 min-w-[240px]">
+            <div class="relative flex-1 min-w-[200px] max-w-sm">
+              <span class="text-slate-400 absolute left-3 top-1/2 -translate-y-1/2 pointer-events-none">${ICONS.search}</span>
+              <input
+                id="product-search-input"
+                type="text"
+                data-field="product-search"
+                value="${escapeHtml(this.productSearch)}"
+                placeholder="Filtrar SKU, código de barras ou descrição (F2)..."
+                class="w-full h-9 pl-9 pr-3 text-xs bg-slate-50 border border-slate-200 rounded-lg focus:outline-none focus:border-blue-600"
+              />
+            </div>
+
+            <select
+              data-field="product-category-filter"
+              aria-label="Filtrar categoria no inventário"
+              class="h-9 px-2.5 text-xs bg-slate-50 border border-slate-200 rounded-lg text-slate-700 focus:outline-none focus:border-blue-600"
+            >
+              <option value="ALL" ${this.productCategoryFilter === 'ALL' ? 'selected' : ''}>Todas as categorias</option>
+              ${usedCategories
+                .map(
+                  (cat) =>
+                    `<option value="${escapeHtml(cat)}" ${
+                      this.productCategoryFilter === cat ? 'selected' : ''
+                    }>${escapeHtml(cat)}</option>`
+                )
+                .join('')}
+            </select>
+
+            <button
+              type="button"
+              data-action="toggle-inventory-only-diff"
+              class="h-9 px-2.5 rounded-lg border text-xs font-medium transition-colors whitespace-nowrap ${
+                this.inventoryOnlyDifferences
+                  ? 'bg-slate-900 text-white border-slate-900'
+                  : 'bg-white text-slate-700 border-slate-200 hover:bg-slate-50'
+              }"
+            >Apenas divergências · ${diffItemsCount}</button>
+
+            ${
+              untrackedActiveCount > 0
+                ? `<button
+                    type="button"
+                    data-action="toggle-inventory-untracked"
+                    class="h-9 px-2.5 rounded-lg border text-xs font-medium transition-colors whitespace-nowrap ${
+                      this.inventoryIncludeUntracked
+                        ? 'bg-blue-50 text-blue-800 border-blue-200'
+                        : 'bg-white text-slate-600 border-slate-200 hover:bg-slate-50'
+                    }"
+                  >Incluir s/ stock ativo (${untrackedActiveCount})</button>`
+                : ''
+            }
+          </div>
+
+          ${
+            canManageCat
+              ? `<div class="flex items-center gap-1.5 shrink-0">
+                  <button
+                    type="button"
+                    data-action="prefill-inventory-system-stock"
+                    class="h-9 px-2.5 rounded-lg border border-slate-200 bg-white text-xs font-medium text-slate-700 hover:bg-slate-50 whitespace-nowrap"
+                  >Preencher c/ stock sistema</button>
+                  <button
+                    type="button"
+                    data-action="clear-inventory-counts"
+                    class="h-9 px-2.5 rounded-lg border border-slate-200 bg-white text-xs text-slate-600 hover:bg-slate-50 whitespace-nowrap"
+                  >Limpar contagem</button>
+                </div>`
+              : ''
+          }
+        </div>
+
+        ${
+          this.inventoryError
+            ? `<div class="px-3.5 py-2 bg-red-50 border-b border-red-200 text-xs text-red-700 shrink-0">${escapeHtml(
+                this.inventoryError
+              )}</div>`
+            : ''
+        }
+
+        <!-- Folha de Contagem Física -->
+        <div class="flex-1 overflow-y-auto">
+          <table class="w-full text-left border-collapse">
+            <thead class="sticky top-0 bg-slate-50 border-b border-slate-200 text-[11px] text-slate-500 z-10">
+              <tr>
+                <th class="py-2.5 px-3 font-medium">SKU / Código Barras</th>
+                <th class="py-2.5 px-3 font-medium">Artigo</th>
+                <th class="py-2.5 px-3 font-medium text-right">Stock Sistema</th>
+                <th class="py-2.5 px-3 font-medium text-right w-40">Contagem Física</th>
+                <th class="py-2.5 px-3 font-medium text-right">Diferença</th>
+                <th class="py-2.5 px-3 font-medium text-right hidden md:table-cell">Impacto Venda</th>
+              </tr>
+            </thead>
+            <tbody class="divide-y divide-slate-100 text-xs">
+              ${
+                visibleRows.length === 0
+                  ? `<tr>
+                      <td colspan="6" class="py-12 px-4 text-center text-xs text-slate-500">
+                        ${
+                          allEligible.length === 0
+                            ? `Nenhum artigo tem controlo de stock ativo. ${
+                                untrackedActiveCount > 0
+                                  ? 'Clique em "Incluir s/ stock ativo" acima para iniciar contagem e ativar o controlo.'
+                                  : 'Cadastre artigos com controlo de stock.'
+                              }`
+                            : 'Nenhum artigo corresponde aos filtros selecionados.'
+                        }
+                      </td>
+                    </tr>`
+                  : visibleRows
+                      .map((p) => {
+                        const sysQty = p.trackStock ? roundKz(Number(p.stockQty) || 0) : 0;
+                        const rawCount = this.inventoryCountInputs[p.id] ?? '';
+                        const hasInput = rawCount.trim() !== '';
+                        const parsedCount = hasInput ? parseDecimalInput(rawCount) : Number.NaN;
+                        const validCount = hasInput && !Number.isNaN(parsedCount) && parsedCount >= 0;
+                        const diff = validCount ? roundKz(parsedCount - sysQty) : 0;
+                        const valImpact = validCount ? roundKz(diff * p.price) : 0;
+                        const diffSign = diff > 0 ? '+' : '';
+                        const impactSign = valImpact > 0 ? '+' : '';
+
+                        let diffCell = '<span class="text-slate-400">Por contar</span>';
+                        if (hasInput && !validCount) {
+                          diffCell = '<span class="text-red-600 font-medium">Valor inválido</span>';
+                        } else if (validCount) {
+                          if (diff === 0) {
+                            diffCell = `<span class="text-emerald-700 font-medium">Conferido · 0</span>`;
+                          } else if (diff > 0) {
+                            diffCell = `<span class="text-blue-700 font-semibold">Sobra · +${diff} ${escapeHtml(
+                              p.unit
+                            )}</span>`;
+                          } else {
+                            diffCell = `<span class="text-red-600 font-semibold">Quebra · ${diff} ${escapeHtml(
+                              p.unit
+                            )}</span>`;
+                          }
+                        }
+
+                        return `
+                          <tr class="${
+                            validCount && diff !== 0 ? 'bg-amber-50/30' : 'hover:bg-slate-50/80'
+                          }">
+                            <td class="py-2 px-3 font-mono tabular-nums">
+                              <div class="font-medium text-slate-800">${escapeHtml(p.code)}</div>
+                              ${
+                                p.barcode
+                                  ? `<div class="text-[10px] text-slate-400">${escapeHtml(p.barcode)}</div>`
+                                  : ''
+                              }
+                            </td>
+                            <td class="py-2 px-3">
+                              <div class="font-medium text-slate-900">${escapeHtml(p.name)}</div>
+                              <div class="text-[11px] text-slate-500">${escapeHtml(
+                                p.category || 'Geral'
+                              )} · ${escapeHtml(p.unit)}${
+                                !p.trackStock ? ' · Ativará controlo ao reconciliar' : ''
+                              }</div>
+                            </td>
+                            <td class="py-2 px-3 text-right font-mono tabular-nums text-slate-700">
+                              ${sysQty} ${escapeHtml(p.unit)}
+                            </td>
+                            <td class="py-2 px-3 text-right">
+                              ${
+                                canManageCat
+                                  ? `<input
+                                      id="inv-count-${escapeHtml(p.id)}"
+                                      type="text"
+                                      inputmode="decimal"
+                                      autocomplete="off"
+                                      data-field="inventory-count-live"
+                                      data-id="${escapeHtml(p.id)}"
+                                      value="${escapeHtml(rawCount)}"
+                                      placeholder="${sysQty}"
+                                      class="w-28 h-8 px-2.5 text-right text-xs font-mono tabular-nums font-semibold bg-white border ${
+                                        validCount && diff !== 0
+                                          ? 'border-amber-400'
+                                          : 'border-slate-200'
+                                      } rounded-md focus:outline-none focus:border-blue-600"
+                                    />`
+                                  : `<span class="font-mono tabular-nums text-slate-400">Consulta</span>`
+                              }
+                            </td>
+                            <td class="py-2 px-3 text-right font-mono tabular-nums text-[11px]">
+                              ${diffCell}
+                            </td>
+                            <td class="py-2 px-3 text-right font-mono tabular-nums text-slate-600 hidden md:table-cell">
+                              ${
+                                validCount && diff !== 0
+                                  ? `<span class="${
+                                      valImpact < 0 ? 'text-red-600' : 'text-emerald-700'
+                                    }">${impactSign}${formatKzNumber(valImpact)} Kz</span>`
+                                  : '—'
+                              }
+                            </td>
+                          </tr>
+                        `;
+                      })
+                      .join('')
+              }
+            </tbody>
+          </table>
+        </div>
+
+        <!-- Barra Inferior de Fecho e Reconciliação do Inventário Físico -->
+        ${
+          canManageCat
+            ? `<form
+                data-form="inventory-reconcile-form"
+                class="p-3 border-t border-slate-200 bg-slate-50 flex flex-wrap items-end justify-between gap-2.5 shrink-0"
+              >
+                <div class="flex flex-wrap items-end gap-2.5 flex-1 min-w-[260px]">
+                  <div class="w-40">
+                    <label class="block text-[10px] font-medium text-slate-600 mb-1">Responsável / Operador</label>
+                    <input
+                      name="inventoryOperator"
+                      type="text"
+                      maxlength="32"
+                      value="${escapeHtml(
+                        this.inventoryOperator || this.getCurrentStockOperatorLabel()
+                      )}"
+                      placeholder="Operador"
+                      class="w-full h-9 px-2.5 text-xs bg-white border border-slate-200 rounded-md focus:outline-none focus:border-blue-600"
+                    />
+                  </div>
+                  <div class="flex-1 min-w-[200px]">
+                    <label class="block text-[10px] font-medium text-slate-600 mb-1">Observação da Reconciliação</label>
+                    <input
+                      name="inventoryNotes"
+                      type="text"
+                      maxlength="240"
+                      value="${escapeHtml(this.inventoryNotes)}"
+                      placeholder="Ex: Contagem física mensal de armazém / conferência de turno"
+                      class="w-full h-9 px-2.5 text-xs bg-white border border-slate-200 rounded-md focus:outline-none focus:border-blue-600"
+                    />
+                  </div>
+                </div>
+                <button
+                  type="submit"
+                  class="h-9 px-4 rounded-lg bg-slate-900 text-white text-xs font-semibold hover:bg-slate-800 whitespace-nowrap shrink-0"
+                >Reconciliar Inventário${diffItemsCount > 0 ? ` (${diffItemsCount})` : ''}</button>
+              </form>`
+            : ''
+        }
+      </div>
+    `;
+  }
+
   private renderProductsWorkspace(): string {
     const canManageCat = this.canManageCatalog();
     const isSuspended = this.isCompanySuspended();
 
     const activeCount = this.products.filter((p) => p.active !== false).length;
     const inactiveCount = this.products.length - activeCount;
-    const lowStockCount = this.products.filter(
-      (p) => p.active !== false && p.trackStock && (p.stockQty ?? 0) <= (p.minStockQty ?? 0)
+    const outOfStockCount = this.products.filter(
+      (p) => p.active !== false && p.trackStock && (p.stockQty ?? 0) <= 0
     ).length;
+    const lowStockCount = this.products.filter(
+      (p) =>
+        p.active !== false &&
+        p.trackStock &&
+        (p.stockQty ?? 0) > 0 &&
+        (p.stockQty ?? 0) <= (p.minStockQty ?? 0)
+    ).length;
+
+    const allCategories = Array.from(
+      new Set([
+        ...DEFAULT_PRODUCT_CATEGORIES,
+        ...this.products.map((p) => (p.category || '').trim()).filter(Boolean),
+      ])
+    ).sort((a, b) => a.localeCompare(b, 'pt'));
+
+    const usedCategories = Array.from(
+      new Set(this.products.map((p) => (p.category || 'Geral').trim()).filter(Boolean))
+    ).sort((a, b) => a.localeCompare(b, 'pt'));
+
+    const subViewBar = `
+      <div class="px-3 py-2 border-b border-slate-200 bg-slate-50/80 flex flex-wrap items-center justify-between gap-2 shrink-0">
+        <div class="flex items-center gap-1 p-0.5 bg-slate-200/70 rounded-lg">
+          <button
+            type="button"
+            data-action="set-products-subview"
+            data-value="CATALOG"
+            class="h-8 px-3 rounded-md text-xs font-medium transition-colors whitespace-nowrap ${
+              this.productsSubView === 'CATALOG'
+                ? 'bg-white text-slate-900 shadow-xs'
+                : 'text-slate-600 hover:text-slate-900'
+            }"
+          >Catálogo e Stock · ${this.products.length}</button>
+          <button
+            type="button"
+            data-action="set-products-subview"
+            data-value="MOVEMENTS"
+            class="h-8 px-3 rounded-md text-xs font-medium transition-colors tabular-nums whitespace-nowrap ${
+              this.productsSubView === 'MOVEMENTS'
+                ? 'bg-white text-slate-900 shadow-xs'
+                : 'text-slate-600 hover:text-slate-900'
+            }"
+          >Entradas e Saídas · ${this.stockMovements.length}</button>
+          <button
+            type="button"
+            data-action="set-products-subview"
+            data-value="INVENTORY"
+            class="h-8 px-3 rounded-md text-xs font-medium transition-colors whitespace-nowrap ${
+              this.productsSubView === 'INVENTORY'
+                ? 'bg-white text-slate-900 shadow-xs'
+                : 'text-slate-600 hover:text-slate-900'
+            }"
+          >Inventário Físico</button>
+        </div>
+
+        <div class="flex items-center gap-2 shrink-0">
+          ${
+            canManageCat
+              ? `<button
+                  type="button"
+                  data-action="open-stock-movement-panel"
+                  data-value="ENTRADA_MERCADORIA"
+                  class="h-8 px-3 rounded-lg border border-slate-300 bg-white text-slate-800 text-xs font-semibold hover:bg-slate-100 flex items-center gap-1.5 whitespace-nowrap"
+                >
+                  ${ICONS.plus}
+                  <span>Entrada / Movimento</span>
+                </button>
+                <button
+                  type="button"
+                  data-action="new-product"
+                  class="h-8 px-3 rounded-lg bg-slate-900 text-white text-xs font-semibold hover:bg-slate-800 flex items-center gap-1.5 whitespace-nowrap"
+                >
+                  ${ICONS.plus}
+                  <span>Novo Artigo</span>
+                </button>`
+              : `<span class="text-xs text-slate-500 whitespace-nowrap">Modo consulta · ${escapeHtml(
+                  formatRoleLabelPt(this.getEffectiveRole())
+                )}</span>`
+          }
+        </div>
+      </div>
+    `;
+
+    const noticeBar = this.productSavedNotice
+      ? `<div class="px-3.5 py-2 bg-emerald-50 border-b border-emerald-200 text-xs text-emerald-800 flex items-center gap-1.5 shrink-0">${ICONS.check}<span>${escapeHtml(
+          this.productSavedNotice
+        )}</span></div>`
+      : '';
+
+    const stockAlertsStrip =
+      this.productsSubView === 'CATALOG' && (outOfStockCount > 0 || lowStockCount > 0)
+        ? `<div class="px-3.5 py-2 bg-amber-50/70 border-b border-amber-200/80 flex flex-wrap items-center justify-between gap-2 text-xs shrink-0">
+            <div class="flex flex-wrap items-center gap-2 text-slate-800">
+              <span class="font-semibold text-amber-900">Alertas de reposição:</span>
+              ${
+                outOfStockCount > 0
+                  ? `<button
+                      type="button"
+                      data-action="set-product-filter"
+                      data-value="OUT_OF_STOCK"
+                      class="font-mono tabular-nums text-red-700 font-semibold hover:underline"
+                    >${outOfStockCount} ${
+                      outOfStockCount === 1 ? 'produto esgotado (0)' : 'produtos esgotados (0)'
+                    }</button>`
+                  : ''
+              }
+              ${
+                outOfStockCount > 0 && lowStockCount > 0
+                  ? `<span aria-hidden="true" class="text-slate-400">·</span>`
+                  : ''
+              }
+              ${
+                lowStockCount > 0
+                  ? `<button
+                      type="button"
+                      data-action="set-product-filter"
+                      data-value="LOW_STOCK"
+                      class="font-mono tabular-nums text-amber-800 font-medium hover:underline"
+                    >${lowStockCount} em stock mínimo</button>`
+                  : ''
+              }
+            </div>
+            ${
+              canManageCat
+                ? `<button
+                    type="button"
+                    data-action="open-stock-movement-panel"
+                    data-value="ENTRADA_MERCADORIA"
+                    class="text-xs font-semibold text-blue-700 hover:text-blue-900 whitespace-nowrap"
+                  >+ Dar entrada de mercadoria</button>`
+                : ''
+            }
+          </div>`
+        : '';
+
+    if (this.productsSubView === 'MOVEMENTS') {
+      return `
+        <div class="h-full flex flex-col bg-white overflow-hidden">
+          ${subViewBar}
+          ${noticeBar}
+          ${this.renderStockMovementPanel(canManageCat)}
+          ${this.renderStockMovementsSubView()}
+        </div>
+      `;
+    }
+
+    if (this.productsSubView === 'INVENTORY') {
+      return `
+        <div class="h-full flex flex-col bg-white overflow-hidden">
+          ${subViewBar}
+          ${noticeBar}
+          ${this.renderPhysicalInventorySubView(canManageCat, usedCategories)}
+        </div>
+      `;
+    }
 
     const prodResult = searchProductsSmart(this.products, this.productSearch);
     const showingSuggestionsOnly =
@@ -8330,23 +12707,17 @@ export class SilaBillingApp {
       }
       if (this.productFilter === 'ACTIVE' && p.active === false) return false;
       if (this.productFilter === 'INACTIVE' && p.active !== false) return false;
+      if (this.productFilter === 'OUT_OF_STOCK') {
+        if (p.active === false || !p.trackStock) return false;
+        if ((p.stockQty ?? 0) > 0) return false;
+      }
       if (this.productFilter === 'LOW_STOCK') {
-        if (!p.trackStock) return false;
-        if ((p.stockQty ?? 0) > (p.minStockQty ?? 0)) return false;
+        if (p.active === false || !p.trackStock) return false;
+        const q = p.stockQty ?? 0;
+        if (q <= 0 || q > (p.minStockQty ?? 0)) return false;
       }
       return true;
     });
-
-    const allCategories = Array.from(
-      new Set([
-        ...DEFAULT_PRODUCT_CATEGORIES,
-        ...this.products.map((p) => (p.category || '').trim()).filter(Boolean),
-      ])
-    ).sort((a, b) => a.localeCompare(b, 'pt'));
-
-    const usedCategories = Array.from(
-      new Set(this.products.map((p) => (p.category || 'Geral').trim()).filter(Boolean))
-    ).sort((a, b) => a.localeCompare(b, 'pt'));
 
     const selectedProd =
       filtered.find((p) => p.id === this.selectedProductDetailId) ||
@@ -8363,10 +12734,18 @@ export class SilaBillingApp {
       ? this.getProductMarginStats(selectedProd.price, selectedProd.costPrice)
       : null;
     const detailHistory = selectedProd?.priceHistory || [];
+    const detailStockMovements = selectedProd
+      ? this.stockMovements.filter((m) => m.productId === selectedProd.id).slice(0, 8)
+      : [];
 
     return `
       <div class="h-full flex flex-col bg-white overflow-hidden">
-        <!-- Barra de Pesquisa, Filtros de Estado/Stock, Categoria e Novo Artigo -->
+        ${subViewBar}
+        ${noticeBar}
+        ${stockAlertsStrip}
+        ${this.renderStockMovementPanel(canManageCat)}
+
+        <!-- Barra de Pesquisa, Filtros de Estado, Esgotados, Stock Mínimo e Categoria -->
         <div class="p-3 border-b border-slate-200 flex flex-wrap items-center justify-between gap-2 shrink-0">
           <div class="flex flex-wrap items-center gap-2 flex-1 min-w-[260px]">
             <div class="relative flex-1 min-w-[220px] max-w-md">
@@ -8377,16 +12756,16 @@ export class SilaBillingApp {
                 data-field="product-search"
                 value="${escapeHtml(this.productSearch)}"
                 placeholder="Pesquisar SKU, código de barras, descrição ou categoria (F2)..."
-                class="w-full h-10 pl-9 pr-3 text-xs bg-slate-50 border border-slate-200 rounded-lg focus:outline-none focus:border-blue-600"
+                class="w-full h-9 pl-9 pr-3 text-xs bg-slate-50 border border-slate-200 rounded-lg focus:outline-none focus:border-blue-600"
               />
             </div>
 
-            <div class="flex items-center gap-0.5 p-0.5 bg-slate-100 rounded-lg">
+            <div class="flex flex-wrap items-center gap-0.5 p-0.5 bg-slate-100 rounded-lg">
               <button
                 type="button"
                 data-action="set-product-filter"
                 data-value="ALL"
-                class="h-9 px-2.5 rounded-md text-xs font-medium transition-colors tabular-nums whitespace-nowrap ${
+                class="h-8 px-2.5 rounded-md text-xs font-medium transition-colors tabular-nums whitespace-nowrap ${
                   this.productFilter === 'ALL'
                     ? 'bg-white text-slate-900 shadow-xs'
                     : 'text-slate-600 hover:text-slate-900'
@@ -8396,7 +12775,7 @@ export class SilaBillingApp {
                 type="button"
                 data-action="set-product-filter"
                 data-value="ACTIVE"
-                class="h-9 px-2.5 rounded-md text-xs font-medium transition-colors tabular-nums whitespace-nowrap ${
+                class="h-8 px-2.5 rounded-md text-xs font-medium transition-colors tabular-nums whitespace-nowrap ${
                   this.productFilter === 'ACTIVE'
                     ? 'bg-white text-slate-900 shadow-xs'
                     : 'text-slate-600 hover:text-slate-900'
@@ -8405,31 +12784,43 @@ export class SilaBillingApp {
               <button
                 type="button"
                 data-action="set-product-filter"
-                data-value="INACTIVE"
-                class="h-9 px-2.5 rounded-md text-xs font-medium transition-colors tabular-nums whitespace-nowrap ${
-                  this.productFilter === 'INACTIVE'
-                    ? 'bg-white text-slate-900 shadow-xs'
-                    : 'text-slate-600 hover:text-slate-900'
+                data-value="OUT_OF_STOCK"
+                class="h-8 px-2.5 rounded-md text-xs font-medium transition-colors tabular-nums whitespace-nowrap ${
+                  this.productFilter === 'OUT_OF_STOCK'
+                    ? 'bg-white text-red-700 shadow-xs'
+                    : outOfStockCount > 0
+                      ? 'text-red-700 hover:text-red-900'
+                      : 'text-slate-600 hover:text-slate-900'
                 }"
-              >Inativos · ${inactiveCount}</button>
+              >Esgotados · ${outOfStockCount}</button>
               <button
                 type="button"
                 data-action="set-product-filter"
                 data-value="LOW_STOCK"
-                class="h-9 px-2.5 rounded-md text-xs font-medium transition-colors tabular-nums whitespace-nowrap ${
+                class="h-8 px-2.5 rounded-md text-xs font-medium transition-colors tabular-nums whitespace-nowrap ${
                   this.productFilter === 'LOW_STOCK'
                     ? 'bg-white text-amber-800 shadow-xs'
                     : lowStockCount > 0
                       ? 'text-amber-800 hover:text-amber-950'
                       : 'text-slate-600 hover:text-slate-900'
                 }"
-              >Stock baixo · ${lowStockCount}</button>
+              >Stock mín. · ${lowStockCount}</button>
+              <button
+                type="button"
+                data-action="set-product-filter"
+                data-value="INACTIVE"
+                class="h-8 px-2.5 rounded-md text-xs font-medium transition-colors tabular-nums whitespace-nowrap ${
+                  this.productFilter === 'INACTIVE'
+                    ? 'bg-white text-slate-900 shadow-xs'
+                    : 'text-slate-600 hover:text-slate-900'
+                }"
+              >Inativos · ${inactiveCount}</button>
             </div>
 
             <select
               data-field="product-category-filter"
               aria-label="Filtrar por categoria"
-              class="h-10 px-2.5 text-xs bg-slate-50 border border-slate-200 rounded-lg text-slate-700 focus:outline-none focus:border-blue-600"
+              class="h-9 px-2.5 text-xs bg-slate-50 border border-slate-200 rounded-lg text-slate-700 focus:outline-none focus:border-blue-600"
             >
               <option value="ALL" ${this.productCategoryFilter === 'ALL' ? 'selected' : ''}>Todas as categorias</option>
               ${usedCategories
@@ -8442,30 +12833,7 @@ export class SilaBillingApp {
                 .join('')}
             </select>
           </div>
-
-          ${
-            canManageCat
-              ? `<button
-                  type="button"
-                  data-action="new-product"
-                  class="h-10 px-3.5 rounded-lg bg-slate-900 text-white text-xs font-semibold hover:bg-slate-800 flex items-center gap-1.5 whitespace-nowrap shrink-0"
-                >
-                  ${ICONS.plus}
-                  <span>Novo Artigo</span>
-                </button>`
-              : `<span class="text-xs text-slate-500 whitespace-nowrap shrink-0">Modo consulta · ${escapeHtml(
-                  formatRoleLabelPt(this.getEffectiveRole())
-                )}</span>`
-          }
         </div>
-
-        ${
-          this.productSavedNotice
-            ? `<div class="px-3.5 py-2 bg-emerald-50 border-b border-emerald-200 text-xs text-emerald-800 flex items-center gap-1.5 shrink-0">${ICONS.check}<span>${escapeHtml(
-                this.productSavedNotice
-              )}</span></div>`
-            : ''
-        }
 
         ${
           this.editingProduct && canManageCat
@@ -8705,7 +13073,7 @@ export class SilaBillingApp {
             : ''
         }
 
-        <!-- Vista Master-Detail: Catálogo de Artigos (8 cols) + Ficha Técnica & Histórico de Preços (4 cols) -->
+        <!-- Vista Master-Detail: Catálogo de Artigos (8 cols) + Ficha Técnica, Stock & Kardex (4 cols) -->
         <div class="flex-1 grid grid-cols-1 lg:grid-cols-12 overflow-hidden">
           <div class="lg:col-span-8 overflow-y-auto border-b lg:border-b-0 lg:border-r border-slate-200">
             <table class="w-full text-left border-collapse">
@@ -8718,7 +13086,7 @@ export class SilaBillingApp {
                   <th class="py-2.5 px-3 font-medium text-right hidden xl:table-cell">Aquisição</th>
                   <th class="py-2.5 px-3 font-medium text-right">Venda / Margem</th>
                   <th class="py-2.5 px-3 font-medium text-right hidden sm:table-cell">Estado</th>
-                  <th class="py-2.5 px-3 font-medium text-right w-28">Ações</th>
+                  <th class="py-2.5 px-3 font-medium text-right w-36">Ações</th>
                 </tr>
               </thead>
               <tbody class="divide-y divide-slate-100 text-xs">
@@ -8751,9 +13119,9 @@ export class SilaBillingApp {
                           const stockCell = !p.trackStock
                             ? `<span class="text-slate-400">Serviço / Livre</span>`
                             : qty <= 0
-                              ? `<span class="text-red-600 font-semibold">Sem stock · 0</span>`
+                              ? `<span class="text-red-600 font-semibold">Esgotado · 0</span>`
                               : qty <= minQty
-                                ? `<span class="text-amber-700 font-medium">Baixo · ${qty} / ${minQty}</span>`
+                                ? `<span class="text-amber-700 font-medium">Mín. · ${qty} / ${minQty}</span>`
                                 : `<span class="text-slate-700">${qty}${minQty > 0 ? ` <span class="text-slate-400">/ mín. ${minQty}</span>` : ''}</span>`;
 
                           const mStats = this.getProductMarginStats(p.price, p.costPrice);
@@ -8812,11 +13180,12 @@ export class SilaBillingApp {
                                   ? `<div class="inline-flex items-center gap-1">
                                       <button
                                         type="button"
-                                        data-action="toggle-product-active"
+                                        data-action="open-stock-movement-panel"
                                         data-id="${escapeHtml(p.id)}"
-                                        title="${isActive ? 'Desativar artigo no POS' : 'Reativar artigo no POS'}"
-                                        class="h-8 px-2 inline-flex items-center justify-center rounded-md text-[11px] font-medium border border-slate-200 bg-white text-slate-600 hover:text-slate-900 hover:bg-slate-100"
-                                      >${isActive ? 'Inativar' : 'Ativar'}</button>
+                                        data-value="ENTRADA_MERCADORIA"
+                                        title="Dar entrada ou ajustar stock"
+                                        class="h-8 px-2 inline-flex items-center justify-center rounded-md text-[11px] font-medium border border-slate-200 bg-white text-slate-700 hover:text-slate-900 hover:bg-slate-100 whitespace-nowrap"
+                                      >Stock</button>
                                       <button
                                         type="button"
                                         data-action="edit-product"
@@ -8837,7 +13206,7 @@ export class SilaBillingApp {
             </table>
           </div>
 
-          <!-- Painel Lateral Direito: Ficha Técnica, Rentabilidade, Stock e Histórico de Preços -->
+          <!-- Painel Lateral Direito: Ficha Técnica, Operações de Stock, Kardex Recente & Preços -->
           <div class="lg:col-span-4 bg-slate-50/50 overflow-y-auto">
             ${
               selectedProd && detailMargin
@@ -8930,8 +13299,73 @@ export class SilaBillingApp {
                     }
                   </div>
 
-                  <!-- Enquadramento Fiscal (IVA / Isenção) & Stock -->
+                  <!-- Disponibilidade em Stock & Atalhos de Movimentação -->
                   <div class="bg-white border border-slate-200 rounded-lg divide-y divide-slate-100 text-xs">
+                    <div class="p-3 space-y-2.5">
+                      <div class="flex items-start justify-between gap-2">
+                        <div>
+                          <div class="text-[10px] text-slate-500">Stock · Armazém Principal</div>
+                          <div class="font-mono tabular-nums font-semibold mt-0.5 ${
+                            !selectedProd.trackStock
+                              ? 'text-slate-700'
+                              : (selectedProd.stockQty ?? 0) <= 0
+                                ? 'text-red-600'
+                                : (selectedProd.stockQty ?? 0) <= (selectedProd.minStockQty ?? 0)
+                                  ? 'text-amber-800'
+                                  : 'text-slate-900'
+                          }">
+                            ${
+                              selectedProd.trackStock
+                                ? `${selectedProd.stockQty ?? 0} ${escapeHtml(selectedProd.unit)} · Mínimo: ${
+                                    selectedProd.minStockQty ?? 0
+                                  } ${escapeHtml(selectedProd.unit)}${
+                                    (selectedProd.stockQty ?? 0) <= 0
+                                      ? ' · Esgotado'
+                                      : (selectedProd.stockQty ?? 0) <= (selectedProd.minStockQty ?? 0)
+                                        ? ' · Abaixo do mínimo'
+                                        : ''
+                                  }`
+                                : 'Sem controlo de stock (venda livre / serviço)'
+                            }
+                          </div>
+                        </div>
+                      </div>
+
+                      ${
+                        canManageCat
+                          ? `<div class="flex flex-wrap items-center gap-1.5">
+                              <button
+                                type="button"
+                                data-action="open-stock-movement-panel"
+                                data-id="${escapeHtml(selectedProd.id)}"
+                                data-value="ENTRADA_MERCADORIA"
+                                class="h-7 px-2.5 rounded border border-slate-200 bg-slate-50 text-[11px] font-semibold text-slate-800 hover:bg-slate-100 whitespace-nowrap"
+                              >+ Entrada</button>
+                              <button
+                                type="button"
+                                data-action="open-stock-movement-panel"
+                                data-id="${escapeHtml(selectedProd.id)}"
+                                data-value="DEVOLUCAO_CLIENTE"
+                                class="h-7 px-2.5 rounded border border-slate-200 bg-white text-[11px] font-medium text-slate-700 hover:bg-slate-50 whitespace-nowrap"
+                              >+ Devolução</button>
+                              <button
+                                type="button"
+                                data-action="open-stock-movement-panel"
+                                data-id="${escapeHtml(selectedProd.id)}"
+                                data-value="AJUSTE_INVENTARIO"
+                                class="h-7 px-2.5 rounded border border-slate-200 bg-white text-[11px] font-medium text-slate-700 hover:bg-slate-50 whitespace-nowrap"
+                              >Ajuste +/-</button>
+                              <button
+                                type="button"
+                                data-action="open-quick-stock"
+                                data-id="${escapeHtml(selectedProd.id)}"
+                                class="h-7 px-2.5 rounded border border-slate-200 bg-white text-[11px] font-medium text-slate-600 hover:bg-slate-50 whitespace-nowrap"
+                              >Saldo exato</button>
+                            </div>`
+                          : ''
+                      }
+                    </div>
+
                     <div class="p-3 flex items-start justify-between gap-2">
                       <div>
                         <div class="text-[10px] text-slate-500">Enquadramento IVA</div>
@@ -8951,58 +13385,64 @@ export class SilaBillingApp {
                         }
                       </div>
                     </div>
+                  </div>
 
-                    <div class="p-3 space-y-2">
-                      <div class="flex items-center justify-between gap-2">
-                        <div>
-                          <div class="text-[10px] text-slate-500">Disponibilidade em Stock</div>
-                          <div class="font-mono tabular-nums font-semibold text-slate-900 mt-0.5">
-                            ${
-                              selectedProd.trackStock
-                                ? `${selectedProd.stockQty ?? 0} ${escapeHtml(selectedProd.unit)} · Mínimo: ${
-                                    selectedProd.minStockQty ?? 0
-                                  } ${escapeHtml(selectedProd.unit)}`
-                                : 'Sem controlo de stock (venda livre / serviço)'
-                            }
-                          </div>
-                        </div>
-                        ${
-                          canManageCat && this.quickStockProductId !== selectedProd.id
-                            ? `<button
-                                type="button"
-                                data-action="open-quick-stock"
-                                data-id="${escapeHtml(selectedProd.id)}"
-                                class="h-7 px-2.5 rounded border border-slate-200 text-[11px] font-medium text-slate-700 hover:bg-slate-50 whitespace-nowrap shrink-0"
-                              >Ajustar stock</button>`
-                            : ''
-                        }
-                      </div>
-
-                      ${
-                        this.quickStockProductId === selectedProd.id && canManageCat
-                          ? `<form data-form="quick-stock-form" class="pt-1 flex items-center gap-1.5">
-                              <input
-                                id="quick-stock-qty-input"
-                                name="stockQty"
-                                type="text"
-                                inputmode="decimal"
-                                value="${escapeHtml(this.quickStockAdjustInput)}"
-                                placeholder="Nova qtd."
-                                class="flex-1 h-8 px-2.5 text-xs font-mono tabular-nums bg-slate-50 border border-slate-200 rounded-md focus:outline-none focus:border-blue-600"
-                              />
-                              <button
-                                type="submit"
-                                class="h-8 px-2.5 rounded-md bg-blue-600 text-white text-xs font-semibold hover:bg-blue-700 whitespace-nowrap"
-                              >Guardar</button>
-                              <button
-                                type="button"
-                                data-action="cancel-quick-stock"
-                                class="h-8 px-2 rounded-md border border-slate-200 text-xs text-slate-600 hover:bg-slate-100"
-                              >Cancelar</button>
-                            </form>`
-                          : ''
-                      }
+                  <!-- Movimentação Recente de Stock do Artigo -->
+                  <div class="space-y-2">
+                    <div class="flex items-center justify-between text-xs">
+                      <span class="font-semibold text-slate-800">Movimentos recentes de stock</span>
+                      <button
+                        type="button"
+                        data-action="view-product-stock-history"
+                        data-id="${escapeHtml(selectedProd.id)}"
+                        class="text-[11px] font-medium text-blue-700 hover:underline"
+                      >Ver histórico completo</button>
                     </div>
+
+                    ${
+                      detailStockMovements.length === 0
+                        ? `<div class="p-3 bg-white border border-slate-200 rounded-lg text-[11px] text-slate-500">
+                            Sem entradas ou saídas registadas para este artigo.
+                          </div>`
+                        : `<div class="bg-white border border-slate-200 rounded-lg divide-y divide-slate-100 max-h-52 overflow-y-auto">
+                            ${detailStockMovements
+                              .map((m) => {
+                                const dt = formatDateTimePt(m.createdAtIso);
+                                const sign =
+                                  m.direction === 'IN' ? '+' : m.direction === 'OUT' ? '-' : '';
+                                const qtyClass =
+                                  m.direction === 'IN'
+                                    ? 'text-emerald-700'
+                                    : m.direction === 'OUT'
+                                      ? 'text-red-600'
+                                      : 'text-slate-600';
+                                return `
+                                  <div class="p-2.5 text-xs space-y-0.5">
+                                    <div class="flex items-center justify-between gap-2">
+                                      <span class="font-medium text-slate-800">${escapeHtml(
+                                        this.formatStockMovementTypePt(m.type)
+                                      )}</span>
+                                      <span class="font-mono tabular-nums font-semibold ${qtyClass}">${sign}${
+                                        m.qty
+                                      } ${escapeHtml(m.unit)} <span class="font-normal text-slate-400">(${
+                                        m.newStock
+                                      })</span></span>
+                                    </div>
+                                    <div class="text-[10px] text-slate-500 truncate">${escapeHtml(
+                                      m.invoiceNumber || m.reference
+                                        ? `${m.invoiceNumber || m.reference} · ${m.reason}`
+                                        : m.reason
+                                    )}</div>
+                                    <div class="text-[10px] text-slate-400 flex items-center justify-between gap-2 font-mono tabular-nums">
+                                      <span>${dt.date} ${dt.time}</span>
+                                      <span>Op. ${escapeHtml(m.operator)}</span>
+                                    </div>
+                                  </div>
+                                `;
+                              })
+                              .join('')}
+                          </div>`
+                    }
                   </div>
 
                   <!-- Histórico de Alterações de Preço -->
@@ -9019,7 +13459,7 @@ export class SilaBillingApp {
                               selectedProd.price
                             )} Kz).
                           </div>`
-                        : `<div class="bg-white border border-slate-200 rounded-lg divide-y divide-slate-100 max-h-60 overflow-y-auto">
+                        : `<div class="bg-white border border-slate-200 rounded-lg divide-y divide-slate-100 max-h-52 overflow-y-auto">
                             ${detailHistory
                               .map((h) => {
                                 const dt = formatDateTimePt(h.changedAtIso);
@@ -9082,18 +13522,18 @@ export class SilaBillingApp {
                           ${
                             this.confirmDeleteProductId === selectedProd.id
                               ? `<div class="flex items-center gap-1.5">
-                                  <button
-                                    type="button"
-                                    data-action="delete-product"
-                                    data-id="${escapeHtml(selectedProd.id)}"
-                                    class="h-8 px-2.5 rounded-md bg-red-600 text-white text-xs font-semibold hover:bg-red-700"
-                                  >Confirmar remoção</button>
-                                  <button
-                                    type="button"
-                                    data-action="cancel-delete-product"
-                                    class="h-8 px-2 rounded-md border border-slate-200 bg-white text-xs text-slate-600 hover:bg-slate-100"
-                                  >Cancelar</button>
-                                </div>`
+                                   <button
+                                     type="button"
+                                     data-action="delete-product"
+                                     data-id="${escapeHtml(selectedProd.id)}"
+                                     class="h-8 px-2.5 rounded-md bg-red-600 text-white text-xs font-semibold hover:bg-red-700"
+                                   >Confirmar remoção</button>
+                                   <button
+                                     type="button"
+                                     data-action="cancel-delete-product"
+                                     class="h-8 px-2 rounded-md border border-slate-200 bg-white text-xs text-slate-600 hover:bg-slate-100"
+                                   >Cancelar</button>
+                                 </div>`
                               : `<button
                                   type="button"
                                   data-action="request-delete-product"
@@ -9110,7 +13550,7 @@ export class SilaBillingApp {
                 </div>
               `
                 : `<div class="h-full flex items-center justify-center p-6 text-center text-xs text-slate-400">
-                    Selecione um artigo na lista para consultar a ficha técnica, margem de lucro, enquadramento de IVA, disponibilidade em stock e histórico de alterações de preço.
+                    Selecione um artigo na lista para consultar a ficha técnica, margem de lucro, enquadramento de IVA, disponibilidade em stock e histórico de movimentações.
                   </div>`
             }
           </div>
@@ -9119,103 +13559,1207 @@ export class SilaBillingApp {
     `;
   }
 
-  // ==================== 5. HISTÓRICO DE FATURAS ====================
+  // ==================== 8. HISTÓRICO E CONTROLO DOCUMENTAL ====================
+
+  private showHistoryNotice(message: string): void {
+    this.historyWorkspaceNotice = message;
+    window.setTimeout(() => {
+      if (this.historyWorkspaceNotice === message) {
+        this.historyWorkspaceNotice = null;
+        if (this.activeModule === 'HISTORY') this.render();
+      }
+    }, 3400);
+  }
+
+  private isIsoInHistoryPeriod(iso: string): boolean {
+    if (this.historyPeriod === 'ALL') return true;
+    const datePart = String(iso || '').slice(0, 10);
+    if (!datePart) return true;
+    const now = new Date();
+    const todayIso = now.toISOString().slice(0, 10);
+
+    if (this.historyPeriod === 'TODAY') return datePart === todayIso;
+    if (this.historyPeriod === 'THIS_MONTH') return datePart.slice(0, 7) === todayIso.slice(0, 7);
+    if (this.historyPeriod === 'THIS_YEAR') return datePart.slice(0, 4) === todayIso.slice(0, 4);
+    if (this.historyPeriod === 'LAST_30D') {
+      const cutoff = new Date(now.getTime() - 30 * 86400000).toISOString().slice(0, 10);
+      return datePart >= cutoff && datePart <= todayIso;
+    }
+    if (this.historyPeriod === 'CUSTOM') {
+      if (this.historyDateFrom && datePart < this.historyDateFrom) return false;
+      if (this.historyDateTo && datePart > this.historyDateTo) return false;
+      return true;
+    }
+    return true;
+  }
+
+  private getHistoryFilterSummaryLabel(): string {
+    const periodText =
+      this.historyPeriod === 'TODAY'
+        ? 'Período: Hoje'
+        : this.historyPeriod === 'THIS_MONTH'
+          ? 'Período: Este mês'
+          : this.historyPeriod === 'LAST_30D'
+            ? 'Período: Últimos 30 dias'
+            : this.historyPeriod === 'THIS_YEAR'
+              ? 'Período: Este ano'
+              : this.historyPeriod === 'CUSTOM'
+                ? `Período: ${this.historyDateFrom || '...'} até ${this.historyDateTo || '...'}`
+                : 'Período: Todo o histórico';
+
+    const statusLabels: Record<HistoryStatusFilter, string> = {
+      ALL: 'Todos estados',
+      PAID: 'Faturas pagas',
+      PENDING: 'Faturas pendentes',
+      PARTIAL: 'Parcialmente pagas',
+      DEBT_ALL: 'Em dívida (pendentes + parciais)',
+      CREDIT_NOTES: 'Notas de crédito e devoluções',
+      CANCELLED: 'Registo de anulações',
+      PROFORMA: 'Faturas proforma',
+    };
+
+    const parts = [periodText, statusLabels[this.historyStatusFilter]];
+    if (this.historyOperatorFilter !== 'ALL') {
+      parts.push(`Operador: ${this.historyOperatorFilter}`);
+    }
+    if (this.historySearch.trim()) {
+      parts.push(`Pesquisa: "${this.historySearch.trim()}"`);
+    }
+    return parts.join(' · ');
+  }
+
+  private getHistoryDistinctOperators(): string[] {
+    const ops = new Set<string>(this.getOperatorSuggestions());
+    for (const inv of this.invoices) {
+      if (inv.operator && inv.operator.trim()) {
+        ops.add(inv.operator.trim());
+      }
+    }
+    return Array.from(ops).sort((a, b) => a.localeCompare(b, 'pt'));
+  }
+
+  private getFilteredHistoryInvoices(): {
+    baseFiltered: InvoiceRecord[];
+    filtered: InvoiceRecord[];
+    counts: {
+      all: number;
+      paid: number;
+      pending: number;
+      partial: number;
+      debtAll: number;
+      creditNotes: number;
+      cancelled: number;
+      proforma: number;
+    };
+  } {
+    const smartMatched = filterInvoicesSmart(this.invoices, this.historySearch);
+    const baseFiltered = smartMatched.filter((inv) => {
+      if (!this.isIsoInHistoryPeriod(inv.issuedAtIso)) return false;
+      if (
+        this.historyOperatorFilter !== 'ALL' &&
+        (inv.operator || '').trim().toLowerCase() !==
+          this.historyOperatorFilter.trim().toLowerCase()
+      ) {
+        return false;
+      }
+      return true;
+    });
+
+    let paid = 0;
+    let pending = 0;
+    let partial = 0;
+    let creditNotes = 0;
+    let cancelled = 0;
+    let proforma = 0;
+
+    for (const inv of baseFiltered) {
+      const cls = classifyInvoiceControlStatus(inv);
+      if (cls.state === 'CANCELLED') cancelled += 1;
+      else if (cls.state === 'CREDIT_NOTE') creditNotes += 1;
+      else if (cls.state === 'PROFORMA') proforma += 1;
+      else if (cls.state === 'PAID') paid += 1;
+      else if (cls.state === 'PARTIAL') partial += 1;
+      else if (cls.state === 'PENDING') pending += 1;
+    }
+
+    const filtered = baseFiltered.filter((inv) => {
+      const cls = classifyInvoiceControlStatus(inv);
+      switch (this.historyStatusFilter) {
+        case 'PAID':
+          return cls.state === 'PAID';
+        case 'PENDING':
+          return cls.state === 'PENDING';
+        case 'PARTIAL':
+          return cls.state === 'PARTIAL';
+        case 'DEBT_ALL':
+          return cls.state === 'PENDING' || cls.state === 'PARTIAL';
+        case 'CREDIT_NOTES':
+          return (
+            cls.state === 'CREDIT_NOTE' ||
+            (inv.status === 'issued' && Boolean(inv.returnOriginInvoiceId))
+          );
+        case 'CANCELLED':
+          return cls.state === 'CANCELLED';
+        case 'PROFORMA':
+          return cls.state === 'PROFORMA';
+        case 'ALL':
+        default:
+          return true;
+      }
+    });
+
+    return {
+      baseFiltered,
+      filtered,
+      counts: {
+        all: baseFiltered.length,
+        paid,
+        pending,
+        partial,
+        debtAll: pending + partial,
+        creditNotes,
+        cancelled,
+        proforma,
+      },
+    };
+  }
+
+  private getRemainingCreditableLines(originInv: InvoiceRecord): Array<{
+    line: CalculatedLineItem;
+    alreadyCreditedQty: number;
+    maxReturnableQty: number;
+  }> {
+    const linkedCredits = this.invoices.filter(
+      (i) =>
+        i.docType === 'NC' &&
+        i.status === 'issued' &&
+        i.returnOriginInvoiceId === originInv.id
+    );
+
+    return originInv.lines.map((line) => {
+      let already = 0;
+      for (const nc of linkedCredits) {
+        for (const ncLine of nc.lines) {
+          if (
+            (ncLine.productId && ncLine.productId === line.productId && ncLine.unitPrice === line.unitPrice) ||
+            (ncLine.code === line.code && ncLine.description === line.description)
+          ) {
+            already = roundKz(already + ncLine.qty);
+          }
+        }
+      }
+      const maxRem = Math.max(0, roundKz(line.qty - already));
+      return {
+        line,
+        alreadyCreditedQty: already,
+        maxReturnableQty: maxRem,
+      };
+    });
+  }
+
+  private openCreditNoteDrawer(originInv: InvoiceRecord): void {
+    const remLines = this.getRemainingCreditableLines(originInv);
+    const qtys: Record<string, string> = {};
+    for (const item of remLines) {
+      qtys[item.line.id] = item.maxReturnableQty > 0 ? String(item.maxReturnableQty) : '0';
+    }
+    this.settlingInvoiceId = null;
+    this.creditNoteOriginId = originInv.id;
+    this.creditNoteLineQtys = qtys;
+    this.creditNoteReason = `Devolução de artigos ref. ${originInv.number}`;
+    this.creditNoteRestoreStock = true;
+    const openDue = roundKz(originInv.amountDue || 0);
+    this.creditNoteRefundMode = openDue >= originInv.grandTotal ? 'CREDIT_ACCOUNT' : 'REFUND_NOW';
+    this.creditNoteRefundMethod =
+      originInv.paymentMethod === 'Multicaixa' || originInv.paymentMethod === 'Transferência'
+        ? originInv.paymentMethod
+        : 'Dinheiro';
+    this.creditNoteRefundRef = '';
+    this.creditNoteAffectCashDrawer = true;
+    this.creditNoteError = null;
+  }
+
+  private async submitCreditNoteForm(fd: FormData): Promise<void> {
+    if (this.isCompanySuspended() || !this.creditNoteOriginId) return;
+    const originInv = this.invoices.find((i) => i.id === this.creditNoteOriginId);
+    if (!originInv || originInv.status === 'cancelled' || originInv.docType !== 'FR') {
+      this.creditNoteOriginId = null;
+      this.render();
+      return;
+    }
+
+    const reason = String(fd.get('creditNoteReason') ?? this.creditNoteReason ?? '').trim();
+    if (reason.length < 4) {
+      this.creditNoteError =
+        'Indique o motivo da nota de crédito / devolução (mínimo de 4 caracteres).';
+      this.render();
+      return;
+    }
+
+    const remLines = this.getRemainingCreditableLines(originInv);
+    const draftItems: CartDraftItem[] = [];
+
+    for (const item of remLines) {
+      const raw = String(this.creditNoteLineQtys[item.line.id] ?? '0').trim();
+      if (!raw || raw === '0') continue;
+      const qty = parseDecimalInput(raw);
+      if (Number.isNaN(qty) || qty < 0) {
+        this.creditNoteError = `Quantidade inválida no artigo "${item.line.description}".`;
+        this.render();
+        return;
+      }
+      if (qty > item.maxReturnableQty + 0.0001) {
+        this.creditNoteError = `A quantidade a devolver em "${item.line.description}" (${formatKzNumber(qty)}) excede o saldo disponível da fatura (${formatKzNumber(item.maxReturnableQty)}).`;
+        this.render();
+        return;
+      }
+      if (qty > 0) {
+        draftItems.push({
+          productId: item.line.productId,
+          code: item.line.code,
+          description: item.line.description,
+          unit: item.line.unit,
+          qty: roundKz(qty),
+          unitPrice: item.line.unitPrice,
+          discountPct: item.line.discountPct,
+          ivaRate: item.line.ivaRate,
+        });
+      }
+    }
+
+    if (draftItems.length === 0) {
+      this.creditNoteError = 'Indique pelo menos um artigo com quantidade superior a zero para emitir a Nota de Crédito.';
+      this.render();
+      return;
+    }
+
+    const ncTotals = calculateInvoiceTotals(draftItems, originInv.globalDiscountPct || 0);
+    const nextNumber = generateNextInvoiceNumber(
+      this.invoices.map((i) => i.number),
+      'NC',
+      this.activeCompany.baseSequence
+    );
+
+    const openSess = this.getActiveOpenCashSession();
+    const now = new Date().toISOString();
+    const originDue = Math.max(0, roundKz(originInv.amountDue || 0));
+    const abatedFromDebt = Math.min(originDue, ncTotals.grandTotal);
+    const remainderAfterDebt = Math.max(0, roundKz(ncTotals.grandTotal - abatedFromDebt));
+    const isImmediateRefund =
+      this.creditNoteRefundMode === 'REFUND_NOW' && remainderAfterDebt > 0;
+    const refundedNow = isImmediateRefund ? remainderAfterDebt : 0;
+    const refText = String(fd.get('creditNoteRefundRef') ?? this.creditNoteRefundRef ?? '')
+      .trim()
+      .slice(0, 80);
+
+    const ncPaymentMethod: PaymentMethod = isImmediateRefund
+      ? this.creditNoteRefundMethod
+      : 'Crédito';
+
+    const summaryParts: string[] = [];
+    if (abatedFromDebt > 0) {
+      summaryParts.push(`Abatido à dívida ${originInv.number}: ${formatKzNumber(abatedFromDebt)} Kz`);
+    }
+    if (refundedNow > 0) {
+      summaryParts.push(`Reembolso ${this.creditNoteRefundMethod}: ${formatKzNumber(refundedNow)} Kz`);
+    } else if (remainderAfterDebt > 0) {
+      summaryParts.push(`Crédito cliente: ${formatKzNumber(remainderAfterDebt)} Kz`);
+    }
+
+    const ncInvoice: InvoiceRecord = {
+      id: `inv_nc_${Date.now()}_${Math.random().toString(36).slice(2, 6)}`,
+      companyId: this.activeCompany.id,
+      number: nextNumber,
+      docType: 'NC',
+      issuedAtIso: now,
+      cashier: openSess?.cashier || this.cashier || '01',
+      operator: openSess?.operator || this.operator || '001',
+      ...(openSess ? { sessionId: openSess.id } : {}),
+      paymentMethod: ncPaymentMethod,
+      customerId: originInv.customerId,
+      customerName: originInv.customerName,
+      customerNif: originInv.customerNif,
+      customerLocality: originInv.customerLocality,
+      merchandiseTotal: ncTotals.merchandiseTotal,
+      discountTotal: ncTotals.discountTotal,
+      ...(ncTotals.globalDiscountPct > 0
+        ? {
+            globalDiscountPct: ncTotals.globalDiscountPct,
+            globalDiscountAmount: ncTotals.globalDiscountAmount,
+          }
+        : {}),
+      taxBase14: ncTotals.taxBase14,
+      taxAmount14: ncTotals.taxAmount14,
+      taxBase0: ncTotals.taxBase0,
+      taxAmount0: 0,
+      taxTotal: ncTotals.taxTotal,
+      grandTotal: ncTotals.grandTotal,
+      amountInWords: ncTotals.amountInWords,
+      amountReceived: refundedNow,
+      changeAmount: 0,
+      ...(refText ? { transferReference: refText } : {}),
+      ...(summaryParts.length > 0 ? { paymentSummary: summaryParts.join(' · ').slice(0, 160) } : {}),
+      returnOriginInvoiceId: originInv.id,
+      returnOriginNumber: originInv.number,
+      notes: reason.slice(0, 300),
+      status: 'issued',
+      lines: ncTotals.lines,
+      syncState: 'pending',
+      synced: false,
+      createdAtIso: now,
+      updatedAtIso: now,
+    };
+
+    await localDb.saveInvoice(ncInvoice, this.activeCompany.id);
+    this.invoices = [ncInvoice, ...this.invoices];
+
+    // Se a fatura original tinha saldo em dívida, abate automaticamente até ao limite da NC
+    let updatedOrigin: InvoiceRecord | null = null;
+    if (abatedFromDebt > 0) {
+      const nextOriginDue = Math.max(0, roundKz(originDue - abatedFromDebt));
+      const dtShort = formatDateTimePt(now).slashDate.slice(0, 5);
+      const prevSum =
+        originInv.paymentSummary ||
+        `${originInv.paymentMethod}: ${formatKzNumber(originInv.amountReceived)} Kz`;
+      updatedOrigin = {
+        ...originInv,
+        initialAmountReceived:
+          typeof originInv.initialAmountReceived === 'number'
+            ? originInv.initialAmountReceived
+            : originInv.amountReceived,
+        initialChangeAmount:
+          typeof originInv.initialChangeAmount === 'number'
+            ? originInv.initialChangeAmount
+            : originInv.changeAmount,
+        amountDue: nextOriginDue,
+        paymentSummary: `${prevSum} + NC ${dtShort} (${nextNumber}): ${formatKzNumber(abatedFromDebt)} Kz`.slice(
+          0,
+          160
+        ),
+        syncState: 'pending',
+        synced: false,
+        updatedAtIso: now,
+      };
+      await localDb.saveInvoice(updatedOrigin, this.activeCompany.id);
+      this.invoices = this.invoices.map((x) => (x.id === updatedOrigin!.id ? updatedOrigin! : x));
+    }
+
+    // Reposição automática de stock quando assinalada
+    if (this.creditNoteRestoreStock) {
+      await this.adjustCatalogStockForInvoiceLines(ncTotals.lines, 'RESTORE', {
+        type: 'DEVOLUCAO_CLIENTE',
+        reason: `Devolução por Nota de Crédito ${ncInvoice.number} (ref. ${originInv.number}): ${reason}`,
+        invoiceId: ncInvoice.id,
+        invoiceNumber: ncInvoice.number,
+        operator: this.getCurrentStockOperatorLabel(),
+      });
+    }
+
+    // Registo de saída financeira se houve reembolso imediato
+    if (refundedNow > 0) {
+      const useCashDrawer =
+        openSess &&
+        (this.creditNoteRefundMethod !== 'Dinheiro' || this.creditNoteAffectCashDrawer);
+      const refundMov: CashMovement = {
+        id: `cm_nc_${Date.now()}_${Math.random().toString(36).slice(2, 6)}`,
+        companyId: this.activeCompany.id,
+        sessionId: useCashDrawer && openSess ? openSess.id : 'sem_turno',
+        cashier: openSess?.cashier || this.cashier || '01',
+        operator: openSess?.operator || this.operator || '001',
+        createdByUid: this.user?.uid,
+        type: 'SAIDA',
+        entryKind: 'MOVIMENTO_CAIXA',
+        category: 'Reembolsos e Devoluções de Clientes',
+        amount: refundedNow,
+        paymentMethod: this.creditNoteRefundMethod,
+        reason: `Reembolso Nota de Crédito ${ncInvoice.number} (ref. ${originInv.number})`.slice(
+          0,
+          240
+        ),
+        ...(refText ? { reference: refText } : {}),
+        invoiceId: ncInvoice.id,
+        invoiceNumber: ncInvoice.number,
+        customerName: originInv.customerName.slice(0, 160),
+        syncState: 'pending',
+        synced: false,
+        createdAtIso: now,
+      };
+      await this.persistAndSyncCashMovement(refundMov);
+    }
+
+    this.creditNoteOriginId = null;
+    this.creditNoteError = null;
+    this.selectedHistoryId = ncInvoice.id;
+    this.historyRightTab = 'PREVIEW';
+    this.showHistoryNotice(
+      `Nota de Crédito ${ncInvoice.number} emitida (${formatKzNumber(ncInvoice.grandTotal)} Kz).`
+    );
+    this.render();
+
+    if (this.user && this.isOnline && canCompanySyncCloudData(this.activeCompany)) {
+      try {
+        await ensureCompanyRegisteredCloud(this.activeCompany);
+        await createInvoiceCloud(ncInvoice, this.activeCompany);
+        await submitInvoiceAudit(ncInvoice, this.activeCompany.id).catch(() => null);
+        const syncedNc: InvoiceRecord = { ...ncInvoice, syncState: 'synced', synced: true };
+        await localDb.saveInvoice(syncedNc, this.activeCompany.id);
+        this.invoices = this.invoices.map((x) => (x.id === syncedNc.id ? syncedNc : x));
+        if (updatedOrigin) {
+          await createInvoiceCloud(updatedOrigin, this.activeCompany);
+          const syncedOrig: InvoiceRecord = {
+            ...updatedOrigin,
+            syncState: 'synced',
+            synced: true,
+          };
+          await localDb.saveInvoice(syncedOrig, this.activeCompany.id);
+          this.invoices = this.invoices.map((x) => (x.id === syncedOrig.id ? syncedOrig : x));
+        }
+        if (this.activeModule === 'HISTORY' || this.activeModule === 'SYNC') this.render();
+      } catch {
+        // Mantém pendente localmente para sincronização posterior
+      }
+    }
+  }
+
+  private async reprintHistoryInvoice(
+    invoiceId: string,
+    overrideFormat?: DocumentFormat
+  ): Promise<void> {
+    const inv = this.invoices.find((i) => i.id === invoiceId);
+    if (!inv) return;
+    const fmt = overrideFormat || this.historyViewFormat;
+    const now = new Date().toISOString();
+    const actor = (this.user?.email || this.operator || formatRoleLabelPt(this.getEffectiveRole())).slice(
+      0,
+      120
+    );
+    const updated: InvoiceRecord = {
+      ...inv,
+      reprintCount: (inv.reprintCount || 0) + 1,
+      lastReprintedAtIso: now,
+      lastReprintedBy: actor,
+      syncState: 'pending',
+      synced: false,
+      updatedAtIso: now,
+    };
+
+    await localDb.saveInvoice(updated, this.activeCompany.id);
+    this.invoices = this.invoices.map((x) => (x.id === updated.id ? updated : x));
+    await this.triggerPrint(updated, fmt, true);
+
+    if (this.user && this.isOnline && canCompanySyncCloudData(this.activeCompany)) {
+      void ensureCompanyRegisteredCloud(this.activeCompany)
+        .then(() => createInvoiceCloud(updated, this.activeCompany))
+        .then(async () => {
+          const synced: InvoiceRecord = { ...updated, syncState: 'synced', synced: true };
+          await localDb.saveInvoice(synced, this.activeCompany.id);
+          this.invoices = this.invoices.map((x) => (x.id === synced.id ? synced : x));
+        })
+        .catch(() => null);
+    }
+  }
+
+  private exportHistoryControl(format: 'PDF' | 'EXCEL' | 'CSV'): void {
+    const { filtered } = this.getFilteredHistoryInvoices();
+    if (filtered.length === 0) {
+      this.showHistoryNotice('Não existem documentos no filtro atual para exportar.');
+      this.render();
+      return;
+    }
+
+    const filterLabel = this.getHistoryFilterSummaryLabel();
+    const dateStamp = new Date().toISOString().slice(0, 10);
+    const safeComp = (this.settings.company.shortName || 'empresa')
+      .toLowerCase()
+      .replace(/[^a-z0-9_-]+/g, '-');
+
+    if (format === 'PDF') {
+      this.triggerHistoryControlReportPrint(filtered, filterLabel);
+      return;
+    }
+
+    if (format === 'CSV') {
+      const csv = buildInvoicesCsvContent(filtered, this.settings.company, filterLabel);
+      triggerBrowserDownload(
+        csv,
+        `controlo-documental-${safeComp}-${dateStamp}.csv`,
+        'text/csv;charset=utf-8'
+      );
+      this.showHistoryNotice(
+        `Exportação CSV concluída (${filtered.length} documento${filtered.length === 1 ? '' : 's'}).`
+      );
+      this.render();
+      return;
+    }
+
+    const xlsXml = buildInvoicesExcelXml(filtered, this.settings.company, filterLabel);
+    triggerBrowserDownload(
+      xlsXml,
+      `controlo-documental-${safeComp}-${dateStamp}.xls`,
+      'application/vnd.ms-excel;charset=utf-8'
+    );
+    this.showHistoryNotice(
+      `Exportação Excel (.xls) concluída (${filtered.length} documento${filtered.length === 1 ? '' : 's'}).`
+    );
+    this.render();
+  }
+
+  private buildDocumentAuditTimeline(inv: InvoiceRecord): Array<{
+    iso: string;
+    title: string;
+    detail: string;
+    actor: string;
+    tone: 'neutral' | 'positive' | 'warning' | 'danger';
+    linkedInvoiceId?: string;
+  }> {
+    const events: Array<{
+      iso: string;
+      title: string;
+      detail: string;
+      actor: string;
+      tone: 'neutral' | 'positive' | 'warning' | 'danger';
+      linkedInvoiceId?: string;
+    }> = [];
+
+    const initRec =
+      typeof inv.initialAmountReceived === 'number'
+        ? roundKz(inv.initialAmountReceived)
+        : roundKz(inv.amountReceived);
+    events.push({
+      iso: inv.issuedAtIso,
+      title:
+        inv.docType === 'NC'
+          ? `Emissão da Nota de Crédito ${inv.number}`
+          : inv.docType === 'FP'
+            ? `Emissão da Proforma ${inv.number}`
+            : `Emissão da Fatura/Recibo ${inv.number}`,
+      detail: `Total: ${formatKzNumber(inv.grandTotal)} Kz · Meio: ${inv.paymentMethod} · Recebido no ato: ${formatKzNumber(initRec)} Kz${
+        inv.returnOriginNumber ? ` · Ref. origem: ${inv.returnOriginNumber}` : ''
+      }`,
+      actor: `Operador ${inv.operator} · Caixa ${inv.cashier}`,
+      tone: 'neutral',
+      ...(inv.returnOriginInvoiceId ? { linkedInvoiceId: inv.returnOriginInvoiceId } : {}),
+    });
+
+    // Movimentos de stock ligados ao documento
+    for (const sm of this.stockMovements) {
+      if (sm.invoiceId === inv.id || (sm.invoiceNumber && sm.invoiceNumber === inv.number)) {
+        const dirSign = sm.direction === 'IN' ? '+' : sm.direction === 'OUT' ? '-' : '';
+        events.push({
+          iso: sm.createdAtIso,
+          title:
+            sm.type === 'SAIDA_VENDA'
+              ? `Saída automática de stock (${sm.productCode})`
+              : sm.type === 'DEVOLUCAO_CLIENTE'
+                ? `Devolução / reposição em stock (${sm.productCode})`
+                : `Ajuste de stock (${sm.productCode})`,
+          detail: `${sm.productName}: ${dirSign}${formatKzNumber(sm.qty)} ${sm.unit} (${formatKzNumber(sm.previousStock)} → ${formatKzNumber(sm.newStock)} ${sm.unit})`,
+          actor: `Operador ${sm.operator}`,
+          tone: sm.direction === 'IN' ? 'positive' : 'neutral',
+        });
+      }
+    }
+
+    // Liquidações parciais / totais ou reembolsos em caixa ligados ao documento
+    for (const cm of this.cashMovements) {
+      if (cm.invoiceId === inv.id || (cm.invoiceNumber && cm.invoiceNumber === inv.number)) {
+        const isOut = cm.type === 'SAIDA' || cm.type === 'SANGRIA';
+        events.push({
+          iso: cm.createdAtIso,
+          title:
+            cm.type === 'LIQUIDACAO_DIVIDA'
+              ? `Pagamento / liquidação de conta corrente`
+              : isOut
+                ? `Saída financeira / reembolso`
+                : `Movimento financeiro associado`,
+          detail: `${isOut ? '-' : '+'}${formatKzNumber(cm.amount)} Kz via ${cm.paymentMethod}${
+            cm.reference ? ` · Ref. ${cm.reference}` : ''
+          } · ${cm.reason}`,
+          actor: `Operador ${cm.operator} · ${cm.sessionId === 'sem_turno' ? 'Tesouraria' : `Caixa ${cm.cashier}`}`,
+          tone: isOut ? 'warning' : 'positive',
+        });
+      }
+    }
+
+    // Notas de crédito ou novas faturas de troca emitidas sobre esta fatura
+    for (const child of this.invoices) {
+      if (child.id !== inv.id && child.returnOriginInvoiceId === inv.id) {
+        events.push({
+          iso: child.issuedAtIso,
+          title:
+            child.docType === 'NC'
+              ? `Nota de Crédito emitida (${child.number})${child.status === 'cancelled' ? ' [Anulada]' : ''}`
+              : `Troca comercial vinculada (${child.number})`,
+          detail:
+            child.docType === 'NC'
+              ? `Valor creditado: ${formatKzNumber(child.grandTotal)} Kz · ${child.notes || 'Devolução'}`
+              : `Crédito compensado: ${formatKzNumber(child.returnCreditApplied || 0)} Kz na venda ${child.number}`,
+          actor: `Operador ${child.operator} · Caixa ${child.cashier}`,
+          tone: 'warning',
+          linkedInvoiceId: child.id,
+        });
+      }
+    }
+
+    // Registo de reimpressões (2.ª via)
+    if ((inv.reprintCount || 0) > 0) {
+      events.push({
+        iso: inv.lastReprintedAtIso || inv.updatedAtIso,
+        title: `Reimpressão documental (2.ª Via · ${inv.reprintCount}x)`,
+        detail: `Última reimpressão registada para controlo documental.`,
+        actor: inv.lastReprintedBy || `Operador ${inv.operator}`,
+        tone: 'neutral',
+      });
+    }
+
+    // Registo formal de anulação
+    if (inv.status === 'cancelled') {
+      events.push({
+        iso: inv.cancelledAtIso || inv.updatedAtIso,
+        title: `Anulação definitiva do documento`,
+        detail: `Motivo registado: ${inv.cancelReason || 'Sem motivo detalhado'}`,
+        actor: inv.cancelledBy || `Operador ${inv.operator}`,
+        tone: 'danger',
+      });
+    }
+
+    events.sort((a, b) => a.iso.localeCompare(b.iso));
+    return events;
+  }
+
+  private renderCreditNoteInlineDrawer(originInv: InvoiceRecord): string {
+    if (this.creditNoteOriginId !== originInv.id || originInv.status === 'cancelled') return '';
+    const remLines = this.getRemainingCreditableLines(originInv);
+    const hasAnyCreditable = remLines.some((r) => r.maxReturnableQty > 0);
+    const openCashSession = this.getActiveOpenCashSession();
+
+    const previewDraftItems: CartDraftItem[] = [];
+    for (const r of remLines) {
+      const q = parseDecimalInput(this.creditNoteLineQtys[r.line.id] || '0');
+      if (!Number.isNaN(q) && q > 0 && q <= r.maxReturnableQty + 0.0001) {
+        previewDraftItems.push({
+          productId: r.line.productId,
+          code: r.line.code,
+          description: r.line.description,
+          unit: r.line.unit,
+          qty: roundKz(q),
+          unitPrice: r.line.unitPrice,
+          discountPct: r.line.discountPct,
+          ivaRate: r.line.ivaRate,
+        });
+      }
+    }
+    const previewTotals = calculateInvoiceTotals(
+      previewDraftItems,
+      originInv.globalDiscountPct || 0
+    );
+    const originDue = Math.max(0, roundKz(originInv.amountDue || 0));
+    const autoDebtAbate = Math.min(originDue, previewTotals.grandTotal);
+    const refundableRemainder = Math.max(0, roundKz(previewTotals.grandTotal - autoDebtAbate));
+
+    return `
+      <form
+        data-form="credit-note-form"
+        class="p-3.5 border-b border-slate-200 bg-slate-50 space-y-3 shrink-0 max-h-[62%] overflow-y-auto"
+      >
+        <div class="flex items-center justify-between gap-2">
+          <div>
+            <div class="text-xs font-bold text-slate-900">Emitir Nota de Crédito / Devolução · Ref. ${escapeHtml(originInv.number)}</div>
+            <div class="text-[11px] text-slate-500">Selecione as quantidades devolvidas (total ou parcial) e o modo de regularização.</div>
+          </div>
+          <div class="flex items-center gap-1.5 shrink-0">
+            <button
+              type="button"
+              data-action="fill-credit-note-all"
+              class="h-7 px-2 rounded border border-slate-200 bg-white text-[11px] font-medium text-slate-700 hover:bg-slate-100 whitespace-nowrap"
+            >Tudo</button>
+            <button
+              type="button"
+              data-action="clear-credit-note-qtys"
+              class="h-7 px-2 rounded border border-slate-200 bg-white text-[11px] font-medium text-slate-600 hover:bg-slate-100 whitespace-nowrap"
+            >Limpar</button>
+            <button
+              type="button"
+              data-action="close-credit-note-panel"
+              class="h-7 w-7 flex items-center justify-center rounded border border-slate-200 bg-white text-slate-600 hover:bg-slate-100"
+            >${ICONS.close}</button>
+          </div>
+        </div>
+
+        ${
+          this.creditNoteError
+            ? `<div class="p-2 rounded border border-red-200 bg-red-50 text-xs text-red-700">${escapeHtml(this.creditNoteError)}</div>`
+            : ''
+        }
+
+        ${
+          !hasAnyCreditable
+            ? `<div class="p-3 rounded border border-slate-200 bg-white text-xs text-slate-600">Todos os artigos desta fatura já foram integralmente creditados em Notas de Crédito anteriores.</div>`
+            : `
+              <div class="border border-slate-200 rounded-md bg-white overflow-hidden">
+                <table class="w-full text-left border-collapse text-[11px]">
+                  <thead>
+                    <tr class="bg-slate-100 text-slate-600 border-b border-slate-200">
+                      <th class="py-1.5 px-2 font-semibold">Artigo</th>
+                      <th class="py-1.5 px-2 font-semibold text-right">Vendido</th>
+                      <th class="py-1.5 px-2 font-semibold text-right">Disp. Dev.</th>
+                      <th class="py-1.5 px-2 font-semibold text-right w-24">Devolver</th>
+                    </tr>
+                  </thead>
+                  <tbody class="divide-y divide-slate-100 tabular-nums">
+                    ${remLines
+                      .map(
+                        ({ line, alreadyCreditedQty, maxReturnableQty }) => `
+                          <tr>
+                            <td class="py-1.5 px-2">
+                              <div class="font-medium text-slate-900 truncate max-w-[200px]">${escapeHtml(line.description)}</div>
+                              <div class="text-[10px] text-slate-500 font-mono">${formatKzNumber(line.unitPrice)} Kz/${escapeHtml(line.unit)}${
+                                alreadyCreditedQty > 0
+                                  ? ` · Já creditado: ${formatKzNumber(alreadyCreditedQty)}`
+                                  : ''
+                              }</div>
+                            </td>
+                            <td class="py-1.5 px-2 text-right font-mono text-slate-600">${formatKzNumber(line.qty)}</td>
+                            <td class="py-1.5 px-2 text-right font-mono font-semibold text-slate-800">${formatKzNumber(maxReturnableQty)}</td>
+                            <td class="py-1.5 px-2 text-right">
+                              <input
+                                id="cn-qty-${escapeHtml(line.id)}"
+                                type="text"
+                                inputmode="decimal"
+                                data-field="credit-note-line-qty"
+                                data-id="${escapeHtml(line.id)}"
+                                ${maxReturnableQty <= 0 ? 'disabled' : ''}
+                                value="${escapeHtml(this.creditNoteLineQtys[line.id] ?? '0')}"
+                                class="w-20 h-7 px-2 text-right text-xs font-mono font-semibold tabular-nums rounded border border-slate-300 bg-white focus:outline-none focus:border-blue-600 disabled:bg-slate-100 disabled:text-slate-400"
+                              />
+                            </td>
+                          </tr>
+                        `
+                      )
+                      .join('')}
+                  </tbody>
+                </table>
+              </div>
+
+              <div class="grid grid-cols-1 sm:grid-cols-12 gap-2.5">
+                <div class="sm:col-span-6">
+                  <label class="block text-[10.5px] font-medium text-slate-700 mb-0.5">Motivo da devolução / retificação</label>
+                  <input
+                    name="creditNoteReason"
+                    type="text"
+                    required
+                    maxlength="240"
+                    value="${escapeHtml(this.creditNoteReason)}"
+                    placeholder="Ex: Produto devolvido com defeito / ajuste de quantidade"
+                    class="w-full h-8 px-2.5 text-xs bg-white border border-slate-300 rounded-md focus:outline-none focus:border-blue-600"
+                  />
+                </div>
+                <div class="sm:col-span-3">
+                  <label class="block text-[10.5px] font-medium text-slate-700 mb-0.5">Regularização do saldo</label>
+                  <select
+                    name="refundMode"
+                    ${refundableRemainder <= 0 ? 'disabled' : ''}
+                    class="w-full h-8 px-2 text-xs bg-white border border-slate-300 rounded-md"
+                  >
+                    <option value="REFUND_NOW" ${this.creditNoteRefundMode === 'REFUND_NOW' ? 'selected' : ''}>Reembolsar cliente</option>
+                    <option value="CREDIT_ACCOUNT" ${this.creditNoteRefundMode === 'CREDIT_ACCOUNT' ? 'selected' : ''}>Crédito em conta</option>
+                  </select>
+                </div>
+                <div class="sm:col-span-3">
+                  <label class="block text-[10.5px] font-medium text-slate-700 mb-0.5">Meio reembolso</label>
+                  <select
+                    name="refundMethod"
+                    ${this.creditNoteRefundMode !== 'REFUND_NOW' || refundableRemainder <= 0 ? 'disabled' : ''}
+                    class="w-full h-8 px-2 text-xs bg-white border border-slate-300 rounded-md disabled:bg-slate-100 disabled:text-slate-400"
+                  >
+                    <option value="Dinheiro" ${this.creditNoteRefundMethod === 'Dinheiro' ? 'selected' : ''}>Dinheiro</option>
+                    <option value="Transferência" ${this.creditNoteRefundMethod === 'Transferência' ? 'selected' : ''}>Transferência</option>
+                    <option value="Multicaixa" ${this.creditNoteRefundMethod === 'Multicaixa' ? 'selected' : ''}>Multicaixa</option>
+                  </select>
+                </div>
+              </div>
+
+              <div class="flex flex-wrap items-center justify-between gap-2 pt-0.5">
+                <div class="flex flex-wrap items-center gap-4 text-xs text-slate-700">
+                  <label class="inline-flex items-center gap-1.5 cursor-pointer">
+                    <input
+                      type="checkbox"
+                      name="restoreStock"
+                      ${this.creditNoteRestoreStock ? 'checked' : ''}
+                      class="rounded border-slate-300"
+                    />
+                    <span>Repor artigos no stock</span>
+                  </label>
+                  ${
+                    this.creditNoteRefundMode === 'REFUND_NOW' &&
+                    refundableRemainder > 0 &&
+                    this.creditNoteRefundMethod === 'Dinheiro' &&
+                    openCashSession
+                      ? `
+                        <label class="inline-flex items-center gap-1.5 cursor-pointer">
+                          <input
+                            type="checkbox"
+                            name="affectCashDrawer"
+                            ${this.creditNoteAffectCashDrawer ? 'checked' : ''}
+                            class="rounded border-slate-300"
+                          />
+                          <span>Saída na gaveta Caixa ${escapeHtml(openCashSession.cashier)}</span>
+                        </label>
+                      `
+                      : ''
+                  }
+                </div>
+
+                <div class="flex items-center gap-3">
+                  <div class="text-right tabular-nums">
+                    <div class="text-xs font-bold font-mono text-slate-900">Total NC: ${formatKzNumber(previewTotals.grandTotal)} Kz</div>
+                    ${
+                      autoDebtAbate > 0
+                        ? `<div class="text-[10px] text-amber-700 font-mono">Abate dívida: ${formatKzNumber(autoDebtAbate)} Kz${
+                            refundableRemainder > 0
+                              ? ` · Restante: ${formatKzNumber(refundableRemainder)} Kz`
+                              : ''
+                          }</div>`
+                        : ''
+                    }
+                  </div>
+                  <button
+                    type="submit"
+                    class="h-8 px-3 rounded-md bg-slate-900 hover:bg-slate-800 text-white text-xs font-semibold whitespace-nowrap shrink-0"
+                  >Emitir Nota de Crédito</button>
+                </div>
+              </div>
+            `
+        }
+      </form>
+    `;
+  }
 
   private renderHistoryWorkspace(): string {
     const canCancel = this.canCancelInvoices();
     const isSuspended = this.isCompanySuspended();
-
-    const baseFiltered = filterInvoicesSmart(this.invoices, this.historySearch);
-    const openDebtCount = this.invoices.filter(
-      (i) => i.status === 'issued' && (i.amountDue || 0) > 0
-    ).length;
-    const filtered = this.historyDebtOnly
-      ? baseFiltered.filter((i) => i.status === 'issued' && (i.amountDue || 0) > 0)
-      : baseFiltered;
+    const operators = this.getHistoryDistinctOperators();
+    const { filtered, counts } = this.getFilteredHistoryInvoices();
+    const filteredSummary = summarizeDocumentControlList(filtered);
 
     const active = filtered.find((i) => i.id === this.selectedHistoryId) || filtered[0] || null;
     let cachedQr = '';
-    if (active) {
+    if (active && this.historyRightTab === 'PREVIEW') {
       const key = `${active.number}|${active.grandTotal.toFixed(2)}|${this.settings.company.nif}`;
       cachedQr = this.qrCache.get(key) || '';
       if (!cachedQr) this.ensureQrForInvoice(active);
     }
 
+    const activeAuditEvents = active ? this.buildDocumentAuditTimeline(active) : [];
+    const hasCustomFilters =
+      this.historySearch.trim() !== '' ||
+      this.historyStatusFilter !== 'ALL' ||
+      this.historyPeriod !== 'ALL' ||
+      this.historyOperatorFilter !== 'ALL';
+
+    const statusTabs: Array<{
+      id: HistoryStatusFilter;
+      label: string;
+      count: number;
+    }> = [
+      { id: 'ALL', label: 'Todos', count: counts.all },
+      { id: 'PAID', label: 'Pagas', count: counts.paid },
+      { id: 'PENDING', label: 'Pendentes', count: counts.pending },
+      { id: 'PARTIAL', label: 'Parciais', count: counts.partial },
+      { id: 'DEBT_ALL', label: 'Em dívida', count: counts.debtAll },
+      { id: 'CREDIT_NOTES', label: 'Notas Crédito', count: counts.creditNotes },
+      { id: 'CANCELLED', label: 'Anuladas', count: counts.cancelled },
+      ...(counts.proforma > 0 || this.historyStatusFilter === 'PROFORMA'
+        ? [{ id: 'PROFORMA' as const, label: 'Proformas', count: counts.proforma }]
+        : []),
+    ];
+
+    const periodPills: Array<{
+      id: HistoryPeriodFilter;
+      label: string;
+    }> = [
+      { id: 'ALL', label: 'Tudo' },
+      { id: 'TODAY', label: 'Hoje' },
+      { id: 'THIS_MONTH', label: 'Este mês' },
+      { id: 'LAST_30D', label: '30 dias' },
+      { id: 'THIS_YEAR', label: 'Este ano' },
+      { id: 'CUSTOM', label: 'Período' },
+    ];
+
+    const isAuditActive = this.historyActiveMainTab === 'OPERATIONAL_AUDIT';
+
     return `
-      <div class="h-full grid grid-cols-1 lg:grid-cols-12 overflow-hidden bg-white">
-        <div class="lg:col-span-6 flex flex-col border-r border-slate-200 overflow-hidden">
-          <div class="p-3 border-b border-slate-200 flex items-center gap-2 shrink-0">
-            <div class="relative flex-1 min-w-0">
-              <span class="text-slate-400 absolute left-3 top-1/2 -translate-y-1/2 pointer-events-none">${ICONS.search}</span>
-              <input
-                id="history-search-input"
-                type="text"
-                data-field="history-search"
-                value="${escapeHtml(this.historySearch)}"
-                placeholder="Pesquisar n.º de fatura, cliente ou NIF (F2)..."
-                class="w-full h-10 pl-9 pr-3 text-xs bg-slate-50 border border-slate-200 rounded-lg focus:outline-none focus:border-blue-600"
-              />
-            </div>
+      <div class="h-full flex flex-col overflow-hidden bg-white">
+        <!-- Top Navigation Bar for History -->
+        <div class="px-3 pt-2 pb-0 border-b border-slate-200 bg-slate-50 flex items-center justify-between gap-3 shrink-0">
+          <div class="flex items-center gap-1">
             <button
               type="button"
-              data-action="toggle-history-debt-filter"
-              class="h-10 px-3 rounded-lg border text-xs font-medium transition-colors whitespace-nowrap shrink-0 tabular-nums ${
-                this.historyDebtOnly
-                  ? 'bg-slate-900 text-white border-slate-900'
-                  : 'border-slate-200 text-slate-600 hover:bg-slate-50'
+              data-action="set-history-main-tab"
+              data-value="DOCUMENTS"
+              class="h-8 px-3 text-xs font-semibold rounded-t-md transition-colors border-t border-x flex items-center gap-1.5 ${
+                !isAuditActive
+                  ? 'bg-white text-slate-900 border-slate-200 -mb-px'
+                  : 'bg-transparent text-slate-500 border-transparent hover:text-slate-800'
               }"
-            >Em dívida · ${openDebtCount}</button>
+            >
+              <span>Documentos Emitidos</span>
+              <span class="font-mono tabular-nums text-[10px] text-slate-400">(${this.invoices.length})</span>
+            </button>
+            <button
+              type="button"
+              data-action="set-history-main-tab"
+              data-value="OPERATIONAL_AUDIT"
+              class="h-8 px-3 text-xs font-semibold rounded-t-md transition-colors border-t border-x flex items-center gap-1.5 ${
+                isAuditActive
+                  ? 'bg-white text-blue-700 border-slate-200 -mb-px'
+                  : 'bg-transparent text-slate-500 border-transparent hover:text-slate-800'
+              }"
+            >
+              ${ICONS.shield}
+              <span>Auditoria de Operações Críticas</span>
+            </button>
+          </div>
+        </div>
+
+        ${
+          isAuditActive
+            ? this.renderOperationalAuditWorkspace()
+            : `
+            <div class="flex-1 grid grid-cols-1 lg:grid-cols-12 overflow-hidden bg-white">
+              <!-- Coluna Esquerda: Pesquisa, Filtros Documentais, Exportação e Lista -->
+              <div class="lg:col-span-6 flex flex-col border-r border-slate-200 overflow-hidden">
+                <div class="p-3 border-b border-slate-200 space-y-2.5 shrink-0 bg-white">
+            ${
+              this.historyWorkspaceNotice
+                ? `<div class="px-3 py-2 rounded-md border border-emerald-200 bg-emerald-50 text-xs text-emerald-800 font-medium">${escapeHtml(
+                    this.historyWorkspaceNotice
+                  )}</div>`
+                : ''
+            }
+
+            <!-- Linha 1: Pesquisa (n.º fatura, cliente, NIF, operador) + Filtro Operador + Exportação -->
+            <div class="flex items-center gap-2 flex-wrap sm:flex-nowrap">
+              <div class="relative flex-1 min-w-[180px]">
+                <span class="text-slate-400 absolute left-3 top-1/2 -translate-y-1/2 pointer-events-none">${ICONS.search}</span>
+                <input
+                  id="history-search-input"
+                  type="text"
+                  data-field="history-search"
+                  value="${escapeHtml(this.historySearch)}"
+                  placeholder="N.º fatura/NC, cliente, NIF ou operador (F2)..."
+                  class="w-full h-9 pl-9 pr-3 text-xs bg-slate-50 border border-slate-200 rounded-md focus:outline-none focus:border-blue-600"
+                />
+              </div>
+
+              <select
+                aria-label="Filtrar por operador"
+                data-field="history-operator-filter"
+                class="h-9 px-2.5 text-xs bg-slate-50 border border-slate-200 rounded-md text-slate-700 focus:outline-none focus:border-blue-600 max-w-[150px]"
+              >
+                <option value="ALL" ${this.historyOperatorFilter === 'ALL' ? 'selected' : ''}>Operador: Todos</option>
+                ${operators
+                  .map(
+                    (op) =>
+                      `<option value="${escapeHtml(op)}" ${
+                        this.historyOperatorFilter === op ? 'selected' : ''
+                      }>Op. ${escapeHtml(op)}</option>`
+                  )
+                  .join('')}
+              </select>
+
+              <div class="flex items-center gap-1 shrink-0">
+                <button
+                  type="button"
+                  data-action="export-history-control"
+                  data-value="PDF"
+                  title="Exportar/Imprimir Mapa de Controlo Documental em PDF (A4)"
+                  class="h-9 px-2.5 rounded-md border border-slate-200 bg-white hover:bg-slate-50 text-[11px] font-semibold text-slate-700 whitespace-nowrap"
+                >PDF</button>
+                <button
+                  type="button"
+                  data-action="export-history-control"
+                  data-value="EXCEL"
+                  title="Exportar documentos filtrados para Excel (.xls)"
+                  class="h-9 px-2.5 rounded-md border border-slate-200 bg-white hover:bg-slate-50 text-[11px] font-semibold text-slate-700 whitespace-nowrap"
+                >Excel</button>
+                <button
+                  type="button"
+                  data-action="export-history-control"
+                  data-value="CSV"
+                  title="Exportar documentos filtrados para CSV"
+                  class="h-9 px-2.5 rounded-md border border-slate-200 bg-white hover:bg-slate-50 text-[11px] font-semibold text-slate-700 whitespace-nowrap"
+                >CSV</button>
+              </div>
+            </div>
+
+            <!-- Linha 2: Período + Datas personalizadas -->
+            <div class="flex items-center justify-between gap-2 flex-wrap">
+              <div class="flex items-center gap-1 bg-slate-100 p-0.5 rounded-md overflow-x-auto">
+                ${periodPills
+                  .map(
+                    (p) => `
+                      <button
+                        type="button"
+                        data-action="set-history-period"
+                        data-value="${p.id}"
+                        class="h-7 px-2.5 rounded text-[11px] font-medium transition-colors whitespace-nowrap ${
+                          this.historyPeriod === p.id
+                            ? 'bg-white text-slate-900 shadow-xs font-semibold'
+                            : 'text-slate-600 hover:text-slate-900'
+                        }"
+                      >${p.label}</button>
+                    `
+                  )
+                  .join('')}
+              </div>
+
+              ${
+                hasCustomFilters
+                  ? `<button
+                      type="button"
+                      data-action="reset-history-filters"
+                      class="text-[11px] font-medium text-blue-600 hover:text-blue-800 whitespace-nowrap"
+                    >Limpar filtros</button>`
+                  : ''
+              }
+            </div>
+
+            ${
+              this.historyPeriod === 'CUSTOM'
+                ? `
+                  <div class="flex items-center gap-2 text-xs">
+                    <label class="text-[11px] text-slate-500 whitespace-nowrap">De</label>
+                    <input
+                      type="date"
+                      data-field="history-date-from"
+                      value="${escapeHtml(this.historyDateFrom)}"
+                      class="h-8 px-2 text-xs font-mono tabular-nums bg-slate-50 border border-slate-200 rounded-md"
+                    />
+                    <label class="text-[11px] text-slate-500 whitespace-nowrap">Até</label>
+                    <input
+                      type="date"
+                      data-field="history-date-to"
+                      value="${escapeHtml(this.historyDateTo)}"
+                      class="h-8 px-2 text-xs font-mono tabular-nums bg-slate-50 border border-slate-200 rounded-md"
+                    />
+                  </div>
+                `
+                : ''
+            }
+
+            <!-- Linha 3: Segmentos de Estado (Pagas, Pendentes, Parciais, Dívida, Notas de Crédito, Anuladas) -->
+            <div class="flex items-center gap-1 overflow-x-auto pb-0.5">
+              ${statusTabs
+                .map((tab) => {
+                  const activeTab = this.historyStatusFilter === tab.id;
+                  return `
+                    <button
+                      type="button"
+                      data-action="set-history-status-filter"
+                      data-value="${tab.id}"
+                      class="h-7 px-2.5 rounded-md border text-[11px] font-medium transition-colors whitespace-nowrap shrink-0 tabular-nums ${
+                        activeTab
+                          ? 'bg-slate-900 text-white border-slate-900'
+                          : 'border-slate-200 text-slate-600 hover:bg-slate-50'
+                      }"
+                    >${tab.label} · ${tab.count}</button>
+                  `;
+                })
+                .join('')}
+            </div>
+
+            <!-- Resumo Rápido do Conjunto Filtrado -->
+            <div class="pt-1.5 border-t border-slate-100 flex items-center justify-between gap-3 text-[11px] text-slate-600 tabular-nums flex-wrap">
+              <span>Líquido: <strong class="font-mono text-slate-900">${formatKzNumber(filteredSummary.netCommercialTotal)} Kz</strong></span>
+              <span>Pago: <strong class="font-mono text-emerald-700">${formatKzNumber(filteredSummary.paidTotal)} Kz</strong></span>
+              <span>Dívida: <strong class="font-mono ${filteredSummary.dueTotal > 0 ? 'text-amber-700' : 'text-slate-700'}">${formatKzNumber(filteredSummary.dueTotal)} Kz</strong></span>
+              ${
+                filteredSummary.creditNoteCount > 0
+                  ? `<span>NC: <strong class="font-mono text-blue-700">${formatKzNumber(filteredSummary.creditNoteTotal)} Kz</strong></span>`
+                  : ''
+              }
+              ${
+                filteredSummary.cancelledCount > 0
+                  ? `<span>Anul.: <strong class="font-mono text-red-600">${filteredSummary.cancelledCount}</strong></span>`
+                  : ''
+              }
+            </div>
           </div>
 
+          <!-- Lista Documental -->
           <div class="flex-1 overflow-y-auto divide-y divide-slate-100">
             ${
               filtered.length === 0
-                ? `<div class="p-8 text-center text-xs text-slate-500">${
-                    this.historyDebtOnly
-                      ? 'Nenhuma fatura com saldo em dívida para o filtro atual.'
-                      : 'Nenhuma fatura encontrada nesta empresa.'
-                  }</div>`
+                ? `<div class="p-8 text-center text-xs text-slate-500">Nenhum documento encontrado para os critérios selecionados.</div>`
                 : filtered
                     .map((inv) => {
                       const dt = formatDateTimePt(inv.issuedAtIso);
                       const isSel = active?.id === inv.id;
-                      const due = inv.status === 'issued' ? inv.amountDue || 0 : 0;
+                      const cls = classifyInvoiceControlStatus(inv);
+                      const statusColor =
+                        cls.state === 'CANCELLED'
+                          ? 'text-red-600 font-semibold'
+                          : cls.state === 'PARTIAL' || cls.state === 'PENDING'
+                            ? 'text-amber-700 font-semibold'
+                            : cls.state === 'CREDIT_NOTE'
+                              ? 'text-blue-700 font-semibold'
+                              : cls.state === 'PROFORMA'
+                                ? 'text-slate-600 font-medium'
+                                : 'text-emerald-700 font-medium';
+
                       return `
                         <button
                           type="button"
                           data-action="select-history"
                           data-id="${escapeHtml(inv.id)}"
-                          class="w-full text-left p-3.5 transition-colors flex items-center justify-between gap-3 ${
+                          class="w-full text-left p-3 transition-colors flex items-start justify-between gap-3 ${
                             isSel ? 'bg-blue-50/60' : 'hover:bg-slate-50'
                           }"
                         >
-                          <div class="min-w-0">
-                            <div class="flex items-center gap-2 text-xs">
-                              <span class="font-bold font-mono text-slate-900 tabular-nums">${escapeHtml(inv.number)}</span>
-                              <span class="text-slate-400">·</span>
+                          <div class="min-w-0 space-y-0.5">
+                            <div class="flex items-center gap-1.5 text-xs flex-wrap">
+                              <span class="font-bold font-mono text-slate-900 tabular-nums ${
+                                cls.state === 'CANCELLED' ? 'line-through text-slate-500' : ''
+                              }">${escapeHtml(inv.number)}</span>
+                              <span class="text-slate-300">·</span>
                               <span class="text-slate-500 tabular-nums">${dt.slashDate} ${dt.time}</span>
-                              ${
-                                inv.status === 'cancelled'
-                                  ? `<span class="text-slate-400">·</span><span class="text-red-600 font-semibold">Anulada</span>`
-                                  : due > 0
-                                    ? `<span class="text-slate-400">·</span><span class="text-amber-700 font-semibold font-mono tabular-nums">Dívida: ${formatKzNumber(due)} Kz</span>`
-                                    : ''
-                              }
+                              <span class="text-slate-300">·</span>
+                              <span class="${statusColor} tabular-nums">${
+                                cls.state === 'PARTIAL'
+                                  ? `Parcial (Falta ${formatKzNumber(cls.dueAmount)} Kz)`
+                                  : cls.state === 'PENDING'
+                                    ? `Pendente (${formatKzNumber(cls.dueAmount)} Kz)`
+                                    : escapeHtml(cls.labelPt)
+                              }</span>
                             </div>
-                            <div class="text-xs text-slate-600 truncate mt-0.5">
-                              ${escapeHtml(inv.customerName)} · ${escapeHtml(inv.paymentMethod)}${
-                                inv.transferReference ? ` · Ref. ${escapeHtml(inv.transferReference)}` : ''
-                              }
+                            <div class="text-xs text-slate-600 truncate">
+                              ${escapeHtml(inv.customerName)} · Op. ${escapeHtml(inv.operator)} (Cx ${escapeHtml(inv.cashier)}) · ${escapeHtml(inv.paymentMethod)}
                             </div>
                             ${
-                              inv.status === 'cancelled' && inv.cancelReason
-                                ? `<div class="text-[11px] text-red-600/90 truncate mt-0.5">Motivo: ${escapeHtml(inv.cancelReason)}</div>`
+                              inv.returnOriginNumber
+                                ? `<div class="text-[11px] text-blue-700 truncate font-mono tabular-nums">Ref. origem: ${escapeHtml(inv.returnOriginNumber)}</div>`
+                                : ''
+                            }
+                            ${
+                              inv.status === 'cancelled'
+                                ? `<div class="text-[11px] text-red-600/90 truncate">Anulado${
+                                    inv.cancelledBy ? ` por ${escapeHtml(inv.cancelledBy)}` : ''
+                                  }${inv.cancelReason ? ` · ${escapeHtml(inv.cancelReason)}` : ''}</div>`
                                 : ''
                             }
                           </div>
                           <div class="text-right shrink-0">
-                            <div class="text-xs font-bold font-mono text-slate-900 tabular-nums">${formatKzNumber(inv.grandTotal)} Kz</div>
-                            <div class="text-[10.5px] text-slate-400 tabular-nums">${inv.lines.length} art.</div>
+                            <div class="text-xs font-bold font-mono ${
+                              cls.state === 'CANCELLED'
+                                ? 'text-slate-400 line-through'
+                                : cls.state === 'CREDIT_NOTE'
+                                  ? 'text-blue-700'
+                                  : 'text-slate-900'
+                            } tabular-nums">${cls.state === 'CREDIT_NOTE' ? '-' : ''}${formatKzNumber(inv.grandTotal)} Kz</div>
+                            <div class="text-[10.5px] text-slate-400 tabular-nums">${inv.lines.length} art.${
+                              inv.reprintCount && inv.reprintCount > 0 ? ` · ${inv.reprintCount}ª reimp.` : ''
+                            }</div>
                           </div>
                         </button>
                       `;
@@ -9225,6 +14769,7 @@ export class SilaBillingApp {
           </div>
         </div>
 
+        <!-- Coluna Direita: Controlo Documental, Ações, Nota de Crédito e Histórico de Alterações -->
         <div class="lg:col-span-6 flex flex-col bg-slate-100 overflow-hidden">
           ${
             active
@@ -9235,21 +14780,46 @@ export class SilaBillingApp {
                     type="button"
                     data-action="set-history-format"
                     data-value="POS"
-                    class="h-8 px-3 text-[11px] font-semibold rounded-md transition-colors whitespace-nowrap ${
-                      this.historyViewFormat === 'POS' ? 'bg-white text-slate-900 shadow-xs' : 'text-slate-600 hover:text-slate-900'
+                    class="h-8 px-2.5 text-[11px] font-semibold rounded-md transition-colors whitespace-nowrap ${
+                      this.historyRightTab === 'PREVIEW' && this.historyViewFormat === 'POS'
+                        ? 'bg-white text-slate-900 shadow-xs'
+                        : 'text-slate-600 hover:text-slate-900'
                     }"
                   >POS 80mm</button>
                   <button
                     type="button"
                     data-action="set-history-format"
                     data-value="A4"
-                    class="h-8 px-3 text-[11px] font-semibold rounded-md transition-colors whitespace-nowrap ${
-                      this.historyViewFormat === 'A4' ? 'bg-white text-slate-900 shadow-xs' : 'text-slate-600 hover:text-slate-900'
+                    class="h-8 px-2.5 text-[11px] font-semibold rounded-md transition-colors whitespace-nowrap ${
+                      this.historyRightTab === 'PREVIEW' && this.historyViewFormat === 'A4'
+                        ? 'bg-white text-slate-900 shadow-xs'
+                        : 'text-slate-600 hover:text-slate-900'
                     }"
                   >A4</button>
+                  <button
+                    type="button"
+                    data-action="set-history-right-tab"
+                    data-value="AUDIT"
+                    class="h-8 px-2.5 text-[11px] font-semibold rounded-md transition-colors whitespace-nowrap tabular-nums ${
+                      this.historyRightTab === 'AUDIT'
+                        ? 'bg-white text-slate-900 shadow-xs'
+                        : 'text-slate-600 hover:text-slate-900'
+                    }"
+                  >Alterações · ${activeAuditEvents.length}</button>
                 </div>
 
                 <div class="flex items-center gap-1.5 flex-wrap">
+                  ${
+                    active.status !== 'cancelled' && active.docType === 'FP'
+                      ? `<button
+                          type="button"
+                          data-action="convert-proforma-to-invoice"
+                          data-id="${escapeHtml(active.id)}"
+                          ${isSuspended ? 'disabled' : ''}
+                          class="h-8 px-2.5 rounded-md border border-blue-200 bg-blue-50 text-xs font-semibold text-blue-800 hover:bg-blue-100 disabled:opacity-40 whitespace-nowrap"
+                        >Converter em Fatura</button>`
+                      : ''
+                  }
                   ${
                     active.status !== 'cancelled' && (active.amountDue || 0) > 0
                       ? `<button
@@ -9257,7 +14827,7 @@ export class SilaBillingApp {
                           data-action="open-settle-debt"
                           data-id="${escapeHtml(active.id)}"
                           ${isSuspended ? 'disabled' : ''}
-                          class="h-8 px-2.5 rounded-lg border border-amber-300 bg-amber-50 text-xs font-semibold text-amber-900 hover:bg-amber-100 disabled:opacity-40 flex items-center gap-1 whitespace-nowrap"
+                          class="h-8 px-2.5 rounded-md border border-amber-300 bg-amber-50 text-xs font-semibold text-amber-900 hover:bg-amber-100 disabled:opacity-40 flex items-center gap-1 whitespace-nowrap"
                         >Liquidar</button>`
                       : ''
                   }
@@ -9265,12 +14835,20 @@ export class SilaBillingApp {
                     active.status !== 'cancelled' && active.docType === 'FR'
                       ? `<button
                           type="button"
+                          data-action="open-credit-note-panel"
+                          data-id="${escapeHtml(active.id)}"
+                          ${isSuspended ? 'disabled' : ''}
+                          title="Emitir Nota de Crédito parcial ou total com devolução ao stock"
+                          class="h-8 px-2.5 rounded-md border border-slate-200 text-xs font-medium text-slate-700 hover:bg-slate-50 disabled:opacity-40 flex items-center gap-1 whitespace-nowrap"
+                        >Nota de Crédito</button>
+                        <button
+                          type="button"
                           data-action="start-return-exchange"
                           data-id="${escapeHtml(active.id)}"
                           ${isSuspended ? 'disabled' : ''}
-                          title="Repor artigos desta fatura em stock e usar crédito numa nova venda"
-                          class="h-8 px-2.5 rounded-lg border border-slate-200 text-xs font-medium text-slate-700 hover:bg-slate-50 disabled:opacity-40 flex items-center gap-1 whitespace-nowrap"
-                        >${ICONS.exchange}<span>Troca / Devolução</span></button>`
+                          title="Usar crédito desta fatura numa troca imediata no POS"
+                          class="h-8 px-2.5 rounded-md border border-slate-200 text-xs font-medium text-slate-700 hover:bg-slate-50 disabled:opacity-40 flex items-center gap-1 whitespace-nowrap"
+                        >${ICONS.exchange}<span>Troca</span></button>`
                       : ''
                   }
                   ${
@@ -9279,7 +14857,7 @@ export class SilaBillingApp {
                           type="button"
                           data-action="cancel-invoice"
                           data-id="${escapeHtml(active.id)}"
-                          class="h-8 px-2.5 rounded-lg border border-slate-200 text-xs font-medium text-red-600 hover:bg-red-50 flex items-center gap-1 whitespace-nowrap"
+                          class="h-8 px-2.5 rounded-md border border-slate-200 text-xs font-medium text-red-600 hover:bg-red-50 flex items-center gap-1 whitespace-nowrap"
                         >${ICONS.ban}<span>Anular</span></button>`
                       : ''
                   }
@@ -9287,8 +14865,16 @@ export class SilaBillingApp {
                     type="button"
                     data-action="print-history"
                     data-id="${escapeHtml(active.id)}"
-                    class="h-8 px-3 rounded-lg bg-slate-900 text-white text-xs font-semibold hover:bg-slate-800 flex items-center gap-1.5 whitespace-nowrap"
-                  >${ICONS.printer}<span>Imprimir</span></button>
+                    data-value="A4"
+                    title="Exportar/Salvar PDF A4 deste documento"
+                    class="h-8 px-2.5 rounded-md border border-slate-200 bg-white text-xs font-medium text-slate-700 hover:bg-slate-50 whitespace-nowrap"
+                  >PDF A4</button>
+                  <button
+                    type="button"
+                    data-action="print-history"
+                    data-id="${escapeHtml(active.id)}"
+                    class="h-8 px-3 rounded-md bg-slate-900 text-white text-xs font-semibold hover:bg-slate-800 flex items-center gap-1.5 whitespace-nowrap"
+                  >${ICONS.printer}<span>Reimprimir</span></button>
                 </div>
               </div>
 
@@ -9359,22 +14945,81 @@ export class SilaBillingApp {
                   : ''
               }
 
+              ${this.renderCreditNoteInlineDrawer(active)}
+
               <div class="flex-1 overflow-y-auto p-4">
-                ${renderDocumentHtml(
-                  active,
-                  this.historyViewFormat,
-                  this.settings.company,
-                  cachedQr,
-                  this.getInvoiceRenderOptions(
-                    active,
-                    shouldShowViralDocumentFooter(this.activeCompany, this.settings)
-                  )
-                )}
+                ${
+                  this.historyRightTab === 'AUDIT'
+                    ? `
+                      <div class="max-w-[720px] mx-auto space-y-3">
+                        <div class="rounded-lg border border-slate-200 bg-white p-4">
+                          <div class="flex items-start justify-between gap-3 pb-3 border-b border-slate-100">
+                            <div>
+                              <h3 class="text-xs font-bold text-slate-900">Histórico de Alterações & Trilho Documental</h3>
+                              <p class="text-[11px] text-slate-500 mt-0.5">Registo cronológico de emissão, cobranças, movimentos de stock, notas de crédito, reimpressões e anulação.</p>
+                            </div>
+                            <span class="font-mono text-xs font-bold text-slate-900 tabular-nums shrink-0">${escapeHtml(active.number)}</span>
+                          </div>
+
+                          <div class="divide-y divide-slate-100 mt-1">
+                            ${activeAuditEvents
+                              .map((ev) => {
+                                const dtEv = formatDateTimePt(ev.iso);
+                                const titleColor =
+                                  ev.tone === 'danger'
+                                    ? 'text-red-700'
+                                    : ev.tone === 'warning'
+                                      ? 'text-amber-800'
+                                      : ev.tone === 'positive'
+                                        ? 'text-emerald-800'
+                                        : 'text-slate-900';
+                                return `
+                                  <div class="py-3 flex items-start justify-between gap-3 text-xs">
+                                    <div class="space-y-0.5 min-w-0">
+                                      <div class="font-semibold ${titleColor}">${escapeHtml(ev.title)}</div>
+                                      <div class="text-slate-600 text-[11.5px]">${escapeHtml(ev.detail)}</div>
+                                      <div class="text-[10.5px] text-slate-400">${escapeHtml(ev.actor)}</div>
+                                    </div>
+                                    <div class="text-right shrink-0 space-y-1">
+                                      <div class="font-mono text-[11px] text-slate-500 tabular-nums">${dtEv.slashDate} ${dtEv.time}</div>
+                                      ${
+                                        ev.linkedInvoiceId
+                                          ? `<button
+                                              type="button"
+                                              data-action="select-history"
+                                              data-id="${escapeHtml(ev.linkedInvoiceId)}"
+                                              class="text-[11px] font-semibold text-blue-600 hover:text-blue-800 whitespace-nowrap"
+                                            >Abrir documento →</button>`
+                                          : ''
+                                      }
+                                    </div>
+                                  </div>
+                                `;
+                              })
+                              .join('')}
+                          </div>
+                        </div>
+                      </div>
+                    `
+                    : renderDocumentHtml(
+                        active,
+                        this.historyViewFormat,
+                        this.settings.company,
+                        cachedQr,
+                        this.getInvoiceRenderOptions(
+                          active,
+                          shouldShowViralDocumentFooter(this.activeCompany, this.settings)
+                        )
+                      )
+                }
               </div>
             `
-              : `<div class="h-full flex items-center justify-center text-xs text-slate-400">Selecione uma fatura para visualizar ou reimprimir.</div>`
+              : `<div class="h-full flex items-center justify-center text-xs text-slate-400">Selecione um documento para visualizar, auditar ou reimprimir.</div>`
           }
         </div>
+      </div>
+    `
+        }
       </div>
     `;
   }
@@ -9514,6 +15159,37 @@ export class SilaBillingApp {
                     <span>Imprimir ao clicar em Emitir</span>
                   </label>
                 </div>
+                <div class="col-span-1 sm:col-span-6">
+                  <label class="block text-[11px] font-medium text-slate-600 mb-1">
+                    Limite Máximo de Desconto para Caixa (%)
+                  </label>
+                  <input
+                    name="maxCashierDiscountPct"
+                    type="number"
+                    min="0"
+                    max="100"
+                    step="0.5"
+                    ${!canManage ? 'disabled' : ''}
+                    value="${this.settings.maxCashierDiscountPct ?? 5}"
+                    class="w-full h-9 px-2.5 text-xs font-mono bg-slate-50 border border-slate-200 rounded-md focus:outline-none focus:border-blue-600 disabled:opacity-60"
+                  />
+                  <span class="text-[10px] text-slate-500">Descontos de linha ou globais acima deste valor exigem autorização com PIN de Supervisor.</span>
+                </div>
+                <div class="col-span-1 sm:col-span-6">
+                  <label class="block text-[11px] font-medium text-slate-600 mb-1">
+                    Código PIN do Supervisor
+                  </label>
+                  <input
+                    name="supervisorPin"
+                    type="password"
+                    maxlength="16"
+                    placeholder="Ex: 1234 (Predefinido: 1234)"
+                    ${!canManage ? 'disabled' : ''}
+                    value="${escapeHtml(this.settings.supervisorPin || '')}"
+                    class="w-full h-9 px-2.5 text-xs font-mono tracking-widest bg-slate-50 border border-slate-200 rounded-md focus:outline-none focus:border-blue-600 disabled:opacity-60"
+                  />
+                  <span class="text-[10px] text-slate-500">Utilizado para autorizar descontos especiais e anulações quando operado por caixas.</span>
+                </div>
                 <div class="col-span-2 sm:col-span-12 pt-1 space-y-2">
                   <label class="flex items-center gap-2 text-xs text-slate-700 cursor-pointer select-none">
                     <input
@@ -9548,26 +15224,82 @@ export class SilaBillingApp {
                 <h2 class="text-xs font-semibold text-slate-900">Permissões e Equipa da Empresa</h2>
                 <p class="text-xs text-slate-500">
                   Emissão POS/A4 ativa · ${this.canManageCatalog() ? 'Gestão de catálogo autorizada' : 'Catálogo em leitura'} · ${
-                    this.canCancelInvoices() ? 'Anulação com justificação autorizada' : 'Anulação bloqueada'
+                    this.canCancelInvoices() ? 'Anulação com justificação autorizada' : 'Anulação bloqueada (requer supervisor)'
                   }
                 </p>
               </div>
-              <div class="flex items-center gap-2 shrink-0">
-                <label class="text-[11px] text-slate-600 whitespace-nowrap" for="terminal-role-select">Modo no terminal:</label>
-                <select
-                  id="terminal-role-select"
-                  data-field="terminal-role-select"
-                  class="h-8 px-2.5 text-xs bg-slate-50 border border-slate-200 rounded-md focus:outline-none focus:border-blue-600"
+              <div class="flex items-center gap-2 shrink-0 flex-wrap">
+                <button
+                  type="button"
+                  data-action="open-operational-audit-from-settings"
+                  class="h-8 px-3 rounded-md border border-blue-200 bg-blue-50 hover:bg-blue-100 text-blue-800 text-xs font-semibold flex items-center gap-1.5 transition-colors"
                 >
-                  ${roleOptions
-                    .map(
-                      (r) =>
-                        `<option value="${r}" ${effectiveRole === r ? 'selected' : ''}>${escapeHtml(
-                          formatRoleLabelPt(r)
-                        )}</option>`
-                    )
-                    .join('')}
-                </select>
+                  ${ICONS.shield}
+                  <span>Auditoria de Operações</span>
+                </button>
+                <div class="flex items-center gap-1.5">
+                  <label class="text-[11px] text-slate-600 whitespace-nowrap" for="terminal-role-select">Modo terminal:</label>
+                  <select
+                    id="terminal-role-select"
+                    data-field="terminal-role-select"
+                    class="h-8 px-2.5 text-xs bg-slate-50 border border-slate-200 rounded-md focus:outline-none focus:border-blue-600"
+                  >
+                    ${roleOptions
+                      .map(
+                        (r) =>
+                          `<option value="${r}" ${effectiveRole === r ? 'selected' : ''}>${escapeHtml(
+                            formatRoleLabelPt(r)
+                          )}</option>`
+                      )
+                      .join('')}
+                  </select>
+                </div>
+              </div>
+            </div>
+
+            <!-- Matriz de Permissões por Perfil -->
+            <div class="p-3 bg-slate-50 rounded-lg border border-slate-200 space-y-2">
+              <div class="text-[11px] font-bold text-slate-700">Matriz de Controlo Operacional por Perfil:</div>
+              <div class="grid grid-cols-1 sm:grid-cols-3 gap-2 text-[11.5px]">
+                <div class="p-2.5 rounded bg-white border border-slate-200 space-y-1">
+                  <div class="font-bold text-slate-900 flex items-center justify-between">
+                    <span>Proprietário (Owner)</span>
+                    <span class="text-[10px] text-emerald-700 font-semibold bg-emerald-50 px-1.5 py-0.5 rounded">Acesso Total</span>
+                  </div>
+                  <ul class="text-slate-600 space-y-0.5 text-[11px]">
+                    <li>✓ Emissão e fecho de caixa</li>
+                    <li>✓ Gestão de catálogo e custos</li>
+                    <li>✓ Descontos especiais ilimitados</li>
+                    <li>✓ Anulação e reversão de faturas</li>
+                    <li>✓ Definições fiscais e equipa</li>
+                  </ul>
+                </div>
+                <div class="p-2.5 rounded bg-white border border-slate-200 space-y-1">
+                  <div class="font-bold text-slate-900 flex items-center justify-between">
+                    <span>Gerente (Manager)</span>
+                    <span class="text-[10px] text-blue-700 font-semibold bg-blue-50 px-1.5 py-0.5 rounded">Supervisão</span>
+                  </div>
+                  <ul class="text-slate-600 space-y-0.5 text-[11px]">
+                    <li>✓ Emissão e fecho de caixa</li>
+                    <li>✓ Gestão de catálogo e compras</li>
+                    <li>✓ Aprovação de descontos especiais</li>
+                    <li>${this.activeCompany.allowManagerCancel ? '✓' : '⚠'} Anulação (${this.activeCompany.allowManagerCancel ? 'Autorizada' : 'Com PIN'})</li>
+                    <li>— Definições de empresa restritas</li>
+                  </ul>
+                </div>
+                <div class="p-2.5 rounded bg-white border border-slate-200 space-y-1">
+                  <div class="font-bold text-slate-900 flex items-center justify-between">
+                    <span>Operador de Caixa</span>
+                    <span class="text-[10px] text-slate-700 font-semibold bg-slate-100 px-1.5 py-0.5 rounded">Faturação</span>
+                  </div>
+                  <ul class="text-slate-600 space-y-0.5 text-[11px]">
+                    <li>✓ Emissão rápida POS & A4</li>
+                    <li>✓ Abertura e contagem de caixa</li>
+                    <li>✓ Desconto até ${this.settings.maxCashierDiscountPct ?? 5}% (limite)</li>
+                    <li>⚠ Desconto especial requer PIN</li>
+                    <li>⚠ Anulação requer PIN de Supervisor</li>
+                  </ul>
+                </div>
               </div>
             </div>
 
@@ -10946,8 +16678,11 @@ export class SilaBillingApp {
     const pInv = !cloudSyncEntitled ? 0 : this.invoices.filter((i) => !i.synced).length;
     const pSess = !cloudSyncEntitled ? 0 : this.cashSessions.filter((s) => !s.synced).length;
     const pMov = !cloudSyncEntitled ? 0 : this.cashMovements.filter((m) => !m.synced).length;
+    const pStock = !cloudSyncEntitled ? 0 : this.stockMovements.filter((m) => !m.synced).length;
+    const pSup = !cloudSyncEntitled ? 0 : this.suppliers.filter((s) => !s.synced).length;
+    const pPur = !cloudSyncEntitled ? 0 : this.purchases.filter((pr) => !pr.synced).length;
     const pSet = !cloudSyncEntitled ? 0 : this.settings.synced ? 0 : 1;
-    const totalPending = pProd + pCust + pInv + pSess + pMov + pSet;
+    const totalPending = pProd + pCust + pInv + pSess + pMov + pStock + pSup + pPur + pSet;
 
     const errCount = !cloudSyncEntitled
       ? 0
@@ -10956,13 +16691,17 @@ export class SilaBillingApp {
         this.invoices.filter((i) => i.syncState === 'error').length +
         this.cashSessions.filter((s) => s.syncState === 'error').length +
         this.cashMovements.filter((m) => m.syncState === 'error').length +
+        this.stockMovements.filter((m) => m.syncState === 'error').length +
+        this.suppliers.filter((s) => s.syncState === 'error').length +
+        this.purchases.filter((pr) => pr.syncState === 'error').length +
         (this.settings.syncState === 'error' ? 1 : 0);
 
     const showCloudProtectionNudge =
       !isUnassigned &&
       !cloudSyncEntitled &&
       (this.invoices.length >= CLOUD_PROTECTION_NUDGE_INVOICES ||
-        this.products.length + this.customers.length >= CLOUD_PROTECTION_NUDGE_RECORDS);
+        this.products.length + this.customers.length + this.suppliers.length >=
+          CLOUD_PROTECTION_NUDGE_RECORDS);
 
     const lastSync = this.lastSyncedIso ? formatDateTimePt(this.lastSyncedIso) : null;
     const bh = this.backendHealth;
@@ -11024,7 +16763,7 @@ export class SilaBillingApp {
               ? `<div class="p-3.5 rounded-lg border border-blue-200 bg-blue-50/70 flex flex-col sm:flex-row sm:items-center justify-between gap-3 text-xs">
                   <div class="text-slate-700 leading-relaxed">
                     <span class="font-semibold text-slate-900">Histórico relevante neste dispositivo:</span>
-                    existem ${this.invoices.length} faturas e ${this.products.length + this.customers.length} registos guardados localmente. Exporte cópia em JSON ou ative o backup automático na Cloud.
+                    existem ${this.invoices.length} faturas e ${this.products.length + this.customers.length + this.suppliers.length} registos guardados localmente. Exporte cópia em JSON ou ative o backup automático na Cloud.
                   </div>
                   <button
                     type="button"
@@ -11104,10 +16843,16 @@ export class SilaBillingApp {
                     ${cloudSyncEntitled ? `<td class="py-2.5 px-3 text-right font-mono text-amber-700">${pSess + pMov}</td>` : ''}
                   </tr>
                   <tr>
-                    <td class="py-2.5 px-3 font-medium text-slate-900">Produtos e serviços</td>
-                    <td class="py-2.5 px-3 text-right font-mono">${this.products.length}</td>
-                    <td class="py-2.5 px-3 text-right font-mono ${cloudSyncEntitled ? 'text-emerald-700' : 'text-slate-600'}">${cloudSyncEntitled ? this.products.length - pProd : 'Local seguro'}</td>
-                    ${cloudSyncEntitled ? `<td class="py-2.5 px-3 text-right font-mono text-amber-700">${pProd}</td>` : ''}
+                    <td class="py-2.5 px-3 font-medium text-slate-900">Produtos e movimentos de stock</td>
+                    <td class="py-2.5 px-3 text-right font-mono">${this.products.length + this.stockMovements.length}</td>
+                    <td class="py-2.5 px-3 text-right font-mono ${cloudSyncEntitled ? 'text-emerald-700' : 'text-slate-600'}">${cloudSyncEntitled ? this.products.length + this.stockMovements.length - (pProd + pStock) : 'Local seguro'}</td>
+                    ${cloudSyncEntitled ? `<td class="py-2.5 px-3 text-right font-mono text-amber-700">${pProd + pStock}</td>` : ''}
+                  </tr>
+                  <tr>
+                    <td class="py-2.5 px-3 font-medium text-slate-900">Compras e fornecedores</td>
+                    <td class="py-2.5 px-3 text-right font-mono">${this.purchases.length + this.suppliers.length}</td>
+                    <td class="py-2.5 px-3 text-right font-mono ${cloudSyncEntitled ? 'text-emerald-700' : 'text-slate-600'}">${cloudSyncEntitled ? this.purchases.length + this.suppliers.length - (pPur + pSup) : 'Local seguro'}</td>
+                    ${cloudSyncEntitled ? `<td class="py-2.5 px-3 text-right font-mono text-amber-700">${pPur + pSup}</td>` : ''}
                   </tr>
                   <tr>
                     <td class="py-2.5 px-3 font-medium text-slate-900">Clientes</td>
@@ -11289,4 +17034,6597 @@ export class SilaBillingApp {
       </div>
     `;
   }
+
+  // ==================== 6. COMPRAS, FORNECEDORES E CONTAS A PAGAR ====================
+
+  private getSupplierOpenPayable(supplierId: string): number {
+    let total = 0;
+    for (const p of this.purchases) {
+      if (p.status === 'recorded' && p.supplierId === supplierId && p.amountDue > 0) {
+        total += p.amountDue;
+      }
+    }
+    return roundKz(total);
+  }
+
+  private isPurchaseOverdue(pur: PurchaseRecord, todayIso: string): boolean {
+    return (
+      pur.status === 'recorded' &&
+      pur.amountDue > 0 &&
+      Boolean(pur.dueDateIso) &&
+      String(pur.dueDateIso).slice(0, 10) < todayIso
+    );
+  }
+
+  private getNextPurchaseNumber(): string {
+    const year = new Date().getFullYear();
+    let maxSeq = 0;
+    for (const p of this.purchases) {
+      const m = String(p.number || '').match(/CMP\s*(\d+)/i);
+      if (m && m[1]) {
+        const n = parseInt(m[1], 10);
+        if (!Number.isNaN(n) && n > maxSeq) maxSeq = n;
+      }
+    }
+    return `CMP ${String(maxSeq + 1).padStart(4, '0')}/${year}`;
+  }
+
+  private addProductToPurchaseDraft(prod: Product): void {
+    const existing = this.purchaseDraftLines.find((l) => l.productId === prod.id);
+    if (existing) {
+      this.purchaseDraftLines = this.purchaseDraftLines.map((l) => {
+        if (l.productId !== prod.id) return l;
+        const cur = parseDecimalInput(l.qtyInput);
+        const next = roundKz((Number.isNaN(cur) || cur <= 0 ? 0 : cur) + 1);
+        return { ...l, qtyInput: String(next) };
+      });
+    } else {
+      const defaultCost =
+        typeof prod.costPrice === 'number' && prod.costPrice > 0
+          ? roundKz(prod.costPrice)
+          : roundKz(prod.price || 0);
+      this.purchaseDraftLines = [
+        ...this.purchaseDraftLines,
+        {
+          productId: prod.id,
+          code: prod.code,
+          name: prod.name,
+          unit: prod.unit || 'un',
+          qtyInput: '1',
+          unitCostInput: String(defaultCost),
+        },
+      ];
+    }
+  }
+
+  private computePurchaseDraftTotal(): {
+    validLines: PurchaseLineItem[];
+    totalAmount: number;
+    hasInvalidLine: boolean;
+  } {
+    const validLines: PurchaseLineItem[] = [];
+    let totalAmount = 0;
+    let hasInvalidLine = false;
+
+    for (const l of this.purchaseDraftLines) {
+      const qty = parseDecimalInput(l.qtyInput);
+      const cost = parseDecimalInput(l.unitCostInput);
+      if (Number.isNaN(qty) || qty <= 0 || Number.isNaN(cost) || cost < 0) {
+        hasInvalidLine = true;
+        continue;
+      }
+      const cleanQty = roundKz(qty);
+      const cleanCost = roundKz(cost);
+      const lineTotal = roundKz(cleanQty * cleanCost);
+      validLines.push({
+        productId: l.productId,
+        code: l.code,
+        name: l.name,
+        unit: l.unit || 'un',
+        qty: cleanQty,
+        unitCost: cleanCost,
+        total: lineTotal,
+      });
+      totalAmount = roundKz(totalAmount + lineTotal);
+    }
+
+    return { validLines, totalAmount, hasInvalidLine };
+  }
+
+  private async persistAndSyncSupplier(sup: Supplier): Promise<void> {
+    if (!this.activeCompany.id) return;
+    await localDb.saveSupplier(sup, this.activeCompany.id);
+    const exists = this.suppliers.some((s) => s.id === sup.id);
+    this.suppliers = exists
+      ? this.suppliers.map((s) => (s.id === sup.id ? sup : s))
+      : [...this.suppliers, sup];
+    this.suppliers.sort((a, b) => a.name.localeCompare(b.name, 'pt'));
+
+    if (this.user && this.isOnline && canCompanySyncCloudData(this.activeCompany)) {
+      void ensureCompanyRegisteredCloud(this.activeCompany)
+        .then(() => upsertSupplierCloud(sup, this.activeCompany))
+        .then(async () => {
+          const synced: Supplier = { ...sup, syncState: 'synced', synced: true };
+          await localDb.saveSupplier(synced, this.activeCompany.id);
+          this.suppliers = this.suppliers.map((s) => (s.id === synced.id ? synced : s));
+          if (this.activeModule === 'PURCHASES' || this.activeModule === 'SYNC') this.render();
+        })
+        .catch(() => null);
+    }
+  }
+
+  private async persistAndSyncPurchase(pur: PurchaseRecord): Promise<void> {
+    if (!this.activeCompany.id) return;
+    await localDb.savePurchase(pur, this.activeCompany.id);
+    const exists = this.purchases.some((p) => p.id === pur.id);
+    this.purchases = exists
+      ? this.purchases.map((p) => (p.id === pur.id ? pur : p))
+      : [pur, ...this.purchases];
+    this.purchases.sort((a, b) => b.issuedAtIso.localeCompare(a.issuedAtIso));
+
+    if (this.user && this.isOnline && canCompanySyncCloudData(this.activeCompany)) {
+      void ensureCompanyRegisteredCloud(this.activeCompany)
+        .then(() => upsertPurchaseCloud(pur, this.activeCompany))
+        .then(async () => {
+          const synced: PurchaseRecord = { ...pur, syncState: 'synced', synced: true };
+          await localDb.savePurchase(synced, this.activeCompany.id);
+          this.purchases = this.purchases.map((p) => (p.id === synced.id ? synced : p));
+          if (this.activeModule === 'PURCHASES' || this.activeModule === 'SYNC') this.render();
+        })
+        .catch(() => null);
+    }
+  }
+
+  private async submitNewPurchase(fd: FormData): Promise<void> {
+    if (!this.canManageCatalog() || !this.activeCompany.id) return;
+    this.purchaseFormError = null;
+
+    const supplierId = String(fd.get('supplierId') || this.purchaseFormDraft.supplierId || '').trim();
+    const supplier = this.suppliers.find((s) => s.id === supplierId);
+    if (!supplier) {
+      this.purchaseFormError = 'Selecione ou cadastre rapidamente um fornecedor para registar a compra.';
+      this.render();
+      return;
+    }
+
+    if (this.purchaseDraftLines.length === 0) {
+      this.purchaseFormError = 'Adicione pelo menos um artigo adquirido à compra.';
+      this.render();
+      return;
+    }
+
+    const { validLines, totalAmount, hasInvalidLine } = this.computePurchaseDraftTotal();
+    if (hasInvalidLine || validLines.length === 0) {
+      this.purchaseFormError =
+        'Verifique as quantidades adquiridas (> 0) e os custos unitários (>= 0) de todas as linhas.';
+      this.render();
+      return;
+    }
+
+    const mode = this.purchaseFormDraft.paymentMode;
+    const directMethod = this.purchaseFormDraft.paymentMethod;
+    let amountPaid = 0;
+    let paymentMethod: PurchasePaymentMethod = directMethod;
+    let paymentSummary = '';
+
+    if (mode === 'PAID') {
+      amountPaid = totalAmount;
+      paymentMethod = directMethod;
+      paymentSummary = `Liquidado integralmente (${directMethod})`;
+    } else if (mode === 'CREDIT') {
+      amountPaid = 0;
+      paymentMethod = 'Crédito';
+      paymentSummary = 'Conta corrente / A pagar';
+    } else {
+      const parsedPaid = parseDecimalInput(this.purchaseFormDraft.amountPaidInput);
+      if (Number.isNaN(parsedPaid) || parsedPaid <= 0 || parsedPaid >= totalAmount) {
+        this.purchaseFormError =
+          'No pagamento parcial, indique um valor pago superior a 0 e inferior ao total da compra.';
+        this.render();
+        return;
+      }
+      amountPaid = roundKz(parsedPaid);
+      paymentMethod = directMethod;
+      paymentSummary = `Entrada ${formatKzNumber(amountPaid)} Kz (${directMethod}) · Restante a crédito`;
+    }
+
+    const amountDue = roundKz(Math.max(0, totalAmount - amountPaid));
+    const supplierInvoiceRef = String(
+      fd.get('supplierInvoiceRef') || this.purchaseFormDraft.supplierInvoiceRef || ''
+    )
+      .trim()
+      .slice(0, 60);
+    const dueDateIso = String(fd.get('dueDateIso') || this.purchaseFormDraft.dueDateIso || '')
+      .trim()
+      .slice(0, 40);
+    const reference = String(fd.get('reference') || this.purchaseFormDraft.reference || '')
+      .trim()
+      .slice(0, 80);
+    const notes = String(fd.get('notes') || this.purchaseFormDraft.notes || '')
+      .trim()
+      .slice(0, 300);
+    const updateStock = Boolean(this.purchaseFormDraft.updateStock);
+    const recordCash = Boolean(this.purchaseFormDraft.recordInCashSession);
+    const now = new Date().toISOString();
+    const purNumber = this.getNextPurchaseNumber();
+    const operatorLabel = this.getCurrentStockOperatorLabel();
+    const actorLabel = (this.user?.email || formatRoleLabelPt(this.getEffectiveRole())).slice(0, 120);
+
+    const purchase: PurchaseRecord = {
+      id: `pur_${Date.now()}_${Math.random().toString(36).slice(2, 6)}`,
+      companyId: this.activeCompany.id,
+      number: purNumber,
+      ...(supplierInvoiceRef ? { supplierInvoiceRef } : {}),
+      supplierId: supplier.id,
+      supplierName: supplier.name,
+      supplierNif: supplier.nif || '',
+      issuedAtIso: now,
+      ...(dueDateIso ? { dueDateIso } : {}),
+      lines: validLines,
+      totalAmount,
+      amountPaid,
+      amountDue,
+      paymentMethod,
+      ...(paymentSummary ? { paymentSummary } : {}),
+      ...(reference ? { reference } : {}),
+      warehouseId: DEFAULT_WAREHOUSE_ID,
+      updateStock,
+      notes,
+      operator: operatorLabel,
+      status: 'recorded',
+      ...(this.user?.uid ? { createdByUid: this.user.uid } : {}),
+      syncState: 'pending',
+      synced: false,
+      updatedAtIso: now,
+    };
+
+    await this.persistAndSyncPurchase(purchase);
+
+    // Atualiza custo de aquisição e (se ativo) soma quantidades adquiridas ao stock + livro-razão
+    const updatedProducts: Product[] = [];
+    const createdMovements: StockMovement[] = [];
+
+    for (const line of validLines) {
+      const target = this.products.find((p) => p.id === line.productId);
+      if (!target) continue;
+
+      const prevStock = target.trackStock ? roundKz(Number(target.stockQty) || 0) : 0;
+      const nextStock = updateStock ? roundKz(prevStock + line.qty) : prevStock;
+
+      let nextCostPrice = target.costPrice;
+      let nextPriceHistory = target.priceHistory ? [...target.priceHistory] : undefined;
+      if (line.unitCost > 0 && roundKz(target.costPrice || 0) !== line.unitCost) {
+        const prevCost =
+          typeof target.costPrice === 'number' && target.costPrice > 0
+            ? roundKz(target.costPrice)
+            : undefined;
+        nextCostPrice = line.unitCost;
+        const histEntry: ProductPriceChange = {
+          changedAtIso: now,
+          previousPrice: roundKz(target.price),
+          newPrice: roundKz(target.price),
+          ...(typeof prevCost === 'number' ? { previousCost: prevCost } : {}),
+          newCost: line.unitCost,
+          changedBy: actorLabel,
+        };
+        nextPriceHistory = [histEntry, ...(nextPriceHistory || [])].slice(0, 20);
+      }
+
+      const updatedProd: Product = {
+        ...target,
+        ...(updateStock
+          ? {
+              trackStock: true,
+              stockQty: nextStock,
+              minStockQty: target.minStockQty ?? 2,
+            }
+          : {}),
+        ...(typeof nextCostPrice === 'number' && nextCostPrice > 0
+          ? { costPrice: nextCostPrice }
+          : {}),
+        ...(nextPriceHistory && nextPriceHistory.length > 0
+          ? { priceHistory: nextPriceHistory }
+          : {}),
+        syncState: 'pending',
+        synced: false,
+        updatedAtIso: now,
+      };
+
+      await localDb.saveProduct(updatedProd, this.activeCompany.id);
+      updatedProducts.push(updatedProd);
+
+      if (updateStock) {
+        const mov: StockMovement = {
+          id: `sm_pur_${Date.now()}_${Math.random().toString(36).slice(2, 6)}`,
+          companyId: this.activeCompany.id,
+          productId: updatedProd.id,
+          productCode: updatedProd.code,
+          productName: updatedProd.name,
+          unit: updatedProd.unit || 'un',
+          type: 'ENTRADA_MERCADORIA',
+          direction: 'IN',
+          qty: line.qty,
+          previousStock: prevStock,
+          newStock: nextStock,
+          ...(line.unitCost > 0 ? { unitCost: line.unitCost } : {}),
+          warehouseId: DEFAULT_WAREHOUSE_ID,
+          reason: `Compra ${purNumber} · ${supplier.name}`.slice(0, 240),
+          reference: (supplierInvoiceRef || purNumber).slice(0, 80),
+          operator: operatorLabel,
+          ...(this.user?.uid ? { createdByUid: this.user.uid } : {}),
+          syncState: 'pending',
+          synced: false,
+          createdAtIso: now,
+        };
+        createdMovements.push(mov);
+        await this.persistAndSyncStockMovement(mov);
+      }
+    }
+
+    if (updatedProducts.length > 0) {
+      const byId = new Map(updatedProducts.map((p) => [p.id, p]));
+      this.products = this.products.map((p) => byId.get(p.id) || p);
+      if (this.user && this.isOnline && canCompanySyncCloudData(this.activeCompany)) {
+        for (const up of updatedProducts) {
+          void upsertProductCloud(up, false, this.activeCompany)
+            .then(async () => {
+              const synced: Product = { ...up, syncState: 'synced', synced: true };
+              await localDb.saveProduct(synced, this.activeCompany.id);
+              this.products = this.products.map((p) => (p.id === synced.id ? synced : p));
+            })
+            .catch(() => null);
+        }
+      }
+    }
+
+    // Regista movimento financeiro de saída a fornecedor (na gaveta se Dinheiro + turno aberto, senão em tesouraria sem_turno)
+    if (recordCash && amountPaid > 0) {
+      const openSess = this.getActiveOpenCashSession();
+      const useDrawer = Boolean(openSess && directMethod === 'Dinheiro');
+      if (useDrawer && openSess) {
+        await this.recordCashDrawerMovement({
+          session: openSess,
+          type: 'SAIDA',
+          entryKind: 'PAGAMENTO_FORNECEDOR',
+          category: 'Fornecedores e Compras',
+          purchaseId: purchase.id,
+          amount: amountPaid,
+          paymentMethod: directMethod,
+          reason: `Pagamento compra ${purNumber} · ${supplier.name}`,
+          reference: reference || supplierInvoiceRef || purNumber,
+        });
+      } else {
+        const supMov: CashMovement = {
+          id: `cm_sup_${Date.now()}_${Math.random().toString(36).slice(2, 6)}`,
+          companyId: this.activeCompany.id,
+          sessionId: 'sem_turno',
+          cashier: openSess?.cashier || this.cashier || '01',
+          operator: openSess?.operator || this.operator || '001',
+          createdByUid: this.user?.uid,
+          type: 'SAIDA',
+          entryKind: 'PAGAMENTO_FORNECEDOR',
+          category: 'Fornecedores e Compras',
+          purchaseId: purchase.id,
+          amount: amountPaid,
+          paymentMethod: directMethod,
+          reason: `Pagamento compra ${purNumber} · ${supplier.name}`.slice(0, 240),
+          reference: (reference || supplierInvoiceRef || purNumber).trim().slice(0, 80),
+          syncState: 'pending',
+          synced: false,
+          createdAtIso: now,
+        };
+        await this.persistAndSyncCashMovement(supMov);
+      }
+    }
+
+    this.purchaseDraftLines = [];
+    this.purchasePanelOpen = false;
+    this.purchaseFormError = null;
+    this.selectedPurchaseDetailId = purchase.id;
+    this.purchasesWorkspaceNotice = `Compra ${purNumber} registada (${formatKzNumber(totalAmount)} Kz)${
+      updateStock ? ` · ${createdMovements.length} entrada(s) em stock atualizada(s)` : ''
+    }.`;
+    this.render();
+  }
+
+  private async settleSinglePurchaseDebt(purchaseId: string): Promise<void> {
+    const pur = this.purchases.find((p) => p.id === purchaseId);
+    if (!pur || pur.status === 'cancelled' || pur.amountDue <= 0) return;
+
+    const amount = parseDecimalInput(this.purchaseSettleAmountInput);
+    if (Number.isNaN(amount) || amount <= 0) {
+      this.purchaseSettleError = 'Indique um valor de pagamento positivo em Kz.';
+      this.render();
+      return;
+    }
+    const payVal = roundKz(amount);
+    if (payVal > roundKz(pur.amountDue)) {
+      this.purchaseSettleError = `O valor excede o saldo em aberto desta compra (${formatKzNumber(pur.amountDue)} Kz).`;
+      this.render();
+      return;
+    }
+
+    const now = new Date().toISOString();
+    const dtLabel = formatDateTimePt(now).slashDate;
+    const nextPaid = roundKz(pur.amountPaid + payVal);
+    const nextDue = roundKz(Math.max(0, pur.totalAmount - nextPaid));
+    const cleanRef = this.purchaseSettleReference.trim().slice(0, 80);
+    const summaryAppend = `Pago +${formatKzNumber(payVal)} Kz (${this.purchaseSettleMethod}) em ${dtLabel}`;
+    const nextSummary = [pur.paymentSummary, summaryAppend]
+      .filter(Boolean)
+      .join(' · ')
+      .slice(0, 160);
+
+    const updated: PurchaseRecord = {
+      ...pur,
+      amountPaid: nextPaid,
+      amountDue: nextDue,
+      paymentMethod: nextDue === 0 ? this.purchaseSettleMethod : 'Crédito',
+      paymentSummary: nextSummary,
+      ...(cleanRef ? { reference: cleanRef } : {}),
+      syncState: 'pending',
+      synced: false,
+      updatedAtIso: now,
+    };
+
+    await this.persistAndSyncPurchase(updated);
+
+    if (this.purchaseSettleRecordCash) {
+      const openSess = this.getActiveOpenCashSession();
+      const useDrawer = Boolean(openSess && this.purchaseSettleMethod === 'Dinheiro');
+      if (useDrawer && openSess) {
+        await this.recordCashDrawerMovement({
+          session: openSess,
+          type: 'SAIDA',
+          entryKind: 'PAGAMENTO_FORNECEDOR',
+          category: 'Fornecedores e Compras',
+          purchaseId: pur.id,
+          amount: payVal,
+          paymentMethod: this.purchaseSettleMethod,
+          reason: `Liquidação compra ${pur.number} · ${pur.supplierName}`,
+          reference: cleanRef || pur.supplierInvoiceRef || pur.number,
+        });
+      } else {
+        const supMov: CashMovement = {
+          id: `cm_sup_${Date.now()}_${Math.random().toString(36).slice(2, 6)}`,
+          companyId: this.activeCompany.id,
+          sessionId: 'sem_turno',
+          cashier: openSess?.cashier || this.cashier || '01',
+          operator: openSess?.operator || this.operator || '001',
+          createdByUid: this.user?.uid,
+          type: 'SAIDA',
+          entryKind: 'PAGAMENTO_FORNECEDOR',
+          category: 'Fornecedores e Compras',
+          purchaseId: pur.id,
+          amount: payVal,
+          paymentMethod: this.purchaseSettleMethod,
+          reason: `Liquidação compra ${pur.number} · ${pur.supplierName}`.slice(0, 240),
+          reference: (cleanRef || pur.supplierInvoiceRef || pur.number).trim().slice(0, 80),
+          syncState: 'pending',
+          synced: false,
+          createdAtIso: now,
+        };
+        await this.persistAndSyncCashMovement(supMov);
+      }
+    }
+
+    this.settlingPurchaseId = null;
+    this.purchaseSettleError = null;
+    const msg =
+      nextDue === 0
+        ? `Compra ${pur.number} liquidada na totalidade (${formatKzNumber(payVal)} Kz).`
+        : `Pagamento parcial de ${formatKzNumber(payVal)} Kz registado na compra ${pur.number}. Saldo restante: ${formatKzNumber(nextDue)} Kz.`;
+    this.purchasesWorkspaceNotice = msg;
+    if (this.activeModule === 'FINANCE') {
+      this.financeWorkspaceNotice = msg;
+    }
+    this.render();
+  }
+
+  private async settleSupplierAccountDebt(supplierId: string): Promise<void> {
+    const sup = this.suppliers.find((s) => s.id === supplierId);
+    if (!sup) return;
+    const totalOpen = this.getSupplierOpenPayable(supplierId);
+    if (totalOpen <= 0) return;
+
+    const amount = parseDecimalInput(this.purchaseSettleAmountInput);
+    if (Number.isNaN(amount) || amount <= 0) {
+      this.purchaseSettleError = 'Indique um valor de pagamento positivo em Kz.';
+      this.render();
+      return;
+    }
+    const payVal = roundKz(amount);
+    if (payVal > totalOpen) {
+      this.purchaseSettleError = `O valor excede o saldo total a pagar ao fornecedor (${formatKzNumber(totalOpen)} Kz).`;
+      this.render();
+      return;
+    }
+
+    // Liquidação FIFO das compras mais antigas em dívida deste fornecedor
+    const openPurchases = this.purchases
+      .filter((p) => p.status === 'recorded' && p.supplierId === supplierId && p.amountDue > 0)
+      .sort((a, b) => a.issuedAtIso.localeCompare(b.issuedAtIso));
+
+    let remaining = payVal;
+    const now = new Date().toISOString();
+    const dtLabel = formatDateTimePt(now).slashDate;
+    const cleanRef = this.purchaseSettleReference.trim().slice(0, 80);
+    let settledDocs = 0;
+
+    for (const pur of openPurchases) {
+      if (remaining <= 0) break;
+      const alloc = roundKz(Math.min(remaining, pur.amountDue));
+      if (alloc <= 0) continue;
+      remaining = roundKz(remaining - alloc);
+      settledDocs++;
+
+      const nextPaid = roundKz(pur.amountPaid + alloc);
+      const nextDue = roundKz(Math.max(0, pur.totalAmount - nextPaid));
+      const summaryAppend = `Pago +${formatKzNumber(alloc)} Kz (${this.purchaseSettleMethod}) em ${dtLabel}`;
+      const nextSummary = [pur.paymentSummary, summaryAppend]
+        .filter(Boolean)
+        .join(' · ')
+        .slice(0, 160);
+
+      const updated: PurchaseRecord = {
+        ...pur,
+        amountPaid: nextPaid,
+        amountDue: nextDue,
+        paymentMethod: nextDue === 0 ? this.purchaseSettleMethod : 'Crédito',
+        paymentSummary: nextSummary,
+        ...(cleanRef ? { reference: cleanRef } : {}),
+        syncState: 'pending',
+        synced: false,
+        updatedAtIso: now,
+      };
+      await this.persistAndSyncPurchase(updated);
+    }
+
+    if (this.purchaseSettleRecordCash) {
+      const openSess = this.getActiveOpenCashSession();
+      const useDrawer = Boolean(openSess && this.purchaseSettleMethod === 'Dinheiro');
+      if (useDrawer && openSess) {
+        await this.recordCashDrawerMovement({
+          session: openSess,
+          type: 'SAIDA',
+          entryKind: 'PAGAMENTO_FORNECEDOR',
+          category: 'Fornecedores e Compras',
+          amount: payVal,
+          paymentMethod: this.purchaseSettleMethod,
+          reason: `Pagamento a fornecedor · ${sup.name} (${settledDocs} doc.)`,
+          reference: cleanRef || sup.nif || sup.name,
+        });
+      } else {
+        const supMov: CashMovement = {
+          id: `cm_sup_${Date.now()}_${Math.random().toString(36).slice(2, 6)}`,
+          companyId: this.activeCompany.id,
+          sessionId: 'sem_turno',
+          cashier: openSess?.cashier || this.cashier || '01',
+          operator: openSess?.operator || this.operator || '001',
+          createdByUid: this.user?.uid,
+          type: 'SAIDA',
+          entryKind: 'PAGAMENTO_FORNECEDOR',
+          category: 'Fornecedores e Compras',
+          amount: payVal,
+          paymentMethod: this.purchaseSettleMethod,
+          reason: `Pagamento a fornecedor · ${sup.name} (${settledDocs} doc.)`.slice(0, 240),
+          reference: (cleanRef || sup.nif || sup.name).trim().slice(0, 80),
+          syncState: 'pending',
+          synced: false,
+          createdAtIso: now,
+        };
+        await this.persistAndSyncCashMovement(supMov);
+      }
+    }
+
+    this.settlingSupplierAccountId = null;
+    this.purchaseSettleError = null;
+    const supMsg = `Pagamento de ${formatKzNumber(payVal)} Kz registado a "${sup.name}" (${settledDocs} compra(s) abatida(s)).`;
+    this.purchasesWorkspaceNotice = supMsg;
+    if (this.activeModule === 'FINANCE') {
+      this.financeWorkspaceNotice = supMsg;
+    }
+    this.render();
+  }
+
+  private async cancelExistingPurchase(purchaseId: string, fd: FormData): Promise<void> {
+    if (!this.canManageCatalog() || !this.activeCompany.id) return;
+    const pur = this.purchases.find((p) => p.id === purchaseId);
+    if (!pur || pur.status === 'cancelled') return;
+
+    const reason = String(fd.get('cancelReason') || this.cancelPurchaseReason || '').trim();
+    if (reason.length < 4) {
+      this.cancelPurchaseError = 'Indique o motivo de anulação da compra (mínimo 4 caracteres).';
+      this.render();
+      return;
+    }
+
+    const now = new Date().toISOString();
+    const actor = (this.user?.email || formatRoleLabelPt(this.getEffectiveRole())).slice(0, 120);
+
+    const cancelled: PurchaseRecord = {
+      ...pur,
+      status: 'cancelled',
+      cancelReason: reason.slice(0, 240),
+      cancelledBy: actor,
+      syncState: 'pending',
+      synced: false,
+      updatedAtIso: now,
+    };
+
+    await this.persistAndSyncPurchase(cancelled);
+
+    // Se a compra tinha somado stock, reverte as quantidades adquiridas de forma auditada
+    if (pur.updateStock) {
+      const operatorLabel = this.getCurrentStockOperatorLabel();
+      for (const line of pur.lines) {
+        const target = this.products.find((p) => p.id === line.productId);
+        if (!target || !target.trackStock) continue;
+        const prevStock = roundKz(Number(target.stockQty) || 0);
+        const nextStock = roundKz(prevStock - line.qty);
+        const updatedProd: Product = {
+          ...target,
+          stockQty: nextStock,
+          syncState: 'pending',
+          synced: false,
+          updatedAtIso: now,
+        };
+        await localDb.saveProduct(updatedProd, this.activeCompany.id);
+        this.products = this.products.map((p) => (p.id === updatedProd.id ? updatedProd : p));
+
+        const mov: StockMovement = {
+          id: `sm_pur_cancel_${Date.now()}_${Math.random().toString(36).slice(2, 6)}`,
+          companyId: this.activeCompany.id,
+          productId: updatedProd.id,
+          productCode: updatedProd.code,
+          productName: updatedProd.name,
+          unit: updatedProd.unit || 'un',
+          type: 'AJUSTE_INVENTARIO',
+          direction: 'OUT',
+          qty: line.qty,
+          previousStock: prevStock,
+          newStock: nextStock,
+          ...(line.unitCost > 0 ? { unitCost: line.unitCost } : {}),
+          warehouseId: DEFAULT_WAREHOUSE_ID,
+          reason: `Estorno anulação compra ${pur.number}: ${reason}`.slice(0, 240),
+          reference: pur.number,
+          operator: operatorLabel,
+          ...(this.user?.uid ? { createdByUid: this.user.uid } : {}),
+          syncState: 'pending',
+          synced: false,
+          createdAtIso: now,
+        };
+        await this.persistAndSyncStockMovement(mov);
+
+        if (this.user && this.isOnline && canCompanySyncCloudData(this.activeCompany)) {
+          void updateProductStockCloud(
+            updatedProd.id,
+            nextStock,
+            this.activeCompany.id,
+            this.activeCompany
+          ).catch(() => null);
+        }
+      }
+    }
+
+    this.cancellingPurchaseId = null;
+    this.cancelPurchaseReason = '';
+    this.cancelPurchaseError = null;
+    this.purchasesWorkspaceNotice = `Compra ${pur.number} anulada${pur.updateStock ? ' e stock revertido' : ''}.`;
+    this.render();
+  }
+
+  private renderPurchasesWorkspace(): string {
+    const canManage = this.canManageCatalog();
+    const todayIso = new Date().toISOString().slice(0, 10);
+
+    const recordedPurchases = this.purchases.filter((p) => p.status === 'recorded');
+    let totalPurchasedAmount = 0;
+    let totalAccountsPayable = 0;
+    let overduePayableAmount = 0;
+    let overdueCount = 0;
+    let openPayableDocs = 0;
+
+    for (const p of recordedPurchases) {
+      totalPurchasedAmount += p.totalAmount;
+      if (p.amountDue > 0) {
+        totalAccountsPayable += p.amountDue;
+        openPayableDocs++;
+        if (this.isPurchaseOverdue(p, todayIso)) {
+          overduePayableAmount += p.amountDue;
+          overdueCount++;
+        }
+      }
+    }
+    totalPurchasedAmount = roundKz(totalPurchasedAmount);
+    totalAccountsPayable = roundKz(totalAccountsPayable);
+    overduePayableAmount = roundKz(overduePayableAmount);
+    const totalSettledAmount = roundKz(Math.max(0, totalPurchasedAmount - totalAccountsPayable));
+    const activeSuppliersCount = this.suppliers.filter((s) => s.active !== false).length;
+
+    return `
+      <div class="h-full flex flex-col overflow-hidden bg-white">
+        <!-- Cabeçalho do Módulo e Navegação Sub-Abas -->
+        <div class="px-4 sm:px-6 py-3 border-b border-slate-200 flex flex-col sm:flex-row sm:items-center justify-between gap-3 shrink-0">
+          <div class="flex flex-wrap items-center gap-3 min-w-0">
+            <div>
+              <h1 class="text-sm font-bold text-slate-900">Compras e Fornecedores</h1>
+              <p class="text-[11px] text-slate-500">Aquisições de mercadoria, custos, entradas em stock e contas a pagar</p>
+            </div>
+            <div class="flex items-center gap-1 p-1 bg-slate-100 rounded-lg shrink-0">
+              <button
+                type="button"
+                data-action="set-purchases-subview"
+                data-value="PURCHASES"
+                class="px-3 py-1.5 text-xs font-medium rounded-md transition-colors whitespace-nowrap shrink-0 ${
+                  this.purchasesSubView === 'PURCHASES'
+                    ? 'bg-white text-slate-900 shadow-xs'
+                    : 'text-slate-600 hover:text-slate-900'
+                }"
+              >Compras e Contas a Pagar (${recordedPurchases.length})</button>
+              <button
+                type="button"
+                data-action="set-purchases-subview"
+                data-value="SUPPLIERS"
+                class="px-3 py-1.5 text-xs font-medium rounded-md transition-colors whitespace-nowrap shrink-0 ${
+                  this.purchasesSubView === 'SUPPLIERS'
+                    ? 'bg-white text-slate-900 shadow-xs'
+                    : 'text-slate-600 hover:text-slate-900'
+                }"
+              >Fornecedores (${this.suppliers.length})</button>
+            </div>
+          </div>
+
+          ${
+            canManage
+              ? `
+                <div class="flex items-center gap-2 shrink-0">
+                  <button
+                    type="button"
+                    data-action="new-supplier"
+                    class="h-9 px-3 rounded-lg border border-slate-200 hover:bg-slate-50 text-xs font-medium text-slate-700 flex items-center gap-1.5 whitespace-nowrap shrink-0"
+                  >
+                    ${ICONS.userPlus}
+                    <span>Novo fornecedor</span>
+                  </button>
+                  <button
+                    type="button"
+                    data-action="open-new-purchase"
+                    class="h-9 px-3.5 rounded-lg bg-slate-900 hover:bg-slate-800 text-white text-xs font-semibold flex items-center gap-1.5 whitespace-nowrap shrink-0"
+                  >
+                    ${ICONS.plus}
+                    <span>Registar compra</span>
+                  </button>
+                </div>
+              `
+              : `<span class="text-xs text-slate-500 whitespace-nowrap">Consulta operacional</span>`
+          }
+        </div>
+
+        <!-- Faixa de Indicadores Financeiros (Tabular Numerals) -->
+        <div class="px-4 sm:px-6 py-2.5 bg-slate-50/70 border-b border-slate-200 grid grid-cols-2 lg:grid-cols-4 gap-3 shrink-0">
+          <div class="space-y-0.5">
+            <div class="text-[11px] text-slate-500">Total de Compras Registadas</div>
+            <div class="text-sm font-bold font-mono tabular-nums text-slate-900">${formatKzNumber(totalPurchasedAmount)} Kz</div>
+            <div class="text-[11px] text-slate-500 font-mono tabular-nums">${recordedPurchases.length} documento(s) ativo(s)</div>
+          </div>
+          <div class="space-y-0.5">
+            <div class="text-[11px] text-slate-500">Contas a Pagar em Aberto</div>
+            <div class="text-sm font-bold font-mono tabular-nums ${totalAccountsPayable > 0 ? 'text-amber-700' : 'text-slate-900'}">${formatKzNumber(totalAccountsPayable)} Kz</div>
+            <div class="text-[11px] text-slate-500 font-mono tabular-nums">${openPayableDocs} compra(s) pendente(s)</div>
+          </div>
+          <div class="space-y-0.5">
+            <div class="text-[11px] text-slate-500">Dívida Vencida a Fornecedores</div>
+            <div class="text-sm font-bold font-mono tabular-nums ${overduePayableAmount > 0 ? 'text-red-700' : 'text-slate-900'}">${formatKzNumber(overduePayableAmount)} Kz</div>
+            <div class="text-[11px] text-slate-500 font-mono tabular-nums">${overdueCount > 0 ? `${overdueCount} compra(s) fora de prazo` : 'Sem faturas vencidas'}</div>
+          </div>
+          <div class="space-y-0.5">
+            <div class="text-[11px] text-slate-500">Total Pago · Fornecedores</div>
+            <div class="text-sm font-bold font-mono tabular-nums text-emerald-700">${formatKzNumber(totalSettledAmount)} Kz</div>
+            <div class="text-[11px] text-slate-500 font-mono tabular-nums">${activeSuppliersCount} fornecedor(es) ativo(s)</div>
+          </div>
+        </div>
+
+        ${
+          this.purchasesWorkspaceNotice
+            ? `
+              <div class="px-4 sm:px-6 py-2 bg-emerald-50 border-b border-emerald-200 text-xs text-emerald-800 flex items-center justify-between gap-2 shrink-0">
+                <span>${escapeHtml(this.purchasesWorkspaceNotice)}</span>
+              </div>
+            `
+            : ''
+        }
+
+        ${
+          this.purchasePanelOpen
+            ? this.renderNewPurchasePanel()
+            : this.purchasesSubView === 'SUPPLIERS'
+              ? this.renderSuppliersSubView(canManage)
+              : this.renderPurchasesHistorySubView(canManage, todayIso)
+        }
+      </div>
+    `;
+  }
+
+  private renderNewPurchasePanel(): string {
+    const activeSuppliers = this.suppliers.filter((s) => s.active !== false);
+    const searchRes = this.purchaseCatalogSearch.trim()
+      ? searchProductsSmart(this.products, this.purchaseCatalogSearch)
+      : {
+          exactCodeMatch: null,
+          matches: this.products.filter((p) => p.active !== false).slice(0, 10),
+        };
+    const catalogMatches = searchRes.matches.slice(0, 10);
+    const { validLines, totalAmount } = this.computePurchaseDraftTotal();
+    const openCashSession = this.getActiveOpenCashSession();
+
+    const mode = this.purchaseFormDraft.paymentMode;
+    const partialVal = parseDecimalInput(this.purchaseFormDraft.amountPaidInput);
+    const previewPaid =
+      mode === 'PAID'
+        ? totalAmount
+        : mode === 'CREDIT'
+          ? 0
+          : !Number.isNaN(partialVal) && partialVal > 0
+            ? roundKz(Math.min(totalAmount, partialVal))
+            : 0;
+    const previewDue = roundKz(Math.max(0, totalAmount - previewPaid));
+
+    return `
+      <div class="flex-1 overflow-y-auto bg-slate-50/40 p-4 sm:p-6">
+        <div class="max-w-5xl mx-auto bg-white border border-slate-200 rounded-lg p-4 sm:p-5 space-y-5">
+          <div class="flex items-center justify-between gap-3 pb-3 border-b border-slate-200">
+            <div>
+              <h2 class="text-sm font-bold text-slate-900">Registar Nova Compra a Fornecedor</h2>
+              <p class="text-xs text-slate-500">Registe quantidades adquiridas, custo unitário de aquisição, entrada automática em stock e condições de pagamento.</p>
+            </div>
+            <button
+              type="button"
+              data-action="close-new-purchase"
+              class="h-8 px-3 rounded-md border border-slate-200 hover:bg-slate-50 text-xs font-medium text-slate-700 whitespace-nowrap shrink-0"
+            >Cancelar</button>
+          </div>
+
+          ${
+            this.purchaseFormError
+              ? `<div class="p-3 rounded-lg border border-red-200 bg-red-50 text-xs text-red-700">${escapeHtml(this.purchaseFormError)}</div>`
+              : ''
+          }
+
+          ${
+            this.showPurchaseQuickSupplier
+              ? `
+                <form data-form="purchase-quick-supplier-form" class="p-3.5 rounded-lg border border-slate-200 bg-slate-50 space-y-3">
+                  <div class="flex items-center justify-between gap-2">
+                    <span class="text-xs font-semibold text-slate-900">Cadastro Rápido de Fornecedor</span>
+                    ${
+                      activeSuppliers.length > 0
+                        ? `<button type="button" data-action="toggle-purchase-quick-supplier" class="text-xs text-slate-500 hover:text-slate-800 whitespace-nowrap">Selecionar existente</button>`
+                        : ''
+                    }
+                  </div>
+                  ${
+                    this.purchaseQuickSupplierError
+                      ? `<div class="text-xs text-red-600">${escapeHtml(this.purchaseQuickSupplierError)}</div>`
+                      : ''
+                  }
+                  <div class="grid grid-cols-1 sm:grid-cols-5 gap-2.5">
+                    <div class="sm:col-span-2">
+                      <label class="block text-[11px] font-medium text-slate-600 mb-1">Designação do Fornecedor *</label>
+                      <input
+                        type="text"
+                        name="name"
+                        required
+                        maxlength="160"
+                        value="${escapeHtml(this.purchaseQuickSupplierDraft.name)}"
+                        placeholder="Ex: AngoAlissar Distribuição, Lda"
+                        class="w-full h-9 px-2.5 rounded-md border border-slate-300 bg-white text-xs"
+                      />
+                    </div>
+                    <div>
+                      <label class="block text-[11px] font-medium text-slate-600 mb-1">NIF</label>
+                      <input
+                        type="text"
+                        name="nif"
+                        maxlength="32"
+                        value="${escapeHtml(this.purchaseQuickSupplierDraft.nif)}"
+                        placeholder="Ex: 5401122334"
+                        class="w-full h-9 px-2.5 rounded-md border border-slate-300 bg-white text-xs font-mono"
+                      />
+                    </div>
+                    <div>
+                      <label class="block text-[11px] font-medium text-slate-600 mb-1">Telefone</label>
+                      <input
+                        type="text"
+                        name="phone"
+                        maxlength="40"
+                        value="${escapeHtml(this.purchaseQuickSupplierDraft.phone)}"
+                        placeholder="923 000 000"
+                        class="w-full h-9 px-2.5 rounded-md border border-slate-300 bg-white text-xs font-mono"
+                      />
+                    </div>
+                    <div>
+                      <label class="block text-[11px] font-medium text-slate-600 mb-1">Prazo (dias)</label>
+                      <input
+                        type="number"
+                        name="paymentTermsDays"
+                        min="0"
+                        max="3650"
+                        value="${escapeHtml(this.purchaseQuickSupplierDraft.paymentTermsDaysInput)}"
+                        class="w-full h-9 px-2.5 rounded-md border border-slate-300 bg-white text-xs font-mono tabular-nums"
+                      />
+                    </div>
+                  </div>
+                  <div class="flex justify-end">
+                    <button
+                      type="submit"
+                      class="h-8 px-3.5 rounded-md bg-slate-900 hover:bg-slate-800 text-white text-xs font-semibold whitespace-nowrap"
+                    >Guardar e selecionar fornecedor</button>
+                  </div>
+                </form>
+              `
+              : ''
+          }
+
+          <form data-form="purchase-form" class="space-y-5">
+            <!-- 1. Dados do Fornecedor e Documento -->
+            <div class="grid grid-cols-1 sm:grid-cols-4 gap-3">
+              <div class="sm:col-span-2">
+                <div class="flex items-center justify-between mb-1">
+                  <label class="text-[11px] font-medium text-slate-600">Fornecedor *</label>
+                  <button
+                    type="button"
+                    data-action="toggle-purchase-quick-supplier"
+                    class="text-[11px] font-medium text-blue-600 hover:underline whitespace-nowrap"
+                  >+ Novo fornecedor rápido</button>
+                </div>
+                <select
+                  name="supplierId"
+                  class="w-full h-9 px-2.5 rounded-md border border-slate-300 bg-white text-xs"
+                >
+                  <option value="">-- Selecione o fornecedor --</option>
+                  ${activeSuppliers
+                    .map(
+                      (s) => `
+                        <option value="${escapeHtml(s.id)}" ${
+                          this.purchaseFormDraft.supplierId === s.id ? 'selected' : ''
+                        }>${escapeHtml(s.name)}${s.nif ? ` · NIF ${escapeHtml(s.nif)}` : ''}</option>
+                      `
+                    )
+                    .join('')}
+                </select>
+              </div>
+              <div>
+                <label class="block text-[11px] font-medium text-slate-600 mb-1">Nº Fatura / Guia Fornecedor</label>
+                <input
+                  type="text"
+                  name="supplierInvoiceRef"
+                  maxlength="60"
+                  value="${escapeHtml(this.purchaseFormDraft.supplierInvoiceRef)}"
+                  placeholder="Ex: FT 2026/00412"
+                  class="w-full h-9 px-2.5 rounded-md border border-slate-300 bg-white text-xs font-mono"
+                />
+              </div>
+              <div>
+                <label class="block text-[11px] font-medium text-slate-600 mb-1">Data de Vencimento</label>
+                <input
+                  type="date"
+                  name="dueDateIso"
+                  value="${escapeHtml(this.purchaseFormDraft.dueDateIso)}"
+                  class="w-full h-9 px-2.5 rounded-md border border-slate-300 bg-white text-xs font-mono tabular-nums"
+                />
+              </div>
+            </div>
+
+            <!-- 2. Pesquisa e Adição de Artigos Adquiridos -->
+            <div class="space-y-2.5 pt-3 border-t border-slate-200">
+              <div class="flex flex-col sm:flex-row sm:items-center justify-between gap-2">
+                <label for="purchase-catalog-search-input" class="text-xs font-semibold text-slate-900">Artigos Adquiridos (Quantidades e Custo de Aquisição)</label>
+                <span class="text-[11px] text-slate-500">Pressione Enter na pesquisa para adicionar imediatamente</span>
+              </div>
+
+              <div class="relative">
+                <span class="absolute left-3 top-1/2 -translate-y-1/2 text-slate-400 pointer-events-none">${ICONS.search}</span>
+                <input
+                  id="purchase-catalog-search-input"
+                  type="text"
+                  data-field="purchase-catalog-search"
+                  value="${escapeHtml(this.purchaseCatalogSearch)}"
+                  placeholder="Pesquisar artigo por código SKU, código de barras ou descrição..."
+                  class="w-full h-9 pl-9 pr-3 rounded-md border border-slate-300 bg-white text-xs"
+                />
+              </div>
+
+              ${
+                catalogMatches.length > 0
+                  ? `
+                    <div class="flex flex-wrap gap-1.5 pt-0.5">
+                      ${catalogMatches
+                        .map(
+                          (p) => `
+                            <button
+                              type="button"
+                              data-action="purchase-add-product"
+                              data-id="${escapeHtml(p.id)}"
+                              class="h-8 px-2.5 rounded-md border border-slate-200 bg-slate-50 hover:bg-slate-100 text-xs text-slate-800 flex items-center gap-1.5 whitespace-nowrap"
+                            >
+                              <span class="font-mono text-[11px] text-slate-500">${escapeHtml(p.code)}</span>
+                              <span class="font-medium truncate max-w-[180px]">${escapeHtml(p.name)}</span>
+                              <span class="text-[11px] font-mono tabular-nums text-slate-500">· Stock: ${p.trackStock ? p.stockQty ?? 0 : 'n/c'}</span>
+                            </button>
+                          `
+                        )
+                        .join('')}
+                    </div>
+                  `
+                  : `<p class="text-xs text-slate-500">Nenhum artigo encontrado para "${escapeHtml(this.purchaseCatalogSearch)}".</p>`
+              }
+
+              <!-- Tabela de Linhas da Compra -->
+              <div class="border border-slate-200 rounded-lg overflow-x-auto">
+                <table class="w-full text-left border-collapse text-xs">
+                  <thead class="bg-slate-50 border-b border-slate-200 text-[11px] text-slate-500">
+                    <tr>
+                      <th class="py-2 px-3 font-medium">Artigo</th>
+                      <th class="py-2 px-3 font-medium text-right w-36">Qtd. Adquirida</th>
+                      <th class="py-2 px-3 font-medium text-right w-40">Custo Unit. (Kz)</th>
+                      <th class="py-2 px-3 font-medium text-right w-36">Subtotal (Kz)</th>
+                      <th class="py-2 px-2 w-10"></th>
+                    </tr>
+                  </thead>
+                  <tbody class="divide-y divide-slate-100 tabular-nums">
+                    ${
+                      this.purchaseDraftLines.length === 0
+                        ? `
+                          <tr>
+                            <td colspan="5" class="py-6 px-3 text-center text-xs text-slate-500">
+                              Selecione artigos acima para indicar as quantidades adquiridas e o custo de aquisição.
+                            </td>
+                          </tr>
+                        `
+                        : this.purchaseDraftLines
+                            .map((line) => {
+                              const q = parseDecimalInput(line.qtyInput);
+                              const c = parseDecimalInput(line.unitCostInput);
+                              const sub =
+                                !Number.isNaN(q) && q > 0 && !Number.isNaN(c) && c >= 0
+                                  ? roundKz(q * c)
+                                  : 0;
+                              const qtyInputId = `pur-qty-${line.productId}`;
+                              const costInputId = `pur-cost-${line.productId}`;
+                              return `
+                                <tr>
+                                  <td class="py-2 px-3">
+                                    <div class="font-medium text-slate-900">${escapeHtml(line.name)}</div>
+                                    <div class="text-[11px] text-slate-500 font-mono">${escapeHtml(line.code)} · ${escapeHtml(line.unit)}</div>
+                                  </td>
+                                  <td class="py-2 px-3 text-right">
+                                    <div class="inline-flex items-center gap-1">
+                                      <button
+                                        type="button"
+                                        data-action="purchase-step-qty"
+                                        data-id="${escapeHtml(line.productId)}"
+                                        data-value="dec"
+                                        class="h-7 w-7 rounded border border-slate-200 hover:bg-slate-50 flex items-center justify-center text-slate-600"
+                                      >${ICONS.minus}</button>
+                                      <input
+                                        id="${escapeHtml(qtyInputId)}"
+                                        type="text"
+                                        inputmode="decimal"
+                                        data-field="purchase-line-qty"
+                                        data-id="${escapeHtml(line.productId)}"
+                                        value="${escapeHtml(line.qtyInput)}"
+                                        class="w-16 h-7 px-1.5 text-right rounded border border-slate-300 font-mono tabular-nums text-xs"
+                                      />
+                                      <button
+                                        type="button"
+                                        data-action="purchase-step-qty"
+                                        data-id="${escapeHtml(line.productId)}"
+                                        data-value="inc"
+                                        class="h-7 w-7 rounded border border-slate-200 hover:bg-slate-50 flex items-center justify-center text-slate-600"
+                                      >+</button>
+                                    </div>
+                                  </td>
+                                  <td class="py-2 px-3 text-right">
+                                    <input
+                                      id="${escapeHtml(costInputId)}"
+                                      type="text"
+                                      inputmode="decimal"
+                                      data-field="purchase-line-cost"
+                                      data-id="${escapeHtml(line.productId)}"
+                                      value="${escapeHtml(line.unitCostInput)}"
+                                      class="w-32 h-7 px-2 text-right rounded border border-slate-300 font-mono tabular-nums text-xs"
+                                    />
+                                  </td>
+                                  <td class="py-2 px-3 text-right font-mono font-semibold text-slate-900">${formatKzNumber(sub)}</td>
+                                  <td class="py-2 px-2 text-center">
+                                    <button
+                                      type="button"
+                                      data-action="purchase-remove-line"
+                                      data-id="${escapeHtml(line.productId)}"
+                                      title="Remover artigo"
+                                      class="h-7 w-7 rounded hover:bg-red-50 text-slate-400 hover:text-red-600 inline-flex items-center justify-center"
+                                    >${ICONS.trash}</button>
+                                  </td>
+                                </tr>
+                              `;
+                            })
+                            .join('')
+                    }
+                  </tbody>
+                </table>
+              </div>
+            </div>
+
+            <!-- 3. Stock, Condições de Pagamento e Contas a Pagar -->
+            <div class="grid grid-cols-1 lg:grid-cols-2 gap-4 pt-3 border-t border-slate-200">
+              <div class="space-y-3">
+                <label class="flex items-start gap-2.5 text-xs text-slate-700 cursor-pointer">
+                  <input
+                    type="checkbox"
+                    name="updateStock"
+                    ${this.purchaseFormDraft.updateStock ? 'checked' : ''}
+                    class="mt-0.5 rounded border-slate-300"
+                  />
+                  <span>
+                    <strong class="font-semibold text-slate-900">Dar entrada automática em stock</strong>
+                    <span class="block text-[11px] text-slate-500">Soma as quantidades adquiridas ao stock disponível e atualiza o custo de aquisição de cada artigo.</span>
+                  </span>
+                </label>
+
+                <div>
+                  <label class="block text-[11px] font-medium text-slate-600 mb-1">Observações da Compra</label>
+                  <input
+                    type="text"
+                    name="notes"
+                    maxlength="300"
+                    value="${escapeHtml(this.purchaseFormDraft.notes)}"
+                    placeholder="Ex: Mercadoria conferida na receção do armazém principal"
+                    class="w-full h-9 px-2.5 rounded-md border border-slate-300 bg-white text-xs"
+                  />
+                </div>
+              </div>
+
+              <div class="space-y-3 bg-slate-50/80 border border-slate-200 rounded-lg p-3.5">
+                <div class="flex items-center justify-between gap-2">
+                  <span class="text-xs font-semibold text-slate-900">Modalidade de Pagamento</span>
+                  <div class="flex items-center gap-1 p-0.5 bg-slate-200/70 rounded-md">
+                    <button
+                      type="button"
+                      data-action="purchase-payment-mode"
+                      data-value="PAID"
+                      class="px-2.5 py-1 text-[11px] font-medium rounded whitespace-nowrap ${
+                        mode === 'PAID' ? 'bg-white text-slate-900 shadow-xs' : 'text-slate-600'
+                      }"
+                    >Pronto Pagamento</button>
+                    <button
+                      type="button"
+                      data-action="purchase-payment-mode"
+                      data-value="PARTIAL"
+                      class="px-2.5 py-1 text-[11px] font-medium rounded whitespace-nowrap ${
+                        mode === 'PARTIAL' ? 'bg-white text-slate-900 shadow-xs' : 'text-slate-600'
+                      }"
+                    >Parcial</button>
+                    <button
+                      type="button"
+                      data-action="purchase-payment-mode"
+                      data-value="CREDIT"
+                      class="px-2.5 py-1 text-[11px] font-medium rounded whitespace-nowrap ${
+                        mode === 'CREDIT' ? 'bg-white text-slate-900 shadow-xs' : 'text-slate-600'
+                      }"
+                    >A Crédito (Conta a Pagar)</button>
+                  </div>
+                </div>
+
+                ${
+                  mode !== 'CREDIT'
+                    ? `
+                      <div class="grid grid-cols-1 sm:grid-cols-2 gap-2.5">
+                        <div>
+                          <label class="block text-[11px] font-medium text-slate-600 mb-1">Meio de Pagamento</label>
+                          <select
+                            name="paymentMethod"
+                            class="w-full h-9 px-2.5 rounded-md border border-slate-300 bg-white text-xs"
+                          >
+                            <option value="Transferência" ${this.purchaseFormDraft.paymentMethod === 'Transferência' ? 'selected' : ''}>Transferência Bancária</option>
+                            <option value="Multicaixa" ${this.purchaseFormDraft.paymentMethod === 'Multicaixa' ? 'selected' : ''}>Multicaixa / TPA</option>
+                            <option value="Dinheiro" ${this.purchaseFormDraft.paymentMethod === 'Dinheiro' ? 'selected' : ''}>Numerário (Dinheiro)</option>
+                          </select>
+                        </div>
+                        <div>
+                          <label class="block text-[11px] font-medium text-slate-600 mb-1">Nº Referência / Comprovativo</label>
+                          <input
+                            type="text"
+                            name="reference"
+                            maxlength="80"
+                            value="${escapeHtml(this.purchaseFormDraft.reference)}"
+                            placeholder="Ex: TRF BAI 992811"
+                            class="w-full h-9 px-2.5 rounded-md border border-slate-300 bg-white text-xs font-mono"
+                          />
+                        </div>
+                      </div>
+                    `
+                    : ''
+                }
+
+                ${
+                  mode === 'PARTIAL'
+                    ? `
+                      <div>
+                        <label class="block text-[11px] font-medium text-slate-600 mb-1">Montante Pago Agora (Kz) *</label>
+                        <input
+                          id="purchase-amount-paid-input"
+                          type="text"
+                          inputmode="decimal"
+                          data-field="purchase-amount-paid-live"
+                          value="${escapeHtml(this.purchaseFormDraft.amountPaidInput)}"
+                          placeholder="0,00"
+                          class="w-full h-9 px-2.5 rounded-md border border-slate-300 bg-white text-xs font-mono tabular-nums"
+                        />
+                      </div>
+                    `
+                    : ''
+                }
+
+                ${
+                  mode !== 'CREDIT' && openCashSession
+                    ? `
+                      <label class="flex items-center gap-2 text-[11px] text-slate-600 cursor-pointer">
+                        <input
+                          type="checkbox"
+                          name="recordInCashSession"
+                          ${this.purchaseFormDraft.recordInCashSession ? 'checked' : ''}
+                          class="rounded border-slate-300"
+                        />
+                        <span>Registar saída no turno aberto (Caixa ${escapeHtml(openCashSession.cashier)})</span>
+                      </label>
+                    `
+                    : ''
+                }
+
+                <div class="pt-2 border-t border-slate-200 space-y-1 text-xs font-mono tabular-nums">
+                  <div class="flex justify-between text-slate-600">
+                    <span class="font-sans">Artigos válidos (${validLines.length}) · Total Compra:</span>
+                    <span class="font-bold text-slate-900">${formatKzNumber(totalAmount)} Kz</span>
+                  </div>
+                  <div class="flex justify-between text-emerald-700">
+                    <span class="font-sans">Pago no ato:</span>
+                    <span>${formatKzNumber(previewPaid)} Kz</span>
+                  </div>
+                  <div class="flex justify-between ${previewDue > 0 ? 'text-amber-700 font-semibold' : 'text-slate-500'}">
+                    <span class="font-sans">Saldo em Conta a Pagar:</span>
+                    <span>${formatKzNumber(previewDue)} Kz</span>
+                  </div>
+                </div>
+              </div>
+            </div>
+
+            <div class="flex items-center justify-end gap-2 pt-3 border-t border-slate-200">
+              <button
+                type="button"
+                data-action="close-new-purchase"
+                class="h-9 px-4 rounded-lg border border-slate-200 hover:bg-slate-50 text-xs font-medium text-slate-700 whitespace-nowrap"
+              >Cancelar</button>
+              <button
+                type="submit"
+                class="h-9 px-4 rounded-lg bg-blue-600 hover:bg-blue-700 text-white text-xs font-semibold whitespace-nowrap"
+              >Confirmar compra (${formatKzNumber(totalAmount)} Kz)</button>
+            </div>
+          </form>
+        </div>
+      </div>
+    `;
+  }
+
+  private renderPurchasesHistorySubView(canManage: boolean, todayIso: string): string {
+    let list = filterPurchasesSmart(this.purchases, this.purchaseSearch);
+    if (this.purchaseSupplierFilterId !== 'ALL') {
+      list = list.filter((p) => p.supplierId === this.purchaseSupplierFilterId);
+    }
+    if (this.purchaseFilter === 'PAYABLE') {
+      list = list.filter((p) => p.status === 'recorded' && p.amountDue > 0);
+    } else if (this.purchaseFilter === 'OVERDUE') {
+      list = list.filter((p) => this.isPurchaseOverdue(p, todayIso));
+    } else if (this.purchaseFilter === 'PAID') {
+      list = list.filter((p) => p.status === 'recorded' && p.amountDue <= 0);
+    } else if (this.purchaseFilter === 'CANCELLED') {
+      list = list.filter((p) => p.status === 'cancelled');
+    }
+
+    const selected =
+      list.find((p) => p.id === this.selectedPurchaseDetailId) ||
+      this.purchases.find((p) => p.id === this.selectedPurchaseDetailId) ||
+      list[0] ||
+      null;
+
+    const openCashSession = this.getActiveOpenCashSession();
+
+    return `
+      <div class="flex-1 flex flex-col lg:flex-row overflow-hidden">
+        <!-- Coluna Esquerda: Filtros e Histórico de Compras -->
+        <div class="flex-1 flex flex-col overflow-hidden border-b lg:border-b-0 lg:border-r border-slate-200">
+          <div class="p-3 sm:px-4 border-b border-slate-200 space-y-2.5 shrink-0">
+            <div class="flex flex-col sm:flex-row gap-2">
+              <div class="relative flex-1">
+                <span class="absolute left-3 top-1/2 -translate-y-1/2 text-slate-400 pointer-events-none">${ICONS.search}</span>
+                <input
+                  id="purchase-search-input"
+                  type="text"
+                  data-field="purchase-search"
+                  value="${escapeHtml(this.purchaseSearch)}"
+                  placeholder="Pesquisar compra por nº interno, fatura do fornecedor, NIF ou artigo (F2)..."
+                  class="w-full h-9 pl-9 pr-3 rounded-lg border border-slate-200 bg-slate-50 focus:bg-white text-xs"
+                />
+              </div>
+              <select
+                data-field="purchase-supplier-filter"
+                class="h-9 px-2.5 rounded-lg border border-slate-200 bg-white text-xs sm:w-52"
+              >
+                <option value="ALL" ${this.purchaseSupplierFilterId === 'ALL' ? 'selected' : ''}>Todos os fornecedores</option>
+                ${this.suppliers
+                  .map(
+                    (s) =>
+                      `<option value="${escapeHtml(s.id)}" ${
+                        this.purchaseSupplierFilterId === s.id ? 'selected' : ''
+                      }>${escapeHtml(s.name)}</option>`
+                  )
+                  .join('')}
+              </select>
+            </div>
+
+            <div class="flex flex-wrap items-center gap-1">
+              ${(
+                [
+                  { id: 'ALL', label: 'Todas' },
+                  { id: 'PAYABLE', label: 'Contas a pagar' },
+                  { id: 'OVERDUE', label: 'Vencidas' },
+                  { id: 'PAID', label: 'Liquidadas' },
+                  { id: 'CANCELLED', label: 'Anuladas' },
+                ] as const
+              )
+                .map(
+                  (f) => `
+                    <button
+                      type="button"
+                      data-action="set-purchase-filter"
+                      data-value="${f.id}"
+                      class="px-2.5 py-1 rounded-md text-xs font-medium transition-colors whitespace-nowrap shrink-0 ${
+                        this.purchaseFilter === f.id
+                          ? 'bg-slate-900 text-white'
+                          : 'bg-slate-100 text-slate-600 hover:text-slate-900'
+                      }"
+                    >${f.label}</button>
+                  `
+                )
+                .join('')}
+            </div>
+          </div>
+
+          <div class="flex-1 overflow-y-auto">
+            ${
+              list.length === 0
+                ? `
+                  <div class="p-8 text-center space-y-2">
+                    <div class="text-xs font-semibold text-slate-900">Nenhuma compra encontrada</div>
+                    <p class="text-xs text-slate-500 max-w-sm mx-auto">Registe compras a fornecedores para atualizar automaticamente o stock, o custo de aquisição e o controlo de contas a pagar.</p>
+                    ${
+                      canManage
+                        ? `
+                          <div class="pt-2">
+                            <button
+                              type="button"
+                              data-action="open-new-purchase"
+                              class="h-9 px-4 rounded-lg bg-slate-900 hover:bg-slate-800 text-white text-xs font-semibold inline-flex items-center gap-1.5 whitespace-nowrap"
+                            >${ICONS.plus}<span>Registar primeira compra</span></button>
+                          </div>
+                        `
+                        : ''
+                    }
+                  </div>
+                `
+                : `
+                  <table class="w-full text-left border-collapse text-xs">
+                    <thead class="bg-slate-50 border-b border-slate-200 text-[11px] text-slate-500 sticky top-0 z-10">
+                      <tr>
+                        <th class="py-2.5 px-3 font-medium">Compra / Data</th>
+                        <th class="py-2.5 px-3 font-medium">Fornecedor</th>
+                        <th class="py-2.5 px-3 font-medium text-right">Total (Kz)</th>
+                        <th class="py-2.5 px-3 font-medium text-right">Por Pagar (Kz)</th>
+                        <th class="py-2.5 px-3 font-medium">Estado</th>
+                      </tr>
+                    </thead>
+                    <tbody class="divide-y divide-slate-100 tabular-nums">
+                      ${list
+                        .map((pur) => {
+                          const isSelected = selected?.id === pur.id;
+                          const dt = formatDateTimePt(pur.issuedAtIso);
+                          const overdue = this.isPurchaseOverdue(pur, todayIso);
+                          const statusText =
+                            pur.status === 'cancelled'
+                              ? 'Anulada'
+                              : overdue
+                                ? 'Vencida'
+                                : pur.amountDue > 0
+                                  ? pur.amountPaid > 0
+                                    ? 'Parcial'
+                                    : 'Em dívida'
+                                  : 'Liquidada';
+                          const statusColor =
+                            pur.status === 'cancelled'
+                              ? 'text-slate-400 line-through'
+                              : overdue
+                                ? 'text-red-700 font-semibold'
+                                : pur.amountDue > 0
+                                  ? 'text-amber-700 font-medium'
+                                  : 'text-emerald-700 font-medium';
+
+                          return `
+                            <tr
+                              data-action="select-purchase-detail"
+                              data-id="${escapeHtml(pur.id)}"
+                              class="cursor-pointer transition-colors ${
+                                isSelected ? 'bg-blue-50/70' : 'hover:bg-slate-50'
+                              }"
+                            >
+                              <td class="py-2.5 px-3">
+                                <div class="font-mono font-semibold text-slate-900 ${pur.status === 'cancelled' ? 'line-through text-slate-400' : ''}">${escapeHtml(pur.number)}</div>
+                                <div class="text-[11px] text-slate-500 font-mono">
+                                  ${dt.slashDate}${pur.supplierInvoiceRef ? ` · Doc: ${escapeHtml(pur.supplierInvoiceRef)}` : ''}
+                                </div>
+                              </td>
+                              <td class="py-2.5 px-3">
+                                <div class="font-medium text-slate-900 truncate max-w-[200px]">${escapeHtml(pur.supplierName)}</div>
+                                <div class="text-[11px] text-slate-500">
+                                  ${pur.lines.length} item(ns)${pur.dueDateIso && pur.amountDue > 0 ? ` · Vence ${escapeHtml(pur.dueDateIso.slice(0, 10))}` : ''}
+                                </div>
+                              </td>
+                              <td class="py-2.5 px-3 text-right font-mono font-semibold text-slate-900">${formatKzNumber(pur.totalAmount)}</td>
+                              <td class="py-2.5 px-3 text-right font-mono ${pur.amountDue > 0 && pur.status === 'recorded' ? 'text-amber-700 font-semibold' : 'text-slate-400'}">${formatKzNumber(pur.status === 'cancelled' ? 0 : pur.amountDue)}</td>
+                              <td class="py-2.5 px-3 ${statusColor} whitespace-nowrap">${statusText}</td>
+                            </tr>
+                          `;
+                        })
+                        .join('')}
+                    </tbody>
+                  </table>
+                `
+            }
+          </div>
+        </div>
+
+        <!-- Coluna Direita: Detalhe da Compra, Pagamento a Fornecedor e Anulação -->
+        <div class="w-full lg:w-[420px] xl:w-[460px] shrink-0 overflow-y-auto bg-slate-50/40 p-4 space-y-4">
+          ${
+            !selected
+              ? `<div class="text-xs text-slate-500 py-8 text-center">Selecione uma compra na tabela para consultar itens adquiridos, custos e pagamentos.</div>`
+              : (() => {
+                  const dt = formatDateTimePt(selected.issuedAtIso);
+                  const overdue = this.isPurchaseOverdue(selected, todayIso);
+                  const isSettling = this.settlingPurchaseId === selected.id;
+                  const isCancelling = this.cancellingPurchaseId === selected.id;
+                  return `
+                    <div class="bg-white border border-slate-200 rounded-lg p-4 space-y-4">
+                      <div class="flex items-start justify-between gap-2 pb-3 border-b border-slate-200">
+                        <div>
+                          <div class="text-sm font-bold font-mono text-slate-900">${escapeHtml(selected.number)}</div>
+                          <div class="text-[11px] text-slate-500">
+                            <span>${dt.slashDate} ${dt.time}</span>
+                            <span aria-hidden="true"> · </span>
+                            <span>Op. ${escapeHtml(selected.operator)}</span>
+                            ${
+                              selected.supplierInvoiceRef
+                                ? `<span aria-hidden="true"> · </span><span>Fatura Forn.: ${escapeHtml(selected.supplierInvoiceRef)}</span>`
+                                : ''
+                            }
+                          </div>
+                        </div>
+                        <div class="text-right text-xs font-semibold ${
+                          selected.status === 'cancelled'
+                            ? 'text-red-600'
+                            : overdue
+                              ? 'text-red-700'
+                              : selected.amountDue > 0
+                                ? 'text-amber-700'
+                                : 'text-emerald-700'
+                        }">
+                          ${
+                            selected.status === 'cancelled'
+                              ? 'Anulada'
+                              : overdue
+                                ? 'Conta Vencida'
+                                : selected.amountDue > 0
+                                  ? 'Conta a Pagar'
+                                  : 'Liquidada'
+                          }
+                        </div>
+                      </div>
+
+                      <div class="space-y-1 text-xs">
+                        <div class="font-semibold text-slate-900">${escapeHtml(selected.supplierName)}</div>
+                        <div class="text-slate-500">
+                          ${selected.supplierNif ? `NIF ${escapeHtml(selected.supplierNif)} · ` : ''}
+                          ${selected.updateStock ? 'Stock atualizado' : 'Sem entrada em stock'}
+                          ${selected.dueDateIso ? ` · Vencimento: ${escapeHtml(selected.dueDateIso.slice(0, 10))}` : ''}
+                        </div>
+                      </div>
+
+                      <!-- Itens Adquiridos -->
+                      <div class="border border-slate-200 rounded-md overflow-hidden">
+                        <table class="w-full text-left border-collapse text-xs">
+                          <thead class="bg-slate-50 border-b border-slate-200 text-[11px] text-slate-500">
+                            <tr>
+                              <th class="py-1.5 px-2.5 font-medium">Artigo</th>
+                              <th class="py-1.5 px-2 text-right font-medium">Qtd.</th>
+                              <th class="py-1.5 px-2 text-right font-medium">Custo</th>
+                              <th class="py-1.5 px-2.5 text-right font-medium">Total</th>
+                            </tr>
+                          </thead>
+                          <tbody class="divide-y divide-slate-100 tabular-nums">
+                            ${selected.lines
+                              .map(
+                                (l) => `
+                                  <tr>
+                                    <td class="py-1.5 px-2.5">
+                                      <div class="font-medium text-slate-900">${escapeHtml(l.name)}</div>
+                                      <div class="text-[10px] font-mono text-slate-500">${escapeHtml(l.code)}</div>
+                                    </td>
+                                    <td class="py-1.5 px-2 text-right font-mono">${l.qty} ${escapeHtml(l.unit)}</td>
+                                    <td class="py-1.5 px-2 text-right font-mono">${formatKzNumber(l.unitCost)}</td>
+                                    <td class="py-1.5 px-2.5 text-right font-mono font-medium">${formatKzNumber(l.total)}</td>
+                                  </tr>
+                                `
+                              )
+                              .join('')}
+                          </tbody>
+                        </table>
+                      </div>
+
+                      <!-- Resumo Financeiro da Compra -->
+                      <div class="pt-2 border-t border-slate-200 space-y-1 text-xs font-mono tabular-nums">
+                        <div class="flex justify-between text-slate-700">
+                          <span class="font-sans">Total da Compra:</span>
+                          <span class="font-bold text-slate-900">${formatKzNumber(selected.totalAmount)} Kz</span>
+                        </div>
+                        <div class="flex justify-between text-emerald-700">
+                          <span class="font-sans">Valor Pago:</span>
+                          <span>${formatKzNumber(selected.amountPaid)} Kz</span>
+                        </div>
+                        <div class="flex justify-between ${selected.amountDue > 0 && selected.status === 'recorded' ? 'text-amber-700 font-bold' : 'text-slate-500'}">
+                          <span class="font-sans">Saldo a Pagar:</span>
+                          <span>${formatKzNumber(selected.status === 'cancelled' ? 0 : selected.amountDue)} Kz</span>
+                        </div>
+                      </div>
+
+                      ${
+                        selected.paymentSummary || selected.reference || selected.notes
+                          ? `
+                            <div class="pt-2 border-t border-slate-100 space-y-1 text-[11px] text-slate-600">
+                              ${selected.paymentSummary ? `<div><strong>Pagamentos:</strong> ${escapeHtml(selected.paymentSummary)}</div>` : ''}
+                              ${selected.reference ? `<div><strong>Ref. Pagamento:</strong> <span class="font-mono">${escapeHtml(selected.reference)}</span></div>` : ''}
+                              ${selected.notes ? `<div><strong>Obs.:</strong> ${escapeHtml(selected.notes)}</div>` : ''}
+                            </div>
+                          `
+                          : ''
+                      }
+
+                      ${
+                        selected.status === 'cancelled'
+                          ? `
+                            <div class="p-2.5 rounded-md border border-red-200 bg-red-50 text-xs text-red-700">
+                              <strong>Compra anulada:</strong> ${escapeHtml(selected.cancelReason || 'Sem motivo')}
+                              ${selected.cancelledBy ? ` · por ${escapeHtml(selected.cancelledBy)}` : ''}
+                            </div>
+                          `
+                          : `
+                            <div class="flex flex-wrap items-center gap-2 pt-2 border-t border-slate-200">
+                              ${
+                                selected.amountDue > 0
+                                  ? `
+                                    <button
+                                      type="button"
+                                      data-action="open-settle-purchase"
+                                      data-id="${escapeHtml(selected.id)}"
+                                      class="flex-1 h-9 px-3 rounded-lg bg-emerald-600 hover:bg-emerald-700 text-white text-xs font-semibold whitespace-nowrap"
+                                    >Registar pagamento (${formatKzNumber(selected.amountDue)} Kz)</button>
+                                  `
+                                  : ''
+                              }
+                              ${
+                                canManage
+                                  ? `
+                                    <button
+                                      type="button"
+                                      data-action="open-cancel-purchase"
+                                      data-id="${escapeHtml(selected.id)}"
+                                      class="h-9 px-3 rounded-lg border border-red-200 hover:bg-red-50 text-xs font-medium text-red-700 whitespace-nowrap"
+                                    >Anular compra</button>
+                                  `
+                                  : ''
+                              }
+                            </div>
+                          `
+                      }
+
+                      ${
+                        isSettling
+                          ? `
+                            <form data-form="settle-purchase-form" class="p-3 rounded-lg border border-slate-200 bg-slate-50 space-y-2.5">
+                              <div class="flex items-center justify-between">
+                                <span class="text-xs font-semibold text-slate-900">Registar Pagamento ao Fornecedor</span>
+                                <button type="button" data-action="close-settle-purchase" class="text-xs text-slate-500 hover:text-slate-800">Fechar</button>
+                              </div>
+                              ${
+                                this.purchaseSettleError
+                                  ? `<div class="text-xs text-red-600">${escapeHtml(this.purchaseSettleError)}</div>`
+                                  : ''
+                              }
+                              <div class="grid grid-cols-2 gap-2">
+                                <div>
+                                  <label class="block text-[11px] font-medium text-slate-600 mb-1">Valor a Pagar (Kz)</label>
+                                  <input
+                                    type="text"
+                                    name="settleAmount"
+                                    inputmode="decimal"
+                                    value="${escapeHtml(this.purchaseSettleAmountInput)}"
+                                    class="w-full h-8 px-2 rounded border border-slate-300 bg-white text-xs font-mono tabular-nums"
+                                  />
+                                </div>
+                                <div>
+                                  <label class="block text-[11px] font-medium text-slate-600 mb-1">Meio de Pagamento</label>
+                                  <select name="settleMethod" class="w-full h-8 px-2 rounded border border-slate-300 bg-white text-xs">
+                                    <option value="Transferência" ${this.purchaseSettleMethod === 'Transferência' ? 'selected' : ''}>Transferência</option>
+                                    <option value="Multicaixa" ${this.purchaseSettleMethod === 'Multicaixa' ? 'selected' : ''}>Multicaixa</option>
+                                    <option value="Dinheiro" ${this.purchaseSettleMethod === 'Dinheiro' ? 'selected' : ''}>Dinheiro</option>
+                                  </select>
+                                </div>
+                              </div>
+                              <div>
+                                <label class="block text-[11px] font-medium text-slate-600 mb-1">Nº Referência / Comprovativo</label>
+                                <input
+                                  type="text"
+                                  name="settleReference"
+                                  maxlength="80"
+                                  value="${escapeHtml(this.purchaseSettleReference)}"
+                                  placeholder="Ex: Comprovativo transferência BAI"
+                                  class="w-full h-8 px-2 rounded border border-slate-300 bg-white text-xs font-mono"
+                                />
+                              </div>
+                              ${
+                                openCashSession
+                                  ? `
+                                    <label class="flex items-center gap-2 text-[11px] text-slate-600 cursor-pointer">
+                                      <input
+                                        type="checkbox"
+                                        name="recordCash"
+                                        ${this.purchaseSettleRecordCash ? 'checked' : ''}
+                                        class="rounded border-slate-300"
+                                      />
+                                      <span>Registar saída na Caixa ${escapeHtml(openCashSession.cashier)}</span>
+                                    </label>
+                                  `
+                                  : ''
+                              }
+                              <button
+                                type="submit"
+                                class="w-full h-8 rounded-md bg-emerald-600 hover:bg-emerald-700 text-white text-xs font-semibold"
+                              >Confirmar pagamento</button>
+                            </form>
+                          `
+                          : ''
+                      }
+
+                      ${
+                        isCancelling
+                          ? `
+                            <form data-form="cancel-purchase-form" class="p-3 rounded-lg border border-red-200 bg-red-50/70 space-y-2.5">
+                              <div class="flex items-center justify-between">
+                                <span class="text-xs font-semibold text-red-900">Confirmar Anulação da Compra</span>
+                                <button type="button" data-action="close-cancel-purchase" class="text-xs text-slate-600">Cancelar</button>
+                              </div>
+                              ${
+                                this.cancelPurchaseError
+                                  ? `<div class="text-xs text-red-700">${escapeHtml(this.cancelPurchaseError)}</div>`
+                                  : ''
+                              }
+                              <p class="text-[11px] text-red-800">
+                                ${selected.updateStock ? 'As quantidades entradas em stock nesta compra serão estornadas automaticamente.' : 'O registo ficará marcado como anulado para auditoria.'}
+                              </p>
+                              <input
+                                type="text"
+                                name="cancelReason"
+                                required
+                                minlength="4"
+                                maxlength="240"
+                                value="${escapeHtml(this.cancelPurchaseReason)}"
+                                placeholder="Motivo obrigatório da anulação..."
+                                class="w-full h-8 px-2.5 rounded border border-red-300 bg-white text-xs"
+                              />
+                              <button
+                                type="submit"
+                                class="w-full h-8 rounded-md bg-red-600 hover:bg-red-700 text-white text-xs font-semibold"
+                              >Confirmar anulação definitiva</button>
+                            </form>
+                          `
+                          : ''
+                      }
+                    </div>
+                  `;
+                })()
+          }
+        </div>
+      </div>
+    `;
+  }
+
+  private renderSuppliersSubView(canManage: boolean): string {
+    if (this.editingSupplier) {
+      const s = this.editingSupplier;
+      return `
+        <div class="flex-1 overflow-y-auto bg-slate-50/40 p-4 sm:p-6">
+          <div class="max-w-2xl mx-auto bg-white border border-slate-200 rounded-lg p-4 sm:p-5 space-y-4">
+            <div class="flex items-center justify-between pb-3 border-b border-slate-200">
+              <div>
+                <h2 class="text-sm font-bold text-slate-900">${this.isNewSupplier ? 'Cadastrar Novo Fornecedor' : 'Editar Fornecedor'}</h2>
+                <p class="text-xs text-slate-500">Dados fiscais, contactos comerciais, IBAN e prazo de pagamento.</p>
+              </div>
+              <button
+                type="button"
+                data-action="cancel-supplier-form"
+                class="h-8 px-3 rounded-md border border-slate-200 hover:bg-slate-50 text-xs font-medium text-slate-700"
+              >Cancelar</button>
+            </div>
+
+            ${
+              this.supplierFormError
+                ? `<div class="p-3 rounded-lg border border-red-200 bg-red-50 text-xs text-red-700">${escapeHtml(this.supplierFormError)}</div>`
+                : ''
+            }
+
+            <form data-form="supplier-form" class="space-y-3.5">
+              <div class="grid grid-cols-1 sm:grid-cols-3 gap-3">
+                <div class="sm:col-span-2">
+                  <label class="block text-[11px] font-medium text-slate-600 mb-1">Designação Comercial / Nome *</label>
+                  <input
+                    type="text"
+                    name="name"
+                    required
+                    maxlength="160"
+                    value="${escapeHtml(s.name)}"
+                    placeholder="Ex: AngoAlissar Distribuição, Lda"
+                    class="w-full h-9 px-2.5 rounded-md border border-slate-300 text-xs"
+                  />
+                </div>
+                <div>
+                  <label class="block text-[11px] font-medium text-slate-600 mb-1">NIF</label>
+                  <input
+                    type="text"
+                    name="nif"
+                    maxlength="32"
+                    value="${escapeHtml(s.nif)}"
+                    placeholder="Ex: 5401122334"
+                    class="w-full h-9 px-2.5 rounded-md border border-slate-300 text-xs font-mono"
+                  />
+                </div>
+              </div>
+
+              <div class="grid grid-cols-1 sm:grid-cols-3 gap-3">
+                <div>
+                  <label class="block text-[11px] font-medium text-slate-600 mb-1">Telefone</label>
+                  <input
+                    type="text"
+                    name="phone"
+                    maxlength="40"
+                    value="${escapeHtml(s.phone)}"
+                    placeholder="+244 923 000 000"
+                    class="w-full h-9 px-2.5 rounded-md border border-slate-300 text-xs font-mono"
+                  />
+                </div>
+                <div>
+                  <label class="block text-[11px] font-medium text-slate-600 mb-1">E-mail</label>
+                  <input
+                    type="email"
+                    name="email"
+                    maxlength="120"
+                    value="${escapeHtml(s.email || '')}"
+                    placeholder="comercial@fornecedor.co.ao"
+                    class="w-full h-9 px-2.5 rounded-md border border-slate-300 text-xs"
+                  />
+                </div>
+                <div>
+                  <label class="block text-[11px] font-medium text-slate-600 mb-1">Pessoa de Contacto</label>
+                  <input
+                    type="text"
+                    name="contactPerson"
+                    maxlength="120"
+                    value="${escapeHtml(s.contactPerson || '')}"
+                    placeholder="Ex: Gestor Comercial"
+                    class="w-full h-9 px-2.5 rounded-md border border-slate-300 text-xs"
+                  />
+                </div>
+              </div>
+
+              <div class="grid grid-cols-1 sm:grid-cols-3 gap-3">
+                <div class="sm:col-span-2">
+                  <label class="block text-[11px] font-medium text-slate-600 mb-1">Endereço / Armazém</label>
+                  <input
+                    type="text"
+                    name="address"
+                    maxlength="200"
+                    value="${escapeHtml(s.address)}"
+                    placeholder="Ex: Zona Industrial de Viana, Polo II"
+                    class="w-full h-9 px-2.5 rounded-md border border-slate-300 text-xs"
+                  />
+                </div>
+                <div>
+                  <label class="block text-[11px] font-medium text-slate-600 mb-1">Localidade / Província</label>
+                  <input
+                    type="text"
+                    name="locality"
+                    maxlength="160"
+                    value="${escapeHtml(s.locality)}"
+                    placeholder="Luanda"
+                    class="w-full h-9 px-2.5 rounded-md border border-slate-300 text-xs"
+                  />
+                </div>
+              </div>
+
+              <div class="grid grid-cols-1 sm:grid-cols-3 gap-3">
+                <div class="sm:col-span-2">
+                  <label class="block text-[11px] font-medium text-slate-600 mb-1">IBAN / Conta Bancária</label>
+                  <input
+                    type="text"
+                    name="iban"
+                    maxlength="48"
+                    value="${escapeHtml(s.iban || '')}"
+                    placeholder="AO06.0040.0000.0000.0000.0000.0"
+                    class="w-full h-9 px-2.5 rounded-md border border-slate-300 text-xs font-mono"
+                  />
+                </div>
+                <div>
+                  <label class="block text-[11px] font-medium text-slate-600 mb-1">Prazo de Pagamento (dias)</label>
+                  <input
+                    type="number"
+                    name="paymentTermsDays"
+                    min="0"
+                    max="3650"
+                    value="${escapeHtml(this.editingSupplierTermsInput)}"
+                    placeholder="30"
+                    class="w-full h-9 px-2.5 rounded-md border border-slate-300 text-xs font-mono tabular-nums"
+                  />
+                </div>
+              </div>
+
+              <div>
+                <label class="block text-[11px] font-medium text-slate-600 mb-1">Observações Comerciais</label>
+                <input
+                  type="text"
+                  name="notes"
+                  maxlength="300"
+                  value="${escapeHtml(s.notes || '')}"
+                  placeholder="Condições de entrega, descontos de rappel, horário de descarga..."
+                  class="w-full h-9 px-2.5 rounded-md border border-slate-300 text-xs"
+                />
+              </div>
+
+              <label class="flex items-center gap-2 text-xs text-slate-700 cursor-pointer pt-1">
+                <input
+                  type="checkbox"
+                  name="active"
+                  ${s.active !== false ? 'checked' : ''}
+                  class="rounded border-slate-300"
+                />
+                <span>Fornecedor ativo para novas compras</span>
+              </label>
+
+              <div class="flex justify-end gap-2 pt-3 border-t border-slate-200">
+                <button
+                  type="button"
+                  data-action="cancel-supplier-form"
+                  class="h-9 px-4 rounded-lg border border-slate-200 hover:bg-slate-50 text-xs font-medium text-slate-700"
+                >Cancelar</button>
+                <button
+                  type="submit"
+                  class="h-9 px-4 rounded-lg bg-slate-900 hover:bg-slate-800 text-white text-xs font-semibold"
+                >Guardar fornecedor</button>
+              </div>
+            </form>
+          </div>
+        </div>
+      `;
+    }
+
+    let list = filterSuppliersSmart(this.suppliers, this.supplierSearch);
+    if (this.supplierFilter === 'WITH_PAYABLE') {
+      list = list.filter((s) => this.getSupplierOpenPayable(s.id) > 0);
+    } else if (this.supplierFilter === 'ACTIVE') {
+      list = list.filter((s) => s.active !== false);
+    } else if (this.supplierFilter === 'INACTIVE') {
+      list = list.filter((s) => s.active === false);
+    }
+
+    const selected =
+      list.find((s) => s.id === this.selectedSupplierDetailId) ||
+      this.suppliers.find((s) => s.id === this.selectedSupplierDetailId) ||
+      list[0] ||
+      null;
+
+    const openCashSession = this.getActiveOpenCashSession();
+
+    return `
+      <div class="flex-1 flex flex-col lg:flex-row overflow-hidden">
+        <!-- Lista de Fornecedores -->
+        <div class="flex-1 flex flex-col overflow-hidden border-b lg:border-b-0 lg:border-r border-slate-200">
+          <div class="p-3 sm:px-4 border-b border-slate-200 space-y-2.5 shrink-0">
+            <div class="relative">
+              <span class="absolute left-3 top-1/2 -translate-y-1/2 text-slate-400 pointer-events-none">${ICONS.search}</span>
+              <input
+                id="supplier-search-input"
+                type="text"
+                data-field="supplier-search"
+                value="${escapeHtml(this.supplierSearch)}"
+                placeholder="Pesquisar fornecedor por nome, NIF, telefone, IBAN ou localidade (F2)..."
+                class="w-full h-9 pl-9 pr-3 rounded-lg border border-slate-200 bg-slate-50 focus:bg-white text-xs"
+              />
+            </div>
+
+            <div class="flex flex-wrap items-center gap-1">
+              ${(
+                [
+                  { id: 'ALL', label: 'Todos' },
+                  { id: 'WITH_PAYABLE', label: 'Com saldo a pagar' },
+                  { id: 'ACTIVE', label: 'Ativos' },
+                  { id: 'INACTIVE', label: 'Inativos' },
+                ] as const
+              )
+                .map(
+                  (f) => `
+                    <button
+                      type="button"
+                      data-action="set-supplier-filter"
+                      data-value="${f.id}"
+                      class="px-2.5 py-1 rounded-md text-xs font-medium transition-colors whitespace-nowrap shrink-0 ${
+                        this.supplierFilter === f.id
+                          ? 'bg-slate-900 text-white'
+                          : 'bg-slate-100 text-slate-600 hover:text-slate-900'
+                      }"
+                    >${f.label}</button>
+                  `
+                )
+                .join('')}
+            </div>
+          </div>
+
+          <div class="flex-1 overflow-y-auto">
+            ${
+              list.length === 0
+                ? `
+                  <div class="p-8 text-center space-y-2">
+                    <div class="text-xs font-semibold text-slate-900">Nenhum fornecedor registado</div>
+                    <p class="text-xs text-slate-500 max-w-sm mx-auto">Cadastre os seus fornecedores com NIF, contactos e IBAN para agilizar compras e gerir contas a pagar.</p>
+                    ${
+                      canManage
+                        ? `
+                          <div class="pt-2">
+                            <button
+                              type="button"
+                              data-action="new-supplier"
+                              class="h-9 px-4 rounded-lg bg-slate-900 hover:bg-slate-800 text-white text-xs font-semibold inline-flex items-center gap-1.5 whitespace-nowrap"
+                            >${ICONS.userPlus}<span>Cadastrar fornecedor</span></button>
+                          </div>
+                        `
+                        : ''
+                    }
+                  </div>
+                `
+                : `
+                  <table class="w-full text-left border-collapse text-xs">
+                    <thead class="bg-slate-50 border-b border-slate-200 text-[11px] text-slate-500 sticky top-0 z-10">
+                      <tr>
+                        <th class="py-2.5 px-3 font-medium">Fornecedor</th>
+                        <th class="py-2.5 px-3 font-medium">NIF / Contacto</th>
+                        <th class="py-2.5 px-3 font-medium text-right">Compras (Kz)</th>
+                        <th class="py-2.5 px-3 font-medium text-right">A Pagar (Kz)</th>
+                      </tr>
+                    </thead>
+                    <tbody class="divide-y divide-slate-100 tabular-nums">
+                      ${list
+                        .map((sup) => {
+                          const isSelected = selected?.id === sup.id;
+                          const supPurchases = this.purchases.filter(
+                            (p) => p.status === 'recorded' && p.supplierId === sup.id
+                          );
+                          const totalBought = roundKz(
+                            supPurchases.reduce((acc, p) => acc + p.totalAmount, 0)
+                          );
+                          const openDue = this.getSupplierOpenPayable(sup.id);
+                          return `
+                            <tr
+                              data-action="select-supplier-detail"
+                              data-id="${escapeHtml(sup.id)}"
+                              class="cursor-pointer transition-colors ${
+                                isSelected ? 'bg-blue-50/70' : 'hover:bg-slate-50'
+                              }"
+                            >
+                              <td class="py-2.5 px-3">
+                                <div class="font-medium text-slate-900 ${sup.active === false ? 'line-through text-slate-400' : ''}">${escapeHtml(sup.name)}</div>
+                                <div class="text-[11px] text-slate-500">
+                                  ${escapeHtml(sup.locality || 'Angola')}${sup.paymentTermsDays ? ` · Prazo ${sup.paymentTermsDays}d` : ''}${sup.active === false ? ' · Inativo' : ''}
+                                </div>
+                              </td>
+                              <td class="py-2.5 px-3 font-mono text-[11px] text-slate-600">
+                                <div>${sup.nif ? escapeHtml(sup.nif) : '---'}</div>
+                                <div class="text-slate-400">${sup.phone ? escapeHtml(sup.phone) : ''}</div>
+                              </td>
+                              <td class="py-2.5 px-3 text-right font-mono text-slate-800">${formatKzNumber(totalBought)}</td>
+                              <td class="py-2.5 px-3 text-right font-mono ${openDue > 0 ? 'text-amber-700 font-semibold' : 'text-slate-400'}">${formatKzNumber(openDue)}</td>
+                            </tr>
+                          `;
+                        })
+                        .join('')}
+                    </tbody>
+                  </table>
+                `
+            }
+          </div>
+        </div>
+
+        <!-- Ficha Lateral do Fornecedor + Liquidação de Conta Corrente + Histórico -->
+        <div class="w-full lg:w-[420px] xl:w-[460px] shrink-0 overflow-y-auto bg-slate-50/40 p-4 space-y-4">
+          ${
+            !selected
+              ? `<div class="text-xs text-slate-500 py-8 text-center">Selecione um fornecedor para consultar dados comerciais, conta corrente e histórico de compras.</div>`
+              : (() => {
+                  const supPurchases = this.purchases.filter((p) => p.supplierId === selected.id);
+                  const activeSupPurchases = supPurchases.filter((p) => p.status === 'recorded');
+                  const totalBought = roundKz(
+                    activeSupPurchases.reduce((acc, p) => acc + p.totalAmount, 0)
+                  );
+                  const openDue = this.getSupplierOpenPayable(selected.id);
+                  const isSettlingAcct = this.settlingSupplierAccountId === selected.id;
+                  const askingDelete = this.confirmDeleteSupplierId === selected.id;
+
+                  return `
+                    <div class="bg-white border border-slate-200 rounded-lg p-4 space-y-4">
+                      <div class="flex items-start justify-between gap-2 pb-3 border-b border-slate-200">
+                        <div>
+                          <h3 class="text-sm font-bold text-slate-900">${escapeHtml(selected.name)}</h3>
+                          <div class="text-[11px] text-slate-500">
+                            <span>${selected.nif ? `NIF ${escapeHtml(selected.nif)}` : 'Sem NIF'}</span>
+                            <span aria-hidden="true"> · </span>
+                            <span>${escapeHtml(selected.locality || 'Angola')}</span>
+                            <span aria-hidden="true"> · </span>
+                            <span>${selected.active === false ? 'Inativo' : 'Ativo'}</span>
+                          </div>
+                        </div>
+                        ${
+                          canManage
+                            ? `
+                              <div class="flex items-center gap-1 shrink-0">
+                                <button
+                                  type="button"
+                                  data-action="edit-supplier"
+                                  data-id="${escapeHtml(selected.id)}"
+                                  title="Editar fornecedor"
+                                  class="h-8 px-2.5 rounded-md border border-slate-200 hover:bg-slate-50 text-xs text-slate-700 inline-flex items-center gap-1"
+                                >${ICONS.edit}<span>Editar</span></button>
+                                <button
+                                  type="button"
+                                  data-action="ask-delete-supplier"
+                                  data-id="${escapeHtml(selected.id)}"
+                                  title="Remover fornecedor"
+                                  class="h-8 w-8 rounded-md border border-slate-200 hover:bg-red-50 text-slate-500 hover:text-red-600 inline-flex items-center justify-center"
+                                >${ICONS.trash}</button>
+                              </div>
+                            `
+                            : ''
+                        }
+                      </div>
+
+                      ${
+                        askingDelete
+                          ? `
+                            <div class="p-3 rounded-lg border border-red-200 bg-red-50 space-y-2 text-xs">
+                              <div class="font-semibold text-red-900">Confirmar remoção de "${escapeHtml(selected.name)}"?</div>
+                              <p class="text-[11px] text-red-800">
+                                ${supPurchases.length > 0 ? 'Como existem compras associadas, o fornecedor será marcado como inativo preservando o histórico.' : 'O registo será eliminado permanentemente.'}
+                              </p>
+                              <div class="flex justify-end gap-2">
+                                <button type="button" data-action="cancel-delete-supplier" class="h-7 px-2.5 rounded border border-slate-300 bg-white text-slate-700">Cancelar</button>
+                                <button type="button" data-action="confirm-delete-supplier" data-id="${escapeHtml(selected.id)}" class="h-7 px-2.5 rounded bg-red-600 text-white font-semibold">Confirmar</button>
+                              </div>
+                            </div>
+                          `
+                          : ''
+                      }
+
+                      <div class="grid grid-cols-2 gap-2.5 text-xs">
+                        <div class="p-2.5 rounded-md border border-slate-200 bg-slate-50/70">
+                          <div class="text-[11px] text-slate-500">Volume Comprado</div>
+                          <div class="font-bold font-mono tabular-nums text-slate-900 mt-0.5">${formatKzNumber(totalBought)} Kz</div>
+                          <div class="text-[10px] text-slate-500 font-mono tabular-nums">${activeSupPurchases.length} compra(s)</div>
+                        </div>
+                        <div class="p-2.5 rounded-md border border-slate-200 bg-slate-50/70">
+                          <div class="text-[11px] text-slate-500">Saldo em Dívida</div>
+                          <div class="font-bold font-mono tabular-nums ${openDue > 0 ? 'text-amber-700' : 'text-emerald-700'} mt-0.5">${formatKzNumber(openDue)} Kz</div>
+                          <div class="text-[10px] text-slate-500">${selected.paymentTermsDays ? `Prazo: ${selected.paymentTermsDays} dias` : 'Pronto pagamento'}</div>
+                        </div>
+                      </div>
+
+                      <div class="space-y-1 text-xs text-slate-600">
+                        ${selected.phone ? `<div><strong>Telefone:</strong> <span class="font-mono">${escapeHtml(selected.phone)}</span></div>` : ''}
+                        ${selected.email ? `<div><strong>E-mail:</strong> ${escapeHtml(selected.email)}</div>` : ''}
+                        ${selected.contactPerson ? `<div><strong>Contacto:</strong> ${escapeHtml(selected.contactPerson)}</div>` : ''}
+                        ${selected.address ? `<div><strong>Endereço:</strong> ${escapeHtml(selected.address)}</div>` : ''}
+                        ${selected.iban ? `<div><strong>IBAN:</strong> <span class="font-mono text-[11px]">${escapeHtml(selected.iban)}</span></div>` : ''}
+                        ${selected.notes ? `<div><strong>Notas:</strong> ${escapeHtml(selected.notes)}</div>` : ''}
+                      </div>
+
+                      <div class="flex flex-wrap gap-2 pt-2 border-t border-slate-200">
+                        ${
+                          openDue > 0
+                            ? `
+                              <button
+                                type="button"
+                                data-action="open-settle-supplier-account"
+                                data-id="${escapeHtml(selected.id)}"
+                                class="flex-1 h-9 px-3 rounded-lg bg-emerald-600 hover:bg-emerald-700 text-white text-xs font-semibold whitespace-nowrap"
+                              >Liquidar conta (${formatKzNumber(openDue)} Kz)</button>
+                            `
+                            : ''
+                        }
+                        ${
+                          canManage
+                            ? `
+                              <button
+                                type="button"
+                                data-action="toggle-supplier-active"
+                                data-id="${escapeHtml(selected.id)}"
+                                class="h-9 px-3 rounded-lg border border-slate-200 hover:bg-slate-50 text-xs font-medium text-slate-700 whitespace-nowrap"
+                              >${selected.active === false ? 'Reativar' : 'Inativar'}</button>
+                            `
+                            : ''
+                        }
+                      </div>
+
+                      ${
+                        isSettlingAcct
+                          ? `
+                            <form data-form="settle-supplier-account-form" class="p-3 rounded-lg border border-slate-200 bg-slate-50 space-y-2.5">
+                              <div class="flex items-center justify-between">
+                                <span class="text-xs font-semibold text-slate-900">Pagamento em Conta Corrente (FIFO)</span>
+                                <button type="button" data-action="close-settle-supplier-account" class="text-xs text-slate-500">Fechar</button>
+                              </div>
+                              ${
+                                this.purchaseSettleError
+                                  ? `<div class="text-xs text-red-600">${escapeHtml(this.purchaseSettleError)}</div>`
+                                  : ''
+                              }
+                              <div class="grid grid-cols-2 gap-2">
+                                <div>
+                                  <label class="block text-[11px] font-medium text-slate-600 mb-1">Montante (Kz)</label>
+                                  <input
+                                    type="text"
+                                    name="settleAmount"
+                                    inputmode="decimal"
+                                    value="${escapeHtml(this.purchaseSettleAmountInput)}"
+                                    class="w-full h-8 px-2 rounded border border-slate-300 bg-white text-xs font-mono tabular-nums"
+                                  />
+                                </div>
+                                <div>
+                                  <label class="block text-[11px] font-medium text-slate-600 mb-1">Meio</label>
+                                  <select name="settleMethod" class="w-full h-8 px-2 rounded border border-slate-300 bg-white text-xs">
+                                    <option value="Transferência" ${this.purchaseSettleMethod === 'Transferência' ? 'selected' : ''}>Transferência</option>
+                                    <option value="Multicaixa" ${this.purchaseSettleMethod === 'Multicaixa' ? 'selected' : ''}>Multicaixa</option>
+                                    <option value="Dinheiro" ${this.purchaseSettleMethod === 'Dinheiro' ? 'selected' : ''}>Dinheiro</option>
+                                  </select>
+                                </div>
+                              </div>
+                              <div>
+                                <label class="block text-[11px] font-medium text-slate-600 mb-1">Referência / Comprovativo</label>
+                                <input
+                                  type="text"
+                                  name="settleReference"
+                                  maxlength="80"
+                                  value="${escapeHtml(this.purchaseSettleReference)}"
+                                  placeholder="Ex: TRF BAI 00912"
+                                  class="w-full h-8 px-2 rounded border border-slate-300 bg-white text-xs font-mono"
+                                />
+                              </div>
+                              ${
+                                openCashSession
+                                  ? `
+                                    <label class="flex items-center gap-2 text-[11px] text-slate-600 cursor-pointer">
+                                      <input
+                                        type="checkbox"
+                                        name="recordCash"
+                                        ${this.purchaseSettleRecordCash ? 'checked' : ''}
+                                        class="rounded border-slate-300"
+                                      />
+                                      <span>Registar saída na Caixa ${escapeHtml(openCashSession.cashier)}</span>
+                                    </label>
+                                  `
+                                  : ''
+                              }
+                              <button
+                                type="submit"
+                                class="w-full h-8 rounded-md bg-emerald-600 hover:bg-emerald-700 text-white text-xs font-semibold"
+                              >Confirmar pagamento ao fornecedor</button>
+                            </form>
+                          `
+                          : ''
+                      }
+
+                      <!-- Histórico de Compras deste Fornecedor -->
+                      <div class="pt-3 border-t border-slate-200 space-y-2">
+                        <div class="flex items-center justify-between">
+                          <span class="text-xs font-semibold text-slate-900">Histórico de Compras (${supPurchases.length})</span>
+                          ${
+                            supPurchases.length > 0
+                              ? `<button type="button" data-action="filter-purchases-by-supplier" data-id="${escapeHtml(selected.id)}" class="text-[11px] text-blue-600 hover:underline">Ver todas</button>`
+                              : ''
+                          }
+                        </div>
+                        ${
+                          supPurchases.length === 0
+                            ? `<p class="text-xs text-slate-500">Sem compras registadas para este fornecedor.</p>`
+                            : `
+                              <div class="divide-y divide-slate-100 border border-slate-200 rounded-md">
+                                ${supPurchases
+                                  .slice(0, 8)
+                                  .map((p) => {
+                                    const dt = formatDateTimePt(p.issuedAtIso);
+                                    return `
+                                      <button
+                                        type="button"
+                                        data-action="filter-purchases-by-supplier"
+                                        data-id="${escapeHtml(selected.id)}"
+                                        class="w-full py-2 px-2.5 text-left hover:bg-slate-50 flex items-center justify-between gap-2 text-xs tabular-nums"
+                                      >
+                                        <div>
+                                          <div class="font-mono font-medium text-slate-900 ${p.status === 'cancelled' ? 'line-through text-slate-400' : ''}">${escapeHtml(p.number)}</div>
+                                          <div class="text-[10px] text-slate-500">${dt.slashDate} · ${p.lines.length} item(ns)</div>
+                                        </div>
+                                        <div class="text-right font-mono">
+                                          <div class="font-semibold text-slate-900">${formatKzNumber(p.totalAmount)} Kz</div>
+                                          <div class="text-[10px] ${p.status === 'cancelled' ? 'text-slate-400' : p.amountDue > 0 ? 'text-amber-700' : 'text-emerald-700'}">
+                                            ${p.status === 'cancelled' ? 'Anulada' : p.amountDue > 0 ? `Dívida: ${formatKzNumber(p.amountDue)}` : 'Liquidada'}
+                                          </div>
+                                        </div>
+                                      </button>
+                                    `;
+                                  })
+                                  .join('')}
+                              </div>
+                            `
+                        }
+                      </div>
+                    </div>
+                  `;
+                })()
+          }
+        </div>
+      </div>
+    `;
+  }
+
+  // ==================== 7. GESTÃO FINANCEIRA (RECEBER/PAGAR, DESPESAS/RECEITAS, FLUXO, DRE & MARGENS) ====================
+
+  private isSupplierPaymentMovement(mov: CashMovement): boolean {
+    if (mov.type !== 'SAIDA') return false;
+    if (mov.entryKind === 'PAGAMENTO_FORNECEDOR') return true;
+    if (mov.purchaseId) return true;
+    return /^(Pagamento compra |Liquidação compra |Pagamento a fornecedor )/i.test(
+      (mov.reason || '').trim()
+    );
+  }
+
+  private isIsoInFinancePeriod(iso: string): boolean {
+    if (!iso || this.financePeriod === 'ALL') return true;
+    const now = new Date();
+    const todayStr = now.toISOString().slice(0, 10);
+    if (this.financePeriod === 'TODAY') {
+      return iso.slice(0, 10) === todayStr;
+    }
+    if (this.financePeriod === 'THIS_MONTH') {
+      return iso.slice(0, 7) === todayStr.slice(0, 7);
+    }
+    if (this.financePeriod === 'THIS_YEAR') {
+      return iso.slice(0, 4) === todayStr.slice(0, 4);
+    }
+    if (this.financePeriod === 'LAST_30D') {
+      const cutoff = new Date(now.getTime() - 30 * 86400000).toISOString();
+      return iso >= cutoff;
+    }
+    return true;
+  }
+
+  private getFinancePeriodLabel(): string {
+    switch (this.financePeriod) {
+      case 'TODAY':
+        return 'Hoje';
+      case 'THIS_MONTH':
+        return 'Este mês';
+      case 'LAST_30D':
+        return 'Últimos 30 dias';
+      case 'THIS_YEAR':
+        return 'Este ano';
+      case 'ALL':
+        return 'Todo o histórico';
+    }
+  }
+
+  private async submitFinanceEntry(fd: FormData): Promise<void> {
+    if (this.isCompanySuspended() || !this.activeCompany.id || !this.financeEntryPanel) return;
+    this.financeEntryError = null;
+
+    const kind = this.financeEntryPanel;
+    const isExpense = kind === 'DESPESA_OPERACIONAL';
+    const rawAmt = String(fd.get('amount') ?? this.financeEntryDraft.amountInput ?? '').trim();
+    const parsedAmt = parseDecimalInput(rawAmt);
+    if (Number.isNaN(parsedAmt) || parsedAmt <= 0 || parsedAmt > 999999999) {
+      this.financeEntryError = 'Indique um valor válido superior a 0,00 Kz.';
+      this.render();
+      return;
+    }
+
+    const defaultCats = isExpense ? DEFAULT_EXPENSE_CATEGORIES : DEFAULT_EXTRA_REVENUE_CATEGORIES;
+    const cleanCat = (
+      String(fd.get('category') ?? this.financeEntryDraft.category ?? '').trim() || defaultCats[0]
+    ).slice(0, 64);
+
+    const cleanReason = String(fd.get('reason') ?? this.financeEntryDraft.reason ?? '')
+      .trim()
+      .slice(0, 240);
+    if (cleanReason.length < 2) {
+      this.financeEntryError = 'Descreva o motivo ou detalhe do lançamento (mínimo 2 caracteres).';
+      this.render();
+      return;
+    }
+
+    const rawMethod = String(fd.get('paymentMethod') ?? this.financeEntryDraft.paymentMethod ?? '');
+    const method: DirectPaymentMethod =
+      rawMethod === 'Dinheiro' || rawMethod === 'Multicaixa' || rawMethod === 'Transferência'
+        ? rawMethod
+        : 'Transferência';
+    const cleanRef = String(fd.get('reference') ?? this.financeEntryDraft.reference ?? '')
+      .trim()
+      .slice(0, 80);
+    const affectDrawer =
+      method === 'Dinheiro' &&
+      (fd.has('affectCashDrawer')
+        ? fd.get('affectCashDrawer') === 'on'
+        : this.financeEntryDraft.affectCashDrawer);
+
+    const openSess = this.getActiveOpenCashSession();
+    const amt = roundKz(parsedAmt);
+
+    if (affectDrawer && openSess) {
+      if (isExpense) {
+        const liveSum = calculateCashSessionSummary(openSess, this.invoices, this.cashMovements);
+        const availCash = Math.max(0, roundKz(liveSum.expectedCash));
+        if (amt > availCash) {
+          this.financeEntryError = `Numerário insuficiente na gaveta da Caixa ${openSess.cashier} (${formatKzNumber(availCash)} Kz disponíveis). Desmarque "Retirar numerário físico na gaveta" ou selecione Transferência/Multicaixa.`;
+          this.render();
+          return;
+        }
+      }
+      const res = await this.recordCashDrawerMovement({
+        session: openSess,
+        type: isExpense ? 'SAIDA' : 'ENTRADA',
+        entryKind: kind,
+        category: cleanCat,
+        amount: amt,
+        paymentMethod: method,
+        reason: cleanReason,
+        ...(cleanRef ? { reference: cleanRef } : {}),
+      });
+      if (!res.ok) {
+        this.financeEntryError = res.error || 'Não foi possível registar o lançamento na caixa.';
+        this.render();
+        return;
+      }
+    } else {
+      const now = new Date().toISOString();
+      const mov: CashMovement = {
+        id: `cm_fin_${Date.now()}_${Math.random().toString(36).slice(2, 6)}`,
+        companyId: this.activeCompany.id,
+        sessionId: 'sem_turno',
+        cashier: openSess?.cashier || this.cashier || '01',
+        operator: openSess?.operator || this.operator || '001',
+        ...(this.user?.uid ? { createdByUid: this.user.uid } : {}),
+        type: isExpense ? 'SAIDA' : 'ENTRADA',
+        entryKind: kind,
+        category: cleanCat,
+        amount: amt,
+        paymentMethod: method,
+        reason: cleanReason,
+        ...(cleanRef ? { reference: cleanRef } : {}),
+        syncState: 'pending',
+        synced: false,
+        createdAtIso: now,
+      };
+      await this.persistAndSyncCashMovement(mov);
+    }
+
+    this.financeEntryPanel = null;
+    this.financeEntryError = null;
+    this.financeWorkspaceNotice = isExpense
+      ? `Despesa operacional registada (${cleanCat}): -${formatKzNumber(amt)} Kz via ${method}.`
+      : `Receita extraordinária registada (${cleanCat}): +${formatKzNumber(amt)} Kz via ${method}.`;
+    this.render();
+  }
+
+  private async submitFinanceProductCostEdit(productId: string, fd: FormData): Promise<void> {
+    if (!this.canManageCatalog() || !this.activeCompany.id) return;
+    const prod = this.products.find((p) => p.id === productId);
+    if (!prod) return;
+
+    this.financeEditProductError = null;
+    const rawCost = String(fd.get('costPrice') ?? this.financeEditCostInput ?? '').trim();
+    const rawPrice = String(fd.get('price') ?? this.financeEditPriceInput ?? '').trim();
+
+    const parsedCost = rawCost === '' ? 0 : parseDecimalInput(rawCost);
+    const parsedPrice = parseDecimalInput(rawPrice);
+
+    if (Number.isNaN(parsedCost) || parsedCost < 0) {
+      this.financeEditProductError = 'Indique um preço de aquisição válido (0 Kz ou superior).';
+      this.render();
+      return;
+    }
+    if (Number.isNaN(parsedPrice) || parsedPrice < 0) {
+      this.financeEditProductError = 'Indique um preço de venda válido.';
+      this.render();
+      return;
+    }
+
+    const validCost = rawCost !== '' && parsedCost > 0 ? roundKz(parsedCost) : undefined;
+    const finalPrice = roundKz(parsedPrice);
+    const prevCost =
+      typeof prod.costPrice === 'number' && prod.costPrice > 0
+        ? roundKz(prod.costPrice)
+        : undefined;
+    const priceChanged = roundKz(prod.price) !== finalPrice;
+    const costChanged = (prevCost ?? 0) !== (validCost ?? 0);
+
+    const now = new Date().toISOString();
+    const actorLabel = (this.user?.email || formatRoleLabelPt(this.getEffectiveRole())).slice(
+      0,
+      120
+    );
+    let nextPriceHistory = prod.priceHistory ? [...prod.priceHistory] : undefined;
+
+    if (priceChanged || costChanged) {
+      const entry: ProductPriceChange = {
+        changedAtIso: now,
+        previousPrice: roundKz(prod.price),
+        newPrice: finalPrice,
+        ...(typeof prevCost === 'number' ? { previousCost: prevCost } : {}),
+        ...(typeof validCost === 'number' ? { newCost: validCost } : {}),
+        changedBy: actorLabel,
+      };
+      nextPriceHistory = [entry, ...(nextPriceHistory || [])].slice(0, 20);
+    }
+
+    const { costPrice: _oldCost, priceHistory: _oldHist, ...restProd } = prod;
+    void _oldCost;
+    void _oldHist;
+
+    const updated: Product = {
+      ...restProd,
+      ...(typeof validCost === 'number' ? { costPrice: validCost } : {}),
+      price: finalPrice,
+      ...(nextPriceHistory && nextPriceHistory.length > 0
+        ? { priceHistory: nextPriceHistory }
+        : {}),
+      syncState: 'pending',
+      synced: false,
+      updatedAtIso: now,
+    };
+
+    await localDb.saveProduct(updated, this.activeCompany.id);
+    this.products = this.products.map((p) => (p.id === updated.id ? updated : p));
+    this.financeEditingProductId = null;
+    this.financeEditProductError = null;
+    this.financeWorkspaceNotice = `Custo e margem do artigo "${updated.name}" atualizados.`;
+    this.render();
+
+    if (this.user && this.isOnline && canCompanySyncCloudData(this.activeCompany)) {
+      void ensureCompanyRegisteredCloud(this.activeCompany)
+        .then(() => upsertProductCloud(updated, false, this.activeCompany))
+        .then(async () => {
+          const synced: Product = { ...updated, syncState: 'synced', synced: true };
+          await localDb.saveProduct(synced, this.activeCompany.id);
+          this.products = this.products.map((p) => (p.id === synced.id ? synced : p));
+          if (
+            this.activeModule === 'FINANCE' ||
+            this.activeModule === 'INDICATORS' ||
+            this.activeModule === 'SYNC'
+          ) {
+            this.render();
+          }
+        })
+        .catch(() => null);
+    }
+  }
+
+  private computeFinancialSnapshot() {
+    const todayIso = new Date().toISOString().slice(0, 10);
+    const directCustId = getDirectCustomerIdForCompany(this.activeCompany.id);
+
+    // 1. Mapa de custo de aquisição de reserva a partir das compras mais recentes registadas
+    const latestPurchaseCostByProd = new Map<string, number>();
+    const sortedRecordedPurchases = [...this.purchases]
+      .filter((p) => p.status === 'recorded')
+      .sort((a, b) => b.issuedAtIso.localeCompare(a.issuedAtIso));
+
+    for (const pur of sortedRecordedPurchases) {
+      for (const ln of pur.lines) {
+        if (ln.productId && ln.unitCost > 0 && !latestPurchaseCostByProd.has(ln.productId)) {
+          latestPurchaseCostByProd.set(ln.productId, roundKz(ln.unitCost));
+        }
+      }
+    }
+
+    const prodById = new Map(this.products.map((p) => [p.id, p]));
+    const prodByCode = new Map(this.products.map((p) => [p.code.trim().toLowerCase(), p]));
+
+    // 2. Contas a Receber, Vendas a Crédito, Dívidas de Clientes e Pagamentos Parciais (Estado Atual + Período)
+    const openReceivables: Array<{
+      invoice: InvoiceRecord;
+      payable: number;
+      paidSoFar: number;
+      due: number;
+      isPartial: boolean;
+      isCreditOrigin: boolean;
+    }> = [];
+    const settledCreditInvoices: Array<{
+      invoice: InvoiceRecord;
+      payable: number;
+    }> = [];
+
+    let totalReceivablesDue = 0;
+    let partialReceivablesCount = 0;
+    let partialReceivablesDue = 0;
+    let creditSalesOpenCount = 0;
+
+    const customerDebtMap = new Map<
+      string,
+      {
+        customerId: string;
+        name: string;
+        nif: string;
+        phone: string;
+        locality: string;
+        creditLimit: number;
+        openDebt: number;
+        paidOnOpen: number;
+        openCount: number;
+        partialCount: number;
+        oldestIso: string;
+      }
+    >();
+
+    // Séries temporais e referências diárias / mensais (Módulo 9 — passagem única)
+    const [tyStr, tmStr, tdStr] = todayIso.split('-');
+    const baseUtcMs = Date.UTC(Number(tyStr), Number(tmStr) - 1, Number(tdStr));
+    const yesterdayIso = new Date(baseUtcMs - 86400000).toISOString().slice(0, 10);
+    const currentMonthKey = todayIso.slice(0, 7);
+    const prevMonthKey = new Date(Date.UTC(Number(tyStr), Number(tmStr) - 2, 1))
+      .toISOString()
+      .slice(0, 7);
+
+    const monthShortPt = [
+      'Jan',
+      'Fev',
+      'Mar',
+      'Abr',
+      'Mai',
+      'Jun',
+      'Jul',
+      'Ago',
+      'Set',
+      'Out',
+      'Nov',
+      'Dez',
+    ];
+    const monthFullPt = [
+      'Janeiro',
+      'Fevereiro',
+      'Março',
+      'Abril',
+      'Maio',
+      'Junho',
+      'Julho',
+      'Agosto',
+      'Setembro',
+      'Outubro',
+      'Novembro',
+      'Dezembro',
+    ];
+
+    const dailyBucketMap = new Map<
+      string,
+      {
+        dateIso: string;
+        shortLabel: string;
+        fullLabel: string;
+        grossSales: number;
+        netSales: number;
+        txCount: number;
+      }
+    >();
+    for (let dOffset = 13; dOffset >= 0; dOffset--) {
+      const dIso = new Date(baseUtcMs - dOffset * 86400000).toISOString().slice(0, 10);
+      const [yy, mm, dd] = dIso.split('-');
+      dailyBucketMap.set(dIso, {
+        dateIso: dIso,
+        shortLabel: `${dd}/${mm}`,
+        fullLabel: `${dd}/${mm}/${yy}`,
+        grossSales: 0,
+        netSales: 0,
+        txCount: 0,
+      });
+    }
+
+    const monthlyBucketMap = new Map<
+      string,
+      {
+        monthKey: string;
+        shortLabel: string;
+        fullLabel: string;
+        grossSales: number;
+        netSales: number;
+        txCount: number;
+      }
+    >();
+    for (let mOffset = 5; mOffset >= 0; mOffset--) {
+      const mDate = new Date(Date.UTC(Number(tyStr), Number(tmStr) - 1 - mOffset, 1));
+      const mKey = mDate.toISOString().slice(0, 7);
+      const mIdx = mDate.getUTCMonth();
+      const yFull = mDate.getUTCFullYear();
+      monthlyBucketMap.set(mKey, {
+        monthKey: mKey,
+        shortLabel: `${monthShortPt[mIdx]}/${String(yFull).slice(2)}`,
+        fullLabel: `${monthFullPt[mIdx]} ${yFull}`,
+        grossSales: 0,
+        netSales: 0,
+        txCount: 0,
+      });
+    }
+
+    let todaySalesGross = 0;
+    let todaySalesNet = 0;
+    let todayTransactions = 0;
+    let yesterdaySalesGross = 0;
+    let yesterdayTransactions = 0;
+    let monthSalesGross = 0;
+    let monthSalesNet = 0;
+    let monthTransactions = 0;
+    let prevMonthSalesGross = 0;
+    let prevMonthTransactions = 0;
+
+    // Acumuladores do Resultado Comercial (DRE) no período selecionado
+    let periodInvoiceCount = 0;
+    let periodGrossItems = 0;
+    let periodDiscounts = 0;
+    let periodReturnCredits = 0;
+    let periodGrossInvoiced = 0;
+    let periodTaxIva = 0;
+    let periodNetSalesRevenue = 0;
+    let periodCreditSalesVolume = 0;
+    let periodCreditSalesCount = 0;
+    let periodEstimatedCogs = 0;
+    let periodUncostedLinesCount = 0;
+
+    const soldStatsByProd = new Map<
+      string,
+      {
+        qty: number;
+        netRevenue: number;
+        grossRevenue: number;
+        costTotal: number;
+        fallbackCode: string;
+        fallbackName: string;
+        fallbackUnit: string;
+      }
+    >();
+
+    const receivedByMethodRaw: Record<
+      DirectPaymentMethod,
+      { sales: number; debtCollections: number; refunds: number }
+    > = {
+      Dinheiro: { sales: 0, debtCollections: 0, refunds: 0 },
+      Multicaixa: { sales: 0, debtCollections: 0, refunds: 0 },
+      Transferência: { sales: 0, debtCollections: 0, refunds: 0 },
+    };
+
+    // Entradas e Saídas do Fluxo de Caixa no período selecionado
+    type CashflowItem = {
+      id: string;
+      iso: string;
+      kind:
+        | 'SALE_RECEIPT'
+        | 'DEBT_COLLECTION'
+        | 'EXTRA_REVENUE'
+        | 'OTHER_INFLOW'
+        | 'OPERATIONAL_EXPENSE'
+        | 'SUPPLIER_PAYMENT'
+        | 'INTERNAL_DRAWER';
+      direction: 'IN' | 'OUT' | 'INTERNAL';
+      category: string;
+      title: string;
+      subtitle: string;
+      method: string;
+      amount: number;
+      reference?: string;
+    };
+    const cashflowItems: CashflowItem[] = [];
+
+    let inflowSalesDirect = 0;
+    let inflowDebtCollections = 0;
+    let inflowExtraRevenues = 0;
+    let outflowSupplierPayments = 0;
+    let outflowOperationalExpenses = 0;
+    let outflowCustomerRefunds = 0;
+    let internalReforcos = 0;
+    let internalSangrias = 0;
+
+    const netByChannel: Record<DirectPaymentMethod, { inVal: number; outVal: number }> = {
+      Dinheiro: { inVal: 0, outVal: 0 },
+      Multicaixa: { inVal: 0, outVal: 0 },
+      Transferência: { inVal: 0, outVal: 0 },
+    };
+
+    for (const inv of this.invoices) {
+      if (inv.docType !== 'FR' || inv.status !== 'issued') continue;
+
+      const returnCred = Math.max(0, roundKz(inv.returnCreditApplied || 0));
+      const payable = Math.max(0, roundKz(inv.grandTotal - returnCred));
+      const due = Math.max(0, roundKz(inv.amountDue || 0));
+      const paidSoFar = Math.max(0, roundKz(payable - due));
+      const initRec =
+        typeof inv.initialAmountReceived === 'number'
+          ? roundKz(inv.initialAmountReceived)
+          : roundKz(inv.amountReceived);
+      const isCreditOrigin =
+        inv.paymentMethod === 'Crédito' ||
+        due > 0 ||
+        initRec < payable ||
+        this.cashMovements.some((m) => m.type === 'LIQUIDACAO_DIVIDA' && m.invoiceId === inv.id);
+      const isPartial = due > 0 && paidSoFar > 0;
+
+      // Acumulação diária e mensal fixa (Hoje / Ontem / Este mês / Mês anterior + Séries 14d e 6m)
+      const invDay = inv.issuedAtIso.slice(0, 10);
+      const invMonth = inv.issuedAtIso.slice(0, 7);
+      const invGrossVal = roundKz(inv.grandTotal);
+      const invNetVal = roundKz(inv.merchandiseTotal);
+
+      if (invDay === todayIso) {
+        todaySalesGross = roundKz(todaySalesGross + invGrossVal);
+        todaySalesNet = roundKz(todaySalesNet + invNetVal);
+        todayTransactions += 1;
+      } else if (invDay === yesterdayIso) {
+        yesterdaySalesGross = roundKz(yesterdaySalesGross + invGrossVal);
+        yesterdayTransactions += 1;
+      }
+      if (invMonth === currentMonthKey) {
+        monthSalesGross = roundKz(monthSalesGross + invGrossVal);
+        monthSalesNet = roundKz(monthSalesNet + invNetVal);
+        monthTransactions += 1;
+      } else if (invMonth === prevMonthKey) {
+        prevMonthSalesGross = roundKz(prevMonthSalesGross + invGrossVal);
+        prevMonthTransactions += 1;
+      }
+      const dBucket = dailyBucketMap.get(invDay);
+      if (dBucket) {
+        dBucket.grossSales = roundKz(dBucket.grossSales + invGrossVal);
+        dBucket.netSales = roundKz(dBucket.netSales + invNetVal);
+        dBucket.txCount += 1;
+      }
+      const mBucket = monthlyBucketMap.get(invMonth);
+      if (mBucket) {
+        mBucket.grossSales = roundKz(mBucket.grossSales + invGrossVal);
+        mBucket.netSales = roundKz(mBucket.netSales + invNetVal);
+        mBucket.txCount += 1;
+      }
+
+      if (due > 0) {
+        totalReceivablesDue = roundKz(totalReceivablesDue + due);
+        if (isPartial) {
+          partialReceivablesCount += 1;
+          partialReceivablesDue = roundKz(partialReceivablesDue + due);
+        }
+        if (isCreditOrigin) {
+          creditSalesOpenCount += 1;
+        }
+        openReceivables.push({
+          invoice: inv,
+          payable,
+          paidSoFar,
+          due,
+          isPartial,
+          isCreditOrigin,
+        });
+
+        const custKey = inv.customerId || `anon_${inv.customerName}`;
+        const catCust = this.customers.find((c) => c.id === inv.customerId);
+        const prev = customerDebtMap.get(custKey);
+        if (prev) {
+          prev.openDebt = roundKz(prev.openDebt + due);
+          prev.paidOnOpen = roundKz(prev.paidOnOpen + paidSoFar);
+          prev.openCount += 1;
+          if (isPartial) prev.partialCount += 1;
+          if (inv.issuedAtIso < prev.oldestIso) prev.oldestIso = inv.issuedAtIso;
+        } else {
+          customerDebtMap.set(custKey, {
+            customerId: inv.customerId || '',
+            name: catCust?.name || inv.customerName || 'Cliente',
+            nif: catCust?.nif || inv.customerNif || '---',
+            phone: catCust?.phone || '',
+            locality: catCust?.locality || inv.customerLocality || '',
+            creditLimit:
+              catCust?.creditLimit && catCust.creditLimit > 0 ? roundKz(catCust.creditLimit) : 0,
+            openDebt: due,
+            paidOnOpen: paidSoFar,
+            openCount: 1,
+            partialCount: isPartial ? 1 : 0,
+            oldestIso: inv.issuedAtIso,
+          });
+        }
+      } else if (isCreditOrigin && payable > 0) {
+        settledCreditInvoices.push({ invoice: inv, payable });
+      }
+
+      // Métricas comerciais e entradas diretas de venda no período selecionado
+      if (this.isIsoInFinancePeriod(inv.issuedAtIso)) {
+        periodInvoiceCount += 1;
+        const grossItems = roundKz(inv.merchandiseTotal + (inv.discountTotal || 0));
+        periodGrossItems = roundKz(periodGrossItems + grossItems);
+        periodDiscounts = roundKz(periodDiscounts + roundKz(inv.discountTotal || 0));
+        periodReturnCredits = roundKz(periodReturnCredits + returnCred);
+        periodGrossInvoiced = roundKz(periodGrossInvoiced + invGrossVal);
+        periodTaxIva = roundKz(periodTaxIva + roundKz(inv.taxTotal));
+        periodNetSalesRevenue = roundKz(periodNetSalesRevenue + invNetVal);
+
+        const br = extractInvoiceSaleReceipts(inv);
+        if (br.credit > 0 || inv.paymentMethod === 'Crédito') {
+          periodCreditSalesVolume = roundKz(
+            periodCreditSalesVolume + (br.credit > 0 ? br.credit : payable)
+          );
+          periodCreditSalesCount += 1;
+        }
+
+        if (br.netReceived > 0) {
+          inflowSalesDirect = roundKz(inflowSalesDirect + br.netReceived);
+          netByChannel.Dinheiro.inVal = roundKz(netByChannel.Dinheiro.inVal + br.cash);
+          netByChannel.Multicaixa.inVal = roundKz(netByChannel.Multicaixa.inVal + br.multicaixa);
+          netByChannel.Transferência.inVal = roundKz(
+            netByChannel.Transferência.inVal + br.transfer
+          );
+          receivedByMethodRaw.Dinheiro.sales = roundKz(
+            receivedByMethodRaw.Dinheiro.sales + br.cash
+          );
+          receivedByMethodRaw.Multicaixa.sales = roundKz(
+            receivedByMethodRaw.Multicaixa.sales + br.multicaixa
+          );
+          receivedByMethodRaw.Transferência.sales = roundKz(
+            receivedByMethodRaw.Transferência.sales + br.transfer
+          );
+
+          const methodLabel =
+            inv.paymentMethod === 'Combinado'
+              ? [
+                  br.cash > 0 ? `Dinheiro ${formatKzNumber(br.cash)}` : '',
+                  br.multicaixa > 0 ? `MCX ${formatKzNumber(br.multicaixa)}` : '',
+                  br.transfer > 0 ? `Trf ${formatKzNumber(br.transfer)}` : '',
+                ]
+                  .filter(Boolean)
+                  .join(' + ')
+              : inv.paymentMethod === 'Crédito'
+                ? 'Entrada inicial'
+                : inv.paymentMethod;
+
+          cashflowItems.push({
+            id: `cf_sale_${inv.id}`,
+            iso: inv.issuedAtIso,
+            kind: 'SALE_RECEIPT',
+            direction: 'IN',
+            category: 'Recebimento de Vendas',
+            title: `Venda ${inv.number}`,
+            subtitle:
+              inv.customerId === directCustId ? 'Consumidor Final' : inv.customerName || 'Cliente',
+            method: methodLabel,
+            amount: br.netReceived,
+            ...(inv.transferReference ? { reference: inv.transferReference } : {}),
+          });
+        }
+
+        const globalDiscFactor =
+          typeof inv.globalDiscountPct === 'number' && inv.globalDiscountPct > 0
+            ? Math.max(0, 1 - inv.globalDiscountPct / 100)
+            : 1;
+
+        for (const line of inv.lines) {
+          const matchedProd =
+            prodById.get(line.productId) ||
+            (line.code ? prodByCode.get(line.code.trim().toLowerCase()) : undefined);
+          const resolvedKey = matchedProd?.id || line.productId || `code_${line.code}`;
+          const unitCost =
+            matchedProd && typeof matchedProd.costPrice === 'number' && matchedProd.costPrice > 0
+              ? roundKz(matchedProd.costPrice)
+              : latestPurchaseCostByProd.get(resolvedKey) || 0;
+
+          if (unitCost <= 0) {
+            periodUncostedLinesCount += 1;
+          }
+
+          const lineGrossAfterGlobal = roundKz(line.lineTotal * globalDiscFactor);
+          const lineNetRevenue =
+            line.ivaRate === 14 ? roundKz(lineGrossAfterGlobal / 1.14) : lineGrossAfterGlobal;
+          const lineCostTotal = unitCost > 0 ? roundKz(line.qty * unitCost) : 0;
+
+          periodEstimatedCogs = roundKz(periodEstimatedCogs + lineCostTotal);
+
+          const curStat = soldStatsByProd.get(resolvedKey);
+          if (curStat) {
+            curStat.qty = roundKz(curStat.qty + line.qty);
+            curStat.netRevenue = roundKz(curStat.netRevenue + lineNetRevenue);
+            curStat.grossRevenue = roundKz(curStat.grossRevenue + lineGrossAfterGlobal);
+            curStat.costTotal = roundKz(curStat.costTotal + lineCostTotal);
+          } else {
+            soldStatsByProd.set(resolvedKey, {
+              qty: roundKz(line.qty),
+              netRevenue: lineNetRevenue,
+              grossRevenue: lineGrossAfterGlobal,
+              costTotal: lineCostTotal,
+              fallbackCode: line.code || 'S/COD',
+              fallbackName: line.description || 'Artigo',
+              fallbackUnit: line.unit || 'un',
+            });
+          }
+        }
+      }
+    }
+
+    // Dedução comercial de Notas de Crédito (NC) válidas (nas séries diárias/mensais e no período ativo)
+    for (const nc of this.invoices) {
+      if (nc.docType !== 'NC' || nc.status !== 'issued') continue;
+
+      const ncDay = nc.issuedAtIso.slice(0, 10);
+      const ncMonth = nc.issuedAtIso.slice(0, 7);
+      const ncGrossVal = roundKz(nc.grandTotal);
+      const ncNetVal = roundKz(nc.merchandiseTotal);
+
+      if (ncDay === todayIso) {
+        todaySalesGross = Math.max(0, roundKz(todaySalesGross - ncGrossVal));
+        todaySalesNet = Math.max(0, roundKz(todaySalesNet - ncNetVal));
+      } else if (ncDay === yesterdayIso) {
+        yesterdaySalesGross = Math.max(0, roundKz(yesterdaySalesGross - ncGrossVal));
+      }
+      if (ncMonth === currentMonthKey) {
+        monthSalesGross = Math.max(0, roundKz(monthSalesGross - ncGrossVal));
+        monthSalesNet = Math.max(0, roundKz(monthSalesNet - ncNetVal));
+      } else if (ncMonth === prevMonthKey) {
+        prevMonthSalesGross = Math.max(0, roundKz(prevMonthSalesGross - ncGrossVal));
+      }
+      const dNcBucket = dailyBucketMap.get(ncDay);
+      if (dNcBucket) {
+        dNcBucket.grossSales = Math.max(0, roundKz(dNcBucket.grossSales - ncGrossVal));
+        dNcBucket.netSales = Math.max(0, roundKz(dNcBucket.netSales - ncNetVal));
+      }
+      const mNcBucket = monthlyBucketMap.get(ncMonth);
+      if (mNcBucket) {
+        mNcBucket.grossSales = Math.max(0, roundKz(mNcBucket.grossSales - ncGrossVal));
+        mNcBucket.netSales = Math.max(0, roundKz(mNcBucket.netSales - ncNetVal));
+      }
+
+      if (!this.isIsoInFinancePeriod(nc.issuedAtIso)) continue;
+
+      periodReturnCredits = roundKz(periodReturnCredits + ncGrossVal);
+      periodGrossInvoiced = Math.max(0, roundKz(periodGrossInvoiced - ncGrossVal));
+      periodTaxIva = Math.max(0, roundKz(periodTaxIva - roundKz(nc.taxTotal)));
+      periodNetSalesRevenue = Math.max(0, roundKz(periodNetSalesRevenue - ncNetVal));
+
+      const globalDiscFactor =
+        typeof nc.globalDiscountPct === 'number' && nc.globalDiscountPct > 0
+          ? Math.max(0, 1 - nc.globalDiscountPct / 100)
+          : 1;
+
+      for (const line of nc.lines) {
+        const matchedProd =
+          prodById.get(line.productId) ||
+          (line.code ? prodByCode.get(line.code.trim().toLowerCase()) : undefined);
+        const resolvedKey = matchedProd?.id || line.productId || `code_${line.code}`;
+        const unitCost =
+          matchedProd && typeof matchedProd.costPrice === 'number' && matchedProd.costPrice > 0
+            ? roundKz(matchedProd.costPrice)
+            : latestPurchaseCostByProd.get(resolvedKey) || 0;
+
+        const lineGrossAfterGlobal = roundKz(line.lineTotal * globalDiscFactor);
+        const lineNetRevenue =
+          line.ivaRate === 14 ? roundKz(lineGrossAfterGlobal / 1.14) : lineGrossAfterGlobal;
+        const lineCostTotal = unitCost > 0 ? roundKz(line.qty * unitCost) : 0;
+
+        periodEstimatedCogs = Math.max(0, roundKz(periodEstimatedCogs - lineCostTotal));
+
+        const curStat = soldStatsByProd.get(resolvedKey);
+        if (curStat) {
+          curStat.qty = Math.max(0, roundKz(curStat.qty - line.qty));
+          curStat.netRevenue = Math.max(0, roundKz(curStat.netRevenue - lineNetRevenue));
+          curStat.grossRevenue = Math.max(0, roundKz(curStat.grossRevenue - lineGrossAfterGlobal));
+          curStat.costTotal = Math.max(0, roundKz(curStat.costTotal - lineCostTotal));
+        }
+      }
+    }
+
+    // 3. Contas a Pagar e Saldos de Fornecedores
+    const openPayables: Array<{
+      purchase: PurchaseRecord;
+      isOverdue: boolean;
+      isPartial: boolean;
+    }> = [];
+    let totalPayablesDue = 0;
+    let overduePayablesDue = 0;
+    let overduePayablesCount = 0;
+    let partialPayablesCount = 0;
+    let partialPayablesDue = 0;
+
+    const supplierPayableMap = new Map<
+      string,
+      {
+        supplierId: string;
+        name: string;
+        nif: string;
+        phone: string;
+        locality: string;
+        openPayable: number;
+        overduePayable: number;
+        paidOnOpen: number;
+        openCount: number;
+        partialCount: number;
+      }
+    >();
+
+    const cancelledPurchaseIds = new Set(
+      this.purchases.filter((p) => p.status === 'cancelled').map((p) => p.id)
+    );
+
+    // Soma já coberta por movimentos de caixa de fornecedores (evita qualquer dupla contagem com PurchaseRecord.amountPaid)
+    const coveredByMovementsPerPurchase = new Map<string, number>();
+    for (const mov of this.cashMovements) {
+      if (!this.isSupplierPaymentMovement(mov)) continue;
+      if (mov.purchaseId) {
+        coveredByMovementsPerPurchase.set(
+          mov.purchaseId,
+          roundKz((coveredByMovementsPerPurchase.get(mov.purchaseId) || 0) + mov.amount)
+        );
+      } else {
+        const matchedPur = this.purchases.find(
+          (p) => p.number && mov.reason && mov.reason.includes(p.number)
+        );
+        if (matchedPur) {
+          coveredByMovementsPerPurchase.set(
+            matchedPur.id,
+            roundKz((coveredByMovementsPerPurchase.get(matchedPur.id) || 0) + mov.amount)
+          );
+        }
+      }
+    }
+
+    for (const pur of this.purchases) {
+      if (pur.status !== 'recorded') continue;
+      const due = Math.max(0, roundKz(pur.amountDue || 0));
+      const paid = Math.max(0, roundKz(pur.amountPaid || 0));
+      const isOverdue = due > 0 && Boolean(pur.dueDateIso && pur.dueDateIso < todayIso);
+      const isPartial = due > 0 && paid > 0;
+
+      if (due > 0) {
+        totalPayablesDue = roundKz(totalPayablesDue + due);
+        if (isOverdue) {
+          overduePayablesDue = roundKz(overduePayablesDue + due);
+          overduePayablesCount += 1;
+        }
+        if (isPartial) {
+          partialPayablesCount += 1;
+          partialPayablesDue = roundKz(partialPayablesDue + due);
+        }
+        openPayables.push({ purchase: pur, isOverdue, isPartial });
+
+        const supObj = this.suppliers.find((s) => s.id === pur.supplierId);
+        const supKey = pur.supplierId || `sup_${pur.supplierName}`;
+        const prevSup = supplierPayableMap.get(supKey);
+        if (prevSup) {
+          prevSup.openPayable = roundKz(prevSup.openPayable + due);
+          if (isOverdue) prevSup.overduePayable = roundKz(prevSup.overduePayable + due);
+          prevSup.paidOnOpen = roundKz(prevSup.paidOnOpen + paid);
+          prevSup.openCount += 1;
+          if (isPartial) prevSup.partialCount += 1;
+        } else {
+          supplierPayableMap.set(supKey, {
+            supplierId: pur.supplierId,
+            name: supObj?.name || pur.supplierName || 'Fornecedor',
+            nif: supObj?.nif || pur.supplierNif || '---',
+            phone: supObj?.phone || '',
+            locality: supObj?.locality || '',
+            openPayable: due,
+            overduePayable: isOverdue ? due : 0,
+            paidOnOpen: paid,
+            openCount: 1,
+            partialCount: isPartial ? 1 : 0,
+          });
+        }
+      }
+
+      // Compras pagas sem movimento individual em cash_movements (ex: registos históricos sem turno aberto)
+      const covered = coveredByMovementsPerPurchase.get(pur.id) || 0;
+      const uncoveredPaid = Math.max(0, roundKz(paid - covered));
+      if (uncoveredPaid > 0 && this.isIsoInFinancePeriod(pur.issuedAtIso)) {
+        outflowSupplierPayments = roundKz(outflowSupplierPayments + uncoveredPaid);
+        const ch: DirectPaymentMethod =
+          pur.paymentMethod === 'Dinheiro' || pur.paymentMethod === 'Multicaixa'
+            ? pur.paymentMethod
+            : 'Transferência';
+        netByChannel[ch].outVal = roundKz(netByChannel[ch].outVal + uncoveredPaid);
+        cashflowItems.push({
+          id: `cf_pur_uncov_${pur.id}`,
+          iso: pur.issuedAtIso,
+          kind: 'SUPPLIER_PAYMENT',
+          direction: 'OUT',
+          category: 'Fornecedores e Compras',
+          title: `Compra ${pur.number}`,
+          subtitle: pur.supplierName,
+          method: ch,
+          amount: uncoveredPaid,
+          ...(pur.reference || pur.supplierInvoiceRef
+            ? { reference: pur.reference || pur.supplierInvoiceRef }
+            : {}),
+        });
+      }
+    }
+
+    // 4. Movimentos Financeiros e de Caixa no Período (Cobranças, Despesas Operacionais, Receitas Extra, Pagamentos a Fornecedores)
+    const expenseByCategory = new Map<string, { category: string; amount: number; count: number }>();
+    const extraRevenueByCategory = new Map<
+      string,
+      { category: string; amount: number; count: number }
+    >();
+
+    for (const mov of this.cashMovements) {
+      if (!this.isIsoInFinancePeriod(mov.createdAtIso)) continue;
+      const amt = Math.max(0, roundKz(Number(mov.amount) || 0));
+      if (amt <= 0) continue;
+      if (mov.purchaseId && cancelledPurchaseIds.has(mov.purchaseId)) continue;
+
+      const ch: DirectPaymentMethod =
+        mov.paymentMethod === 'Dinheiro' ||
+        mov.paymentMethod === 'Multicaixa' ||
+        mov.paymentMethod === 'Transferência'
+          ? mov.paymentMethod
+          : 'Dinheiro';
+
+      if (mov.type === 'LIQUIDACAO_DIVIDA') {
+        inflowDebtCollections = roundKz(inflowDebtCollections + amt);
+        netByChannel[ch].inVal = roundKz(netByChannel[ch].inVal + amt);
+        receivedByMethodRaw[ch].debtCollections = roundKz(
+          receivedByMethodRaw[ch].debtCollections + amt
+        );
+        cashflowItems.push({
+          id: mov.id,
+          iso: mov.createdAtIso,
+          kind: 'DEBT_COLLECTION',
+          direction: 'IN',
+          category: 'Cobrança de Dívida',
+          title: mov.reason || `Liquidação ${mov.invoiceNumber || ''}`.trim(),
+          subtitle: mov.customerName || 'Cliente',
+          method: ch,
+          amount: amt,
+          ...(mov.reference ? { reference: mov.reference } : {}),
+        });
+      } else if (mov.type === 'ENTRADA') {
+        inflowExtraRevenues = roundKz(inflowExtraRevenues + amt);
+        netByChannel[ch].inVal = roundKz(netByChannel[ch].inVal + amt);
+        const cat =
+          mov.category ||
+          (mov.entryKind === 'RECEITA_EXTRAORDINARIA'
+            ? 'Receitas Extraordinárias'
+            : 'Outras Entradas de Caixa');
+        const prevCat = extraRevenueByCategory.get(cat);
+        if (prevCat) {
+          prevCat.amount = roundKz(prevCat.amount + amt);
+          prevCat.count += 1;
+        } else {
+          extraRevenueByCategory.set(cat, { category: cat, amount: amt, count: 1 });
+        }
+        cashflowItems.push({
+          id: mov.id,
+          iso: mov.createdAtIso,
+          kind: mov.entryKind === 'RECEITA_EXTRAORDINARIA' ? 'EXTRA_REVENUE' : 'OTHER_INFLOW',
+          direction: 'IN',
+          category: cat,
+          title: mov.reason,
+          subtitle: mov.sessionId === 'sem_turno' ? 'Tesouraria / Empresa' : `Caixa ${mov.cashier}`,
+          method: ch,
+          amount: amt,
+          ...(mov.reference ? { reference: mov.reference } : {}),
+        });
+      } else if (mov.type === 'SAIDA') {
+        const isCustomerRefund =
+          mov.category === 'Reembolsos e Devoluções de Clientes' ||
+          /^Reembolso Nota de Crédito /i.test((mov.reason || '').trim());
+        if (this.isSupplierPaymentMovement(mov)) {
+          outflowSupplierPayments = roundKz(outflowSupplierPayments + amt);
+          netByChannel[ch].outVal = roundKz(netByChannel[ch].outVal + amt);
+          cashflowItems.push({
+            id: mov.id,
+            iso: mov.createdAtIso,
+            kind: 'SUPPLIER_PAYMENT',
+            direction: 'OUT',
+            category: 'Fornecedores e Compras',
+            title: mov.reason,
+            subtitle:
+              mov.sessionId === 'sem_turno' ? 'Tesouraria / Empresa' : `Caixa ${mov.cashier}`,
+            method: ch,
+            amount: amt,
+            ...(mov.reference ? { reference: mov.reference } : {}),
+          });
+        } else if (isCustomerRefund) {
+          outflowCustomerRefunds = roundKz(outflowCustomerRefunds + amt);
+          netByChannel[ch].outVal = roundKz(netByChannel[ch].outVal + amt);
+          receivedByMethodRaw[ch].refunds = roundKz(receivedByMethodRaw[ch].refunds + amt);
+          cashflowItems.push({
+            id: mov.id,
+            iso: mov.createdAtIso,
+            kind: 'OPERATIONAL_EXPENSE',
+            direction: 'OUT',
+            category: 'Reembolsos e Devoluções de Clientes',
+            title: mov.reason,
+            subtitle:
+              mov.sessionId === 'sem_turno' ? 'Tesouraria / Empresa' : `Caixa ${mov.cashier}`,
+            method: ch,
+            amount: amt,
+            ...(mov.reference ? { reference: mov.reference } : {}),
+          });
+        } else {
+          outflowOperationalExpenses = roundKz(outflowOperationalExpenses + amt);
+          netByChannel[ch].outVal = roundKz(netByChannel[ch].outVal + amt);
+          const cat =
+            mov.category ||
+            (mov.entryKind === 'DESPESA_OPERACIONAL'
+              ? 'Outras Despesas Operacionais'
+              : 'Saídas Operacionais de Caixa');
+          const prevExp = expenseByCategory.get(cat);
+          if (prevExp) {
+            prevExp.amount = roundKz(prevExp.amount + amt);
+            prevExp.count += 1;
+          } else {
+            expenseByCategory.set(cat, { category: cat, amount: amt, count: 1 });
+          }
+          cashflowItems.push({
+            id: mov.id,
+            iso: mov.createdAtIso,
+            kind: 'OPERATIONAL_EXPENSE',
+            direction: 'OUT',
+            category: cat,
+            title: mov.reason,
+            subtitle:
+              mov.sessionId === 'sem_turno' ? 'Tesouraria / Empresa' : `Caixa ${mov.cashier}`,
+            method: ch,
+            amount: amt,
+            ...(mov.reference ? { reference: mov.reference } : {}),
+          });
+        }
+      } else if (mov.type === 'REFORCO' || mov.type === 'SANGRIA') {
+        if (mov.type === 'REFORCO') internalReforcos = roundKz(internalReforcos + amt);
+        else internalSangrias = roundKz(internalSangrias + amt);
+        cashflowItems.push({
+          id: mov.id,
+          iso: mov.createdAtIso,
+          kind: 'INTERNAL_DRAWER',
+          direction: 'INTERNAL',
+          category: mov.type === 'REFORCO' ? 'Reforço de Trocos' : 'Sangria para Cofre',
+          title: mov.reason,
+          subtitle: `Caixa ${mov.cashier} · Mov. interno`,
+          method: 'Dinheiro',
+          amount: amt,
+          ...(mov.reference ? { reference: mov.reference } : {}),
+        });
+      }
+    }
+
+    cashflowItems.sort((a, b) => b.iso.localeCompare(a.iso));
+
+    const totalCashInflows = roundKz(
+      inflowSalesDirect + inflowDebtCollections + inflowExtraRevenues
+    );
+    const totalCashOutflows = roundKz(
+      outflowSupplierPayments + outflowOperationalExpenses + outflowCustomerRefunds
+    );
+    const netCashFlow = roundKz(totalCashInflows - totalCashOutflows);
+
+    const grossProfit = roundKz(periodNetSalesRevenue - periodEstimatedCogs);
+    const grossMarginPct =
+      periodNetSalesRevenue > 0 ? roundKz((grossProfit / periodNetSalesRevenue) * 100) : 0;
+    const netCommercialResult = roundKz(
+      grossProfit + inflowExtraRevenues - outflowOperationalExpenses
+    );
+    const netResultMarginPct =
+      periodNetSalesRevenue + inflowExtraRevenues > 0
+        ? roundKz(
+            (netCommercialResult / (periodNetSalesRevenue + inflowExtraRevenues)) * 100
+          )
+        : 0;
+
+    // 5. Margem de Lucro por Produto + Stock Disponível e Stock Crítico (numa única passagem)
+    let activeCatalogCount = 0;
+    let trackedStockCount = 0;
+    let availableUnitsTotal = 0;
+    let stockCostValuation = 0;
+    let stockRetailValuation = 0;
+    const outOfStockProducts: Product[] = [];
+    const lowStockProducts: Product[] = [];
+
+    const productMargins = this.products.map((prod) => {
+      const catCost =
+        typeof prod.costPrice === 'number' && prod.costPrice > 0 ? roundKz(prod.costPrice) : 0;
+      const fallbackCost = latestPurchaseCostByProd.get(prod.id) || 0;
+      const unitCost = catCost > 0 ? catCost : fallbackCost;
+      const costSource: 'catalog' | 'purchase' | 'none' =
+        catCost > 0 ? 'catalog' : fallbackCost > 0 ? 'purchase' : 'none';
+
+      const grossPrice = roundKz(prod.price);
+      const netUnitPrice = prod.ivaRate === 14 ? roundKz(grossPrice / 1.14) : grossPrice;
+      const unitProfit = unitCost > 0 ? roundKz(netUnitPrice - unitCost) : null;
+      const marginPct =
+        unitProfit !== null && netUnitPrice > 0
+          ? roundKz((unitProfit / netUnitPrice) * 100)
+          : null;
+      const markupPct =
+        unitProfit !== null && unitCost > 0 ? roundKz((unitProfit / unitCost) * 100) : null;
+
+      const sold = soldStatsByProd.get(prod.id) || {
+        qty: 0,
+        netRevenue: 0,
+        grossRevenue: 0,
+        costTotal: 0,
+        fallbackCode: prod.code,
+        fallbackName: prod.name,
+        fallbackUnit: prod.unit || 'un',
+      };
+      const realizedProfit =
+        sold.qty > 0
+          ? unitCost > 0
+            ? roundKz(sold.netRevenue - sold.costTotal)
+            : roundKz(sold.netRevenue)
+          : 0;
+
+      if (prod.active !== false) {
+        activeCatalogCount += 1;
+        if (prod.trackStock) {
+          trackedStockCount += 1;
+          const q = roundKz(prod.stockQty ?? 0);
+          const minQ = roundKz(prod.minStockQty ?? 0);
+          if (q > 0) {
+            availableUnitsTotal = roundKz(availableUnitsTotal + q);
+            if (unitCost > 0) {
+              stockCostValuation = roundKz(stockCostValuation + q * unitCost);
+            }
+            stockRetailValuation = roundKz(stockRetailValuation + q * grossPrice);
+            if (minQ > 0 && q <= minQ) {
+              lowStockProducts.push(prod);
+            }
+          } else {
+            outOfStockProducts.push(prod);
+          }
+        }
+      }
+
+      return {
+        product: prod,
+        unitCost,
+        costSource,
+        netUnitPrice,
+        grossPrice,
+        unitProfit,
+        marginPct,
+        markupPct,
+        soldQty: sold.qty,
+        soldNetRevenue: sold.netRevenue,
+        soldGrossRevenue: sold.grossRevenue,
+        soldCostTotal: sold.costTotal,
+        realizedProfit,
+      };
+    });
+
+    // Rankings Comerciais e Indicadores Derivados (Módulo 9)
+    const todayAvgTicket =
+      todayTransactions > 0 ? roundKz(todaySalesGross / todayTransactions) : 0;
+    const monthAvgTicket =
+      monthTransactions > 0 ? roundKz(monthSalesGross / monthTransactions) : 0;
+    const periodAvgTicket =
+      periodInvoiceCount > 0 ? roundKz(periodGrossInvoiced / periodInvoiceCount) : 0;
+    const todayGrowthPct =
+      yesterdaySalesGross > 0
+        ? roundKz(((todaySalesGross - yesterdaySalesGross) / yesterdaySalesGross) * 100)
+        : null;
+    const monthGrowthPct =
+      prevMonthSalesGross > 0
+        ? roundKz(((monthSalesGross - prevMonthSalesGross) / prevMonthSalesGross) * 100)
+        : null;
+
+    const dailySalesSeries = Array.from(dailyBucketMap.values()).map((d) => ({
+      ...d,
+      avgTicket: d.txCount > 0 ? roundKz(d.grossSales / d.txCount) : 0,
+    }));
+    const monthlySalesSeries = Array.from(monthlyBucketMap.values()).map((m) => ({
+      ...m,
+      avgTicket: m.txCount > 0 ? roundKz(m.grossSales / m.txCount) : 0,
+    }));
+
+    const receivedChannelsOrder: DirectPaymentMethod[] = [
+      'Dinheiro',
+      'Multicaixa',
+      'Transferência',
+    ];
+    const receivedMethodNetMap: Record<
+      DirectPaymentMethod,
+      {
+        method: DirectPaymentMethod;
+        sales: number;
+        debtCollections: number;
+        refunds: number;
+        net: number;
+        sharePct: number;
+      }
+    > = {
+      Dinheiro: {
+        method: 'Dinheiro',
+        ...receivedByMethodRaw.Dinheiro,
+        net: Math.max(
+          0,
+          roundKz(
+            receivedByMethodRaw.Dinheiro.sales +
+              receivedByMethodRaw.Dinheiro.debtCollections -
+              receivedByMethodRaw.Dinheiro.refunds
+          )
+        ),
+        sharePct: 0,
+      },
+      Multicaixa: {
+        method: 'Multicaixa',
+        ...receivedByMethodRaw.Multicaixa,
+        net: Math.max(
+          0,
+          roundKz(
+            receivedByMethodRaw.Multicaixa.sales +
+              receivedByMethodRaw.Multicaixa.debtCollections -
+              receivedByMethodRaw.Multicaixa.refunds
+          )
+        ),
+        sharePct: 0,
+      },
+      Transferência: {
+        method: 'Transferência',
+        ...receivedByMethodRaw.Transferência,
+        net: Math.max(
+          0,
+          roundKz(
+            receivedByMethodRaw.Transferência.sales +
+              receivedByMethodRaw.Transferência.debtCollections -
+              receivedByMethodRaw.Transferência.refunds
+          )
+        ),
+        sharePct: 0,
+      },
+    };
+    const totalCustomerReceiptsNet = roundKz(
+      receivedMethodNetMap.Dinheiro.net +
+        receivedMethodNetMap.Multicaixa.net +
+        receivedMethodNetMap.Transferência.net
+    );
+    for (const ch of receivedChannelsOrder) {
+      receivedMethodNetMap[ch].sharePct =
+        totalCustomerReceiptsNet > 0
+          ? roundKz((receivedMethodNetMap[ch].net / totalCustomerReceiptsNet) * 100)
+          : 0;
+    }
+
+    type RankedProductEntry = {
+      id: string;
+      code: string;
+      name: string;
+      unit: string;
+      category: string;
+      soldQty: number;
+      soldGrossRevenue: number;
+      soldNetRevenue: number;
+      realizedProfit: number;
+      marginPct: number | null;
+      markupPct: number | null;
+      unitProfit: number | null;
+      grossPrice: number;
+      stockQty: number | null;
+      trackStock: boolean;
+      inCatalog: boolean;
+    };
+
+    const catalogRankedBase: RankedProductEntry[] = productMargins.map((m) => ({
+      id: m.product.id,
+      code: m.product.code,
+      name: m.product.name,
+      unit: m.product.unit || 'un',
+      category: m.product.category || 'Geral',
+      soldQty: m.soldQty,
+      soldGrossRevenue: m.soldGrossRevenue,
+      soldNetRevenue: m.soldNetRevenue,
+      realizedProfit: m.realizedProfit,
+      marginPct: m.marginPct,
+      markupPct: m.markupPct,
+      unitProfit: m.unitProfit,
+      grossPrice: m.grossPrice,
+      stockQty: m.product.trackStock ? roundKz(m.product.stockQty ?? 0) : null,
+      trackStock: Boolean(m.product.trackStock),
+      inCatalog: true,
+    }));
+
+    const orphanSoldEntries: RankedProductEntry[] = [];
+    for (const [key, st] of soldStatsByProd.entries()) {
+      if (!prodById.has(key) && st.qty > 0) {
+        orphanSoldEntries.push({
+          id: key,
+          code: st.fallbackCode,
+          name: st.fallbackName,
+          unit: st.fallbackUnit,
+          category: 'Linha avulsa',
+          soldQty: st.qty,
+          soldGrossRevenue: st.grossRevenue,
+          soldNetRevenue: st.netRevenue,
+          realizedProfit: roundKz(st.netRevenue - st.costTotal),
+          marginPct: null,
+          markupPct: null,
+          unitProfit: null,
+          grossPrice: st.qty > 0 ? roundKz(st.grossRevenue / st.qty) : 0,
+          stockQty: null,
+          trackStock: false,
+          inCatalog: false,
+        });
+      }
+    }
+
+    const totalUnitsSoldInPeriod = roundKz(
+      [...catalogRankedBase, ...orphanSoldEntries].reduce((acc, r) => acc + r.soldQty, 0)
+    );
+
+    const topSellingProducts = [...catalogRankedBase, ...orphanSoldEntries]
+      .filter((r) => r.soldQty > 0)
+      .sort(
+        (a, b) => b.soldQty - a.soldQty || b.soldGrossRevenue - a.soldGrossRevenue
+      );
+
+    const activeCatalogRanked = catalogRankedBase.filter((_, idx) => {
+      const p = productMargins[idx]?.product;
+      return p ? p.active !== false : false;
+    });
+
+    const leastSellingAllActive = [...activeCatalogRanked].sort(
+      (a, b) =>
+        a.soldQty - b.soldQty ||
+        (b.stockQty ?? -1) - (a.stockQty ?? -1) ||
+        b.grossPrice - a.grossPrice
+    );
+
+    const leastSellingSoldOnly = activeCatalogRanked
+      .filter((r) => r.soldQty > 0)
+      .sort((a, b) => a.soldQty - b.soldQty || a.soldGrossRevenue - b.soldGrossRevenue);
+
+    const highestMarginByPct = activeCatalogRanked
+      .filter((r) => r.marginPct !== null)
+      .sort(
+        (a, b) =>
+          (b.marginPct ?? -9999) - (a.marginPct ?? -9999) ||
+          (b.unitProfit ?? -999999) - (a.unitProfit ?? -999999)
+      );
+
+    const highestMarginByProfit = [...catalogRankedBase, ...orphanSoldEntries]
+      .filter((r) => r.soldQty > 0 || (r.unitProfit !== null && r.unitProfit > 0))
+      .sort(
+        (a, b) =>
+          b.realizedProfit - a.realizedProfit ||
+          (b.marginPct ?? -9999) - (a.marginPct ?? -9999) ||
+          (b.unitProfit ?? -999999) - (a.unitProfit ?? -999999)
+      );
+
+    outOfStockProducts.sort((a, b) => a.name.localeCompare(b.name, 'pt'));
+    lowStockProducts.sort((a, b) => {
+      const ra = (a.stockQty ?? 0) / Math.max(1, a.minStockQty ?? 1);
+      const rb = (b.stockQty ?? 0) / Math.max(1, b.minStockQty ?? 1);
+      return ra - rb || a.name.localeCompare(b.name, 'pt');
+    });
+    const criticalStockProducts = [...outOfStockProducts, ...lowStockProducts];
+
+    const customerDebts = Array.from(customerDebtMap.values()).sort(
+      (a, b) => b.openDebt - a.openDebt
+    );
+    const supplierPayables = Array.from(supplierPayableMap.values()).sort(
+      (a, b) => b.openPayable - a.openPayable
+    );
+    const expensesBreakdown = Array.from(expenseByCategory.values()).sort(
+      (a, b) => b.amount - a.amount
+    );
+    const extraRevenuesBreakdown = Array.from(extraRevenueByCategory.values()).sort(
+      (a, b) => b.amount - a.amount
+    );
+
+    return {
+      periodLabel: this.getFinancePeriodLabel(),
+      todayIso,
+      todaySalesGross,
+      todaySalesNet,
+      todayTransactions,
+      todayAvgTicket,
+      yesterdaySalesGross,
+      yesterdayTransactions,
+      todayGrowthPct,
+      monthSalesGross,
+      monthSalesNet,
+      monthTransactions,
+      monthAvgTicket,
+      prevMonthSalesGross,
+      prevMonthTransactions,
+      monthGrowthPct,
+      periodAvgTicket,
+      dailySalesSeries,
+      monthlySalesSeries,
+      openReceivables,
+      settledCreditInvoices,
+      customerDebts,
+      totalReceivablesDue,
+      partialReceivablesCount,
+      partialReceivablesDue,
+      creditSalesOpenCount,
+      openPayables,
+      supplierPayables,
+      totalPayablesDue,
+      overduePayablesDue,
+      overduePayablesCount,
+      partialPayablesCount,
+      partialPayablesDue,
+      periodInvoiceCount,
+      periodGrossItems,
+      periodDiscounts,
+      periodReturnCredits,
+      periodGrossInvoiced,
+      periodTaxIva,
+      periodNetSalesRevenue,
+      periodCreditSalesVolume,
+      periodCreditSalesCount,
+      periodEstimatedCogs,
+      periodUncostedLinesCount,
+      grossProfit,
+      grossMarginPct,
+      netCommercialResult,
+      netResultMarginPct,
+      inflowSalesDirect,
+      inflowDebtCollections,
+      inflowExtraRevenues,
+      outflowSupplierPayments,
+      outflowOperationalExpenses,
+      outflowCustomerRefunds,
+      internalReforcos,
+      internalSangrias,
+      totalCashInflows,
+      totalCashOutflows,
+      netCashFlow,
+      netByChannel,
+      receivedByMethod: receivedChannelsOrder.map((ch) => receivedMethodNetMap[ch]),
+      totalCustomerReceiptsNet,
+      cashflowItems,
+      expensesBreakdown,
+      extraRevenuesBreakdown,
+      productMargins,
+      totalUnitsSoldInPeriod,
+      topSellingProducts,
+      leastSellingAllActive,
+      leastSellingSoldOnly,
+      highestMarginByPct,
+      highestMarginByProfit,
+      stockSummary: {
+        activeCatalogCount,
+        trackedStockCount,
+        availableUnitsTotal,
+        stockCostValuation,
+        stockRetailValuation,
+        outOfStockProducts,
+        lowStockProducts,
+        criticalStockProducts,
+      },
+    };
+  }
+
+  private renderFinanceEntryDrawer(openCashSession: CashSession | null): string {
+    if (!this.financeEntryPanel) return '';
+    const isExpense = this.financeEntryPanel === 'DESPESA_OPERACIONAL';
+    const categories = isExpense
+      ? DEFAULT_EXPENSE_CATEGORIES
+      : DEFAULT_EXTRA_REVENUE_CATEGORIES;
+
+    return `
+      <form
+        data-form="finance-entry-form"
+        class="p-4 border-b border-slate-200 bg-slate-50 space-y-3"
+      >
+        <div class="flex items-center justify-between gap-2">
+          <div>
+            <h2 class="text-xs font-bold text-slate-900">
+              ${isExpense ? 'Registar Despesa Operacional' : 'Registar Receita Extraordinária'}
+            </h2>
+            <p class="text-[11px] text-slate-500">
+              ${
+                isExpense
+                  ? 'Afeta o Fluxo de Caixa e o Resultado Comercial líquido da empresa.'
+                  : 'Entrada complementar fora da faturação normal de mercadorias/serviços.'
+              }
+            </p>
+          </div>
+          <button
+            type="button"
+            data-action="close-finance-entry"
+            class="h-7 px-2.5 rounded border border-slate-200 bg-white text-xs text-slate-600 hover:text-slate-900 whitespace-nowrap shrink-0"
+          >Cancelar</button>
+        </div>
+
+        ${
+          this.financeEntryError
+            ? `<div class="p-2.5 rounded border border-red-200 bg-red-50 text-xs text-red-700">${escapeHtml(
+                this.financeEntryError
+              )}</div>`
+            : ''
+        }
+
+        <div class="grid grid-cols-1 sm:grid-cols-12 gap-2.5">
+          <div class="sm:col-span-4">
+            <label class="block text-[11px] font-medium text-slate-700 mb-1">Categoria</label>
+            <select
+              name="category"
+              class="w-full h-9 px-2.5 rounded-md border border-slate-300 bg-white text-xs text-slate-900"
+            >
+              ${categories
+                .map(
+                  (cat) =>
+                    `<option value="${escapeHtml(cat)}" ${
+                      this.financeEntryDraft.category === cat ? 'selected' : ''
+                    }>${escapeHtml(cat)}</option>`
+                )
+                .join('')}
+            </select>
+          </div>
+          <div class="sm:col-span-3">
+            <label class="block text-[11px] font-medium text-slate-700 mb-1">Montante (Kz)</label>
+            <input
+              id="finance-entry-amount-input"
+              name="amount"
+              type="text"
+              inputmode="decimal"
+              required
+              placeholder="0,00"
+              value="${escapeHtml(this.financeEntryDraft.amountInput)}"
+              class="w-full h-9 px-2.5 rounded-md border border-slate-300 bg-white text-xs font-mono tabular-nums text-slate-900"
+            />
+          </div>
+          <div class="sm:col-span-2">
+            <label class="block text-[11px] font-medium text-slate-700 mb-1">Meio</label>
+            <select
+              name="paymentMethod"
+              class="w-full h-9 px-2 rounded-md border border-slate-300 bg-white text-xs text-slate-900"
+            >
+              <option value="Transferência" ${this.financeEntryDraft.paymentMethod === 'Transferência' ? 'selected' : ''}>Transferência</option>
+              <option value="Multicaixa" ${this.financeEntryDraft.paymentMethod === 'Multicaixa' ? 'selected' : ''}>Multicaixa</option>
+              <option value="Dinheiro" ${this.financeEntryDraft.paymentMethod === 'Dinheiro' ? 'selected' : ''}>Dinheiro</option>
+            </select>
+          </div>
+          <div class="sm:col-span-3">
+            <label class="block text-[11px] font-medium text-slate-700 mb-1">Ref. / Documento (opcional)</label>
+            <input
+              name="reference"
+              type="text"
+              maxlength="80"
+              placeholder="Ex: Recibo 042 / TRF BAI"
+              value="${escapeHtml(this.financeEntryDraft.reference)}"
+              class="w-full h-9 px-2.5 rounded-md border border-slate-300 bg-white text-xs font-mono text-slate-900"
+            />
+          </div>
+          <div class="sm:col-span-8">
+            <label class="block text-[11px] font-medium text-slate-700 mb-1">Descrição / Justificação</label>
+            <input
+              name="reason"
+              type="text"
+              required
+              maxlength="240"
+              placeholder="${
+                isExpense
+                  ? 'Ex: Pagamento mensal de energia ENDE / combustível gerador'
+                  : 'Ex: Comissão comercial / aluguer pontual de equipamento'
+              }"
+              value="${escapeHtml(this.financeEntryDraft.reason)}"
+              class="w-full h-9 px-2.5 rounded-md border border-slate-300 bg-white text-xs text-slate-900"
+            />
+          </div>
+          <div class="sm:col-span-4 flex items-end justify-end gap-2">
+            <button
+              type="submit"
+              class="w-full h-9 px-4 rounded-md ${
+                isExpense
+                  ? 'bg-slate-900 hover:bg-slate-800'
+                  : 'bg-emerald-600 hover:bg-emerald-700'
+              } text-white text-xs font-semibold whitespace-nowrap"
+            >
+              ${isExpense ? 'Guardar despesa' : 'Guardar receita'}
+            </button>
+          </div>
+        </div>
+
+        ${
+          this.financeEntryDraft.paymentMethod === 'Dinheiro' && openCashSession
+            ? `
+              <label class="inline-flex items-center gap-2 text-xs text-slate-600 cursor-pointer">
+                <input
+                  type="checkbox"
+                  name="affectCashDrawer"
+                  ${this.financeEntryDraft.affectCashDrawer ? 'checked' : ''}
+                  class="rounded border-slate-300"
+                />
+                <span>
+                  ${isExpense ? 'Retirar' : 'Adicionar'} numerário físico na gaveta da Caixa ${escapeHtml(
+                    openCashSession.cashier
+                  )} (turno aberto)
+                </span>
+              </label>
+            `
+            : ''
+        }
+      </form>
+    `;
+  }
+
+  private renderFinanceWorkspace(): string {
+    const snap = this.computeFinancialSnapshot();
+    const openCashSession = this.getActiveOpenCashSession();
+    const canManageCat = this.canManageCatalog();
+    const suspended = this.isCompanySuspended();
+    const netWorkingBalance = roundKz(snap.totalReceivablesDue - snap.totalPayablesDue);
+
+    const periodButtons: Array<{
+      id: 'TODAY' | 'THIS_MONTH' | 'LAST_30D' | 'THIS_YEAR' | 'ALL';
+      label: string;
+    }> = [
+      { id: 'TODAY', label: 'Hoje' },
+      { id: 'THIS_MONTH', label: 'Este mês' },
+      { id: 'LAST_30D', label: '30 dias' },
+      { id: 'THIS_YEAR', label: 'Este ano' },
+      { id: 'ALL', label: 'Tudo' },
+    ];
+
+    const subTabs: Array<{
+      id: 'OVERVIEW' | 'ACCOUNTS' | 'CASHFLOW' | 'MARGINS';
+      label: string;
+    }> = [
+      { id: 'OVERVIEW', label: 'Resultado & Visão Geral' },
+      {
+        id: 'ACCOUNTS',
+        label: `Contas a Receber & Pagar (${
+          snap.openReceivables.length + snap.openPayables.length
+        })`,
+      },
+      { id: 'CASHFLOW', label: `Fluxo de Caixa (${snap.cashflowItems.length})` },
+      { id: 'MARGINS', label: `Margem por Produto (${snap.productMargins.length})` },
+    ];
+
+    return `
+      <div class="h-full flex flex-col overflow-hidden bg-white">
+        <!-- Cabeçalho Principal do Módulo Financeiro -->
+        <div class="px-4 py-2.5 border-b border-slate-200 flex flex-wrap items-center justify-between gap-3 shrink-0">
+          <div class="flex flex-wrap items-center gap-3 min-w-0">
+            <div>
+              <h1 class="text-sm font-bold text-slate-900 whitespace-nowrap">Gestão Financeira</h1>
+              <div class="text-[11px] text-slate-500 flex items-center gap-1.5">
+                <span>Período ativo: <strong class="text-slate-700">${escapeHtml(snap.periodLabel)}</strong></span>
+                <span aria-hidden="true">·</span>
+                <span class="font-mono tabular-nums">${snap.periodInvoiceCount} fatura(s) FR</span>
+              </div>
+            </div>
+
+            <!-- Seletor de Período -->
+            <div class="flex items-center gap-0.5 p-0.5 bg-slate-100 rounded-md border border-slate-200">
+              ${periodButtons
+                .map(
+                  (p) => `
+                    <button
+                      type="button"
+                      data-action="set-finance-period"
+                      data-value="${p.id}"
+                      class="h-7 px-2.5 rounded text-[11px] font-medium transition-colors whitespace-nowrap shrink-0 ${
+                        this.financePeriod === p.id
+                          ? 'bg-white text-slate-900 shadow-xs'
+                          : 'text-slate-600 hover:text-slate-900'
+                      }"
+                    >${escapeHtml(p.label)}</button>
+                  `
+                )
+                .join('')}
+            </div>
+          </div>
+
+          <!-- Ações Rápidas: Indicadores Comerciais, Despesa Operacional & Receita Extraordinária -->
+          <div class="flex items-center gap-2 shrink-0">
+            <button
+              type="button"
+              data-action="nav"
+              data-value="INDICATORS"
+              class="h-8 px-3 rounded-md border border-slate-200 bg-white hover:bg-slate-50 text-slate-700 text-xs font-medium flex items-center gap-1.5 whitespace-nowrap shrink-0"
+            >
+              ${ICONS.trendingUp}
+              <span>Indicadores comerciais</span>
+            </button>
+            <button
+              type="button"
+              data-action="open-finance-entry"
+              data-value="RECEITA_EXTRAORDINARIA"
+              ${suspended ? 'disabled' : ''}
+              class="h-8 px-3 rounded-md border ${
+                this.financeEntryPanel === 'RECEITA_EXTRAORDINARIA'
+                  ? 'border-emerald-600 bg-emerald-50 text-emerald-800'
+                  : 'border-slate-200 bg-white hover:bg-slate-50 text-slate-700'
+              } text-xs font-medium flex items-center gap-1.5 whitespace-nowrap shrink-0 disabled:opacity-40"
+            >
+              ${ICONS.plus}
+              <span>Receita extraordinária</span>
+            </button>
+            <button
+              type="button"
+              data-action="open-finance-entry"
+              data-value="DESPESA_OPERACIONAL"
+              ${suspended ? 'disabled' : ''}
+              class="h-8 px-3 rounded-md ${
+                this.financeEntryPanel === 'DESPESA_OPERACIONAL'
+                  ? 'bg-slate-700 text-white'
+                  : 'bg-slate-900 hover:bg-slate-800 text-white'
+              } text-xs font-semibold flex items-center gap-1.5 whitespace-nowrap shrink-0 disabled:opacity-40"
+            >
+              ${ICONS.plus}
+              <span>Despesa operacional</span>
+            </button>
+          </div>
+        </div>
+
+        <!-- Sub-navegação Financeira -->
+        <div class="px-4 py-1.5 border-b border-slate-200 bg-slate-50/70 flex items-center gap-1 overflow-x-auto shrink-0">
+          ${subTabs
+            .map(
+              (tab) => `
+                <button
+                  type="button"
+                  data-action="set-finance-subview"
+                  data-value="${tab.id}"
+                  class="h-8 px-3 rounded-md text-xs font-medium transition-colors whitespace-nowrap shrink-0 ${
+                    this.financeSubView === tab.id
+                      ? 'bg-slate-900 text-white'
+                      : 'text-slate-600 hover:text-slate-900 hover:bg-slate-200/60'
+                  }"
+                >${escapeHtml(tab.label)}</button>
+              `
+            )
+            .join('')}
+        </div>
+
+        ${this.renderFinanceEntryDrawer(openCashSession)}
+
+        ${
+          this.financeWorkspaceNotice
+            ? `
+              <div class="px-4 py-2 border-b border-emerald-200 bg-emerald-50 text-xs text-emerald-800 flex items-center justify-between gap-2 shrink-0">
+                <span>${escapeHtml(this.financeWorkspaceNotice)}</span>
+                <button
+                  type="button"
+                  data-action="set-finance-subview"
+                  data-value="${this.financeSubView}"
+                  class="text-[11px] font-medium text-emerald-900 hover:underline whitespace-nowrap shrink-0"
+                >Fechar aviso</button>
+              </div>
+            `
+            : ''
+        }
+
+        <!-- Conteúdo Principal Rolável -->
+        <div class="flex-1 overflow-y-auto p-4 space-y-5">
+          <!-- Faixa Global de Indicadores Financeiros (Sempre Visível e Clicável) -->
+          <div class="grid grid-cols-2 lg:grid-cols-5 gap-3">
+            <button
+              type="button"
+              data-action="set-finance-accounts-side"
+              data-value="RECEIVABLES"
+              class="p-3 rounded-lg border border-slate-200 bg-white hover:border-slate-300 text-left transition-colors"
+            >
+              <div class="text-[11px] font-medium text-slate-500">Contas a Receber (Ativas)</div>
+              <div class="mt-1 text-base font-bold font-mono tabular-nums ${
+                snap.totalReceivablesDue > 0 ? 'text-amber-700' : 'text-slate-900'
+              }">${formatKzNumber(snap.totalReceivablesDue)} Kz</div>
+              <div class="mt-1 text-[11px] text-slate-500 font-mono tabular-nums">
+                ${snap.customerDebts.length} cliente(s) · ${snap.partialReceivablesCount} parc.
+              </div>
+            </button>
+
+            <button
+              type="button"
+              data-action="set-finance-accounts-side"
+              data-value="PAYABLES"
+              class="p-3 rounded-lg border border-slate-200 bg-white hover:border-slate-300 text-left transition-colors"
+            >
+              <div class="text-[11px] font-medium text-slate-500">Contas a Pagar (Fornecedores)</div>
+              <div class="mt-1 text-base font-bold font-mono tabular-nums ${
+                snap.overduePayablesDue > 0 ? 'text-red-700' : 'text-slate-900'
+              }">${formatKzNumber(snap.totalPayablesDue)} Kz</div>
+              <div class="mt-1 text-[11px] ${
+                snap.overduePayablesCount > 0 ? 'text-red-600 font-medium' : 'text-slate-500'
+              } font-mono tabular-nums">
+                ${
+                  snap.overduePayablesCount > 0
+                    ? `${snap.overduePayablesCount} vencida(s) (${formatKzNumber(snap.overduePayablesDue)} Kz)`
+                    : `${snap.supplierPayables.length} fornecedor(es) · ${snap.partialPayablesCount} parc.`
+                }
+              </div>
+            </button>
+
+            <button
+              type="button"
+              data-action="set-finance-subview"
+              data-value="CASHFLOW"
+              class="p-3 rounded-lg border border-slate-200 bg-white hover:border-slate-300 text-left transition-colors"
+            >
+              <div class="text-[11px] font-medium text-slate-500">Fluxo de Caixa (${escapeHtml(snap.periodLabel)})</div>
+              <div class="mt-1 text-base font-bold font-mono tabular-nums ${
+                snap.netCashFlow >= 0 ? 'text-emerald-700' : 'text-red-700'
+              }">${snap.netCashFlow >= 0 ? '+' : ''}${formatKzNumber(snap.netCashFlow)} Kz</div>
+              <div class="mt-1 text-[11px] text-slate-500 font-mono tabular-nums">
+                +${formatKzNumber(snap.totalCashInflows)} · -${formatKzNumber(snap.totalCashOutflows)}
+              </div>
+            </button>
+
+            <button
+              type="button"
+              data-action="set-finance-cashflow-filter"
+              data-value="EXPENSES"
+              class="p-3 rounded-lg border border-slate-200 bg-white hover:border-slate-300 text-left transition-colors"
+            >
+              <div class="text-[11px] font-medium text-slate-500">Despesas Operacionais (${escapeHtml(snap.periodLabel)})</div>
+              <div class="mt-1 text-base font-bold font-mono tabular-nums text-slate-900">
+                ${formatKzNumber(snap.outflowOperationalExpenses)} Kz
+              </div>
+              <div class="mt-1 text-[11px] text-slate-500 font-mono tabular-nums">
+                Receitas extra: +${formatKzNumber(snap.inflowExtraRevenues)} Kz
+              </div>
+            </button>
+
+            <button
+              type="button"
+              data-action="set-finance-subview"
+              data-value="OVERVIEW"
+              class="col-span-2 lg:col-span-1 p-3 rounded-lg border border-slate-200 bg-white hover:border-slate-300 text-left transition-colors"
+            >
+              <div class="text-[11px] font-medium text-slate-500">Resultado Comercial (${escapeHtml(snap.periodLabel)})</div>
+              <div class="mt-1 text-base font-bold font-mono tabular-nums ${
+                snap.netCommercialResult >= 0 ? 'text-emerald-700' : 'text-red-700'
+              }">${snap.netCommercialResult >= 0 ? '+' : ''}${formatKzNumber(snap.netCommercialResult)} Kz</div>
+              <div class="mt-1 text-[11px] text-slate-500 font-mono tabular-nums">
+                Margem líquida: ${formatKzNumber(snap.netResultMarginPct)}% · Balanço C/C: ${netWorkingBalance >= 0 ? '+' : ''}${formatKzNumber(netWorkingBalance)}
+              </div>
+            </button>
+          </div>
+
+          ${
+            this.financeSubView === 'OVERVIEW'
+              ? this.renderFinanceOverviewTab(snap)
+              : this.financeSubView === 'ACCOUNTS'
+                ? this.renderFinanceAccountsTab(snap, openCashSession)
+                : this.financeSubView === 'CASHFLOW'
+                  ? this.renderFinanceCashflowTab(snap)
+                  : this.renderFinanceMarginsTab(snap, canManageCat)
+          }
+        </div>
+      </div>
+    `;
+  }
+
+  private renderFinanceOverviewTab(
+    snap: ReturnType<SilaBillingApp['computeFinancialSnapshot']>
+  ): string {
+    const topMargins = [...snap.productMargins]
+      .filter((m) => m.soldQty > 0)
+      .sort((a, b) => b.realizedProfit - a.realizedProfit)
+      .slice(0, 5);
+
+    return `
+      <div class="grid grid-cols-1 lg:grid-cols-12 gap-4 items-start">
+        <!-- Demonstração do Resultado Comercial (DRE Simplificada) -->
+        <div class="lg:col-span-7 rounded-lg border border-slate-200 bg-white overflow-hidden">
+          <div class="px-4 py-3 border-b border-slate-200 flex items-center justify-between gap-2">
+            <div>
+              <h2 class="text-xs font-bold text-slate-900">Demonstração do Resultado Comercial</h2>
+              <p class="text-[11px] text-slate-500">Apuramento económico de vendas emitidas (FR), custos de mercadoria, receitas extra e despesas.</p>
+            </div>
+            <span class="text-[11px] font-mono tabular-nums text-slate-500 shrink-0">${escapeHtml(snap.periodLabel)}</span>
+          </div>
+
+          <div class="divide-y divide-slate-100 text-xs">
+            <div class="px-4 py-2.5 flex items-center justify-between gap-2">
+              <span class="text-slate-600">Faturação Bruta de Artigos (${snap.periodInvoiceCount} doc. FR)</span>
+              <span class="font-mono tabular-nums text-slate-900">${formatKzNumber(snap.periodGrossItems)} Kz</span>
+            </div>
+            <div class="px-4 py-2 flex items-center justify-between gap-2 text-slate-500">
+              <span>(-) Descontos Comerciais Concedidos${
+                snap.periodReturnCredits > 0 ? ' e Créditos de Troca' : ''
+              }</span>
+              <span class="font-mono tabular-nums">-${formatKzNumber(
+                roundKz(snap.periodDiscounts + snap.periodReturnCredits)
+              )} Kz</span>
+            </div>
+            <div class="px-4 py-2.5 flex items-center justify-between gap-2 bg-slate-50/70 font-medium">
+              <span class="text-slate-800">(=) Total Faturado c/ IVA (incl. ${formatKzNumber(snap.periodCreditSalesVolume)} Kz a crédito)</span>
+              <span class="font-mono tabular-nums text-slate-900">${formatKzNumber(snap.periodGrossInvoiced)} Kz</span>
+            </div>
+            <div class="px-4 py-2 flex items-center justify-between gap-2 text-slate-500">
+              <span>(-) IVA Liquidado nas Vendas (14%)</span>
+              <span class="font-mono tabular-nums">-${formatKzNumber(snap.periodTaxIva)} Kz</span>
+            </div>
+            <div class="px-4 py-2.5 flex items-center justify-between gap-2 font-semibold">
+              <span class="text-slate-900">(=) Receita Líquida de Vendas (s/ IVA)</span>
+              <span class="font-mono tabular-nums text-slate-900">${formatKzNumber(snap.periodNetSalesRevenue)} Kz</span>
+            </div>
+            <div class="px-4 py-2 flex items-center justify-between gap-2 text-slate-600">
+              <span>
+                (-) Custo das Mercadorias Vendidas (CMV estimado)${
+                  snap.periodUncostedLinesCount > 0
+                    ? ` · <button type="button" data-action="set-finance-margin-filter" data-value="NO_COST" class="text-amber-700 hover:underline">${snap.periodUncostedLinesCount} linha(s) s/ custo</button>`
+                    : ''
+                }
+              </span>
+              <span class="font-mono tabular-nums text-red-700">-${formatKzNumber(snap.periodEstimatedCogs)} Kz</span>
+            </div>
+            <div class="px-4 py-2.5 flex items-center justify-between gap-2 bg-slate-50 font-semibold">
+              <span class="text-slate-900">(=) Lucro Bruto Comercial (Margem Bruta: ${formatKzNumber(snap.grossMarginPct)}%)</span>
+              <span class="font-mono tabular-nums ${
+                snap.grossProfit >= 0 ? 'text-emerald-700' : 'text-red-700'
+              }">${formatKzNumber(snap.grossProfit)} Kz</span>
+            </div>
+            <div class="px-4 py-2 flex items-center justify-between gap-2 text-slate-600">
+              <span>(+) Receitas Extraordinárias e Outras Entradas</span>
+              <span class="font-mono tabular-nums text-emerald-700">+${formatKzNumber(snap.inflowExtraRevenues)} Kz</span>
+            </div>
+            <div class="px-4 py-2 flex items-center justify-between gap-2 text-slate-600">
+              <span>(-) Despesas Operacionais do Período</span>
+              <span class="font-mono tabular-nums text-red-700">-${formatKzNumber(snap.outflowOperationalExpenses)} Kz</span>
+            </div>
+            <div class="px-4 py-3 flex items-center justify-between gap-2 bg-slate-900 text-white font-bold">
+              <div>
+                <div>(=) Resultado Comercial Líquido</div>
+                <div class="text-[11px] font-normal text-slate-300 font-mono tabular-nums">
+                  Rentabilidade líquida: ${formatKzNumber(snap.netResultMarginPct)}%
+                </div>
+              </div>
+              <div class="text-sm font-mono tabular-nums ${
+                snap.netCommercialResult >= 0 ? 'text-emerald-400' : 'text-red-400'
+              }">
+                ${snap.netCommercialResult >= 0 ? '+' : ''}${formatKzNumber(snap.netCommercialResult)} Kz
+              </div>
+            </div>
+          </div>
+        </div>
+
+        <!-- Coluna Direita: Despesas/Receitas por Categoria + Resumo de Crédito e Dívidas -->
+        <div class="lg:col-span-5 space-y-4">
+          <div class="rounded-lg border border-slate-200 bg-white p-4 space-y-3">
+            <div class="flex items-center justify-between gap-2">
+              <h2 class="text-xs font-bold text-slate-900">Carteira de Crédito & Pagamentos Parciais</h2>
+              <button
+                type="button"
+                data-action="set-finance-subview"
+                data-value="ACCOUNTS"
+                class="text-[11px] font-medium text-blue-600 hover:underline whitespace-nowrap shrink-0"
+              >Gerir contas</button>
+            </div>
+            <div class="divide-y divide-slate-100 text-xs">
+              <div class="py-2 flex items-center justify-between gap-2">
+                <button
+                  type="button"
+                  data-action="set-finance-receivable-filter"
+                  data-value="CREDIT_SALES"
+                  class="text-left text-slate-700 hover:text-blue-600"
+                >Vendas a crédito no período (${snap.periodCreditSalesCount})</button>
+                <span class="font-mono tabular-nums font-medium text-slate-900">${formatKzNumber(snap.periodCreditSalesVolume)} Kz</span>
+              </div>
+              <div class="py-2 flex items-center justify-between gap-2">
+                <button
+                  type="button"
+                  data-action="set-finance-receivable-filter"
+                  data-value="BY_CUSTOMER"
+                  class="text-left text-slate-700 hover:text-blue-600"
+                >Dívidas ativas de clientes (${snap.customerDebts.length})</button>
+                <span class="font-mono tabular-nums font-semibold ${
+                  snap.totalReceivablesDue > 0 ? 'text-amber-700' : 'text-slate-900'
+                }">${formatKzNumber(snap.totalReceivablesDue)} Kz</span>
+              </div>
+              <div class="py-2 flex items-center justify-between gap-2">
+                <button
+                  type="button"
+                  data-action="set-finance-receivable-filter"
+                  data-value="PARTIAL_PAYMENTS"
+                  class="text-left text-slate-700 hover:text-blue-600"
+                >Faturas c/ pagamento parcial (${snap.partialReceivablesCount})</button>
+                <span class="font-mono tabular-nums text-slate-900">${formatKzNumber(snap.partialReceivablesDue)} Kz</span>
+              </div>
+              <div class="py-2 flex items-center justify-between gap-2">
+                <button
+                  type="button"
+                  data-action="set-finance-payable-filter"
+                  data-value="PARTIAL_PAYMENTS"
+                  class="text-left text-slate-700 hover:text-blue-600"
+                >Compras a fornecedor c/ pag. parcial (${snap.partialPayablesCount})</button>
+                <span class="font-mono tabular-nums text-slate-900">${formatKzNumber(snap.partialPayablesDue)} Kz</span>
+              </div>
+              <div class="py-2 flex items-center justify-between gap-2">
+                <span class="text-slate-600">Dívidas de clientes cobradas no período</span>
+                <span class="font-mono tabular-nums text-emerald-700">+${formatKzNumber(snap.inflowDebtCollections)} Kz</span>
+              </div>
+            </div>
+          </div>
+
+          <div class="rounded-lg border border-slate-200 bg-white p-4 space-y-3">
+            <div class="flex items-center justify-between gap-2">
+              <h2 class="text-xs font-bold text-slate-900">Despesas Operacionais & Receitas Extra</h2>
+              <button
+                type="button"
+                data-action="set-finance-subview"
+                data-value="CASHFLOW"
+                class="text-[11px] font-medium text-blue-600 hover:underline whitespace-nowrap shrink-0"
+              >Ver movimentos</button>
+            </div>
+
+            ${
+              snap.expensesBreakdown.length === 0 && snap.extraRevenuesBreakdown.length === 0
+                ? `<p class="text-xs text-slate-500">Sem despesas operacionais nem receitas extraordinárias registadas neste período.</p>`
+                : `
+                  <div class="space-y-2 text-xs">
+                    ${snap.expensesBreakdown
+                      .map(
+                        (item) => `
+                          <div class="flex items-center justify-between gap-2">
+                            <span class="text-slate-700 truncate">${escapeHtml(item.category)} <span class="text-slate-400">· ${item.count}</span></span>
+                            <span class="font-mono tabular-nums text-red-700 shrink-0">-${formatKzNumber(item.amount)} Kz</span>
+                          </div>
+                        `
+                      )
+                      .join('')}
+                    ${snap.extraRevenuesBreakdown
+                      .map(
+                        (item) => `
+                          <div class="flex items-center justify-between gap-2 pt-1 border-t border-slate-100">
+                            <span class="text-slate-700 truncate">${escapeHtml(item.category)} <span class="text-slate-400">· ${item.count}</span></span>
+                            <span class="font-mono tabular-nums text-emerald-700 shrink-0">+${formatKzNumber(item.amount)} Kz</span>
+                          </div>
+                        `
+                      )
+                      .join('')}
+                  </div>
+                `
+            }
+          </div>
+
+          <div class="rounded-lg border border-slate-200 bg-white p-4 space-y-2.5">
+            <div class="flex items-center justify-between gap-2">
+              <h2 class="text-xs font-bold text-slate-900">Top Lucro por Produto (${escapeHtml(snap.periodLabel)})</h2>
+              <button
+                type="button"
+                data-action="set-finance-subview"
+                data-value="MARGINS"
+                class="text-[11px] font-medium text-blue-600 hover:underline whitespace-nowrap shrink-0"
+              >Análise completa</button>
+            </div>
+            ${
+              topMargins.length === 0
+                ? `<p class="text-xs text-slate-500">Sem vendas registadas no período selecionado.</p>`
+                : `
+                  <div class="divide-y divide-slate-100 text-xs">
+                    ${topMargins
+                      .map(
+                        (m) => `
+                          <div class="py-1.5 flex items-center justify-between gap-2">
+                            <div class="min-w-0">
+                              <div class="font-medium text-slate-900 truncate">${escapeHtml(m.product.name)}</div>
+                              <div class="text-[11px] text-slate-500 font-mono tabular-nums">
+                                Qtd ${formatKzNumber(m.soldQty)} · ${
+                                  m.marginPct !== null
+                                    ? `Margem ${formatKzNumber(m.marginPct)}%`
+                                    : 'Custo não definido'
+                                }
+                              </div>
+                            </div>
+                            <span class="font-mono tabular-nums font-semibold ${
+                              m.realizedProfit >= 0 ? 'text-emerald-700' : 'text-red-700'
+                            } shrink-0">${formatKzNumber(m.realizedProfit)} Kz</span>
+                          </div>
+                        `
+                      )
+                      .join('')}
+                  </div>
+                `
+            }
+          </div>
+        </div>
+      </div>
+    `;
+  }
+
+  private renderFinanceAccountsTab(
+    snap: ReturnType<SilaBillingApp['computeFinancialSnapshot']>,
+    openCashSession: CashSession | null
+  ): string {
+    const q = this.financeAccountsSearch.trim().toLowerCase();
+    const isReceivables = this.financeAccountsSide === 'RECEIVABLES';
+
+    return `
+      <div class="space-y-4">
+        <div class="flex flex-wrap items-center justify-between gap-3">
+          <div class="flex items-center gap-1 p-1 bg-slate-100 rounded-lg border border-slate-200">
+            <button
+              type="button"
+              data-action="set-finance-accounts-side"
+              data-value="RECEIVABLES"
+              class="h-8 px-3 rounded-md text-xs font-semibold transition-colors whitespace-nowrap shrink-0 ${
+                isReceivables
+                  ? 'bg-white text-slate-900 shadow-xs'
+                  : 'text-slate-600 hover:text-slate-900'
+              }"
+            >Contas a Receber · ${formatKzNumber(snap.totalReceivablesDue)} Kz</button>
+            <button
+              type="button"
+              data-action="set-finance-accounts-side"
+              data-value="PAYABLES"
+              class="h-8 px-3 rounded-md text-xs font-semibold transition-colors whitespace-nowrap shrink-0 ${
+                !isReceivables
+                  ? 'bg-white text-slate-900 shadow-xs'
+                  : 'text-slate-600 hover:text-slate-900'
+              }"
+            >Contas a Pagar · ${formatKzNumber(snap.totalPayablesDue)} Kz</button>
+          </div>
+
+          <div class="relative flex-1 min-w-[220px] max-w-sm">
+            <span class="absolute left-2.5 top-1/2 -translate-y-1/2 text-slate-400 pointer-events-none">${ICONS.search}</span>
+            <input
+              id="finance-accounts-search-input"
+              type="text"
+              data-field="finance-accounts-search"
+              value="${escapeHtml(this.financeAccountsSearch)}"
+              placeholder="${
+                isReceivables
+                  ? 'Pesquisar cliente, NIF ou nº fatura (F2)...'
+                  : 'Pesquisar fornecedor, NIF ou nº compra (F2)...'
+              }"
+              class="w-full h-8 pl-8 pr-7 rounded-md border border-slate-200 bg-white text-xs text-slate-900 focus:outline-none focus:border-blue-600"
+            />
+            ${
+              this.financeAccountsSearch
+                ? `<button type="button" data-action="clear-finance-accounts-search" class="absolute right-2 top-1/2 -translate-y-1/2 text-slate-400 hover:text-slate-700">${ICONS.close}</button>`
+                : ''
+            }
+          </div>
+        </div>
+
+        ${
+          isReceivables
+            ? this.renderFinanceReceivablesList(snap, q)
+            : this.renderFinancePayablesList(snap, q, openCashSession)
+        }
+      </div>
+    `;
+  }
+
+  private renderFinanceReceivablesList(
+    snap: ReturnType<SilaBillingApp['computeFinancialSnapshot']>,
+    q: string
+  ): string {
+    const filterButtons: Array<{
+      id: 'OPEN_ALL' | 'BY_CUSTOMER' | 'CREDIT_SALES' | 'PARTIAL_PAYMENTS' | 'SETTLED_CREDIT';
+      label: string;
+    }> = [
+      { id: 'OPEN_ALL', label: `Faturas a receber (${snap.openReceivables.length})` },
+      { id: 'BY_CUSTOMER', label: `Dívidas por cliente (${snap.customerDebts.length})` },
+      { id: 'CREDIT_SALES', label: `Vendas a crédito (${snap.creditSalesOpenCount})` },
+      { id: 'PARTIAL_PAYMENTS', label: `Pagamentos parciais (${snap.partialReceivablesCount})` },
+      { id: 'SETTLED_CREDIT', label: `Crédito já liquidado (${snap.settledCreditInvoices.length})` },
+    ];
+
+    if (this.financeReceivableFilter === 'BY_CUSTOMER') {
+      const rows = snap.customerDebts.filter(
+        (c) =>
+          !q ||
+          c.name.toLowerCase().includes(q) ||
+          c.nif.toLowerCase().includes(q) ||
+          c.phone.toLowerCase().includes(q)
+      );
+
+      return `
+        <div class="space-y-3">
+          <div class="flex flex-wrap items-center gap-1.5">
+            ${filterButtons
+              .map(
+                (f) => `
+                  <button
+                    type="button"
+                    data-action="set-finance-receivable-filter"
+                    data-value="${f.id}"
+                    class="h-7 px-2.5 rounded-md text-xs font-medium whitespace-nowrap shrink-0 ${
+                      this.financeReceivableFilter === f.id
+                        ? 'bg-slate-900 text-white'
+                        : 'border border-slate-200 bg-white text-slate-600 hover:text-slate-900'
+                    }"
+                  >${escapeHtml(f.label)}</button>
+                `
+              )
+              .join('')}
+          </div>
+
+          ${
+            rows.length === 0
+              ? `<div class="p-8 rounded-lg border border-slate-200 bg-slate-50 text-center text-xs text-slate-500">Nenhum cliente com saldo em dívida para o filtro selecionado.</div>`
+              : `
+                <div class="rounded-lg border border-slate-200 bg-white divide-y divide-slate-100">
+                  ${rows
+                    .map((cust) => {
+                      const isSettlingAcct =
+                        Boolean(cust.customerId) &&
+                        this.settlingCustomerAccountId === cust.customerId;
+                      const limitPct =
+                        cust.creditLimit > 0
+                          ? Math.min(999, roundKz((cust.openDebt / cust.creditLimit) * 100))
+                          : null;
+                      return `
+                        <div class="p-3.5 space-y-2.5">
+                          <div class="flex flex-wrap items-center justify-between gap-3">
+                            <div class="min-w-0">
+                              <div class="flex items-center gap-2">
+                                <span class="text-xs font-bold text-slate-900">${escapeHtml(cust.name)}</span>
+                                <span class="text-[11px] text-slate-500 font-mono tabular-nums">NIF ${escapeHtml(cust.nif)}</span>
+                                ${
+                                  cust.phone
+                                    ? `<span class="text-[11px] text-slate-400">· ${escapeHtml(cust.phone)}</span>`
+                                    : ''
+                                }
+                              </div>
+                              <div class="mt-0.5 text-[11px] text-slate-500 font-mono tabular-nums">
+                                ${cust.openCount} fatura(s) em aberto${
+                                  cust.partialCount > 0 ? ` · ${cust.partialCount} c/ pag. parcial` : ''
+                                } · Desde ${formatDateTimePt(cust.oldestIso).slashDate}${
+                                  cust.creditLimit > 0
+                                    ? ` · Limite: ${formatKzNumber(cust.creditLimit)} Kz (${formatKzNumber(limitPct || 0)}%)`
+                                    : ''
+                                }
+                              </div>
+                            </div>
+
+                            <div class="flex items-center gap-2.5 shrink-0">
+                              <div class="text-right font-mono tabular-nums">
+                                <div class="text-xs font-bold text-amber-700">${formatKzNumber(cust.openDebt)} Kz</div>
+                                ${
+                                  cust.paidOnOpen > 0
+                                    ? `<div class="text-[10px] text-emerald-700">Já amortizado: ${formatKzNumber(cust.paidOnOpen)} Kz</div>`
+                                    : `<div class="text-[10px] text-slate-400">Saldo em dívida</div>`
+                                }
+                              </div>
+                              ${
+                                cust.customerId
+                                  ? `
+                                    <button
+                                      type="button"
+                                      data-action="finance-open-customer-detail"
+                                      data-id="${escapeHtml(cust.customerId)}"
+                                      class="h-8 px-2.5 rounded-md border border-slate-200 hover:bg-slate-50 text-xs text-slate-700 whitespace-nowrap shrink-0"
+                                    >Ficha</button>
+                                    <button
+                                      type="button"
+                                      data-action="open-settle-customer-account"
+                                      data-id="${escapeHtml(cust.customerId)}"
+                                      class="h-8 px-3 rounded-md bg-emerald-600 hover:bg-emerald-700 text-white text-xs font-semibold whitespace-nowrap shrink-0"
+                                    >Receber / Abater</button>
+                                  `
+                                  : ''
+                              }
+                            </div>
+                          </div>
+
+                          ${
+                            isSettlingAcct
+                              ? `
+                                <form data-form="settle-customer-debt-form" class="p-3 rounded-md border border-slate-200 bg-slate-50 space-y-2.5">
+                                  <div class="flex items-center justify-between">
+                                    <span class="text-xs font-semibold text-slate-900">Receber Pagamento Total ou Parcial em Conta Corrente (FIFO)</span>
+                                    <button type="button" data-action="close-settle-customer-account" class="text-xs text-slate-500 hover:text-slate-800">Fechar</button>
+                                  </div>
+                                  ${
+                                    this.settleError
+                                      ? `<div class="text-xs text-red-600">${escapeHtml(this.settleError)}</div>`
+                                      : ''
+                                  }
+                                  <div class="grid grid-cols-1 sm:grid-cols-12 gap-2 items-end">
+                                    <div class="sm:col-span-3">
+                                      <label class="block text-[11px] font-medium text-slate-600 mb-1">Valor recebido (Kz)</label>
+                                      <input
+                                        type="text"
+                                        name="settleAmount"
+                                        inputmode="decimal"
+                                        value="${escapeHtml(this.settleAmountInput)}"
+                                        class="w-full h-8 px-2 rounded border border-slate-300 bg-white text-xs font-mono tabular-nums"
+                                      />
+                                    </div>
+                                    <div class="sm:col-span-3">
+                                      <label class="block text-[11px] font-medium text-slate-600 mb-1">Meio de recebimento</label>
+                                      <select name="settleMethod" class="w-full h-8 px-2 rounded border border-slate-300 bg-white text-xs">
+                                        <option value="Dinheiro" ${this.settleMethod === 'Dinheiro' ? 'selected' : ''}>Dinheiro</option>
+                                        <option value="Multicaixa" ${this.settleMethod === 'Multicaixa' ? 'selected' : ''}>Multicaixa</option>
+                                        <option value="Transferência" ${this.settleMethod === 'Transferência' ? 'selected' : ''}>Transferência</option>
+                                      </select>
+                                    </div>
+                                    <div class="sm:col-span-3">
+                                      <label class="block text-[11px] font-medium text-slate-600 mb-1">Referência (opcional)</label>
+                                      <input
+                                        type="text"
+                                        name="settleReference"
+                                        maxlength="80"
+                                        placeholder="Ex: MCX / TRF BAI"
+                                        value="${escapeHtml(this.settleReference)}"
+                                        class="w-full h-8 px-2 rounded border border-slate-300 bg-white text-xs font-mono"
+                                      />
+                                    </div>
+                                    <div class="sm:col-span-3">
+                                      <button
+                                        type="submit"
+                                        class="w-full h-8 px-3 rounded-md bg-emerald-600 hover:bg-emerald-700 text-white text-xs font-semibold whitespace-nowrap"
+                                      >Confirmar recebimento</button>
+                                    </div>
+                                  </div>
+                                </form>
+                              `
+                              : ''
+                          }
+                        </div>
+                      `;
+                    })
+                    .join('')}
+                </div>
+              `
+          }
+        </div>
+      `;
+    }
+
+    if (this.financeReceivableFilter === 'SETTLED_CREDIT') {
+      const settledRows = snap.settledCreditInvoices.filter(
+        ({ invoice }) =>
+          !q ||
+          invoice.number.toLowerCase().includes(q) ||
+          invoice.customerName.toLowerCase().includes(q) ||
+          invoice.customerNif.toLowerCase().includes(q)
+      );
+
+      return `
+        <div class="space-y-3">
+          <div class="flex flex-wrap items-center gap-1.5">
+            ${filterButtons
+              .map(
+                (f) => `
+                  <button
+                    type="button"
+                    data-action="set-finance-receivable-filter"
+                    data-value="${f.id}"
+                    class="h-7 px-2.5 rounded-md text-xs font-medium whitespace-nowrap shrink-0 ${
+                      this.financeReceivableFilter === f.id
+                        ? 'bg-slate-900 text-white'
+                        : 'border border-slate-200 bg-white text-slate-600 hover:text-slate-900'
+                    }"
+                  >${escapeHtml(f.label)}</button>
+                `
+              )
+              .join('')}
+          </div>
+
+          ${
+            settledRows.length === 0
+              ? `<div class="p-8 rounded-lg border border-slate-200 bg-slate-50 text-center text-xs text-slate-500">Nenhuma venda a crédito liquidada encontrada.</div>`
+              : `
+                <div class="rounded-lg border border-slate-200 bg-white divide-y divide-slate-100">
+                  ${settledRows
+                    .slice(0, 80)
+                    .map(({ invoice, payable }) => {
+                      const dt = formatDateTimePt(invoice.issuedAtIso);
+                      return `
+                        <div class="p-3 flex flex-wrap items-center justify-between gap-2 text-xs">
+                          <div>
+                            <div class="font-mono font-semibold text-slate-900">${escapeHtml(invoice.number)} · ${escapeHtml(invoice.customerName)}</div>
+                            <div class="text-[11px] text-slate-500 font-mono tabular-nums">
+                              Emitida ${dt.slashDate} · ${escapeHtml(invoice.paymentSummary || invoice.paymentMethod)}
+                            </div>
+                          </div>
+                          <div class="flex items-center gap-2 shrink-0">
+                            <div class="text-right font-mono tabular-nums">
+                              <div class="font-semibold text-emerald-700">${formatKzNumber(payable)} Kz</div>
+                              <div class="text-[10px] text-emerald-700">Liquidada</div>
+                            </div>
+                            <button
+                              type="button"
+                              data-action="open-invoice-in-history"
+                              data-id="${escapeHtml(invoice.id)}"
+                              class="h-7 px-2.5 rounded border border-slate-200 hover:bg-slate-50 text-[11px] text-slate-700 whitespace-nowrap"
+                            >Ver fatura</button>
+                          </div>
+                        </div>
+                      `;
+                    })
+                    .join('')}
+                </div>
+              `
+          }
+        </div>
+      `;
+    }
+
+    const filteredOpen = snap.openReceivables.filter((item) => {
+      if (this.financeReceivableFilter === 'PARTIAL_PAYMENTS' && !item.isPartial) return false;
+      if (this.financeReceivableFilter === 'CREDIT_SALES' && !item.isCreditOrigin) return false;
+      if (!q) return true;
+      return (
+        item.invoice.number.toLowerCase().includes(q) ||
+        item.invoice.customerName.toLowerCase().includes(q) ||
+        item.invoice.customerNif.toLowerCase().includes(q)
+      );
+    });
+
+    return `
+      <div class="space-y-3">
+        <div class="flex flex-wrap items-center gap-1.5">
+          ${filterButtons
+            .map(
+              (f) => `
+                <button
+                  type="button"
+                  data-action="set-finance-receivable-filter"
+                  data-value="${f.id}"
+                  class="h-7 px-2.5 rounded-md text-xs font-medium whitespace-nowrap shrink-0 ${
+                    this.financeReceivableFilter === f.id
+                      ? 'bg-slate-900 text-white'
+                      : 'border border-slate-200 bg-white text-slate-600 hover:text-slate-900'
+                  }"
+                >${escapeHtml(f.label)}</button>
+              `
+            )
+            .join('')}
+        </div>
+
+        ${
+          filteredOpen.length === 0
+            ? `<div class="p-8 rounded-lg border border-slate-200 bg-slate-50 text-center text-xs text-slate-500">Nenhuma fatura pendente de recebimento para o filtro selecionado.</div>`
+            : `
+              <div class="rounded-lg border border-slate-200 bg-white divide-y divide-slate-100">
+                ${filteredOpen
+                  .map(({ invoice, payable, paidSoFar, due, isPartial }) => {
+                    const dt = formatDateTimePt(invoice.issuedAtIso);
+                    const isSettling = this.settlingInvoiceId === invoice.id;
+                    const paidPct = payable > 0 ? Math.min(100, roundKz((paidSoFar / payable) * 100)) : 0;
+                    return `
+                      <div class="p-3.5 space-y-2.5">
+                        <div class="flex flex-wrap items-center justify-between gap-3">
+                          <div class="min-w-0">
+                            <div class="flex flex-wrap items-center gap-2">
+                              <span class="text-xs font-mono font-bold text-slate-900">${escapeHtml(invoice.number)}</span>
+                              <span class="text-xs font-semibold text-slate-800">${escapeHtml(invoice.customerName)}</span>
+                              <span class="text-[11px] font-mono tabular-nums text-slate-500">NIF ${escapeHtml(invoice.customerNif)}</span>
+                            </div>
+                            <div class="mt-0.5 text-[11px] text-slate-500 font-mono tabular-nums">
+                              ${dt.slashDate} ${dt.time} · Total: ${formatKzNumber(payable)} Kz · ${
+                                isPartial
+                                  ? `Pago parcial: ${formatKzNumber(paidSoFar)} Kz (${formatKzNumber(paidPct)}%)`
+                                  : 'Venda a crédito (0% recebido)'
+                              }
+                            </div>
+                          </div>
+
+                          <div class="flex items-center gap-2 shrink-0">
+                            <div class="text-right font-mono tabular-nums">
+                              <div class="text-xs font-bold text-amber-700">${formatKzNumber(due)} Kz</div>
+                              <div class="text-[10px] text-slate-500">Em falta</div>
+                            </div>
+                            <button
+                              type="button"
+                              data-action="open-invoice-in-history"
+                              data-id="${escapeHtml(invoice.id)}"
+                              class="h-8 px-2.5 rounded-md border border-slate-200 hover:bg-slate-50 text-xs text-slate-700 whitespace-nowrap shrink-0"
+                            >Documento</button>
+                            <button
+                              type="button"
+                              data-action="open-settle-debt"
+                              data-id="${escapeHtml(invoice.id)}"
+                              class="h-8 px-3 rounded-md bg-emerald-600 hover:bg-emerald-700 text-white text-xs font-semibold whitespace-nowrap shrink-0"
+                            >Receber</button>
+                          </div>
+                        </div>
+
+                        ${
+                          isSettling
+                            ? `
+                              <form data-form="settle-debt-form" class="p-3 rounded-md border border-slate-200 bg-slate-50 space-y-2.5">
+                                <div class="flex items-center justify-between">
+                                  <span class="text-xs font-semibold text-slate-900">Registar Pagamento Total ou Parcial — ${escapeHtml(invoice.number)}</span>
+                                  <button type="button" data-action="close-settle-debt" class="text-xs text-slate-500 hover:text-slate-800">Fechar</button>
+                                </div>
+                                ${
+                                  this.settleError
+                                    ? `<div class="text-xs text-red-600">${escapeHtml(this.settleError)}</div>`
+                                    : ''
+                                }
+                                <div class="grid grid-cols-1 sm:grid-cols-12 gap-2 items-end">
+                                  <div class="sm:col-span-3">
+                                    <label class="block text-[11px] font-medium text-slate-600 mb-1">Montante recebido (Kz)</label>
+                                    <input
+                                      type="text"
+                                      name="settleAmount"
+                                      inputmode="decimal"
+                                      value="${escapeHtml(this.settleAmountInput)}"
+                                      class="w-full h-8 px-2 rounded border border-slate-300 bg-white text-xs font-mono tabular-nums"
+                                    />
+                                  </div>
+                                  <div class="sm:col-span-3">
+                                    <label class="block text-[11px] font-medium text-slate-600 mb-1">Meio</label>
+                                    <select name="settleMethod" class="w-full h-8 px-2 rounded border border-slate-300 bg-white text-xs">
+                                      <option value="Dinheiro" ${this.settleMethod === 'Dinheiro' ? 'selected' : ''}>Dinheiro</option>
+                                      <option value="Multicaixa" ${this.settleMethod === 'Multicaixa' ? 'selected' : ''}>Multicaixa</option>
+                                      <option value="Transferência" ${this.settleMethod === 'Transferência' ? 'selected' : ''}>Transferência</option>
+                                    </select>
+                                  </div>
+                                  <div class="sm:col-span-3">
+                                    <label class="block text-[11px] font-medium text-slate-600 mb-1">Referência (opcional)</label>
+                                    <input
+                                      type="text"
+                                      name="settleReference"
+                                      maxlength="80"
+                                      placeholder="Ex: MCX / TRF BAI"
+                                      value="${escapeHtml(this.settleReference)}"
+                                      class="w-full h-8 px-2 rounded border border-slate-300 bg-white text-xs font-mono"
+                                    />
+                                  </div>
+                                  <div class="sm:col-span-3">
+                                    <button
+                                      type="submit"
+                                      class="w-full h-8 px-3 rounded-md bg-emerald-600 hover:bg-emerald-700 text-white text-xs font-semibold whitespace-nowrap"
+                                    >Confirmar pagamento</button>
+                                  </div>
+                                </div>
+                              </form>
+                            `
+                            : ''
+                        }
+                      </div>
+                    `;
+                  })
+                  .join('')}
+              </div>
+            `
+        }
+      </div>
+    `;
+  }
+
+  private renderFinancePayablesList(
+    snap: ReturnType<SilaBillingApp['computeFinancialSnapshot']>,
+    q: string,
+    openCashSession: CashSession | null
+  ): string {
+    const filterButtons: Array<{
+      id: 'OPEN_ALL' | 'OVERDUE' | 'PARTIAL_PAYMENTS' | 'BY_SUPPLIER';
+      label: string;
+    }> = [
+      { id: 'OPEN_ALL', label: `Compras a pagar (${snap.openPayables.length})` },
+      { id: 'OVERDUE', label: `Vencidas (${snap.overduePayablesCount})` },
+      { id: 'PARTIAL_PAYMENTS', label: `Pagamentos parciais (${snap.partialPayablesCount})` },
+      { id: 'BY_SUPPLIER', label: `Saldos por fornecedor (${snap.supplierPayables.length})` },
+    ];
+
+    if (this.financePayableFilter === 'BY_SUPPLIER') {
+      const supRows = snap.supplierPayables.filter(
+        (s) =>
+          !q ||
+          s.name.toLowerCase().includes(q) ||
+          s.nif.toLowerCase().includes(q) ||
+          s.phone.toLowerCase().includes(q)
+      );
+
+      return `
+        <div class="space-y-3">
+          <div class="flex flex-wrap items-center justify-between gap-2">
+            <div class="flex flex-wrap items-center gap-1.5">
+              ${filterButtons
+                .map(
+                  (f) => `
+                    <button
+                      type="button"
+                      data-action="set-finance-payable-filter"
+                      data-value="${f.id}"
+                      class="h-7 px-2.5 rounded-md text-xs font-medium whitespace-nowrap shrink-0 ${
+                        this.financePayableFilter === f.id
+                          ? 'bg-slate-900 text-white'
+                          : 'border border-slate-200 bg-white text-slate-600 hover:text-slate-900'
+                      }"
+                    >${escapeHtml(f.label)}</button>
+                  `
+                )
+                .join('')}
+            </div>
+            <button
+              type="button"
+              data-action="finance-go-new-purchase"
+              class="h-7 px-2.5 rounded-md border border-slate-200 hover:bg-slate-50 text-xs font-medium text-slate-700 whitespace-nowrap shrink-0"
+            >+ Nova compra</button>
+          </div>
+
+          ${
+            supRows.length === 0
+              ? `<div class="p-8 rounded-lg border border-slate-200 bg-slate-50 text-center text-xs text-slate-500">Sem saldos em aberto a fornecedores.</div>`
+              : `
+                <div class="rounded-lg border border-slate-200 bg-white divide-y divide-slate-100">
+                  ${supRows
+                    .map((sup) => {
+                      const isSettlingSup =
+                        Boolean(sup.supplierId) &&
+                        this.settlingSupplierAccountId === sup.supplierId;
+                      return `
+                        <div class="p-3.5 space-y-2.5">
+                          <div class="flex flex-wrap items-center justify-between gap-3">
+                            <div class="min-w-0">
+                              <div class="flex items-center gap-2">
+                                <span class="text-xs font-bold text-slate-900">${escapeHtml(sup.name)}</span>
+                                <span class="text-[11px] font-mono tabular-nums text-slate-500">NIF ${escapeHtml(sup.nif || '---')}</span>
+                                ${
+                                  sup.phone
+                                    ? `<span class="text-[11px] text-slate-400">· ${escapeHtml(sup.phone)}</span>`
+                                    : ''
+                                }
+                              </div>
+                              <div class="mt-0.5 text-[11px] text-slate-500 font-mono tabular-nums">
+                                ${sup.openCount} compra(s) em aberto${
+                                  sup.partialCount > 0 ? ` · ${sup.partialCount} c/ pag. parcial` : ''
+                                }${
+                                  sup.overduePayable > 0
+                                    ? ` · Vencido: ${formatKzNumber(sup.overduePayable)} Kz`
+                                    : ''
+                                }
+                              </div>
+                            </div>
+                            <div class="flex items-center gap-2 shrink-0">
+                              <div class="text-right font-mono tabular-nums">
+                                <div class="text-xs font-bold ${
+                                  sup.overduePayable > 0 ? 'text-red-700' : 'text-slate-900'
+                                }">${formatKzNumber(sup.openPayable)} Kz</div>
+                                <div class="text-[10px] text-slate-500">A pagar</div>
+                              </div>
+                              ${
+                                sup.supplierId
+                                  ? `
+                                    <button
+                                      type="button"
+                                      data-action="finance-open-supplier-detail"
+                                      data-id="${escapeHtml(sup.supplierId)}"
+                                      class="h-8 px-2.5 rounded-md border border-slate-200 hover:bg-slate-50 text-xs text-slate-700 whitespace-nowrap shrink-0"
+                                    >Ficha</button>
+                                    <button
+                                      type="button"
+                                      data-action="open-settle-supplier-account"
+                                      data-id="${escapeHtml(sup.supplierId)}"
+                                      class="h-8 px-3 rounded-md bg-slate-900 hover:bg-slate-800 text-white text-xs font-semibold whitespace-nowrap shrink-0"
+                                    >Pagar conta</button>
+                                  `
+                                  : ''
+                              }
+                            </div>
+                          </div>
+
+                          ${
+                            isSettlingSup
+                              ? `
+                                <form data-form="settle-supplier-account-form" class="p-3 rounded-md border border-slate-200 bg-slate-50 space-y-2.5">
+                                  <div class="flex items-center justify-between">
+                                    <span class="text-xs font-semibold text-slate-900">Liquidar Conta Corrente do Fornecedor (FIFO)</span>
+                                    <button type="button" data-action="close-settle-supplier-account" class="text-xs text-slate-500 hover:text-slate-800">Fechar</button>
+                                  </div>
+                                  ${
+                                    this.purchaseSettleError
+                                      ? `<div class="text-xs text-red-600">${escapeHtml(this.purchaseSettleError)}</div>`
+                                      : ''
+                                  }
+                                  <div class="grid grid-cols-1 sm:grid-cols-12 gap-2 items-end">
+                                    <div class="sm:col-span-3">
+                                      <label class="block text-[11px] font-medium text-slate-600 mb-1">Montante (Kz)</label>
+                                      <input
+                                        type="text"
+                                        name="settleAmount"
+                                        inputmode="decimal"
+                                        value="${escapeHtml(this.purchaseSettleAmountInput)}"
+                                        class="w-full h-8 px-2 rounded border border-slate-300 bg-white text-xs font-mono tabular-nums"
+                                      />
+                                    </div>
+                                    <div class="sm:col-span-3">
+                                      <label class="block text-[11px] font-medium text-slate-600 mb-1">Meio</label>
+                                      <select name="settleMethod" class="w-full h-8 px-2 rounded border border-slate-300 bg-white text-xs">
+                                        <option value="Transferência" ${this.purchaseSettleMethod === 'Transferência' ? 'selected' : ''}>Transferência</option>
+                                        <option value="Multicaixa" ${this.purchaseSettleMethod === 'Multicaixa' ? 'selected' : ''}>Multicaixa</option>
+                                        <option value="Dinheiro" ${this.purchaseSettleMethod === 'Dinheiro' ? 'selected' : ''}>Dinheiro</option>
+                                      </select>
+                                    </div>
+                                    <div class="sm:col-span-3">
+                                      <label class="block text-[11px] font-medium text-slate-600 mb-1">Referência / Doc.</label>
+                                      <input
+                                        type="text"
+                                        name="settleReference"
+                                        maxlength="80"
+                                        placeholder="Ex: TRF BAI 00912"
+                                        value="${escapeHtml(this.purchaseSettleReference)}"
+                                        class="w-full h-8 px-2 rounded border border-slate-300 bg-white text-xs font-mono"
+                                      />
+                                    </div>
+                                    <div class="sm:col-span-3">
+                                      <button
+                                        type="submit"
+                                        class="w-full h-8 px-3 rounded-md bg-emerald-600 hover:bg-emerald-700 text-white text-xs font-semibold whitespace-nowrap"
+                                      >Confirmar pagamento</button>
+                                    </div>
+                                  </div>
+                                  ${
+                                    openCashSession && this.purchaseSettleMethod === 'Dinheiro'
+                                      ? `
+                                        <label class="inline-flex items-center gap-2 text-[11px] text-slate-600 cursor-pointer">
+                                          <input
+                                            type="checkbox"
+                                            name="recordCash"
+                                            ${this.purchaseSettleRecordCash ? 'checked' : ''}
+                                            class="rounded border-slate-300"
+                                          />
+                                          <span>Retirar numerário da gaveta da Caixa ${escapeHtml(openCashSession.cashier)}</span>
+                                        </label>
+                                      `
+                                      : ''
+                                  }
+                                </form>
+                              `
+                              : ''
+                          }
+                        </div>
+                      `;
+                    })
+                    .join('')}
+                </div>
+              `
+          }
+        </div>
+      `;
+    }
+
+    const filteredPayables = snap.openPayables.filter((item) => {
+      if (this.financePayableFilter === 'OVERDUE' && !item.isOverdue) return false;
+      if (this.financePayableFilter === 'PARTIAL_PAYMENTS' && !item.isPartial) return false;
+      if (!q) return true;
+      return (
+        item.purchase.number.toLowerCase().includes(q) ||
+        item.purchase.supplierName.toLowerCase().includes(q) ||
+        item.purchase.supplierNif.toLowerCase().includes(q) ||
+        (item.purchase.supplierInvoiceRef || '').toLowerCase().includes(q)
+      );
+    });
+
+    return `
+      <div class="space-y-3">
+        <div class="flex flex-wrap items-center justify-between gap-2">
+          <div class="flex flex-wrap items-center gap-1.5">
+            ${filterButtons
+              .map(
+                (f) => `
+                  <button
+                    type="button"
+                    data-action="set-finance-payable-filter"
+                    data-value="${f.id}"
+                    class="h-7 px-2.5 rounded-md text-xs font-medium whitespace-nowrap shrink-0 ${
+                      this.financePayableFilter === f.id
+                        ? 'bg-slate-900 text-white'
+                        : 'border border-slate-200 bg-white text-slate-600 hover:text-slate-900'
+                    }"
+                  >${escapeHtml(f.label)}</button>
+                `
+              )
+              .join('')}
+          </div>
+          <button
+            type="button"
+            data-action="finance-go-new-purchase"
+            class="h-7 px-2.5 rounded-md border border-slate-200 hover:bg-slate-50 text-xs font-medium text-slate-700 whitespace-nowrap shrink-0"
+          >+ Registar compra</button>
+        </div>
+
+        ${
+          filteredPayables.length === 0
+            ? `<div class="p-8 rounded-lg border border-slate-200 bg-slate-50 text-center text-xs text-slate-500">Nenhuma conta a pagar pendente para o filtro selecionado.</div>`
+            : `
+              <div class="rounded-lg border border-slate-200 bg-white divide-y divide-slate-100">
+                ${filteredPayables
+                  .map(({ purchase, isOverdue, isPartial }) => {
+                    const dt = formatDateTimePt(purchase.issuedAtIso);
+                    const isSettling = this.settlingPurchaseId === purchase.id;
+                    return `
+                      <div class="p-3.5 space-y-2.5">
+                        <div class="flex flex-wrap items-center justify-between gap-3">
+                          <div class="min-w-0">
+                            <div class="flex flex-wrap items-center gap-2">
+                              <span class="text-xs font-mono font-bold text-slate-900">${escapeHtml(purchase.number)}</span>
+                              <span class="text-xs font-semibold text-slate-800">${escapeHtml(purchase.supplierName)}</span>
+                              ${
+                                purchase.supplierInvoiceRef
+                                  ? `<span class="text-[11px] font-mono text-slate-500">· Fat. Forn. ${escapeHtml(purchase.supplierInvoiceRef)}</span>`
+                                  : ''
+                              }
+                            </div>
+                            <div class="mt-0.5 text-[11px] font-mono tabular-nums ${
+                              isOverdue ? 'text-red-600 font-medium' : 'text-slate-500'
+                            }">
+                              Compra ${dt.slashDate}${
+                                purchase.dueDateIso
+                                  ? ` · Vencimento: ${purchase.dueDateIso}${isOverdue ? ' (Vencida)' : ''}`
+                                  : ''
+                              } · Total: ${formatKzNumber(purchase.totalAmount)} Kz${
+                                isPartial
+                                  ? ` · Já pago: ${formatKzNumber(purchase.amountPaid)} Kz`
+                                  : ''
+                              }
+                            </div>
+                          </div>
+
+                          <div class="flex items-center gap-2 shrink-0">
+                            <div class="text-right font-mono tabular-nums">
+                              <div class="text-xs font-bold ${
+                                isOverdue ? 'text-red-700' : 'text-slate-900'
+                              }">${formatKzNumber(purchase.amountDue)} Kz</div>
+                              <div class="text-[10px] text-slate-500">Em aberto</div>
+                            </div>
+                            <button
+                              type="button"
+                              data-action="open-settle-purchase"
+                              data-id="${escapeHtml(purchase.id)}"
+                              class="h-8 px-3 rounded-md bg-slate-900 hover:bg-slate-800 text-white text-xs font-semibold whitespace-nowrap shrink-0"
+                            >Pagar</button>
+                          </div>
+                        </div>
+
+                        ${
+                          isSettling
+                            ? `
+                              <form data-form="settle-purchase-form" class="p-3 rounded-md border border-slate-200 bg-slate-50 space-y-2.5">
+                                <div class="flex items-center justify-between">
+                                  <span class="text-xs font-semibold text-slate-900">Pagamento Total ou Parcial — ${escapeHtml(purchase.number)}</span>
+                                  <button type="button" data-action="close-settle-purchase" class="text-xs text-slate-500 hover:text-slate-800">Fechar</button>
+                                </div>
+                                ${
+                                  this.purchaseSettleError
+                                    ? `<div class="text-xs text-red-600">${escapeHtml(this.purchaseSettleError)}</div>`
+                                    : ''
+                                }
+                                <div class="grid grid-cols-1 sm:grid-cols-12 gap-2 items-end">
+                                  <div class="sm:col-span-3">
+                                    <label class="block text-[11px] font-medium text-slate-600 mb-1">Montante a pagar (Kz)</label>
+                                    <input
+                                      type="text"
+                                      name="settleAmount"
+                                      inputmode="decimal"
+                                      value="${escapeHtml(this.purchaseSettleAmountInput)}"
+                                      class="w-full h-8 px-2 rounded border border-slate-300 bg-white text-xs font-mono tabular-nums"
+                                    />
+                                  </div>
+                                  <div class="sm:col-span-3">
+                                    <label class="block text-[11px] font-medium text-slate-600 mb-1">Meio</label>
+                                    <select name="settleMethod" class="w-full h-8 px-2 rounded border border-slate-300 bg-white text-xs">
+                                      <option value="Transferência" ${this.purchaseSettleMethod === 'Transferência' ? 'selected' : ''}>Transferência</option>
+                                      <option value="Multicaixa" ${this.purchaseSettleMethod === 'Multicaixa' ? 'selected' : ''}>Multicaixa</option>
+                                      <option value="Dinheiro" ${this.purchaseSettleMethod === 'Dinheiro' ? 'selected' : ''}>Dinheiro</option>
+                                    </select>
+                                  </div>
+                                  <div class="sm:col-span-3">
+                                    <label class="block text-[11px] font-medium text-slate-600 mb-1">Referência / Doc.</label>
+                                    <input
+                                      type="text"
+                                      name="settleReference"
+                                      maxlength="80"
+                                      placeholder="Ex: TRF BAI 00912"
+                                      value="${escapeHtml(this.purchaseSettleReference)}"
+                                      class="w-full h-8 px-2 rounded border border-slate-300 bg-white text-xs font-mono"
+                                    />
+                                  </div>
+                                  <div class="sm:col-span-3">
+                                    <button
+                                      type="submit"
+                                      class="w-full h-8 px-3 rounded-md bg-emerald-600 hover:bg-emerald-700 text-white text-xs font-semibold whitespace-nowrap"
+                                    >Confirmar pagamento</button>
+                                  </div>
+                                </div>
+                                ${
+                                  openCashSession && this.purchaseSettleMethod === 'Dinheiro'
+                                    ? `
+                                      <label class="inline-flex items-center gap-2 text-[11px] text-slate-600 cursor-pointer">
+                                        <input
+                                          type="checkbox"
+                                          name="recordCash"
+                                          ${this.purchaseSettleRecordCash ? 'checked' : ''}
+                                          class="rounded border-slate-300"
+                                        />
+                                        <span>Retirar numerário da gaveta da Caixa ${escapeHtml(openCashSession.cashier)}</span>
+                                      </label>
+                                    `
+                                    : ''
+                                }
+                              </form>
+                            `
+                            : ''
+                        }
+                      </div>
+                    `;
+                  })
+                  .join('')}
+              </div>
+            `
+        }
+      </div>
+    `;
+  }
+
+  private renderFinanceCashflowTab(
+    snap: ReturnType<SilaBillingApp['computeFinancialSnapshot']>
+  ): string {
+    const q = this.financeCashflowSearch.trim().toLowerCase();
+    const filterButtons: Array<{
+      id:
+        | 'ALL'
+        | 'INFLOWS'
+        | 'OUTFLOWS'
+        | 'EXPENSES'
+        | 'EXTRA_REVENUES'
+        | 'DEBT_COLLECTIONS'
+        | 'SUPPLIER_PAYMENTS';
+      label: string;
+    }> = [
+      { id: 'ALL', label: 'Todos' },
+      { id: 'INFLOWS', label: 'Entradas' },
+      { id: 'OUTFLOWS', label: 'Saídas' },
+      { id: 'EXPENSES', label: 'Despesas operacionais' },
+      { id: 'EXTRA_REVENUES', label: 'Receitas extra' },
+      { id: 'DEBT_COLLECTIONS', label: 'Cobranças de dívida' },
+      { id: 'SUPPLIER_PAYMENTS', label: 'Pagamentos a fornecedores' },
+    ];
+
+    const filtered = snap.cashflowItems.filter((item) => {
+      if (this.financeCashflowFilter === 'INFLOWS' && item.direction !== 'IN') return false;
+      if (this.financeCashflowFilter === 'OUTFLOWS' && item.direction !== 'OUT') return false;
+      if (this.financeCashflowFilter === 'EXPENSES' && item.kind !== 'OPERATIONAL_EXPENSE') {
+        return false;
+      }
+      if (
+        this.financeCashflowFilter === 'EXTRA_REVENUES' &&
+        item.kind !== 'EXTRA_REVENUE' &&
+        item.kind !== 'OTHER_INFLOW'
+      ) {
+        return false;
+      }
+      if (this.financeCashflowFilter === 'DEBT_COLLECTIONS' && item.kind !== 'DEBT_COLLECTION') {
+        return false;
+      }
+      if (this.financeCashflowFilter === 'SUPPLIER_PAYMENTS' && item.kind !== 'SUPPLIER_PAYMENT') {
+        return false;
+      }
+      if (!q) return true;
+      return (
+        item.title.toLowerCase().includes(q) ||
+        item.subtitle.toLowerCase().includes(q) ||
+        item.category.toLowerCase().includes(q) ||
+        item.method.toLowerCase().includes(q) ||
+        (item.reference || '').toLowerCase().includes(q)
+      );
+    });
+
+    const netCash = roundKz(snap.netByChannel.Dinheiro.inVal - snap.netByChannel.Dinheiro.outVal);
+    const netMcx = roundKz(
+      snap.netByChannel.Multicaixa.inVal - snap.netByChannel.Multicaixa.outVal
+    );
+    const netTrf = roundKz(
+      snap.netByChannel.Transferência.inVal - snap.netByChannel.Transferência.outVal
+    );
+
+    return `
+      <div class="space-y-4">
+        <div class="grid grid-cols-1 sm:grid-cols-3 gap-3">
+          <div class="p-3 rounded-lg border border-slate-200 bg-slate-50/70">
+            <div class="text-[11px] font-medium text-slate-500">Saldo Líquido · Dinheiro</div>
+            <div class="mt-0.5 text-sm font-bold font-mono tabular-nums ${
+              netCash >= 0 ? 'text-slate-900' : 'text-red-700'
+            }">${netCash >= 0 ? '+' : ''}${formatKzNumber(netCash)} Kz</div>
+            <div class="mt-0.5 text-[11px] text-slate-500 font-mono tabular-nums">
+              Entradas: +${formatKzNumber(snap.netByChannel.Dinheiro.inVal)} · Saídas: -${formatKzNumber(
+                snap.netByChannel.Dinheiro.outVal
+              )}
+            </div>
+          </div>
+          <div class="p-3 rounded-lg border border-slate-200 bg-slate-50/70">
+            <div class="text-[11px] font-medium text-slate-500">Saldo Líquido · Multicaixa</div>
+            <div class="mt-0.5 text-sm font-bold font-mono tabular-nums ${
+              netMcx >= 0 ? 'text-slate-900' : 'text-red-700'
+            }">${netMcx >= 0 ? '+' : ''}${formatKzNumber(netMcx)} Kz</div>
+            <div class="mt-0.5 text-[11px] text-slate-500 font-mono tabular-nums">
+              Entradas: +${formatKzNumber(snap.netByChannel.Multicaixa.inVal)} · Saídas: -${formatKzNumber(
+                snap.netByChannel.Multicaixa.outVal
+              )}
+            </div>
+          </div>
+          <div class="p-3 rounded-lg border border-slate-200 bg-slate-50/70">
+            <div class="text-[11px] font-medium text-slate-500">Saldo Líquido · Transferência</div>
+            <div class="mt-0.5 text-sm font-bold font-mono tabular-nums ${
+              netTrf >= 0 ? 'text-slate-900' : 'text-red-700'
+            }">${netTrf >= 0 ? '+' : ''}${formatKzNumber(netTrf)} Kz</div>
+            <div class="mt-0.5 text-[11px] text-slate-500 font-mono tabular-nums">
+              Entradas: +${formatKzNumber(snap.netByChannel.Transferência.inVal)} · Saídas: -${formatKzNumber(
+                snap.netByChannel.Transferência.outVal
+              )}
+            </div>
+          </div>
+        </div>
+
+        <div class="flex flex-wrap items-center justify-between gap-2">
+          <div class="flex flex-wrap items-center gap-1.5">
+            ${filterButtons
+              .map(
+                (f) => `
+                  <button
+                    type="button"
+                    data-action="set-finance-cashflow-filter"
+                    data-value="${f.id}"
+                    class="h-7 px-2.5 rounded-md text-xs font-medium whitespace-nowrap shrink-0 ${
+                      this.financeCashflowFilter === f.id
+                        ? 'bg-slate-900 text-white'
+                        : 'border border-slate-200 bg-white text-slate-600 hover:text-slate-900'
+                    }"
+                  >${escapeHtml(f.label)}</button>
+                `
+              )
+              .join('')}
+          </div>
+
+          <div class="relative min-w-[220px] flex-1 max-w-xs">
+            <span class="absolute left-2.5 top-1/2 -translate-y-1/2 text-slate-400 pointer-events-none">${ICONS.search}</span>
+            <input
+              id="finance-cashflow-search-input"
+              type="text"
+              data-field="finance-cashflow-search"
+              value="${escapeHtml(this.financeCashflowSearch)}"
+              placeholder="Filtrar descrição, categoria ou ref. (F2)..."
+              class="w-full h-8 pl-8 pr-7 rounded-md border border-slate-200 bg-white text-xs text-slate-900 focus:outline-none focus:border-blue-600"
+            />
+            ${
+              this.financeCashflowSearch
+                ? `<button type="button" data-action="clear-finance-cashflow-search" class="absolute right-2 top-1/2 -translate-y-1/2 text-slate-400 hover:text-slate-700">${ICONS.close}</button>`
+                : ''
+            }
+          </div>
+        </div>
+
+        ${
+          filtered.length === 0
+            ? `<div class="p-8 rounded-lg border border-slate-200 bg-slate-50 text-center text-xs text-slate-500">Sem movimentos financeiros para o período e filtro selecionados.</div>`
+            : `
+              <div class="rounded-lg border border-slate-200 bg-white overflow-x-auto">
+                <table class="w-full text-left border-collapse text-xs">
+                  <thead>
+                    <tr class="border-b border-slate-200 bg-slate-50 text-[11px] font-semibold text-slate-600">
+                      <th class="py-2.5 px-3 whitespace-nowrap">Data / Hora</th>
+                      <th class="py-2.5 px-3 whitespace-nowrap">Categoria</th>
+                      <th class="py-2.5 px-3">Descrição / Entidade</th>
+                      <th class="py-2.5 px-3 whitespace-nowrap">Meio / Ref.</th>
+                      <th class="py-2.5 px-3 text-right whitespace-nowrap">Valor (Kz)</th>
+                    </tr>
+                  </thead>
+                  <tbody class="divide-y divide-slate-100">
+                    ${filtered
+                      .slice(0, 150)
+                      .map((item) => {
+                        const dt = formatDateTimePt(item.iso);
+                        const sign =
+                          item.direction === 'IN' ? '+' : item.direction === 'OUT' ? '-' : '⇄ ';
+                        const valClass =
+                          item.direction === 'IN'
+                            ? 'text-emerald-700 font-semibold'
+                            : item.direction === 'OUT'
+                              ? 'text-red-700 font-semibold'
+                              : 'text-slate-500';
+                        return `
+                          <tr class="hover:bg-slate-50/80">
+                            <td class="py-2.5 px-3 font-mono tabular-nums text-slate-600 whitespace-nowrap">
+                              ${dt.slashDate} <span class="text-slate-400">${dt.time}</span>
+                            </td>
+                            <td class="py-2.5 px-3 text-slate-700 whitespace-nowrap">
+                              ${escapeHtml(item.category)}
+                            </td>
+                            <td class="py-2.5 px-3">
+                              <div class="font-medium text-slate-900">${escapeHtml(item.title)}</div>
+                              <div class="text-[11px] text-slate-500">${escapeHtml(item.subtitle)}</div>
+                            </td>
+                            <td class="py-2.5 px-3 font-mono text-[11px] text-slate-600 whitespace-nowrap">
+                              ${escapeHtml(item.method)}${
+                                item.reference ? ` · ${escapeHtml(item.reference)}` : ''
+                              }
+                            </td>
+                            <td class="py-2.5 px-3 text-right font-mono tabular-nums whitespace-nowrap ${valClass}">
+                              ${sign}${formatKzNumber(item.amount)} Kz
+                            </td>
+                          </tr>
+                        `;
+                      })
+                      .join('')}
+                  </tbody>
+                </table>
+              </div>
+            `
+        }
+      </div>
+    `;
+  }
+
+  private renderFinanceMarginsTab(
+    snap: ReturnType<SilaBillingApp['computeFinancialSnapshot']>,
+    canManageCat: boolean
+  ): string {
+    const q = this.financeMarginSearch.trim().toLowerCase();
+    const filterButtons: Array<{
+      id: 'ALL' | 'SOLD_IN_PERIOD' | 'LOW_MARGIN' | 'NO_COST';
+      label: string;
+    }> = [
+      { id: 'ALL', label: `Todos os produtos (${snap.productMargins.length})` },
+      {
+        id: 'SOLD_IN_PERIOD',
+        label: `Vendidos no período (${snap.productMargins.filter((m) => m.soldQty > 0).length})`,
+      },
+      {
+        id: 'LOW_MARGIN',
+        label: `Margem baixa < 15% (${
+          snap.productMargins.filter((m) => m.marginPct !== null && m.marginPct < 15).length
+        })`,
+      },
+      {
+        id: 'NO_COST',
+        label: `Sem custo definido (${
+          snap.productMargins.filter((m) => m.costSource === 'none').length
+        })`,
+      },
+    ];
+
+    const sortButtons: Array<{
+      id: 'PROFIT_DESC' | 'MARGIN_DESC' | 'MARGIN_ASC' | 'QTY_DESC' | 'QTY_ASC';
+      label: string;
+    }> = [
+      { id: 'PROFIT_DESC', label: 'Maior lucro (Kz)' },
+      { id: 'MARGIN_DESC', label: 'Maior margem (%)' },
+      { id: 'MARGIN_ASC', label: 'Menor margem (%)' },
+      { id: 'QTY_DESC', label: 'Mais vendidos' },
+      { id: 'QTY_ASC', label: 'Menos vendidos' },
+    ];
+
+    const filtered = snap.productMargins
+      .filter((m) => {
+        if (this.financeMarginFilter === 'SOLD_IN_PERIOD' && m.soldQty <= 0) return false;
+        if (this.financeMarginFilter === 'LOW_MARGIN' && !(m.marginPct !== null && m.marginPct < 15)) {
+          return false;
+        }
+        if (this.financeMarginFilter === 'NO_COST' && m.costSource !== 'none') return false;
+        if (!q) return true;
+        return (
+          m.product.name.toLowerCase().includes(q) ||
+          m.product.code.toLowerCase().includes(q) ||
+          (m.product.category || '').toLowerCase().includes(q)
+        );
+      })
+      .sort((a, b) => {
+        if (this.financeMarginSort === 'MARGIN_DESC') {
+          return (b.marginPct ?? -9999) - (a.marginPct ?? -9999);
+        }
+        if (this.financeMarginSort === 'MARGIN_ASC') {
+          return (a.marginPct ?? 9999) - (b.marginPct ?? 9999);
+        }
+        if (this.financeMarginSort === 'QTY_DESC') {
+          return b.soldQty - a.soldQty;
+        }
+        if (this.financeMarginSort === 'QTY_ASC') {
+          return a.soldQty - b.soldQty || (b.product.stockQty ?? 0) - (a.product.stockQty ?? 0);
+        }
+        if (b.realizedProfit !== a.realizedProfit) {
+          return b.realizedProfit - a.realizedProfit;
+        }
+        return (b.unitProfit ?? -999999) - (a.unitProfit ?? -999999);
+      });
+
+    return `
+      <div class="space-y-4">
+        <div class="flex flex-wrap items-center justify-between gap-2">
+          <div class="flex flex-wrap items-center gap-1.5">
+            ${filterButtons
+              .map(
+                (f) => `
+                  <button
+                    type="button"
+                    data-action="set-finance-margin-filter"
+                    data-value="${f.id}"
+                    class="h-7 px-2.5 rounded-md text-xs font-medium whitespace-nowrap shrink-0 ${
+                      this.financeMarginFilter === f.id
+                        ? 'bg-slate-900 text-white'
+                        : 'border border-slate-200 bg-white text-slate-600 hover:text-slate-900'
+                    }"
+                  >${escapeHtml(f.label)}</button>
+                `
+              )
+              .join('')}
+          </div>
+
+          <div class="flex flex-wrap items-center gap-2">
+            <div class="flex items-center gap-1">
+              ${sortButtons
+                .map(
+                  (s) => `
+                    <button
+                      type="button"
+                      data-action="set-finance-margin-sort"
+                      data-value="${s.id}"
+                      class="h-7 px-2 rounded text-[11px] font-medium whitespace-nowrap shrink-0 ${
+                        this.financeMarginSort === s.id
+                          ? 'bg-slate-200 text-slate-900'
+                          : 'text-slate-500 hover:text-slate-900'
+                      }"
+                    >${escapeHtml(s.label)}</button>
+                  `
+                )
+                .join('')}
+            </div>
+
+            <div class="relative min-w-[200px]">
+              <span class="absolute left-2.5 top-1/2 -translate-y-1/2 text-slate-400 pointer-events-none">${ICONS.search}</span>
+              <input
+                id="finance-margin-search-input"
+                type="text"
+                data-field="finance-margin-search"
+                value="${escapeHtml(this.financeMarginSearch)}"
+                placeholder="Pesquisar SKU ou produto (F2)..."
+                class="w-full h-8 pl-8 pr-7 rounded-md border border-slate-200 bg-white text-xs text-slate-900 focus:outline-none focus:border-blue-600"
+              />
+              ${
+                this.financeMarginSearch
+                  ? `<button type="button" data-action="clear-finance-margin-search" class="absolute right-2 top-1/2 -translate-y-1/2 text-slate-400 hover:text-slate-700">${ICONS.close}</button>`
+                  : ''
+              }
+            </div>
+          </div>
+        </div>
+
+        ${
+          filtered.length === 0
+            ? `<div class="p-8 rounded-lg border border-slate-200 bg-slate-50 text-center text-xs text-slate-500">Nenhum artigo encontrado para este filtro de margem.</div>`
+            : `
+              <div class="rounded-lg border border-slate-200 bg-white overflow-x-auto">
+                <table class="w-full text-left border-collapse text-xs">
+                  <thead>
+                    <tr class="border-b border-slate-200 bg-slate-50 text-[11px] font-semibold text-slate-600">
+                      <th class="py-2.5 px-3">Artigo / SKU</th>
+                      <th class="py-2.5 px-3 text-right whitespace-nowrap">Custo Unit.</th>
+                      <th class="py-2.5 px-3 text-right whitespace-nowrap">Venda Líq. s/ IVA</th>
+                      <th class="py-2.5 px-3 text-right whitespace-nowrap">PVP c/ IVA</th>
+                      <th class="py-2.5 px-3 text-right whitespace-nowrap">Lucro Unit.</th>
+                      <th class="py-2.5 px-3 text-right whitespace-nowrap">Margem / Markup</th>
+                      <th class="py-2.5 px-3 text-right whitespace-nowrap">Vendido (${escapeHtml(snap.periodLabel)})</th>
+                      <th class="py-2.5 px-3 text-right whitespace-nowrap">Lucro Realizado</th>
+                      ${canManageCat ? `<th class="py-2.5 px-3 text-right whitespace-nowrap">Ação</th>` : ''}
+                    </tr>
+                  </thead>
+                  <tbody class="divide-y divide-slate-100">
+                    ${filtered
+                      .map((m) => {
+                        const isEditing = this.financeEditingProductId === m.product.id;
+                        const marginTone =
+                          m.marginPct === null
+                            ? 'text-amber-700'
+                            : m.marginPct < 0
+                              ? 'text-red-700 font-semibold'
+                              : m.marginPct < 15
+                                ? 'text-amber-700 font-medium'
+                                : 'text-emerald-700 font-semibold';
+                        return `
+                          <tr class="hover:bg-slate-50/80">
+                            <td class="py-2.5 px-3">
+                              <div class="font-medium text-slate-900">${escapeHtml(m.product.name)}</div>
+                              <div class="text-[11px] text-slate-500 font-mono tabular-nums">
+                                ${escapeHtml(m.product.code)} · ${escapeHtml(m.product.category || 'Geral')} · IVA ${m.product.ivaRate}%
+                              </div>
+                            </td>
+                            <td class="py-2.5 px-3 text-right font-mono tabular-nums whitespace-nowrap">
+                              ${
+                                m.unitCost > 0
+                                  ? `<span class="text-slate-900">${formatKzNumber(m.unitCost)} Kz</span>${
+                                      m.costSource === 'purchase'
+                                        ? `<div class="text-[10px] text-slate-400">Últ. compra</div>`
+                                        : ''
+                                    }`
+                                  : `<span class="text-amber-700">Sem custo</span>`
+                              }
+                            </td>
+                            <td class="py-2.5 px-3 text-right font-mono tabular-nums text-slate-700 whitespace-nowrap">
+                              ${formatKzNumber(m.netUnitPrice)} Kz
+                            </td>
+                            <td class="py-2.5 px-3 text-right font-mono tabular-nums text-slate-900 font-medium whitespace-nowrap">
+                              ${formatKzNumber(m.grossPrice)} Kz
+                            </td>
+                            <td class="py-2.5 px-3 text-right font-mono tabular-nums whitespace-nowrap ${
+                              m.unitProfit === null
+                                ? 'text-slate-400'
+                                : m.unitProfit >= 0
+                                  ? 'text-emerald-700'
+                                  : 'text-red-700 font-semibold'
+                            }">
+                              ${
+                                m.unitProfit !== null
+                                  ? `${m.unitProfit >= 0 ? '+' : ''}${formatKzNumber(m.unitProfit)} Kz`
+                                  : '---'
+                              }
+                            </td>
+                            <td class="py-2.5 px-3 text-right font-mono tabular-nums whitespace-nowrap ${marginTone}">
+                              ${
+                                m.marginPct !== null
+                                  ? `<div>${formatKzNumber(m.marginPct)}%</div><div class="text-[10px] text-slate-400 font-normal">Markup ${formatKzNumber(m.markupPct ?? 0)}%</div>`
+                                  : 'Definir custo'
+                              }
+                            </td>
+                            <td class="py-2.5 px-3 text-right font-mono tabular-nums text-slate-700 whitespace-nowrap">
+                              ${formatKzNumber(m.soldQty)} ${escapeHtml(m.product.unit || 'un')}
+                            </td>
+                            <td class="py-2.5 px-3 text-right font-mono tabular-nums whitespace-nowrap ${
+                              m.soldQty === 0
+                                ? 'text-slate-400'
+                                : m.realizedProfit >= 0
+                                  ? 'text-emerald-700 font-semibold'
+                                  : 'text-red-700 font-semibold'
+                            }">
+                              ${m.soldQty > 0 ? `${formatKzNumber(m.realizedProfit)} Kz` : '0,00 Kz'}
+                            </td>
+                            ${
+                              canManageCat
+                                ? `
+                                  <td class="py-2.5 px-3 text-right whitespace-nowrap">
+                                    <button
+                                      type="button"
+                                      data-action="open-finance-product-cost"
+                                      data-id="${escapeHtml(m.product.id)}"
+                                      class="h-7 px-2.5 rounded border border-slate-200 hover:bg-slate-100 text-[11px] font-medium text-slate-700 whitespace-nowrap"
+                                    >${isEditing ? 'Fechar' : 'Ajustar custo'}</button>
+                                  </td>
+                                `
+                                : ''
+                            }
+                          </tr>
+                          ${
+                            isEditing && canManageCat
+                              ? `
+                                <tr class="bg-slate-50">
+                                  <td colspan="9" class="p-3">
+                                    <form data-form="finance-product-cost-form" class="flex flex-wrap items-end justify-between gap-3">
+                                      <div class="flex flex-wrap items-end gap-2.5">
+                                        <div>
+                                          <label class="block text-[11px] font-medium text-slate-600 mb-1">Preço de aquisição / custo (Kz)</label>
+                                          <input
+                                            id="finance-edit-cost-${escapeHtml(m.product.id)}"
+                                            type="text"
+                                            name="costPrice"
+                                            inputmode="decimal"
+                                            placeholder="0,00"
+                                            value="${escapeHtml(this.financeEditCostInput)}"
+                                            class="w-36 h-8 px-2.5 rounded border border-slate-300 bg-white text-xs font-mono tabular-nums"
+                                          />
+                                        </div>
+                                        <div>
+                                          <label class="block text-[11px] font-medium text-slate-600 mb-1">PVP de venda c/ IVA (Kz)</label>
+                                          <input
+                                            type="text"
+                                            name="price"
+                                            inputmode="decimal"
+                                            required
+                                            value="${escapeHtml(this.financeEditPriceInput)}"
+                                            class="w-36 h-8 px-2.5 rounded border border-slate-300 bg-white text-xs font-mono tabular-nums"
+                                          />
+                                        </div>
+                                        ${
+                                          this.financeEditProductError
+                                            ? `<span class="text-xs text-red-600 pb-1.5">${escapeHtml(this.financeEditProductError)}</span>`
+                                            : ''
+                                        }
+                                      </div>
+                                      <div class="flex items-center gap-2">
+                                        <button
+                                          type="button"
+                                          data-action="close-finance-product-cost"
+                                          class="h-8 px-3 rounded border border-slate-200 bg-white text-xs text-slate-600 whitespace-nowrap"
+                                        >Cancelar</button>
+                                        <button
+                                          type="submit"
+                                          class="h-8 px-3 rounded bg-slate-900 hover:bg-slate-800 text-white text-xs font-semibold whitespace-nowrap"
+                                        >Guardar custo e PVP</button>
+                                      </div>
+                                    </form>
+                                  </td>
+                                </tr>
+                              `
+                              : ''
+                          }
+                        `;
+                      })
+                      .join('')}
+                  </tbody>
+                </table>
+              </div>
+            `
+        }
+      </div>
+    `;
+  }
+
+  // ==================== 9. INDICADORES COMERCIAIS NO BACKOFFICE ====================
+
+  private renderIndicatorsWorkspace(): string {
+    const snap = this.computeFinancialSnapshot();
+    const canManageCat = this.canManageCatalog();
+    const suspended = this.isCompanySuspended();
+
+    const periodButtons: Array<{
+      id: 'TODAY' | 'THIS_MONTH' | 'LAST_30D' | 'THIS_YEAR' | 'ALL';
+      label: string;
+    }> = [
+      { id: 'TODAY', label: 'Hoje' },
+      { id: 'THIS_MONTH', label: 'Este mês' },
+      { id: 'LAST_30D', label: '30 dias' },
+      { id: 'THIS_YEAR', label: 'Este ano' },
+      { id: 'ALL', label: 'Tudo' },
+    ];
+
+    const renderGrowthText = (pct: number | null, refLabel: string, refValueKz: number): string => {
+      if (pct === null) {
+        return `<span class="text-slate-500">${escapeHtml(refLabel)}: <span class="font-mono tabular-nums">${formatKzNumber(refValueKz)} Kz</span></span>`;
+      }
+      const sign = pct > 0 ? '+' : '';
+      const tone =
+        pct > 0 ? 'text-emerald-700 font-semibold' : pct < 0 ? 'text-red-700 font-semibold' : 'text-slate-600';
+      return `<span class="${tone} font-mono tabular-nums">${sign}${formatKzNumber(pct)}%</span> <span class="text-slate-400">·</span> <span class="text-slate-500">${escapeHtml(refLabel)}: <span class="font-mono tabular-nums">${formatKzNumber(refValueKz)} Kz</span></span>`;
+    };
+
+    const isDailyTrend = this.indicatorsTrendMode === 'DAILY';
+    const maxDailyGross = Math.max(1, ...snap.dailySalesSeries.map((d) => d.grossSales));
+    const maxMonthlyGross = Math.max(1, ...snap.monthlySalesSeries.map((m) => m.grossSales));
+
+    const leastList =
+      this.indicatorsLeastSoldMode === 'ALL_ACTIVE'
+        ? snap.leastSellingAllActive
+        : snap.leastSellingSoldOnly;
+
+    const marginList =
+      this.indicatorsMarginRankMode === 'PCT'
+        ? snap.highestMarginByPct
+        : snap.highestMarginByProfit;
+
+    const maxTopQty = Math.max(1, snap.topSellingProducts[0]?.soldQty || 1);
+    const maxExpenseCat = Math.max(1, snap.expensesBreakdown[0]?.amount || 1);
+
+    return `
+      <div class="h-full flex flex-col overflow-hidden bg-slate-50">
+        <!-- Cabeçalho Operacional de Indicadores Comerciais -->
+        <div class="px-4 py-2.5 bg-white border-b border-slate-200 flex flex-wrap items-center justify-between gap-3 shrink-0">
+          <div class="flex flex-wrap items-center gap-3 min-w-0">
+            <div>
+              <h1 class="text-sm font-bold text-slate-900 whitespace-nowrap">Indicadores Comerciais</h1>
+              <div class="text-[11px] text-slate-500 flex flex-wrap items-center gap-1.5">
+                <span>Período de análise: <strong class="text-slate-700">${escapeHtml(snap.periodLabel)}</strong></span>
+                <span aria-hidden="true">·</span>
+                <span class="font-mono tabular-nums">${snap.periodInvoiceCount} transação(ões) FR</span>
+                <span aria-hidden="true">·</span>
+                <span class="font-mono tabular-nums">Ticket médio ${formatKzNumber(snap.periodAvgTicket)} Kz</span>
+              </div>
+            </div>
+
+            <div class="flex items-center gap-0.5 p-0.5 bg-slate-100 rounded-md border border-slate-200">
+              ${periodButtons
+                .map(
+                  (p) => `
+                    <button
+                      type="button"
+                      data-action="set-finance-period"
+                      data-value="${p.id}"
+                      class="h-7 px-2.5 rounded text-[11px] font-medium transition-colors whitespace-nowrap shrink-0 ${
+                        this.financePeriod === p.id
+                          ? 'bg-white text-slate-900 shadow-xs'
+                          : 'text-slate-600 hover:text-slate-900'
+                      }"
+                    >${escapeHtml(p.label)}</button>
+                  `
+                )
+                .join('')}
+            </div>
+          </div>
+
+          <div class="flex items-center gap-2 shrink-0">
+            <button
+              type="button"
+              data-action="nav"
+              data-value="FINANCE"
+              class="h-8 px-3 rounded-md border border-slate-200 bg-white hover:bg-slate-50 text-xs font-medium text-slate-700 flex items-center gap-1.5 whitespace-nowrap shrink-0"
+            >
+              ${ICONS.chartBar}
+              <span>Gestão financeira</span>
+            </button>
+            <button
+              type="button"
+              data-action="nav"
+              data-value="HISTORY"
+              class="h-8 px-3 rounded-md border border-slate-200 bg-white hover:bg-slate-50 text-xs font-medium text-slate-700 flex items-center gap-1.5 whitespace-nowrap shrink-0"
+            >
+              ${ICONS.history}
+              <span>Documentos</span>
+            </button>
+          </div>
+        </div>
+
+        <!-- Corpo Rolável dos 11 Indicadores Comerciais -->
+        <div class="flex-1 overflow-y-auto p-4 space-y-4">
+          <!-- Secção 1: Volume Diário, Vendas Mensais, N.º de Transações e Ticket Médio -->
+          <div class="grid grid-cols-1 sm:grid-cols-2 xl:grid-cols-4 gap-3">
+            <!-- 1. Volume de Vendas Diário -->
+            <div class="p-3.5 rounded-lg border border-slate-200 bg-white flex flex-col justify-between gap-2">
+              <div class="flex items-center justify-between gap-2">
+                <span class="text-[11px] font-semibold uppercase tracking-wide text-slate-500">Volume de Vendas Diário</span>
+                <button
+                  type="button"
+                  data-action="indicators-drill-day"
+                  data-id="${escapeHtml(snap.todayIso)}"
+                  class="text-[11px] font-medium text-blue-600 hover:underline whitespace-nowrap shrink-0"
+                >Hoje</button>
+              </div>
+              <div>
+                <div class="text-lg font-bold text-slate-900 font-mono tabular-nums">
+                  ${formatKzNumber(snap.todaySalesGross)} Kz
+                </div>
+                <div class="text-[11px] text-slate-500 font-mono tabular-nums mt-0.5">
+                  ${snap.todayTransactions} venda(s) hoje · s/ IVA ${formatKzNumber(snap.todaySalesNet)} Kz
+                </div>
+              </div>
+              <div class="pt-2 border-t border-slate-100 text-[11px] truncate">
+                ${renderGrowthText(snap.todayGrowthPct, 'Ontem', snap.yesterdaySalesGross)}
+              </div>
+            </div>
+
+            <!-- 2. Vendas Mensais -->
+            <div class="p-3.5 rounded-lg border border-slate-200 bg-white flex flex-col justify-between gap-2">
+              <div class="flex items-center justify-between gap-2">
+                <span class="text-[11px] font-semibold uppercase tracking-wide text-slate-500">Vendas Mensais (Mês Atual)</span>
+                <button
+                  type="button"
+                  data-action="indicators-drill-month"
+                  data-id="${escapeHtml(snap.todayIso.slice(0, 7))}"
+                  class="text-[11px] font-medium text-blue-600 hover:underline whitespace-nowrap shrink-0"
+                >${escapeHtml(snap.todayIso.slice(0, 7))}</button>
+              </div>
+              <div>
+                <div class="text-lg font-bold text-slate-900 font-mono tabular-nums">
+                  ${formatKzNumber(snap.monthSalesGross)} Kz
+                </div>
+                <div class="text-[11px] text-slate-500 font-mono tabular-nums mt-0.5">
+                  ${snap.monthTransactions} venda(s) no mês · s/ IVA ${formatKzNumber(snap.monthSalesNet)} Kz
+                </div>
+              </div>
+              <div class="pt-2 border-t border-slate-100 text-[11px] truncate">
+                ${renderGrowthText(snap.monthGrowthPct, 'Mês ant.', snap.prevMonthSalesGross)}
+              </div>
+            </div>
+
+            <!-- 3. Número de Transações -->
+            <div class="p-3.5 rounded-lg border border-slate-200 bg-white flex flex-col justify-between gap-2">
+              <div class="flex items-center justify-between gap-2">
+                <span class="text-[11px] font-semibold uppercase tracking-wide text-slate-500">Número de Transações</span>
+                <span class="text-[11px] text-slate-400 whitespace-nowrap">${escapeHtml(snap.periodLabel)}</span>
+              </div>
+              <div>
+                <div class="text-lg font-bold text-slate-900 font-mono tabular-nums">
+                  ${snap.periodInvoiceCount} <span class="text-xs font-normal text-slate-500">fatura(s) FR</span>
+                </div>
+                <div class="text-[11px] text-slate-500 font-mono tabular-nums mt-0.5">
+                  Pronto: ${Math.max(0, snap.periodInvoiceCount - snap.periodCreditSalesCount)} · Crédito: ${snap.periodCreditSalesCount} · ${formatKzNumber(snap.totalUnitsSoldInPeriod)} un.
+                </div>
+              </div>
+              <div class="pt-2 border-t border-slate-100 text-[11px] text-slate-500 font-mono tabular-nums">
+                Hoje: <strong class="text-slate-800">${snap.todayTransactions}</strong> · Este mês: <strong class="text-slate-800">${snap.monthTransactions}</strong>
+              </div>
+            </div>
+
+            <!-- 4. Ticket Médio -->
+            <div class="p-3.5 rounded-lg border border-slate-200 bg-white flex flex-col justify-between gap-2">
+              <div class="flex items-center justify-between gap-2">
+                <span class="text-[11px] font-semibold uppercase tracking-wide text-slate-500">Ticket Médio</span>
+                <span class="text-[11px] text-slate-400 whitespace-nowrap">${escapeHtml(snap.periodLabel)}</span>
+              </div>
+              <div>
+                <div class="text-lg font-bold text-slate-900 font-mono tabular-nums">
+                  ${formatKzNumber(snap.periodAvgTicket)} Kz
+                </div>
+                <div class="text-[11px] text-slate-500 font-mono tabular-nums mt-0.5">
+                  Volume período: ${formatKzNumber(snap.periodGrossInvoiced)} Kz
+                </div>
+              </div>
+              <div class="pt-2 border-t border-slate-100 text-[11px] text-slate-500 font-mono tabular-nums truncate">
+                Hoje: <strong class="text-slate-800">${formatKzNumber(snap.todayAvgTicket)} Kz</strong> · Mês: <strong class="text-slate-800">${formatKzNumber(snap.monthAvgTicket)} Kz</strong>
+              </div>
+            </div>
+          </div>
+
+          <!-- Secção 2: Série Diária / Mensal + Total Recebido por Método de Pagamento -->
+          <div class="grid grid-cols-1 lg:grid-cols-12 gap-4">
+            <!-- Evolução Comercial Diária (14 dias) / Mensal (6 meses) -->
+            <div class="lg:col-span-7 rounded-lg border border-slate-200 bg-white p-4 flex flex-col justify-between gap-3">
+              <div class="flex flex-wrap items-center justify-between gap-2">
+                <div>
+                  <h2 class="text-xs font-bold text-slate-900">
+                    ${isDailyTrend ? 'Evolução Diária de Vendas (Últimos 14 Dias)' : 'Evolução Mensal de Vendas (Últimos 6 Meses)'}
+                  </h2>
+                  <p class="text-[11px] text-slate-500">
+                    Clique em qualquer coluna para inspecionar os documentos emitidos na data selecionada.
+                  </p>
+                </div>
+                <div class="flex items-center gap-0.5 p-0.5 bg-slate-100 rounded-md border border-slate-200 shrink-0">
+                  <button
+                    type="button"
+                    data-action="set-indicators-trend-mode"
+                    data-value="DAILY"
+                    class="h-7 px-2.5 rounded text-[11px] font-medium whitespace-nowrap shrink-0 ${
+                      isDailyTrend ? 'bg-white text-slate-900 shadow-xs' : 'text-slate-600 hover:text-slate-900'
+                    }"
+                  >Diário (14d)</button>
+                  <button
+                    type="button"
+                    data-action="set-indicators-trend-mode"
+                    data-value="MONTHLY"
+                    class="h-7 px-2.5 rounded text-[11px] font-medium whitespace-nowrap shrink-0 ${
+                      !isDailyTrend ? 'bg-white text-slate-900 shadow-xs' : 'text-slate-600 hover:text-slate-900'
+                    }"
+                  >Mensal (6m)</button>
+                </div>
+              </div>
+
+              ${
+                isDailyTrend
+                  ? `
+                    <div class="grid grid-cols-7 sm:grid-cols-14 gap-1.5 items-end pt-2">
+                      ${snap.dailySalesSeries
+                        .map((d) => {
+                          const barH =
+                            d.grossSales > 0
+                              ? Math.max(6, Math.round((d.grossSales / maxDailyGross) * 76))
+                              : 2;
+                          const yPos = 80 - barH;
+                          const isToday = d.dateIso === snap.todayIso;
+                          return `
+                            <button
+                              type="button"
+                              data-action="indicators-drill-day"
+                              data-id="${escapeHtml(d.dateIso)}"
+                              title="${escapeHtml(d.fullLabel)} · Vendas: ${formatKzNumber(d.grossSales)} Kz · ${d.txCount} transação(ões) · Ticket médio: ${formatKzNumber(d.avgTicket)} Kz"
+                              class="group flex flex-col items-center gap-1 rounded p-1 hover:bg-slate-50 focus:outline-none"
+                            >
+                              <span class="text-[9px] font-mono tabular-nums text-slate-400 group-hover:text-slate-700">
+                                ${d.txCount > 0 ? d.txCount : ''}
+                              </span>
+                              <svg class="w-full h-20 overflow-visible" viewBox="0 0 24 80" preserveAspectRatio="none">
+                                <rect x="2" y="0" width="20" height="80" rx="2" class="fill-slate-100" />
+                                <rect
+                                  x="2"
+                                  y="${yPos}"
+                                  width="20"
+                                  height="${barH}"
+                                  rx="2"
+                                  class="${
+                                    d.grossSales <= 0
+                                      ? 'fill-slate-200'
+                                      : isToday
+                                        ? 'fill-blue-600'
+                                        : 'fill-slate-700 group-hover:fill-blue-600'
+                                  }"
+                                />
+                              </svg>
+                              <span class="text-[10px] font-mono tabular-nums ${
+                                isToday ? 'font-bold text-blue-700' : 'text-slate-500'
+                              }">${escapeHtml(d.shortLabel)}</span>
+                            </button>
+                          `;
+                        })
+                        .join('')}
+                    </div>
+                  `
+                  : `
+                    <div class="grid grid-cols-3 sm:grid-cols-6 gap-2.5 items-end pt-2">
+                      ${snap.monthlySalesSeries
+                        .map((m) => {
+                          const barH =
+                            m.grossSales > 0
+                              ? Math.max(6, Math.round((m.grossSales / maxMonthlyGross) * 76))
+                              : 2;
+                          const yPos = 80 - barH;
+                          const isCurrentMonth = m.monthKey === snap.todayIso.slice(0, 7);
+                          return `
+                            <button
+                              type="button"
+                              data-action="indicators-drill-month"
+                              data-id="${escapeHtml(m.monthKey)}"
+                              title="${escapeHtml(m.fullLabel)} · Vendas: ${formatKzNumber(m.grossSales)} Kz · ${m.txCount} transação(ões) · Ticket médio: ${formatKzNumber(m.avgTicket)} Kz"
+                              class="group flex flex-col items-center gap-1 rounded-md p-2 border border-slate-100 hover:border-slate-300 hover:bg-slate-50 focus:outline-none"
+                            >
+                              <span class="text-[10px] font-mono tabular-nums text-slate-700 font-medium truncate max-w-full">
+                                ${m.grossSales > 0 ? `${formatKzNumber(m.grossSales)}` : '0,00'}
+                              </span>
+                              <svg class="w-full h-16 overflow-visible" viewBox="0 0 48 80" preserveAspectRatio="none">
+                                <rect x="8" y="0" width="32" height="80" rx="3" class="fill-slate-100" />
+                                <rect
+                                  x="8"
+                                  y="${yPos}"
+                                  width="32"
+                                  height="${barH}"
+                                  rx="3"
+                                  class="${
+                                    m.grossSales <= 0
+                                      ? 'fill-slate-200'
+                                      : isCurrentMonth
+                                        ? 'fill-blue-600'
+                                        : 'fill-slate-700 group-hover:fill-blue-600'
+                                  }"
+                                />
+                              </svg>
+                              <span class="text-[11px] font-mono tabular-nums ${
+                                isCurrentMonth ? 'font-bold text-blue-700' : 'text-slate-600'
+                              }">${escapeHtml(m.shortLabel)}</span>
+                              <span class="text-[10px] font-mono tabular-nums text-slate-400">${m.txCount} doc.</span>
+                            </button>
+                          `;
+                        })
+                        .join('')}
+                    </div>
+                  `
+              }
+
+              <div class="pt-2 border-t border-slate-100 flex flex-wrap items-center justify-between gap-2 text-[11px] text-slate-500">
+                <span>Valores líquidos de descontos comerciais e Notas de Crédito emitidas.</span>
+                <span class="font-mono tabular-nums">
+                  IVA apurado (${escapeHtml(snap.periodLabel)}): <strong class="text-slate-700">${formatKzNumber(snap.periodTaxIva)} Kz</strong>
+                </span>
+              </div>
+            </div>
+
+            <!-- 8. Total Recebido por Método de Pagamento -->
+            <div class="lg:col-span-5 rounded-lg border border-slate-200 bg-white p-4 flex flex-col justify-between gap-3">
+              <div class="flex items-start justify-between gap-2">
+                <div>
+                  <h2 class="text-xs font-bold text-slate-900">Total Recebido por Método de Pagamento</h2>
+                  <p class="text-[11px] text-slate-500">
+                    Vendas a pronto + cobranças de dívida líquidas de reembolsos (${escapeHtml(snap.periodLabel)})
+                  </p>
+                </div>
+                <div class="text-right shrink-0">
+                  <div class="text-sm font-bold text-emerald-700 font-mono tabular-nums whitespace-nowrap">
+                    ${formatKzNumber(snap.totalCustomerReceiptsNet)} Kz
+                  </div>
+                  <div class="text-[10px] text-slate-400">Total recebido</div>
+                </div>
+              </div>
+
+              <div class="space-y-3">
+                ${snap.receivedByMethod
+                  .map((ch) => {
+                    const barW = Math.max(0, Math.min(100, ch.sharePct));
+                    const barClass =
+                      ch.method === 'Dinheiro'
+                        ? 'fill-emerald-600'
+                        : ch.method === 'Multicaixa'
+                          ? 'fill-blue-600'
+                          : 'fill-slate-700';
+                    return `
+                      <div class="space-y-1">
+                        <div class="flex items-center justify-between gap-2 text-xs">
+                          <span class="font-semibold text-slate-800">${escapeHtml(ch.method)}</span>
+                          <span class="font-mono tabular-nums font-semibold text-slate-900 whitespace-nowrap">
+                            ${formatKzNumber(ch.net)} Kz
+                            <span class="text-[11px] font-normal text-slate-500">(${formatKzNumber(ch.sharePct)}%)</span>
+                          </span>
+                        </div>
+                        <svg class="w-full h-1.5 rounded bg-slate-100 overflow-hidden" viewBox="0 0 100 6" preserveAspectRatio="none">
+                          <rect x="0" y="0" width="${barW}" height="6" class="${barClass}" />
+                        </svg>
+                        <div class="text-[10px] text-slate-500 font-mono tabular-nums flex flex-wrap items-center gap-x-2">
+                          <span>Vendas: ${formatKzNumber(ch.sales)} Kz</span>
+                          <span>·</span>
+                          <span>Cobranças dívida: ${formatKzNumber(ch.debtCollections)} Kz</span>
+                          ${
+                            ch.refunds > 0
+                              ? `<span>·</span><span class="text-red-600">Reembolsos NC: -${formatKzNumber(ch.refunds)} Kz</span>`
+                              : ''
+                          }
+                        </div>
+                      </div>
+                    `;
+                  })
+                  .join('')}
+              </div>
+
+              <div class="pt-2.5 border-t border-slate-100 flex items-center justify-between gap-2 text-[11px]">
+                <span class="text-slate-500">Faturado a crédito (${escapeHtml(snap.periodLabel)}):</span>
+                <button
+                  type="button"
+                  data-action="indicators-open-receivables"
+                  data-value="OPEN_ALL"
+                  class="font-mono tabular-nums font-semibold text-amber-700 hover:underline whitespace-nowrap"
+                >${formatKzNumber(snap.periodCreditSalesVolume)} Kz (${snap.periodCreditSalesCount} doc.)</button>
+              </div>
+            </div>
+          </div>
+
+          <!-- Secção 3: Rankings de Produtos (Mais Vendidos, Menos Vendidos e Maior Margem) -->
+          <div class="grid grid-cols-1 lg:grid-cols-3 gap-4">
+            <!-- 5. Produtos Mais Vendidos -->
+            <div class="rounded-lg border border-slate-200 bg-white p-4 flex flex-col justify-between gap-3">
+              <div class="flex items-center justify-between gap-2 pb-2 border-b border-slate-100">
+                <div>
+                  <h2 class="text-xs font-bold text-slate-900">Produtos Mais Vendidos</h2>
+                  <p class="text-[11px] text-slate-500">Ranking por quantidade líquida (${escapeHtml(snap.periodLabel)})</p>
+                </div>
+                <button
+                  type="button"
+                  data-action="indicators-open-margins"
+                  data-value="QTY_DESC"
+                  class="text-[11px] font-medium text-blue-600 hover:underline whitespace-nowrap shrink-0"
+                >Ver grelha</button>
+              </div>
+
+              ${
+                snap.topSellingProducts.length === 0
+                  ? `<div class="py-8 text-center text-xs text-slate-500">Sem vendas registadas neste período.</div>`
+                  : `
+                    <div class="divide-y divide-slate-100">
+                      ${snap.topSellingProducts
+                        .slice(0, 7)
+                        .map((item, idx) => {
+                          const relPct = Math.max(
+                            4,
+                            Math.min(100, Math.round((item.soldQty / maxTopQty) * 100))
+                          );
+                          const unitShare =
+                            snap.totalUnitsSoldInPeriod > 0
+                              ? roundKz((item.soldQty / snap.totalUnitsSoldInPeriod) * 100)
+                              : 0;
+                          return `
+                            <div class="py-2 space-y-1">
+                              <div class="flex items-start justify-between gap-2 text-xs">
+                                <div class="min-w-0">
+                                  <div class="font-medium text-slate-900 truncate">
+                                    <span class="font-mono tabular-nums text-slate-400 mr-1">${String(idx + 1).padStart(2, '0')}.</span>${escapeHtml(item.name)}
+                                  </div>
+                                  <div class="text-[10px] text-slate-500 font-mono tabular-nums truncate">
+                                    ${escapeHtml(item.code)} · ${escapeHtml(item.category)} · Quota ${formatKzNumber(unitShare)}%
+                                  </div>
+                                </div>
+                                <div class="text-right font-mono tabular-nums shrink-0">
+                                  <div class="font-bold text-slate-900">${formatKzNumber(item.soldQty)} ${escapeHtml(item.unit)}</div>
+                                  <div class="text-[10px] text-slate-500">${formatKzNumber(item.soldGrossRevenue)} Kz</div>
+                                </div>
+                              </div>
+                              <svg class="w-full h-1 rounded bg-slate-100 overflow-hidden" viewBox="0 0 100 4" preserveAspectRatio="none">
+                                <rect x="0" y="0" width="${relPct}" height="4" class="fill-blue-600" />
+                              </svg>
+                            </div>
+                          `;
+                        })
+                        .join('')}
+                    </div>
+                  `
+              }
+            </div>
+
+            <!-- 6. Produtos Menos Vendidos -->
+            <div class="rounded-lg border border-slate-200 bg-white p-4 flex flex-col justify-between gap-3">
+              <div class="flex items-center justify-between gap-2 pb-2 border-b border-slate-100">
+                <div>
+                  <h2 class="text-xs font-bold text-slate-900">Produtos Menos Vendidos</h2>
+                  <p class="text-[11px] text-slate-500">Baixa rotação e stock parado (${escapeHtml(snap.periodLabel)})</p>
+                </div>
+                <div class="flex items-center gap-0.5 p-0.5 bg-slate-100 rounded border border-slate-200 shrink-0">
+                  <button
+                    type="button"
+                    data-action="set-indicators-least-mode"
+                    data-value="ALL_ACTIVE"
+                    title="Inclui artigos ativos com 0 vendas no período"
+                    class="h-6 px-2 rounded text-[10px] font-medium whitespace-nowrap ${
+                      this.indicatorsLeastSoldMode === 'ALL_ACTIVE'
+                        ? 'bg-white text-slate-900 shadow-xs'
+                        : 'text-slate-600 hover:text-slate-900'
+                    }"
+                  >Incl. 0 un.</button>
+                  <button
+                    type="button"
+                    data-action="set-indicators-least-mode"
+                    data-value="SOLD_ONLY"
+                    title="Apenas artigos que tiveram pelo menos 1 venda no período"
+                    class="h-6 px-2 rounded text-[10px] font-medium whitespace-nowrap ${
+                      this.indicatorsLeastSoldMode === 'SOLD_ONLY'
+                        ? 'bg-white text-slate-900 shadow-xs'
+                        : 'text-slate-600 hover:text-slate-900'
+                    }"
+                  >Vendidos</button>
+                </div>
+              </div>
+
+              ${
+                leastList.length === 0
+                  ? `<div class="py-8 text-center text-xs text-slate-500">Sem artigos elegíveis para este filtro.</div>`
+                  : `
+                    <div class="divide-y divide-slate-100">
+                      ${leastList
+                        .slice(0, 7)
+                        .map((item, idx) => `
+                          <div class="py-2 flex items-start justify-between gap-2 text-xs">
+                            <div class="min-w-0">
+                              <div class="font-medium text-slate-900 truncate">
+                                <span class="font-mono tabular-nums text-slate-400 mr-1">${String(idx + 1).padStart(2, '0')}.</span>${escapeHtml(item.name)}
+                              </div>
+                              <div class="text-[10px] text-slate-500 font-mono tabular-nums truncate">
+                                ${escapeHtml(item.code)} · PVP ${formatKzNumber(item.grossPrice)} Kz${
+                                  item.trackStock && item.stockQty !== null
+                                    ? ` · Stock: ${formatKzNumber(item.stockQty)} ${escapeHtml(item.unit)}`
+                                    : ''
+                                }
+                              </div>
+                            </div>
+                            <div class="text-right font-mono tabular-nums shrink-0">
+                              <div class="font-semibold ${
+                                item.soldQty === 0 ? 'text-amber-700' : 'text-slate-800'
+                              }">
+                                ${formatKzNumber(item.soldQty)} ${escapeHtml(item.unit)}
+                              </div>
+                              <div class="text-[10px] text-slate-500">
+                                ${item.soldQty > 0 ? `${formatKzNumber(item.soldGrossRevenue)} Kz` : 'Sem saída'}
+                              </div>
+                            </div>
+                          </div>
+                        `)
+                        .join('')}
+                    </div>
+                  `
+              }
+
+              <div class="pt-2 border-t border-slate-100 flex items-center justify-between text-[11px] text-slate-500">
+                <span class="font-mono tabular-nums">
+                  Sem saída no período: <strong class="text-slate-800">${
+                    snap.leastSellingAllActive.filter((x) => x.soldQty === 0).length
+                  }</strong> artigo(s)
+                </span>
+                <button
+                  type="button"
+                  data-action="indicators-open-margins"
+                  data-value="QTY_ASC"
+                  class="font-medium text-blue-600 hover:underline whitespace-nowrap"
+                >Ver todos</button>
+              </div>
+            </div>
+
+            <!-- 7. Produtos com Maior Margem -->
+            <div class="rounded-lg border border-slate-200 bg-white p-4 flex flex-col justify-between gap-3">
+              <div class="flex items-center justify-between gap-2 pb-2 border-b border-slate-100">
+                <div>
+                  <h2 class="text-xs font-bold text-slate-900">Produtos com Maior Margem</h2>
+                  <p class="text-[11px] text-slate-500">Rentabilidade s/ IVA vs custo de aquisição</p>
+                </div>
+                <div class="flex items-center gap-0.5 p-0.5 bg-slate-100 rounded border border-slate-200 shrink-0">
+                  <button
+                    type="button"
+                    data-action="set-indicators-margin-mode"
+                    data-value="PCT"
+                    class="h-6 px-2 rounded text-[10px] font-medium whitespace-nowrap ${
+                      this.indicatorsMarginRankMode === 'PCT'
+                        ? 'bg-white text-slate-900 shadow-xs'
+                        : 'text-slate-600 hover:text-slate-900'
+                    }"
+                  >Margem %</button>
+                  <button
+                    type="button"
+                    data-action="set-indicators-margin-mode"
+                    data-value="REALIZED"
+                    class="h-6 px-2 rounded text-[10px] font-medium whitespace-nowrap ${
+                      this.indicatorsMarginRankMode === 'REALIZED'
+                        ? 'bg-white text-slate-900 shadow-xs'
+                        : 'text-slate-600 hover:text-slate-900'
+                    }"
+                  >Lucro Kz</button>
+                </div>
+              </div>
+
+              ${
+                marginList.length === 0
+                  ? `<div class="py-8 text-center text-xs text-slate-500">Defina o preço de custo nos produtos ou registe compras para calcular margens.</div>`
+                  : `
+                    <div class="divide-y divide-slate-100">
+                      ${marginList
+                        .slice(0, 7)
+                        .map((item, idx) => `
+                          <div class="py-2 flex items-start justify-between gap-2 text-xs">
+                            <div class="min-w-0">
+                              <div class="font-medium text-slate-900 truncate">
+                                <span class="font-mono tabular-nums text-slate-400 mr-1">${String(idx + 1).padStart(2, '0')}.</span>${escapeHtml(item.name)}
+                              </div>
+                              <div class="text-[10px] text-slate-500 font-mono tabular-nums truncate">
+                                ${escapeHtml(item.code)} · ${
+                                  item.unitProfit !== null
+                                    ? `Lucro unit. ${formatKzNumber(item.unitProfit)} Kz`
+                                    : `PVP ${formatKzNumber(item.grossPrice)} Kz`
+                                } · Vend.: ${formatKzNumber(item.soldQty)} ${escapeHtml(item.unit)}
+                              </div>
+                            </div>
+                            <div class="text-right font-mono tabular-nums shrink-0">
+                              ${
+                                this.indicatorsMarginRankMode === 'PCT'
+                                  ? `
+                                    <div class="font-bold text-emerald-700">${formatKzNumber(item.marginPct ?? 0)}%</div>
+                                    <div class="text-[10px] text-slate-500">Markup ${formatKzNumber(item.markupPct ?? 0)}%</div>
+                                  `
+                                  : `
+                                    <div class="font-bold ${
+                                      item.realizedProfit >= 0 ? 'text-emerald-700' : 'text-red-700'
+                                    }">${formatKzNumber(item.realizedProfit)} Kz</div>
+                                    <div class="text-[10px] text-slate-500">${
+                                      item.marginPct !== null
+                                        ? `Margem ${formatKzNumber(item.marginPct)}%`
+                                        : 'Sem custo'
+                                    }</div>
+                                  `
+                              }
+                            </div>
+                          </div>
+                        `)
+                        .join('')}
+                    </div>
+                  `
+              }
+
+              <div class="pt-2 border-t border-slate-100 flex items-center justify-between text-[11px] text-slate-500">
+                <span class="font-mono tabular-nums">
+                  Sem custo: <strong class="text-slate-800">${
+                    snap.productMargins.filter((m) => m.costSource === 'none').length
+                  }</strong> artigo(s)
+                </span>
+                <button
+                  type="button"
+                  data-action="indicators-open-margins"
+                  data-value="${this.indicatorsMarginRankMode === 'PCT' ? 'MARGIN_DESC' : 'PROFIT_DESC'}"
+                  class="font-medium text-blue-600 hover:underline whitespace-nowrap"
+                >Gerir margens</button>
+              </div>
+            </div>
+          </div>
+
+          <!-- Secção 4: Dívidas de Clientes, Despesas & Resultados, e Stock Disponível & Crítico -->
+          <div class="grid grid-cols-1 lg:grid-cols-12 gap-4">
+            <!-- 9. Total de Dívidas de Clientes -->
+            <div class="lg:col-span-4 rounded-lg border border-slate-200 bg-white p-4 flex flex-col justify-between gap-3">
+              <div class="flex items-start justify-between gap-2 pb-2 border-b border-slate-100">
+                <div>
+                  <h2 class="text-xs font-bold text-slate-900">Total de Dívidas de Clientes</h2>
+                  <p class="text-[11px] text-slate-500">
+                    ${snap.openReceivables.length} fatura(s) pendente(s) · ${snap.partialReceivablesCount} parcial(is)
+                  </p>
+                </div>
+                <div class="text-right shrink-0">
+                  <div class="text-sm font-bold font-mono tabular-nums ${
+                    snap.totalReceivablesDue > 0 ? 'text-amber-700' : 'text-slate-900'
+                  } whitespace-nowrap">
+                    ${formatKzNumber(snap.totalReceivablesDue)} Kz
+                  </div>
+                  <div class="text-[10px] text-slate-400">${snap.customerDebts.length} cliente(s)</div>
+                </div>
+              </div>
+
+              ${
+                snap.customerDebts.length === 0
+                  ? `<div class="py-8 text-center text-xs text-slate-500">Nenhuma dívida de cliente em aberto no momento.</div>`
+                  : `
+                    <div class="divide-y divide-slate-100">
+                      ${snap.customerDebts
+                        .slice(0, 6)
+                        .map((c) => {
+                          const overLimit = c.creditLimit > 0 && c.openDebt > c.creditLimit;
+                          return `
+                            <div class="py-2 flex items-start justify-between gap-2 text-xs">
+                              <div class="min-w-0">
+                                <div class="font-medium text-slate-900 truncate">${escapeHtml(c.name)}</div>
+                                <div class="text-[10px] text-slate-500 font-mono tabular-nums truncate">
+                                  NIF ${escapeHtml(c.nif)} · ${c.openCount} doc.${
+                                    overLimit
+                                      ? ` · <span class="text-red-700 font-semibold">Excede limite (${formatKzNumber(c.creditLimit)})</span>`
+                                      : ''
+                                  }
+                                </div>
+                              </div>
+                              <div class="text-right font-mono tabular-nums shrink-0">
+                                <div class="font-bold text-amber-700 whitespace-nowrap">${formatKzNumber(c.openDebt)} Kz</div>
+                                ${
+                                  c.paidOnOpen > 0
+                                    ? `<div class="text-[10px] text-emerald-700">Pago parc.: ${formatKzNumber(c.paidOnOpen)}</div>`
+                                    : ''
+                                }
+                              </div>
+                            </div>
+                          `;
+                        })
+                        .join('')}
+                    </div>
+                  `
+              }
+
+              <div class="pt-2 border-t border-slate-100 flex items-center justify-between gap-2 text-[11px]">
+                <span class="text-slate-500 font-mono tabular-nums">
+                  Cobrado (${escapeHtml(snap.periodLabel)}): <strong class="text-emerald-700">${formatKzNumber(snap.inflowDebtCollections)} Kz</strong>
+                </span>
+                <button
+                  type="button"
+                  data-action="indicators-open-receivables"
+                  data-value="BY_CUSTOMER"
+                  class="font-medium text-blue-600 hover:underline whitespace-nowrap"
+                >Cobrar dívidas</button>
+              </div>
+            </div>
+
+            <!-- 10. Despesas e Resultados -->
+            <div class="lg:col-span-4 rounded-lg border border-slate-200 bg-white p-4 flex flex-col justify-between gap-3">
+              <div class="flex items-start justify-between gap-2 pb-2 border-b border-slate-100">
+                <div>
+                  <h2 class="text-xs font-bold text-slate-900">Despesas e Resultados</h2>
+                  <p class="text-[11px] text-slate-500">Demonstração comercial (${escapeHtml(snap.periodLabel)})</p>
+                </div>
+                <div class="text-right shrink-0">
+                  <div class="text-sm font-bold font-mono tabular-nums ${
+                    snap.netCommercialResult >= 0 ? 'text-emerald-700' : 'text-red-700'
+                  } whitespace-nowrap">
+                    ${snap.netCommercialResult >= 0 ? '+' : ''}${formatKzNumber(snap.netCommercialResult)} Kz
+                  </div>
+                  <div class="text-[10px] text-slate-400 font-mono tabular-nums">
+                    Margem líq. ${formatKzNumber(snap.netResultMarginPct)}%
+                  </div>
+                </div>
+              </div>
+
+              <div class="space-y-1.5 text-xs">
+                <div class="flex items-center justify-between gap-2">
+                  <span class="text-slate-600">Vendas líquidas (s/ IVA)</span>
+                  <span class="font-mono tabular-nums font-medium text-slate-900">${formatKzNumber(snap.periodNetSalesRevenue)} Kz</span>
+                </div>
+                <div class="flex items-center justify-between gap-2">
+                  <span class="text-slate-600">Custo mercadorias (CMV)</span>
+                  <span class="font-mono tabular-nums text-slate-700">-${formatKzNumber(snap.periodEstimatedCogs)} Kz</span>
+                </div>
+                <div class="flex items-center justify-between gap-2 pt-1 border-t border-slate-100">
+                  <span class="font-medium text-slate-800">Lucro bruto (${formatKzNumber(snap.grossMarginPct)}%)</span>
+                  <span class="font-mono tabular-nums font-semibold ${
+                    snap.grossProfit >= 0 ? 'text-emerald-700' : 'text-red-700'
+                  }">${formatKzNumber(snap.grossProfit)} Kz</span>
+                </div>
+                ${
+                  snap.inflowExtraRevenues > 0
+                    ? `
+                      <div class="flex items-center justify-between gap-2">
+                        <span class="text-slate-600">Receitas extraordinárias</span>
+                        <span class="font-mono tabular-nums text-emerald-700">+${formatKzNumber(snap.inflowExtraRevenues)} Kz</span>
+                      </div>
+                    `
+                    : ''
+                }
+                <div class="flex items-center justify-between gap-2">
+                  <span class="font-medium text-slate-800">Despesas operacionais</span>
+                  <span class="font-mono tabular-nums font-semibold text-red-700">-${formatKzNumber(snap.outflowOperationalExpenses)} Kz</span>
+                </div>
+              </div>
+
+              ${
+                snap.expensesBreakdown.length > 0
+                  ? `
+                    <div class="pt-2 border-t border-slate-100 space-y-1.5">
+                      <div class="text-[10px] font-semibold uppercase tracking-wide text-slate-400">Principais Despesas</div>
+                      ${snap.expensesBreakdown
+                        .slice(0, 3)
+                        .map((e) => {
+                          const w = Math.max(4, Math.min(100, Math.round((e.amount / maxExpenseCat) * 100)));
+                          return `
+                            <div class="space-y-0.5">
+                              <div class="flex items-center justify-between text-[11px]">
+                                <span class="text-slate-700 truncate">${escapeHtml(e.category)}</span>
+                                <span class="font-mono tabular-nums text-slate-900 shrink-0">${formatKzNumber(e.amount)} Kz</span>
+                              </div>
+                              <svg class="w-full h-1 rounded bg-slate-100 overflow-hidden" viewBox="0 0 100 4" preserveAspectRatio="none">
+                                <rect x="0" y="0" width="${w}" height="4" class="fill-red-500" />
+                              </svg>
+                            </div>
+                          `;
+                        })
+                        .join('')}
+                    </div>
+                  `
+                  : ''
+              }
+
+              <div class="pt-2 border-t border-slate-100 flex items-center justify-between gap-2 text-[11px]">
+                <span class="text-slate-500 font-mono tabular-nums">
+                  Fornecedores a pagar: <strong class="text-slate-800">${formatKzNumber(snap.totalPayablesDue)} Kz</strong>
+                </span>
+                <div class="flex items-center gap-2 shrink-0">
+                  ${
+                    !suspended
+                      ? `<button
+                          type="button"
+                          data-action="indicators-open-dre"
+                          data-value="EXPENSE"
+                          class="font-medium text-slate-700 hover:text-slate-900 hover:underline whitespace-nowrap"
+                        >+ Despesa</button>`
+                      : ''
+                  }
+                  <button
+                    type="button"
+                    data-action="indicators-open-dre"
+                    data-value="OVERVIEW"
+                    class="font-medium text-blue-600 hover:underline whitespace-nowrap"
+                  >Ver DRE</button>
+                </div>
+              </div>
+            </div>
+
+            <!-- 11. Stock Disponível e Stock Crítico -->
+            <div class="lg:col-span-4 rounded-lg border border-slate-200 bg-white p-4 flex flex-col justify-between gap-3">
+              <div class="flex items-start justify-between gap-2 pb-2 border-b border-slate-100">
+                <div>
+                  <h2 class="text-xs font-bold text-slate-900">Stock Disponível e Stock Crítico</h2>
+                  <p class="text-[11px] text-slate-500">
+                    ${snap.stockSummary.trackedStockCount} c/ stock controlado · ${snap.stockSummary.activeCatalogCount} ativo(s)
+                  </p>
+                </div>
+                <div class="text-right shrink-0">
+                  <div class="text-sm font-bold text-slate-900 font-mono tabular-nums whitespace-nowrap">
+                    ${formatKzNumber(snap.stockSummary.availableUnitsTotal)} un.
+                  </div>
+                  <div class="text-[10px] text-slate-400 font-mono tabular-nums">
+                    PVP ${formatKzNumber(snap.stockSummary.stockRetailValuation)} Kz
+                  </div>
+                </div>
+              </div>
+
+              <div class="grid grid-cols-3 gap-2 text-center">
+                <button
+                  type="button"
+                  data-action="indicators-go-stock-filter"
+                  data-value="ACTIVE"
+                  class="p-2 rounded border border-slate-200 hover:bg-slate-50 text-left"
+                >
+                  <div class="text-[10px] text-slate-500">Valor Custo</div>
+                  <div class="text-xs font-bold text-slate-900 font-mono tabular-nums truncate">
+                    ${formatKzNumber(snap.stockSummary.stockCostValuation)}
+                  </div>
+                </button>
+                <button
+                  type="button"
+                  data-action="indicators-go-stock-filter"
+                  data-value="OUT_OF_STOCK"
+                  class="p-2 rounded border border-slate-200 hover:bg-slate-50 text-left"
+                >
+                  <div class="text-[10px] text-slate-500">Esgotados</div>
+                  <div class="text-xs font-bold font-mono tabular-nums ${
+                    snap.stockSummary.outOfStockProducts.length > 0 ? 'text-red-700' : 'text-slate-900'
+                  }">
+                    ${snap.stockSummary.outOfStockProducts.length}
+                  </div>
+                </button>
+                <button
+                  type="button"
+                  data-action="indicators-go-stock-filter"
+                  data-value="LOW_STOCK"
+                  class="p-2 rounded border border-slate-200 hover:bg-slate-50 text-left"
+                >
+                  <div class="text-[10px] text-slate-500">Stock Mín.</div>
+                  <div class="text-xs font-bold font-mono tabular-nums ${
+                    snap.stockSummary.lowStockProducts.length > 0 ? 'text-amber-700' : 'text-slate-900'
+                  }">
+                    ${snap.stockSummary.lowStockProducts.length}
+                  </div>
+                </button>
+              </div>
+
+              ${
+                snap.stockSummary.criticalStockProducts.length === 0
+                  ? `<div class="py-6 text-center text-xs text-emerald-700 font-medium">Todos os artigos controlados estão acima do stock mínimo.</div>`
+                  : `
+                    <div class="divide-y divide-slate-100">
+                      ${snap.stockSummary.criticalStockProducts
+                        .slice(0, 5)
+                        .map((p) => {
+                          const q = roundKz(p.stockQty ?? 0);
+                          const minQ = roundKz(p.minStockQty ?? 0);
+                          const isOut = q <= 0;
+                          return `
+                            <div class="py-2 flex items-center justify-between gap-2 text-xs">
+                              <div class="min-w-0">
+                                <div class="font-medium text-slate-900 truncate">${escapeHtml(p.name)}</div>
+                                <div class="text-[10px] font-mono tabular-nums ${
+                                  isOut ? 'text-red-700 font-semibold' : 'text-amber-700'
+                                }">
+                                  ${escapeHtml(p.code)} · ${
+                                    isOut
+                                      ? 'Esgotado (0)'
+                                      : `Disp. ${formatKzNumber(q)} / Mín. ${formatKzNumber(minQ)} ${escapeHtml(p.unit || 'un')}`
+                                  }
+                                </div>
+                              </div>
+                              ${
+                                canManageCat && !suspended
+                                  ? `<button
+                                      type="button"
+                                      data-action="indicators-restock-product"
+                                      data-id="${escapeHtml(p.id)}"
+                                      class="h-7 px-2 rounded border border-slate-200 bg-white hover:bg-slate-50 text-[11px] font-medium text-slate-700 whitespace-nowrap shrink-0"
+                                    >+ Repor</button>`
+                                  : ''
+                              }
+                            </div>
+                          `;
+                        })
+                        .join('')}
+                    </div>
+                  `
+              }
+
+              <div class="pt-2 border-t border-slate-100 flex items-center justify-between text-[11px]">
+                <span class="text-slate-500 font-mono tabular-nums">
+                  Total alertas: <strong class="text-slate-800">${snap.stockSummary.criticalStockProducts.length}</strong>
+                </span>
+                <button
+                  type="button"
+                  data-action="indicators-go-stock-filter"
+                  data-value="${
+                    snap.stockSummary.outOfStockProducts.length > 0
+                      ? 'OUT_OF_STOCK'
+                      : snap.stockSummary.lowStockProducts.length > 0
+                        ? 'LOW_STOCK'
+                        : 'ALL'
+                  }"
+                  class="font-medium text-blue-600 hover:underline whitespace-nowrap"
+                >Abrir stock</button>
+              </div>
+            </div>
+          </div>
+        </div>
+      </div>
+    `;
+  }
 }
+
+
+

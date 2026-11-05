@@ -1,5 +1,6 @@
 import {
   DEFAULT_SETTINGS,
+  DEFAULT_WAREHOUSE_ID,
   type AppSettings,
   type CalculatedLineItem,
   type CashMovement,
@@ -14,6 +15,13 @@ import {
   type PlanTier,
   type Product,
   type ProductPriceChange,
+  type PurchaseLineItem,
+  type PurchasePaymentMethod,
+  type PurchaseRecord,
+  type StockMovement,
+  type StockMovementDirection,
+  type StockMovementType,
+  type Supplier,
 } from '../../src/core/types.ts';
 import { auth } from '../../src/services/firebaseClient.ts';
 
@@ -334,6 +342,9 @@ export async function fetchCompanyWorkspaceBackend(companyId: string): Promise<{
   invoices: InvoiceRecord[];
   cashSessions: CashSession[];
   cashMovements: CashMovement[];
+  stockMovements: StockMovement[];
+  suppliers: Supplier[];
+  purchases: PurchaseRecord[];
   settings: AppSettings | null;
 } | null> {
   const resolvedId = String(companyId || '').trim();
@@ -357,6 +368,9 @@ export async function fetchCompanyWorkspaceBackend(companyId: string): Promise<{
       invoices?: Array<Record<string, unknown>>;
       cashSessions?: Array<Record<string, unknown>>;
       cashMovements?: Array<Record<string, unknown>>;
+      stockMovements?: Array<Record<string, unknown>>;
+      suppliers?: Array<Record<string, unknown>>;
+      purchases?: Array<Record<string, unknown>>;
       settings?: Record<string, unknown> | null;
     };
     if (!json.ok) return null;
@@ -599,6 +613,123 @@ export async function fetchCompanyWorkspaceBackend(companyId: string): Promise<{
       };
     });
 
+    const stockMovements: StockMovement[] = (json.stockMovements || []).map((sm) => {
+      const rawType = String(sm.type || 'AJUSTE_INVENTARIO') as StockMovementType;
+      const validType: StockMovementType =
+        rawType === 'ENTRADA_MERCADORIA' ||
+        rawType === 'SAIDA_VENDA' ||
+        rawType === 'DEVOLUCAO_CLIENTE' ||
+        rawType === 'AJUSTE_INVENTARIO' ||
+        rawType === 'RECONCILIACAO_FISICA' ||
+        rawType === 'TRANSFERENCIA_ARMAZEM'
+          ? rawType
+          : 'AJUSTE_INVENTARIO';
+      const rawDir = String(sm.direction || 'NEUTRAL') as StockMovementDirection;
+      const validDir: StockMovementDirection =
+        rawDir === 'IN' || rawDir === 'OUT' || rawDir === 'NEUTRAL' ? rawDir : 'NEUTRAL';
+      return {
+        id: String(sm.id || ''),
+        companyId: resolvedId,
+        productId: String(sm.productId || ''),
+        productCode: String(sm.productCode || ''),
+        productName: String(sm.productName || ''),
+        unit: String(sm.unit || 'un'),
+        type: validType,
+        direction: validDir,
+        qty: Math.max(0, Number(sm.qty) || 0),
+        previousStock: Number(sm.previousStock) || 0,
+        newStock: Number(sm.newStock) || 0,
+        ...(typeof sm.unitCost === 'number' && sm.unitCost >= 0
+          ? { unitCost: Number(sm.unitCost) }
+          : {}),
+        warehouseId: String(sm.warehouseId || DEFAULT_WAREHOUSE_ID),
+        ...(sm.targetWarehouseId ? { targetWarehouseId: String(sm.targetWarehouseId) } : {}),
+        reason: String(sm.reason || ''),
+        ...(sm.reference ? { reference: String(sm.reference) } : {}),
+        ...(sm.invoiceId ? { invoiceId: String(sm.invoiceId) } : {}),
+        ...(sm.invoiceNumber ? { invoiceNumber: String(sm.invoiceNumber) } : {}),
+        operator: String(sm.operator || '001'),
+        ...(sm.createdByUid ? { createdByUid: String(sm.createdByUid) } : {}),
+        syncState: 'synced',
+        synced: true,
+        createdAtIso: String(sm.createdAtIso || now),
+      };
+    });
+
+    const suppliers: Supplier[] = (json.suppliers || []).map((sup) => ({
+      id: String(sup.id || ''),
+      companyId: resolvedId,
+      name: String(sup.name || ''),
+      nif: String(sup.nif || ''),
+      phone: String(sup.phone || ''),
+      ...(sup.email ? { email: String(sup.email) } : {}),
+      address: String(sup.address || ''),
+      locality: String(sup.locality || ''),
+      ...(sup.contactPerson ? { contactPerson: String(sup.contactPerson) } : {}),
+      ...(sup.iban ? { iban: String(sup.iban) } : {}),
+      ...(typeof sup.paymentTermsDays === 'number'
+        ? { paymentTermsDays: Number(sup.paymentTermsDays) }
+        : {}),
+      ...(sup.notes ? { notes: String(sup.notes) } : {}),
+      active: sup.active !== false,
+      syncState: 'synced',
+      synced: true,
+      updatedAtIso: now,
+    }));
+
+    const purchases: PurchaseRecord[] = (json.purchases || []).map((pur) => {
+      const rawLines = Array.isArray(pur.lines)
+        ? (pur.lines as Array<Record<string, unknown>>)
+        : [];
+      const lines: PurchaseLineItem[] = rawLines.map((it) => ({
+        productId: String(it.productId || ''),
+        code: String(it.code || ''),
+        name: String(it.name || ''),
+        unit: String(it.unit || 'UN'),
+        qty: Math.max(0, Number(it.qty) || 0),
+        unitCost: Math.max(0, Number(it.unitCost) || 0),
+        total: Math.max(0, Number(it.total) || 0),
+      }));
+      const pm: PurchasePaymentMethod =
+        pur.paymentMethod === 'Multicaixa' ||
+        pur.paymentMethod === 'Transferência' ||
+        pur.paymentMethod === 'Crédito'
+          ? pur.paymentMethod
+          : 'Dinheiro';
+
+      return {
+        id: String(pur.id || ''),
+        companyId: resolvedId,
+        number: String(pur.number || ''),
+        ...(pur.supplierInvoiceRef
+          ? { supplierInvoiceRef: String(pur.supplierInvoiceRef) }
+          : {}),
+        supplierId: String(pur.supplierId || ''),
+        supplierName: String(pur.supplierName || ''),
+        supplierNif: String(pur.supplierNif || ''),
+        issuedAtIso: String(pur.issuedAtIso || now),
+        ...(pur.dueDateIso ? { dueDateIso: String(pur.dueDateIso) } : {}),
+        lines,
+        totalAmount: Math.max(0, Number(pur.totalAmount) || 0),
+        amountPaid: Math.max(0, Number(pur.amountPaid) || 0),
+        amountDue: Math.max(0, Number(pur.amountDue) || 0),
+        paymentMethod: pm,
+        ...(pur.paymentSummary ? { paymentSummary: String(pur.paymentSummary) } : {}),
+        ...(pur.reference ? { reference: String(pur.reference) } : {}),
+        warehouseId: String(pur.warehouseId || DEFAULT_WAREHOUSE_ID),
+        updateStock: Boolean(pur.updateStock ?? true),
+        notes: String(pur.notes || ''),
+        operator: String(pur.operator || '001'),
+        status: pur.status === 'cancelled' ? 'cancelled' : 'recorded',
+        ...(pur.cancelReason ? { cancelReason: String(pur.cancelReason) } : {}),
+        ...(pur.cancelledBy ? { cancelledBy: String(pur.cancelledBy) } : {}),
+        ...(pur.createdByUid ? { createdByUid: String(pur.createdByUid) } : {}),
+        syncState: 'synced',
+        synced: true,
+        updatedAtIso: String(pur.issuedAtIso || now),
+      };
+    });
+
     let settings: AppSettings | null = null;
     if (json.settings && typeof json.settings === 'object') {
       const sd = json.settings;
@@ -629,7 +760,17 @@ export async function fetchCompanyWorkspaceBackend(companyId: string): Promise<{
       };
     }
 
-    return { products, customers, invoices, cashSessions, cashMovements, settings };
+    return {
+      products,
+      customers,
+      invoices,
+      cashSessions,
+      cashMovements,
+      stockMovements,
+      suppliers,
+      purchases,
+      settings,
+    };
   } catch {
     return null;
   }

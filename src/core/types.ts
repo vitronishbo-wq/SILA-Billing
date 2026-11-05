@@ -1,7 +1,7 @@
 export type TaxRate = 0 | 14;
 export type DirectPaymentMethod = 'Dinheiro' | 'Multicaixa' | 'Transferência';
 export type PaymentMethod = DirectPaymentMethod | 'Crédito' | 'Combinado';
-export type DocumentType = 'FR' | 'FP';
+export type DocumentType = 'FR' | 'FP' | 'NC';
 export type DocumentFormat = 'POS' | 'A4';
 export type InvoiceStatus = 'issued' | 'cancelled';
 
@@ -240,7 +240,10 @@ export interface SyncQueueEntry {
     | 'invoice'
     | 'settings'
     | 'cash_session'
-    | 'cash_movement';
+    | 'cash_movement'
+    | 'stock_movement'
+    | 'supplier'
+    | 'purchase';
   entityId: string;
   operation: 'upsert' | 'delete' | 'cancel';
   status: SyncState;
@@ -260,6 +263,8 @@ export interface AppSettings {
   autoPrintOnEmit: boolean;
   hidePromotionalFooter?: boolean;
   allowCashierPriceEdit?: boolean;
+  maxCashierDiscountPct?: number; // Limite máx. de desconto permitido a operador de caixa sem PIN de supervisor (ex: 5%)
+  supervisorPin?: string; // PIN do supervisor para desbloquear descontos especiais e operações restritas
   syncState?: SyncState;
   syncError?: string;
   synced?: boolean;
@@ -289,6 +294,9 @@ export const DEFAULT_SETTINGS: AppSettings = {
   defaultNotes: 'Venda directa a retalho.',
   autoPrintOnEmit: false,
   hidePromotionalFooter: false,
+  allowCashierPriceEdit: false,
+  maxCashierDiscountPct: 5,
+  supervisorPin: '',
   syncState: 'pending',
   synced: false,
   updatedAtIso: new Date().toISOString(),
@@ -454,6 +462,10 @@ export interface InvoiceRecord {
   cancelReason?: string;
   cancelledBy?: string;
   cancelledAtIso?: string;
+  discountAuthorizedBy?: string;
+  reprintCount?: number;
+  lastReprintedAtIso?: string;
+  lastReprintedBy?: string;
   lines: CalculatedLineItem[];
   syncState?: SyncState;
   syncError?: string;
@@ -483,6 +495,30 @@ export type CashMovementType =
   | 'SAIDA'
   | 'LIQUIDACAO_DIVIDA';
 
+export type FinancialEntryKind =
+  | 'DESPESA_OPERACIONAL'
+  | 'RECEITA_EXTRAORDINARIA'
+  | 'PAGAMENTO_FORNECEDOR'
+  | 'MOVIMENTO_CAIXA';
+
+export const DEFAULT_EXPENSE_CATEGORIES = [
+  'Renda e Instalações',
+  'Energia, Água e Telecom',
+  'Salários e Pessoal',
+  'Transporte e Combustível',
+  'Impostos e Taxas',
+  'Manutenção e Material',
+  'Outras Despesas Operacionais',
+] as const;
+
+export const DEFAULT_EXTRA_REVENUE_CATEGORIES = [
+  'Prestação Eventual de Serviços',
+  'Comissões e Intermediação',
+  'Aluguer / Cedência de Espaço',
+  'Recuperação / Reembolso',
+  'Rendimentos e Outras Receitas',
+] as const;
+
 export type CashSessionStatus = 'open' | 'closed';
 
 export interface CashMovement {
@@ -492,6 +528,8 @@ export interface CashMovement {
   cashier: string;
   operator: string;
   type: CashMovementType;
+  entryKind?: FinancialEntryKind;
+  category?: string;
   amount: number;
   paymentMethod: DirectPaymentMethod;
   reason: string;
@@ -499,6 +537,7 @@ export interface CashMovement {
   invoiceId?: string;
   invoiceNumber?: string;
   customerName?: string;
+  purchaseId?: string;
   createdByUid?: string;
   syncState?: SyncState;
   syncError?: string;
@@ -570,3 +609,106 @@ export interface CashSessionSummary {
   movementCount: number;
 }
 
+export const DEFAULT_WAREHOUSE_ID = 'armazem_principal';
+
+export type StockMovementType =
+  | 'ENTRADA_MERCADORIA'
+  | 'SAIDA_VENDA'
+  | 'DEVOLUCAO_CLIENTE'
+  | 'AJUSTE_INVENTARIO'
+  | 'RECONCILIACAO_FISICA'
+  | 'TRANSFERENCIA_ARMAZEM';
+
+export type StockMovementDirection = 'IN' | 'OUT' | 'NEUTRAL';
+
+export interface StockMovement {
+  id: string;
+  companyId: string;
+  productId: string;
+  productCode: string;
+  productName: string;
+  unit: string;
+  type: StockMovementType;
+  direction: StockMovementDirection;
+  qty: number;
+  previousStock: number;
+  newStock: number;
+  unitCost?: number;
+  warehouseId: string;
+  targetWarehouseId?: string;
+  reason: string;
+  reference?: string;
+  invoiceId?: string;
+  invoiceNumber?: string;
+  operator: string;
+  createdByUid?: string;
+  syncState?: SyncState;
+  syncError?: string;
+  synced?: boolean;
+  createdAtIso: string;
+}
+
+export type PurchasePaymentMethod = DirectPaymentMethod | 'Crédito';
+
+export type PurchaseStatus = 'recorded' | 'cancelled';
+
+export interface Supplier {
+  id: string;
+  companyId: string;
+  name: string;
+  nif: string;
+  phone: string;
+  email?: string;
+  address: string;
+  locality: string;
+  contactPerson?: string;
+  iban?: string;
+  paymentTermsDays?: number;
+  notes?: string;
+  active?: boolean;
+  syncState?: SyncState;
+  syncError?: string;
+  synced?: boolean;
+  updatedAtIso?: string;
+}
+
+export interface PurchaseLineItem {
+  productId: string;
+  code: string;
+  name: string;
+  unit: string;
+  qty: number;
+  unitCost: number;
+  total: number;
+}
+
+export interface PurchaseRecord {
+  id: string;
+  companyId: string;
+  number: string;
+  supplierInvoiceRef?: string;
+  supplierId: string;
+  supplierName: string;
+  supplierNif: string;
+  issuedAtIso: string;
+  dueDateIso?: string;
+  lines: PurchaseLineItem[];
+  totalAmount: number;
+  amountPaid: number;
+  amountDue: number;
+  paymentMethod: PurchasePaymentMethod;
+  paymentSummary?: string;
+  reference?: string;
+  warehouseId: string;
+  updateStock: boolean;
+  notes: string;
+  operator: string;
+  status: PurchaseStatus;
+  cancelReason?: string;
+  cancelledBy?: string;
+  createdByUid?: string;
+  syncState?: SyncState;
+  syncError?: string;
+  synced?: boolean;
+  updatedAtIso?: string;
+}

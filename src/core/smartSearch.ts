@@ -1,4 +1,4 @@
-import { Customer, InvoiceRecord, Product } from './types';
+import { Customer, InvoiceRecord, Product, PurchaseRecord, Supplier } from './types';
 
 const DIACRITIC_FALLBACK_MAP: Record<string, string> = {
   á: 'a', à: 'a', â: 'a', ã: 'a', ä: 'a', å: 'a',
@@ -375,7 +375,7 @@ export function filterCustomersSmart(customers: Customer[], rawQuery: string): C
 }
 
 /**
- * Pesquisa inteligente no histórico de faturas por número documental, nome do cliente ou NIF.
+ * Pesquisa inteligente no histórico documental por n.º de documento, cliente, NIF, operador, caixa ou referência.
  */
 export function filterInvoicesSmart(invoices: InvoiceRecord[], rawQuery: string): InvoiceRecord[] {
   const trimmed = String(rawQuery || '').trim();
@@ -390,17 +390,32 @@ export function filterInvoicesSmart(invoices: InvoiceRecord[], rawQuery: string)
     if (String(inv.number || '').toLowerCase().includes(rawLower)) return true;
     if (matchesFormattedIdentifier(inv.number, trimmed)) return true;
     if (matchesFormattedIdentifier(inv.customerNif || '', trimmed)) return true;
+    if (inv.returnOriginNumber && String(inv.returnOriginNumber).toLowerCase().includes(rawLower)) {
+      return true;
+    }
+    if (inv.transferReference && String(inv.transferReference).toLowerCase().includes(rawLower)) {
+      return true;
+    }
+    if (String(inv.operator || '').toLowerCase().includes(rawLower)) return true;
 
     if (!qNorm) return false;
-    const normCust = normalizeSearchText(`${inv.customerName || ''} ${inv.customerLocality || ''}`);
-    if (normCust.includes(qNorm)) return true;
+    const searchableText = [
+      inv.customerName || '',
+      inv.customerLocality || '',
+      inv.operator || '',
+      inv.cashier ? `caixa ${inv.cashier} cx ${inv.cashier}` : '',
+      inv.cancelReason || '',
+      inv.notes || '',
+    ].join(' ');
+    const normHaystack = normalizeSearchText(searchableText);
+    if (normHaystack.includes(qNorm)) return true;
 
-    const foldedCust = foldOrthographyPt(normCust);
-    if (qFoldedTokens.length > 0 && qFoldedTokens.every((ft) => foldedCust.includes(ft))) {
+    const foldedHaystack = foldOrthographyPt(normHaystack);
+    if (qFoldedTokens.length > 0 && qFoldedTokens.every((ft) => foldedHaystack.includes(ft))) {
       return true;
     }
 
-    const words = foldedCust.split(' ').filter(Boolean);
+    const words = foldedHaystack.split(' ').filter(Boolean);
     return (
       qFoldedTokens.some((ft) => ft.length >= 4) &&
       qFoldedTokens.every((ft) => {
@@ -410,3 +425,86 @@ export function filterInvoicesSmart(invoices: InvoiceRecord[], rawQuery: string)
     );
   });
 }
+
+export function filterSuppliersSmart(suppliers: Supplier[], rawQuery: string): Supplier[] {
+  const trimmed = rawQuery.trim();
+  if (!trimmed) return suppliers;
+
+  const qNorm = normalizeSearchText(trimmed);
+  const qFolded = foldOrthographyPt(qNorm);
+  const qFoldedTokens = qFolded ? qFolded.split(' ').filter(Boolean) : [];
+
+  return suppliers.filter((s) => {
+    if (matchesFormattedIdentifier(s.nif || '', trimmed)) return true;
+    if (matchesFormattedIdentifier(s.phone || '', trimmed)) return true;
+    if (s.iban && matchesFormattedIdentifier(s.iban, trimmed)) return true;
+
+    if (!qNorm) return false;
+    const normHay = normalizeSearchText(
+      `${s.name || ''} ${s.locality || ''} ${s.address || ''} ${s.contactPerson || ''} ${s.email || ''}`
+    );
+    if (normHay.includes(qNorm)) return true;
+
+    const foldedHay = foldOrthographyPt(normHay);
+    if (qFoldedTokens.length > 0 && qFoldedTokens.every((ft) => foldedHay.includes(ft))) {
+      return true;
+    }
+
+    const words = foldedHay.split(' ').filter(Boolean);
+    return (
+      qFoldedTokens.some((ft) => ft.length >= 4) &&
+      qFoldedTokens.every((ft) => {
+        const maxDist = ft.length >= 7 ? 2 : ft.length >= 4 ? 1 : 0;
+        return tokenMatchesWordsWithTypo(ft, words, maxDist);
+      })
+    );
+  });
+}
+
+export function filterPurchasesSmart(
+  purchases: PurchaseRecord[],
+  rawQuery: string
+): PurchaseRecord[] {
+  const trimmed = rawQuery.trim();
+  if (!trimmed) return purchases;
+
+  const rawLower = trimmed.toLowerCase();
+  const qNorm = normalizeSearchText(trimmed);
+  const qFolded = foldOrthographyPt(qNorm);
+  const qFoldedTokens = qFolded ? qFolded.split(' ').filter(Boolean) : [];
+
+  return purchases.filter((p) => {
+    if (String(p.number || '').toLowerCase().includes(rawLower)) return true;
+    if (matchesFormattedIdentifier(p.number, trimmed)) return true;
+    if (p.supplierInvoiceRef && String(p.supplierInvoiceRef).toLowerCase().includes(rawLower)) {
+      return true;
+    }
+    if (p.supplierInvoiceRef && matchesFormattedIdentifier(p.supplierInvoiceRef, trimmed)) {
+      return true;
+    }
+    if (matchesFormattedIdentifier(p.supplierNif || '', trimmed)) return true;
+    if (p.reference && String(p.reference).toLowerCase().includes(rawLower)) return true;
+
+    if (!qNorm) return false;
+    const itemsText = (p.lines || []).map((l) => `${l.code} ${l.name}`).join(' ');
+    const normHay = normalizeSearchText(
+      `${p.supplierName || ''} ${p.notes || ''} ${itemsText}`
+    );
+    if (normHay.includes(qNorm)) return true;
+
+    const foldedHay = foldOrthographyPt(normHay);
+    if (qFoldedTokens.length > 0 && qFoldedTokens.every((ft) => foldedHay.includes(ft))) {
+      return true;
+    }
+
+    const words = foldedHay.split(' ').filter(Boolean);
+    return (
+      qFoldedTokens.some((ft) => ft.length >= 4) &&
+      qFoldedTokens.every((ft) => {
+        const maxDist = ft.length >= 7 ? 2 : ft.length >= 4 ? 1 : 0;
+        return tokenMatchesWordsWithTypo(ft, words, maxDist);
+      })
+    );
+  });
+}
+

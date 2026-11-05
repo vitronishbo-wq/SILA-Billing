@@ -22,6 +22,7 @@ import {
   CompanyRecord,
   Customer,
   DEFAULT_SETTINGS,
+  DEFAULT_WAREHOUSE_ID,
   DirectPaymentMethod,
   InvoiceRecord,
   isJaimonaOwnerEmail,
@@ -31,6 +32,13 @@ import {
   PaymentSplit,
   Product,
   ProductPriceChange,
+  PurchaseLineItem,
+  PurchasePaymentMethod,
+  PurchaseRecord,
+  StockMovement,
+  StockMovementDirection,
+  StockMovementType,
+  Supplier,
   validateCompanyNif,
   VITRONIS_INSTITUTIONAL,
 } from '../core/types';
@@ -609,12 +617,15 @@ export async function createInvoiceCloud(
           status: 'cancelled',
           cancelReason: (invoice.cancelReason || 'Anulação operacional').slice(0, 240),
           cancelledBy: (invoice.cancelledBy || user.email || user.uid).slice(0, 120),
+          cancelledAtIso: (invoice.cancelledAtIso || new Date().toISOString()).slice(0, 40),
           updatedAt: serverTimestamp(),
         });
       } else if (
         invoice.status === 'issued' &&
         exData?.status === 'issued' &&
-        (Number(exData?.amountDue) || 0) !== (Number(invoice.amountDue) || 0)
+        ((Number(exData?.amountDue) || 0) !== (Number(invoice.amountDue) || 0) ||
+          (Number(exData?.reprintCount) || 0) !== (Number(invoice.reprintCount) || 0) ||
+          String(exData?.notes || '') !== String(invoice.notes || ''))
       ) {
         await updateDoc(invRef, {
           amountReceived: invoice.amountReceived,
@@ -628,6 +639,15 @@ export async function createInvoiceCloud(
             : {}),
           ...(invoice.paymentSummary ? { paymentSummary: invoice.paymentSummary.slice(0, 160) } : {}),
           ...(invoice.transferReference ? { transferReference: invoice.transferReference.slice(0, 80) } : {}),
+          ...(typeof invoice.reprintCount === 'number' && invoice.reprintCount > 0
+            ? { reprintCount: Math.min(10000, Math.floor(invoice.reprintCount)) }
+            : {}),
+          ...(invoice.lastReprintedAtIso
+            ? { lastReprintedAtIso: invoice.lastReprintedAtIso.slice(0, 40) }
+            : {}),
+          ...(invoice.lastReprintedBy
+            ? { lastReprintedBy: invoice.lastReprintedBy.slice(0, 120) }
+            : {}),
           notes: (invoice.notes || '').slice(0, 300),
           updatedAt: serverTimestamp(),
         });
@@ -694,6 +714,15 @@ export async function createInvoiceCloud(
       ...(invoice.returnOriginInvoiceId ? { returnOriginInvoiceId: sanitizeId(invoice.returnOriginInvoiceId) } : {}),
       ...(invoice.returnOriginNumber ? { returnOriginNumber: invoice.returnOriginNumber.slice(0, 40) } : {}),
       ...(invoice.returnCreditApplied ? { returnCreditApplied: invoice.returnCreditApplied } : {}),
+      ...(typeof invoice.reprintCount === 'number' && invoice.reprintCount > 0
+        ? { reprintCount: Math.min(10000, Math.floor(invoice.reprintCount)) }
+        : {}),
+      ...(invoice.lastReprintedAtIso
+        ? { lastReprintedAtIso: invoice.lastReprintedAtIso.slice(0, 40) }
+        : {}),
+      ...(invoice.lastReprintedBy
+        ? { lastReprintedBy: invoice.lastReprintedBy.slice(0, 120) }
+        : {}),
       notes: (invoice.notes || '').slice(0, 300),
       itemCount: invoice.lines.length,
       status: 'issued',
@@ -751,6 +780,7 @@ export async function cancelInvoiceCloud(
         status: 'cancelled',
         cancelReason: cancelReason.trim().slice(0, 240),
         cancelledBy: (user.email || user.uid).slice(0, 120),
+        cancelledAtIso: new Date().toISOString().slice(0, 40),
         updatedAt: serverTimestamp(),
       });
     }
@@ -961,6 +991,14 @@ export async function createCashMovementCloud(
     const existing = await getDoc(movRef);
     if (existing.exists()) return;
 
+    const validEntryKind =
+      movement.entryKind === 'DESPESA_OPERACIONAL' ||
+      movement.entryKind === 'RECEITA_EXTRAORDINARIA' ||
+      movement.entryKind === 'PAGAMENTO_FORNECEDOR' ||
+      movement.entryKind === 'MOVIMENTO_CAIXA'
+        ? movement.entryKind
+        : undefined;
+
     await setDoc(movRef, {
       id: movementId,
       companyId,
@@ -970,6 +1008,8 @@ export async function createCashMovementCloud(
       cashier: (movement.cashier || '01').slice(0, 16),
       operator: (movement.operator || '001').slice(0, 32),
       type: movement.type,
+      ...(validEntryKind ? { entryKind: validEntryKind } : {}),
+      ...(movement.category ? { category: movement.category.trim().slice(0, 64) } : {}),
       amount: Math.min(999999999, Math.max(0.01, Number(movement.amount) || 0.01)),
       paymentMethod:
         movement.paymentMethod === 'Multicaixa'
@@ -982,11 +1022,337 @@ export async function createCashMovementCloud(
       ...(movement.invoiceId ? { invoiceId: sanitizeId(movement.invoiceId) } : {}),
       ...(movement.invoiceNumber ? { invoiceNumber: movement.invoiceNumber.slice(0, 40) } : {}),
       ...(movement.customerName ? { customerName: movement.customerName.slice(0, 160) } : {}),
+      ...(movement.purchaseId ? { purchaseId: sanitizeId(movement.purchaseId) } : {}),
       createdAtIso: (movement.createdAtIso || new Date().toISOString()).slice(0, 40),
       createdAt: serverTimestamp(),
     });
   } catch (err) {
     handleFirestoreError(err, OperationType.CREATE, movPath);
+  }
+}
+
+export async function createStockMovementCloud(
+  movement: StockMovement,
+  company?: CompanyRecord
+): Promise<void> {
+  const user = auth.currentUser;
+  if (!user || !user.emailVerified) return;
+
+  const rawCompanyId = movement.companyId || company?.id || '';
+  if (!rawCompanyId) return;
+  if (company && !canCompanySyncCloudData(company)) return;
+
+  const companyId = sanitizeId(rawCompanyId);
+  const movementId = sanitizeId(movement.id);
+  const ownerUid = company?.ownerUid || user.uid;
+  if (companyId === JAIMONA_COMPANY_ID && !company?.ownerUid && !isJaimonaOwnerEmail(user.email)) {
+    return;
+  }
+
+  const stockMovPath = `companies/${companyId}/stock_movements/${movementId}`;
+  const stockMovRef = doc(db, 'companies', companyId, 'stock_movements', movementId);
+
+  const validType: StockMovementType =
+    movement.type === 'ENTRADA_MERCADORIA' ||
+    movement.type === 'SAIDA_VENDA' ||
+    movement.type === 'DEVOLUCAO_CLIENTE' ||
+    movement.type === 'AJUSTE_INVENTARIO' ||
+    movement.type === 'RECONCILIACAO_FISICA' ||
+    movement.type === 'TRANSFERENCIA_ARMAZEM'
+      ? movement.type
+      : 'AJUSTE_INVENTARIO';
+
+  const validDirection: StockMovementDirection =
+    movement.direction === 'IN' || movement.direction === 'OUT' || movement.direction === 'NEUTRAL'
+      ? movement.direction
+      : 'NEUTRAL';
+
+  try {
+    const existing = await getDoc(stockMovRef);
+    if (existing.exists()) return;
+
+    const cleanRef = movement.reference ? movement.reference.trim().slice(0, 80) : '';
+    const cleanTargetWh = movement.targetWarehouseId
+      ? sanitizeId(movement.targetWarehouseId).slice(0, 64)
+      : '';
+
+    await setDoc(stockMovRef, {
+      id: movementId,
+      companyId,
+      companyOwnerUid: ownerUid,
+      createdByUid: user.uid,
+      productId: sanitizeId(movement.productId || 'prod_default'),
+      productCode: (movement.productCode || 'SKU').trim().slice(0, 32) || 'SKU',
+      productName: (movement.productName || 'Artigo').trim().slice(0, 160) || 'Artigo',
+      unit: (movement.unit || 'un').trim().slice(0, 16) || 'un',
+      type: validType,
+      direction: validDirection,
+      qty: Math.min(999999999, Math.max(0, Number(movement.qty) || 0)),
+      previousStock: Math.min(999999999, Math.max(-999999, Number(movement.previousStock) || 0)),
+      newStock: Math.min(999999999, Math.max(-999999, Number(movement.newStock) || 0)),
+      ...(typeof movement.unitCost === 'number' &&
+      Number.isFinite(movement.unitCost) &&
+      movement.unitCost >= 0
+        ? { unitCost: Math.min(999999999, movement.unitCost) }
+        : {}),
+      warehouseId: sanitizeId(movement.warehouseId || DEFAULT_WAREHOUSE_ID).slice(0, 64),
+      ...(cleanTargetWh ? { targetWarehouseId: cleanTargetWh } : {}),
+      reason: (movement.reason || 'Movimento de stock').trim().slice(0, 240) || 'Movimento de stock',
+      ...(cleanRef ? { reference: cleanRef } : {}),
+      ...(movement.invoiceId ? { invoiceId: sanitizeId(movement.invoiceId) } : {}),
+      ...(movement.invoiceNumber ? { invoiceNumber: movement.invoiceNumber.trim().slice(0, 40) } : {}),
+      operator: (movement.operator || '001').trim().slice(0, 32) || '001',
+      createdAtIso: (movement.createdAtIso || new Date().toISOString()).slice(0, 40),
+      createdAt: serverTimestamp(),
+    });
+  } catch (err) {
+    handleFirestoreError(err, OperationType.CREATE, stockMovPath);
+  }
+}
+
+export async function upsertSupplierCloud(
+  supplier: Supplier,
+  company?: CompanyRecord
+): Promise<void> {
+  const user = auth.currentUser;
+  if (!user || !user.emailVerified) return;
+
+  const rawCompanyId = supplier.companyId || company?.id || '';
+  if (!rawCompanyId) return;
+  if (company && !canCompanySyncCloudData(company)) return;
+
+  const companyId = sanitizeId(rawCompanyId);
+  const supplierId = sanitizeId(supplier.id);
+  const ownerUid = company?.ownerUid || user.uid;
+  if (companyId === JAIMONA_COMPANY_ID && !company?.ownerUid && !isJaimonaOwnerEmail(user.email)) {
+    return;
+  }
+
+  const supPath = `companies/${companyId}/suppliers/${supplierId}`;
+  const supRef = doc(db, 'companies', companyId, 'suppliers', supplierId);
+  const privRef = doc(db, 'companies', companyId, 'suppliers', supplierId, 'private', 'contact');
+
+  try {
+    const existing = await getDoc(supRef);
+    const batch = writeBatch(db);
+
+    const commonPayload: Record<string, unknown> = {
+      updatedByUid: user.uid,
+      name: (supplier.name || 'Fornecedor').trim().slice(0, 160) || 'Fornecedor',
+      nif: (supplier.nif || '').trim().slice(0, 32),
+      locality: (supplier.locality || '').trim().slice(0, 160),
+      active: supplier.active !== false,
+      updatedAt: serverTimestamp(),
+      ...(supplier.contactPerson
+        ? { contactPerson: supplier.contactPerson.trim().slice(0, 120) }
+        : {}),
+      ...(supplier.iban ? { iban: supplier.iban.trim().slice(0, 48) } : {}),
+      ...(typeof supplier.paymentTermsDays === 'number' &&
+      Number.isFinite(supplier.paymentTermsDays) &&
+      supplier.paymentTermsDays >= 0
+        ? { paymentTermsDays: Math.min(3650, Math.round(supplier.paymentTermsDays)) }
+        : {}),
+      ...(supplier.notes ? { notes: supplier.notes.trim().slice(0, 300) } : {}),
+    };
+
+    if (!existing.exists()) {
+      batch.set(supRef, {
+        id: supplierId,
+        companyId,
+        companyOwnerUid: ownerUid,
+        ...commonPayload,
+        createdAt: serverTimestamp(),
+      });
+    } else {
+      batch.update(supRef, commonPayload);
+    }
+
+    const privSnap = await getDoc(privRef).catch(() => null);
+    if (!privSnap || !privSnap.exists()) {
+      batch.set(privRef, {
+        companyId,
+        companyOwnerUid: ownerUid,
+        updatedByUid: user.uid,
+        phone: (supplier.phone || '').trim().slice(0, 40),
+        email: (supplier.email || '').trim().slice(0, 120),
+        address: (supplier.address || '').trim().slice(0, 200),
+        updatedAt: serverTimestamp(),
+      });
+    } else {
+      batch.update(privRef, {
+        updatedByUid: user.uid,
+        phone: (supplier.phone || '').trim().slice(0, 40),
+        email: (supplier.email || '').trim().slice(0, 120),
+        address: (supplier.address || '').trim().slice(0, 200),
+        updatedAt: serverTimestamp(),
+      });
+    }
+
+    await batch.commit();
+  } catch (err) {
+    handleFirestoreError(err, OperationType.WRITE, supPath);
+  }
+}
+
+export async function removeSupplierCloud(
+  supplierIdRaw: string,
+  companyIdRaw: string
+): Promise<void> {
+  const user = auth.currentUser;
+  if (!user || !user.emailVerified || !companyIdRaw || !supplierIdRaw) return;
+
+  const companyId = sanitizeId(companyIdRaw);
+  const supplierId = sanitizeId(supplierIdRaw);
+  if (companyId === JAIMONA_COMPANY_ID && !isJaimonaOwnerEmail(user.email)) {
+    return;
+  }
+
+  const supPath = `companies/${companyId}/suppliers/${supplierId}`;
+  const supRef = doc(db, 'companies', companyId, 'suppliers', supplierId);
+  const privRef = doc(db, 'companies', companyId, 'suppliers', supplierId, 'private', 'contact');
+
+  try {
+    const batch = writeBatch(db);
+    batch.delete(privRef);
+    batch.delete(supRef);
+    await batch.commit();
+  } catch (err) {
+    handleFirestoreError(err, OperationType.DELETE, supPath);
+  }
+}
+
+export async function upsertPurchaseCloud(
+  purchase: PurchaseRecord,
+  company?: CompanyRecord
+): Promise<void> {
+  const user = auth.currentUser;
+  if (!user || !user.emailVerified) return;
+
+  const rawCompanyId = purchase.companyId || company?.id || '';
+  if (!rawCompanyId) return;
+  if (company && !canCompanySyncCloudData(company)) return;
+
+  const companyId = sanitizeId(rawCompanyId);
+  const purchaseId = sanitizeId(purchase.id);
+  const ownerUid = company?.ownerUid || user.uid;
+  if (companyId === JAIMONA_COMPANY_ID && !company?.ownerUid && !isJaimonaOwnerEmail(user.email)) {
+    return;
+  }
+
+  const purPath = `companies/${companyId}/purchases/${purchaseId}`;
+  const purRef = doc(db, 'companies', companyId, 'purchases', purchaseId);
+
+  const validPm: PurchasePaymentMethod =
+    purchase.paymentMethod === 'Multicaixa' ||
+    purchase.paymentMethod === 'Transferência' ||
+    purchase.paymentMethod === 'Crédito'
+      ? purchase.paymentMethod
+      : 'Dinheiro';
+
+  try {
+    const existing = await getDoc(purRef);
+    if (!existing.exists()) {
+      const batch = writeBatch(db);
+      const safeLines = (purchase.lines || []).slice(0, 200);
+      const itemCount = Math.max(1, safeLines.length);
+
+      batch.set(purRef, {
+        id: purchaseId,
+        companyId,
+        companyOwnerUid: ownerUid,
+        createdByUid: user.uid,
+        updatedByUid: user.uid,
+        number: (purchase.number || 'CMP 001').trim().slice(0, 40) || 'CMP 001',
+        ...(purchase.supplierInvoiceRef
+          ? { supplierInvoiceRef: purchase.supplierInvoiceRef.trim().slice(0, 60) }
+          : {}),
+        supplierId: sanitizeId(purchase.supplierId || 'sup_default'),
+        supplierName: (purchase.supplierName || 'Fornecedor').trim().slice(0, 160) || 'Fornecedor',
+        supplierNif: (purchase.supplierNif || '').trim().slice(0, 32),
+        issuedAtIso: (purchase.issuedAtIso || new Date().toISOString()).slice(0, 40),
+        ...(purchase.dueDateIso ? { dueDateIso: purchase.dueDateIso.slice(0, 40) } : {}),
+        totalAmount: Math.min(999999999, Math.max(0, Number(purchase.totalAmount) || 0)),
+        amountPaid: Math.min(999999999, Math.max(0, Number(purchase.amountPaid) || 0)),
+        amountDue: Math.min(999999999, Math.max(0, Number(purchase.amountDue) || 0)),
+        paymentMethod: validPm,
+        ...(purchase.paymentSummary
+          ? { paymentSummary: purchase.paymentSummary.trim().slice(0, 160) }
+          : {}),
+        ...(purchase.reference ? { reference: purchase.reference.trim().slice(0, 80) } : {}),
+        warehouseId: sanitizeId(purchase.warehouseId || DEFAULT_WAREHOUSE_ID).slice(0, 64),
+        updateStock: Boolean(purchase.updateStock),
+        notes: (purchase.notes || '').trim().slice(0, 300),
+        operator: (purchase.operator || '001').trim().slice(0, 32) || '001',
+        itemCount,
+        status: 'recorded',
+        createdAt: serverTimestamp(),
+        updatedAt: serverTimestamp(),
+      });
+
+      safeLines.forEach((line, idx) => {
+        const itemId = sanitizeId(`item_${idx + 1}_${line.productId || idx}`);
+        const itemRef = doc(db, 'companies', companyId, 'purchases', purchaseId, 'items', itemId);
+        batch.set(itemRef, {
+          id: itemId,
+          purchaseId,
+          companyId,
+          companyOwnerUid: ownerUid,
+          productId: sanitizeId(line.productId || 'prod_default'),
+          code: (line.code || 'SKU').trim().slice(0, 32) || 'SKU',
+          name: (line.name || 'Artigo').trim().slice(0, 160) || 'Artigo',
+          unit: (line.unit || 'UN').trim().slice(0, 16) || 'UN',
+          qty: Math.min(1000000, Math.max(0.0001, Number(line.qty) || 1)),
+          unitCost: Math.min(999999999, Math.max(0, Number(line.unitCost) || 0)),
+          total: Math.min(999999999, Math.max(0, Number(line.total) || 0)),
+          createdAt: serverTimestamp(),
+        });
+      });
+
+      await batch.commit();
+
+      // Caso tenha sido criada localmente e logo anulada antes da primeira sincronização
+      if (purchase.status === 'cancelled') {
+        const reason =
+          (purchase.cancelReason || 'Anulada pelo utilizador').trim().slice(0, 240);
+        await updateDoc(purRef, {
+          updatedByUid: user.uid,
+          status: 'cancelled',
+          cancelReason: reason.length >= 4 ? reason : 'Anulada',
+          cancelledBy: (purchase.cancelledBy || user.email || 'Operador').trim().slice(0, 120),
+          updatedAt: serverTimestamp(),
+        });
+      }
+      return;
+    }
+
+    const existingData = existing.data();
+    if (existingData.status === 'cancelled') return;
+
+    if (purchase.status === 'cancelled') {
+      const reason = (purchase.cancelReason || 'Anulada pelo utilizador').trim().slice(0, 240);
+      await updateDoc(purRef, {
+        updatedByUid: user.uid,
+        status: 'cancelled',
+        cancelReason: reason.length >= 4 ? reason : 'Anulada',
+        cancelledBy: (purchase.cancelledBy || user.email || 'Operador').trim().slice(0, 120),
+        updatedAt: serverTimestamp(),
+      });
+    } else {
+      await updateDoc(purRef, {
+        updatedByUid: user.uid,
+        amountPaid: Math.min(999999999, Math.max(0, Number(purchase.amountPaid) || 0)),
+        amountDue: Math.min(999999999, Math.max(0, Number(purchase.amountDue) || 0)),
+        paymentMethod: validPm,
+        ...(purchase.paymentSummary
+          ? { paymentSummary: purchase.paymentSummary.trim().slice(0, 160) }
+          : {}),
+        ...(purchase.reference ? { reference: purchase.reference.trim().slice(0, 80) } : {}),
+        notes: (purchase.notes || '').trim().slice(0, 300),
+        updatedAt: serverTimestamp(),
+      });
+    }
+  } catch (err) {
+    handleFirestoreError(err, OperationType.WRITE, purPath);
   }
 }
 
@@ -996,6 +1362,9 @@ export async function pullCompanyFromCloud(companyIdRaw: string): Promise<{
   invoices: InvoiceRecord[];
   cashSessions: CashSession[];
   cashMovements: CashMovement[];
+  stockMovements: StockMovement[];
+  suppliers: Supplier[];
+  purchases: PurchaseRecord[];
   settings: AppSettings | null;
 } | null> {
   const user = auth.currentUser;
@@ -1031,10 +1400,23 @@ export async function pullCompanyFromCloud(companyIdRaw: string): Promise<{
   const invPath = `companies/${companyId}/invoices`;
   const sessPath = `companies/${companyId}/cash_sessions`;
   const movPath = `companies/${companyId}/cash_movements`;
+  const stockMovPath = `companies/${companyId}/stock_movements`;
+  const supPath = `companies/${companyId}/suppliers`;
+  const purPath = `companies/${companyId}/purchases`;
   const settingsRef = doc(db, 'companies', companyId, 'settings', 'general');
 
   try {
-    const [prodSnap, custSnap, invSnap, sessSnap, movSnap, settingsSnap] = await Promise.all([
+    const [
+      prodSnap,
+      custSnap,
+      invSnap,
+      sessSnap,
+      movSnap,
+      stockMovSnap,
+      supSnap,
+      purSnap,
+      settingsSnap,
+    ] = await Promise.all([
       getDocs(
         query(
           collection(db, prodPath),
@@ -1066,6 +1448,27 @@ export async function pullCompanyFromCloud(companyIdRaw: string): Promise<{
       getDocs(
         query(
           collection(db, movPath),
+          where('companyId', '==', companyId),
+          where('companyOwnerUid', '==', user.uid)
+        )
+      ).catch(() => null),
+      getDocs(
+        query(
+          collection(db, stockMovPath),
+          where('companyId', '==', companyId),
+          where('companyOwnerUid', '==', user.uid)
+        )
+      ).catch(() => null),
+      getDocs(
+        query(
+          collection(db, supPath),
+          where('companyId', '==', companyId),
+          where('companyOwnerUid', '==', user.uid)
+        )
+      ).catch(() => null),
+      getDocs(
+        query(
+          collection(db, purPath),
           where('companyId', '==', companyId),
           where('companyOwnerUid', '==', user.uid)
         )
@@ -1189,7 +1592,7 @@ export async function pullCompanyFromCloud(companyIdRaw: string): Promise<{
           id: data.id,
           companyId,
           number: data.number,
-          docType: data.docType === 'FP' ? 'FP' : 'FR',
+          docType: data.docType === 'FP' ? 'FP' : data.docType === 'NC' ? 'NC' : 'FR',
           issuedAtIso: data.issuedAtIso,
           cashier: data.cashier,
           operator: data.operator,
@@ -1242,11 +1645,15 @@ export async function pullCompanyFromCloud(companyIdRaw: string): Promise<{
           status: data.status === 'cancelled' ? 'cancelled' : 'issued',
           cancelReason: data.cancelReason || undefined,
           cancelledBy: data.cancelledBy || undefined,
+          cancelledAtIso: data.cancelledAtIso ? String(data.cancelledAtIso) : undefined,
+          reprintCount: typeof data.reprintCount === 'number' ? data.reprintCount : undefined,
+          lastReprintedAtIso: data.lastReprintedAtIso ? String(data.lastReprintedAtIso) : undefined,
+          lastReprintedBy: data.lastReprintedBy ? String(data.lastReprintedBy) : undefined,
           lines,
           syncState: 'synced',
           synced: true,
           createdAtIso: data.issuedAtIso,
-          updatedAtIso: data.issuedAtIso,
+          updatedAtIso: data.cancelledAtIso ? String(data.cancelledAtIso) : data.issuedAtIso,
         };
       })
     );
@@ -1308,6 +1715,14 @@ export async function pullCompanyFromCloud(companyIdRaw: string): Promise<{
           : data.paymentMethod === 'Transferência'
             ? 'Transferência'
             : 'Dinheiro';
+      const rawKind = String(data.entryKind || '');
+      const validEntryKind =
+        rawKind === 'DESPESA_OPERACIONAL' ||
+        rawKind === 'RECEITA_EXTRAORDINARIA' ||
+        rawKind === 'PAGAMENTO_FORNECEDOR' ||
+        rawKind === 'MOVIMENTO_CAIXA'
+          ? (rawKind as CashMovement['entryKind'])
+          : undefined;
       return {
         id: String(data.id || d.id),
         companyId,
@@ -1315,6 +1730,8 @@ export async function pullCompanyFromCloud(companyIdRaw: string): Promise<{
         cashier: String(data.cashier || '01'),
         operator: String(data.operator || '001'),
         type: validType,
+        ...(validEntryKind ? { entryKind: validEntryKind } : {}),
+        ...(data.category ? { category: String(data.category) } : {}),
         amount: Number(data.amount) || 0,
         paymentMethod: pm,
         reason: String(data.reason || ''),
@@ -1322,12 +1739,164 @@ export async function pullCompanyFromCloud(companyIdRaw: string): Promise<{
         invoiceId: data.invoiceId ? String(data.invoiceId) : undefined,
         invoiceNumber: data.invoiceNumber ? String(data.invoiceNumber) : undefined,
         customerName: data.customerName ? String(data.customerName) : undefined,
+        purchaseId: data.purchaseId ? String(data.purchaseId) : undefined,
         createdByUid: data.createdByUid ? String(data.createdByUid) : undefined,
         syncState: 'synced',
         synced: true,
         createdAtIso: String(data.createdAtIso || new Date().toISOString()),
       };
     });
+
+    const stockMovements: StockMovement[] = (stockMovSnap?.docs || []).map((d) => {
+      const data = d.data();
+      const rawType = String(data.type || 'AJUSTE_INVENTARIO') as StockMovementType;
+      const validType: StockMovementType =
+        rawType === 'ENTRADA_MERCADORIA' ||
+        rawType === 'SAIDA_VENDA' ||
+        rawType === 'DEVOLUCAO_CLIENTE' ||
+        rawType === 'AJUSTE_INVENTARIO' ||
+        rawType === 'RECONCILIACAO_FISICA' ||
+        rawType === 'TRANSFERENCIA_ARMAZEM'
+          ? rawType
+          : 'AJUSTE_INVENTARIO';
+      const rawDir = String(data.direction || 'NEUTRAL') as StockMovementDirection;
+      const validDir: StockMovementDirection =
+        rawDir === 'IN' || rawDir === 'OUT' || rawDir === 'NEUTRAL' ? rawDir : 'NEUTRAL';
+      return {
+        id: String(data.id || d.id),
+        companyId,
+        productId: String(data.productId || ''),
+        productCode: String(data.productCode || ''),
+        productName: String(data.productName || ''),
+        unit: String(data.unit || 'un'),
+        type: validType,
+        direction: validDir,
+        qty: Number(data.qty) || 0,
+        previousStock: Number(data.previousStock) || 0,
+        newStock: Number(data.newStock) || 0,
+        ...(typeof data.unitCost === 'number' ? { unitCost: Number(data.unitCost) } : {}),
+        warehouseId: String(data.warehouseId || DEFAULT_WAREHOUSE_ID),
+        ...(data.targetWarehouseId ? { targetWarehouseId: String(data.targetWarehouseId) } : {}),
+        reason: String(data.reason || ''),
+        ...(data.reference ? { reference: String(data.reference) } : {}),
+        ...(data.invoiceId ? { invoiceId: String(data.invoiceId) } : {}),
+        ...(data.invoiceNumber ? { invoiceNumber: String(data.invoiceNumber) } : {}),
+        operator: String(data.operator || '001'),
+        ...(data.createdByUid ? { createdByUid: String(data.createdByUid) } : {}),
+        syncState: 'synced',
+        synced: true,
+        createdAtIso: String(data.createdAtIso || new Date().toISOString()),
+      };
+    });
+
+    const suppliers: Supplier[] = await Promise.all(
+      (supSnap?.docs || []).map(async (d) => {
+        const data = d.data();
+        const supId = String(data.id || d.id);
+        let phone = '';
+        let email = '';
+        let address = '';
+        try {
+          const privSnap = await getDoc(
+            doc(db, 'companies', companyId, 'suppliers', supId, 'private', 'contact')
+          );
+          if (privSnap.exists()) {
+            phone = String(privSnap.data().phone || '');
+            email = String(privSnap.data().email || '');
+            address = String(privSnap.data().address || '');
+          }
+        } catch {
+          // Ignore missing private doc
+        }
+        return {
+          id: supId,
+          companyId,
+          name: String(data.name || ''),
+          nif: String(data.nif || ''),
+          phone,
+          ...(email ? { email } : {}),
+          address,
+          locality: String(data.locality || ''),
+          ...(data.contactPerson ? { contactPerson: String(data.contactPerson) } : {}),
+          ...(data.iban ? { iban: String(data.iban) } : {}),
+          ...(typeof data.paymentTermsDays === 'number'
+            ? { paymentTermsDays: Number(data.paymentTermsDays) }
+            : {}),
+          ...(data.notes ? { notes: String(data.notes) } : {}),
+          active: data.active !== false,
+          syncState: 'synced',
+          synced: true,
+          updatedAtIso: new Date().toISOString(),
+        };
+      })
+    );
+
+    const purchases: PurchaseRecord[] = await Promise.all(
+      (purSnap?.docs || []).map(async (d) => {
+        const data = d.data();
+        const purId = String(data.id || d.id);
+        const itemsPath = `companies/${companyId}/purchases/${purId}/items`;
+        const itemsSnap = await getDocs(
+          query(
+            collection(db, itemsPath),
+            where('companyId', '==', companyId),
+            where('companyOwnerUid', '==', user.uid)
+          )
+        ).catch(() => null);
+
+        const lines: PurchaseLineItem[] = (itemsSnap?.docs || []).map((itemDoc) => {
+          const it = itemDoc.data();
+          return {
+            productId: String(it.productId || ''),
+            code: String(it.code || ''),
+            name: String(it.name || ''),
+            unit: String(it.unit || 'UN'),
+            qty: Number(it.qty) || 0,
+            unitCost: Number(it.unitCost) || 0,
+            total: Number(it.total) || 0,
+          };
+        });
+
+        const pm: PurchasePaymentMethod =
+          data.paymentMethod === 'Multicaixa' ||
+          data.paymentMethod === 'Transferência' ||
+          data.paymentMethod === 'Crédito'
+            ? data.paymentMethod
+            : 'Dinheiro';
+
+        return {
+          id: purId,
+          companyId,
+          number: String(data.number || ''),
+          ...(data.supplierInvoiceRef
+            ? { supplierInvoiceRef: String(data.supplierInvoiceRef) }
+            : {}),
+          supplierId: String(data.supplierId || ''),
+          supplierName: String(data.supplierName || ''),
+          supplierNif: String(data.supplierNif || ''),
+          issuedAtIso: String(data.issuedAtIso || new Date().toISOString()),
+          ...(data.dueDateIso ? { dueDateIso: String(data.dueDateIso) } : {}),
+          lines,
+          totalAmount: Number(data.totalAmount) || 0,
+          amountPaid: Number(data.amountPaid) || 0,
+          amountDue: Number(data.amountDue) || 0,
+          paymentMethod: pm,
+          ...(data.paymentSummary ? { paymentSummary: String(data.paymentSummary) } : {}),
+          ...(data.reference ? { reference: String(data.reference) } : {}),
+          warehouseId: String(data.warehouseId || DEFAULT_WAREHOUSE_ID),
+          updateStock: Boolean(data.updateStock ?? true),
+          notes: String(data.notes || ''),
+          operator: String(data.operator || '001'),
+          status: data.status === 'cancelled' ? 'cancelled' : 'recorded',
+          ...(data.cancelReason ? { cancelReason: String(data.cancelReason) } : {}),
+          ...(data.cancelledBy ? { cancelledBy: String(data.cancelledBy) } : {}),
+          ...(data.createdByUid ? { createdByUid: String(data.createdByUid) } : {}),
+          syncState: 'synced',
+          synced: true,
+          updatedAtIso: String(data.issuedAtIso || new Date().toISOString()),
+        };
+      })
+    );
 
     let settings: AppSettings | null = null;
     if (settingsSnap && settingsSnap.exists()) {
@@ -1359,7 +1928,17 @@ export async function pullCompanyFromCloud(companyIdRaw: string): Promise<{
       };
     }
 
-    return { products, customers, invoices, cashSessions, cashMovements, settings };
+    return {
+      products,
+      customers,
+      invoices,
+      cashSessions,
+      cashMovements,
+      stockMovements,
+      suppliers,
+      purchases,
+      settings,
+    };
   } catch (err) {
     handleFirestoreError(err, OperationType.LIST, invPath);
   }
@@ -1371,6 +1950,9 @@ async function pullLegacyJaimonaFromCloud(): Promise<{
   invoices: InvoiceRecord[];
   cashSessions: CashSession[];
   cashMovements: CashMovement[];
+  stockMovements: StockMovement[];
+  suppliers: Supplier[];
+  purchases: PurchaseRecord[];
   settings: AppSettings | null;
 } | null> {
   const user = auth.currentUser;
@@ -1481,7 +2063,7 @@ async function pullLegacyJaimonaFromCloud(): Promise<{
         id: data.id,
         companyId: JAIMONA_COMPANY_ID,
         number: data.number,
-        docType: data.docType === 'FP' ? 'FP' : 'FR',
+        docType: data.docType === 'FP' ? 'FP' : data.docType === 'NC' ? 'NC' : 'FR',
         issuedAtIso: data.issuedAtIso,
         cashier: data.cashier,
         operator: data.operator,
@@ -1539,7 +2121,17 @@ async function pullLegacyJaimonaFromCloud(): Promise<{
     };
   }
 
-  return { products, customers, invoices, cashSessions: [], cashMovements: [], settings };
+  return {
+    products,
+    customers,
+    invoices,
+    cashSessions: [],
+    cashMovements: [],
+    stockMovements: [],
+    suppliers: [],
+    purchases: [],
+    settings,
+  };
 }
 
 /**

@@ -31,6 +31,9 @@ import {
   PaymentMethod,
   PaymentSplit,
   Product,
+  PurchaseRecord,
+  StockMovement,
+  Supplier,
   SuspendedSale,
   SyncQueueEntry,
   validateCompanyNif,
@@ -45,6 +48,9 @@ export interface PosWorkspaceDraft {
     | 'CASH'
     | 'CUSTOMERS'
     | 'PRODUCTS'
+    | 'PURCHASES'
+    | 'FINANCE'
+    | 'INDICATORS'
     | 'HISTORY'
     | 'SETTINGS'
     | 'SYNC';
@@ -87,6 +93,9 @@ export interface CompanyWorkspaceBundle {
   invoices: InvoiceRecord[];
   cashSessions: CashSession[];
   cashMovements: CashMovement[];
+  stockMovements: StockMovement[];
+  suppliers: Supplier[];
+  purchases: PurchaseRecord[];
   settings: AppSettings;
   posDraft: PosWorkspaceDraft | null;
   hasPreMigrationBackup: boolean;
@@ -162,6 +171,21 @@ const REQUIRED_SCHEMA: StoreSchemaSpec[] = [
   },
   {
     name: 'cash_movements',
+    keyPath: 'id',
+    indexes: [{ name: 'by_company', keyPath: 'companyId', unique: false }],
+  },
+  {
+    name: 'stock_movements',
+    keyPath: 'id',
+    indexes: [{ name: 'by_company', keyPath: 'companyId', unique: false }],
+  },
+  {
+    name: 'suppliers',
+    keyPath: 'id',
+    indexes: [{ name: 'by_company', keyPath: 'companyId', unique: false }],
+  },
+  {
+    name: 'purchases',
     keyPath: 'id',
     indexes: [{ name: 'by_company', keyPath: 'companyId', unique: false }],
   },
@@ -309,6 +333,9 @@ async function flushFallbackStoresIfReady(db: IDBDatabase): Promise<void> {
     'sync_queue',
     'cash_sessions',
     'cash_movements',
+    'stock_movements',
+    'suppliers',
+    'purchases',
   ];
 
   for (const storeName of fallbackStoreNames) {
@@ -1017,6 +1044,9 @@ export async function loadCompanyWorkspace(
       invoices: [],
       cashSessions: [],
       cashMovements: [],
+      stockMovements: [],
+      suppliers: [],
+      purchases: [],
       settings: { ...DEFAULT_SETTINGS },
       posDraft: null,
       hasPreMigrationBackup: Boolean(backupMeta?.value),
@@ -1042,6 +1072,9 @@ export async function loadCompanyWorkspace(
     invoices,
     cashSessions,
     cashMovements,
+    stockMovements,
+    suppliers,
+    purchases,
     members,
     scopedSettingsMeta,
     legacySettingsMeta,
@@ -1052,6 +1085,9 @@ export async function loadCompanyWorkspace(
     getAllByCompanyIndex<InvoiceRecord>('invoices', activeCompany.id),
     getAllByCompanyIndex<CashSession>('cash_sessions', activeCompany.id),
     getAllByCompanyIndex<CashMovement>('cash_movements', activeCompany.id),
+    getAllByCompanyIndex<StockMovement>('stock_movements', activeCompany.id),
+    getAllByCompanyIndex<Supplier>('suppliers', activeCompany.id),
+    getAllByCompanyIndex<PurchaseRecord>('purchases', activeCompany.id),
     getAllByCompanyIndex<CompanyMember>('company_members', activeCompany.id),
     getFromStore<{ key: string; value: AppSettings }>(
       'meta',
@@ -1097,6 +1133,9 @@ export async function loadCompanyWorkspace(
   invoices.sort((a, b) => b.issuedAtIso.localeCompare(a.issuedAtIso));
   cashSessions.sort((a, b) => b.openedAtIso.localeCompare(a.openedAtIso));
   cashMovements.sort((a, b) => b.createdAtIso.localeCompare(a.createdAtIso));
+  stockMovements.sort((a, b) => b.createdAtIso.localeCompare(a.createdAtIso));
+  suppliers.sort((a, b) => a.name.localeCompare(b.name, 'pt'));
+  purchases.sort((a, b) => b.issuedAtIso.localeCompare(a.issuedAtIso));
 
   const fallbackSettings = createDefaultSettingsForCompany(activeCompany);
   const validLegacySettings =
@@ -1118,6 +1157,9 @@ export async function loadCompanyWorkspace(
     invoices,
     cashSessions,
     cashMovements,
+    stockMovements,
+    suppliers,
+    purchases,
     settings: resolvedSettings,
     posDraft: draftMeta?.value || null,
     hasPreMigrationBackup: Boolean(backupMeta?.value),
@@ -1360,6 +1402,18 @@ export const localDb = {
     for (const mv of movements) {
       await deleteFromStore('cash_movements', mv.id);
     }
+    const stockMovs = await getAllByCompanyIndex<StockMovement>('stock_movements', companyId);
+    for (const sm of stockMovs) {
+      await deleteFromStore('stock_movements', sm.id);
+    }
+    const supList = await getAllByCompanyIndex<Supplier>('suppliers', companyId);
+    for (const s of supList) {
+      await deleteFromStore('suppliers', s.id);
+    }
+    const purList = await getAllByCompanyIndex<PurchaseRecord>('purchases', companyId);
+    for (const pr of purList) {
+      await deleteFromStore('purchases', pr.id);
+    }
     await deleteFromStore('meta', `app_settings:${companyId}`);
   },
   getAllCompanies: () => getAllFromStore<CompanyRecord>('companies'),
@@ -1422,6 +1476,55 @@ export const localDb = {
       `cmov_${Date.now()}_${Math.random().toString(36).slice(2, 6)}`;
     return putInStore('cash_movements', {
       ...movement,
+      id: resolvedId,
+      companyId: resolvedCompanyId,
+    });
+  },
+  saveStockMovement: (movement: StockMovement, companyId: string) => {
+    const resolvedCompanyId = String(companyId || movement.companyId || '').trim();
+    if (!resolvedCompanyId) {
+      return Promise.reject(
+        new Error('Selecione ou cadastre uma empresa antes de registar movimentos de stock.')
+      );
+    }
+    const resolvedId =
+      String(movement.id || '').trim() ||
+      `smov_${Date.now()}_${Math.random().toString(36).slice(2, 6)}`;
+    return putInStore('stock_movements', {
+      ...movement,
+      id: resolvedId,
+      companyId: resolvedCompanyId,
+    });
+  },
+  saveSupplier: (supplier: Supplier, companyId: string) => {
+    const resolvedCompanyId = String(companyId || supplier.companyId || '').trim();
+    if (!resolvedCompanyId) {
+      return Promise.reject(
+        new Error('Selecione ou cadastre uma empresa antes de guardar fornecedores.')
+      );
+    }
+    const resolvedId =
+      String(supplier.id || '').trim() ||
+      `sup_${Date.now()}_${Math.random().toString(36).slice(2, 6)}`;
+    return putInStore('suppliers', {
+      ...supplier,
+      id: resolvedId,
+      companyId: resolvedCompanyId,
+    });
+  },
+  deleteSupplier: (id: string) => deleteFromStore('suppliers', id),
+  savePurchase: (purchase: PurchaseRecord, companyId: string) => {
+    const resolvedCompanyId = String(companyId || purchase.companyId || '').trim();
+    if (!resolvedCompanyId) {
+      return Promise.reject(
+        new Error('Selecione ou cadastre uma empresa antes de registar compras.')
+      );
+    }
+    const resolvedId =
+      String(purchase.id || '').trim() ||
+      `pur_${Date.now()}_${Math.random().toString(36).slice(2, 6)}`;
+    return putInStore('purchases', {
+      ...purchase,
       id: resolvedId,
       companyId: resolvedCompanyId,
     });

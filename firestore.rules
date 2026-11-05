@@ -220,7 +220,7 @@ service cloud.firestore {
         && data.id is string && data.id == invoiceId && isValidId(data.id)
         && data.ownerId is string && data.ownerId == request.auth.uid && isValidId(data.ownerId)
         && data.number is string && data.number.size() >= 1 && data.number.size() <= 40
-        && data.docType is string && data.docType.size() <= 8 && (data.docType == 'FR' || data.docType == 'FP')
+        && data.docType is string && data.docType.size() <= 8 && (data.docType == 'FR' || data.docType == 'FP' || data.docType == 'NC')
         && data.issuedAtIso is string && data.issuedAtIso.size() >= 10 && data.issuedAtIso.size() <= 40
         && data.cashier is string && data.cashier.size() >= 1 && data.cashier.size() <= 16
         && data.operator is string && data.operator.size() >= 1 && data.operator.size() <= 32
@@ -499,14 +499,15 @@ service cloud.firestore {
           'amountInWords', 'sessionId', 'amountReceived', 'initialAmountReceived', 'changeAmount',
           'initialChangeAmount', 'amountDue', 'transferReference', 'paymentSplits',
           'paymentSummary', 'returnOriginInvoiceId', 'returnOriginNumber', 'returnCreditApplied',
-          'notes', 'itemCount', 'status', 'cancelReason', 'cancelledBy', 'createdAt', 'updatedAt'
+          'notes', 'itemCount', 'status', 'cancelReason', 'cancelledBy', 'cancelledAtIso',
+          'reprintCount', 'lastReprintedAtIso', 'lastReprintedBy', 'createdAt', 'updatedAt'
         ])
         && data.id is string && data.id == invoiceId && isValidId(data.id)
         && data.companyId is string && data.companyId == companyId && isValidId(data.companyId)
         && data.companyOwnerUid is string && isValidId(data.companyOwnerUid)
         && data.emittedByUid is string && isValidId(data.emittedByUid)
         && data.number is string && data.number.size() >= 1 && data.number.size() <= 40
-        && data.docType is string && data.docType.size() <= 8 && (data.docType == 'FR' || data.docType == 'FP')
+        && data.docType is string && data.docType.size() <= 8 && (data.docType == 'FR' || data.docType == 'FP' || data.docType == 'NC')
         && data.issuedAtIso is string && data.issuedAtIso.size() >= 10 && data.issuedAtIso.size() <= 40
         && data.cashier is string && data.cashier.size() >= 1 && data.cashier.size() <= 16
         && data.operator is string && data.operator.size() >= 1 && data.operator.size() <= 32
@@ -548,6 +549,10 @@ service cloud.firestore {
         && data.status is string && data.status.size() <= 16 && (data.status == 'issued' || data.status == 'cancelled')
         && (!('cancelReason' in data) || (data.cancelReason is string && data.cancelReason.size() >= 4 && data.cancelReason.size() <= 240))
         && (!('cancelledBy' in data) || (data.cancelledBy is string && data.cancelledBy.size() >= 1 && data.cancelledBy.size() <= 120))
+        && (!('cancelledAtIso' in data) || (data.cancelledAtIso is string && data.cancelledAtIso.size() >= 10 && data.cancelledAtIso.size() <= 40))
+        && (!('reprintCount' in data) || (data.reprintCount is number && data.reprintCount >= 0 && data.reprintCount <= 10000))
+        && (!('lastReprintedAtIso' in data) || (data.lastReprintedAtIso is string && data.lastReprintedAtIso.size() >= 10 && data.lastReprintedAtIso.size() <= 40))
+        && (!('lastReprintedBy' in data) || (data.lastReprintedBy is string && data.lastReprintedBy.size() >= 1 && data.lastReprintedBy.size() <= 120))
         && data.createdAt is timestamp
         && data.updatedAt is timestamp;
     }
@@ -670,8 +675,8 @@ service cloud.firestore {
         ])
         && data.keys().hasOnly([
           'id', 'companyId', 'companyOwnerUid', 'createdByUid', 'sessionId',
-          'cashier', 'operator', 'type', 'amount', 'paymentMethod', 'reason',
-          'reference', 'invoiceId', 'invoiceNumber', 'customerName', 'createdAtIso', 'createdAt'
+          'cashier', 'operator', 'type', 'entryKind', 'category', 'amount', 'paymentMethod', 'reason',
+          'reference', 'invoiceId', 'invoiceNumber', 'customerName', 'purchaseId', 'createdAtIso', 'createdAt'
         ])
         && data.id is string && data.id == movementId && isValidId(data.id)
         && data.companyId is string && data.companyId == companyId && isValidId(data.companyId)
@@ -682,6 +687,17 @@ service cloud.firestore {
         && data.operator is string && data.operator.size() >= 1 && data.operator.size() <= 32
         && data.type is string && data.type.size() <= 24
         && (data.type == 'REFORCO' || data.type == 'SANGRIA' || data.type == 'ENTRADA' || data.type == 'SAIDA' || data.type == 'LIQUIDACAO_DIVIDA')
+        && (!('entryKind' in data) || (
+          data.entryKind is string
+          && data.entryKind.size() <= 32
+          && (
+            data.entryKind == 'DESPESA_OPERACIONAL'
+            || data.entryKind == 'RECEITA_EXTRAORDINARIA'
+            || data.entryKind == 'PAGAMENTO_FORNECEDOR'
+            || data.entryKind == 'MOVIMENTO_CAIXA'
+          )
+        ))
+        && (!('category' in data) || (data.category is string && data.category.size() <= 64))
         && data.amount is number && data.amount > 0 && data.amount <= 999999999
         && data.paymentMethod is string && data.paymentMethod.size() <= 24
         && (data.paymentMethod == 'Dinheiro' || data.paymentMethod == 'Multicaixa' || data.paymentMethod == 'Transferência')
@@ -690,7 +706,167 @@ service cloud.firestore {
         && (!('invoiceId' in data) || (data.invoiceId is string && data.invoiceId.size() <= 128))
         && (!('invoiceNumber' in data) || (data.invoiceNumber is string && data.invoiceNumber.size() <= 40))
         && (!('customerName' in data) || (data.customerName is string && data.customerName.size() <= 160))
+        && (!('purchaseId' in data) || (data.purchaseId is string && data.purchaseId.size() <= 128 && isValidId(data.purchaseId)))
         && data.createdAtIso is string && data.createdAtIso.size() >= 10 && data.createdAtIso.size() <= 40
+        && data.createdAt is timestamp;
+    }
+
+    function isValidCompanyStockMovement(data, companyId, movementId) {
+      return data.keys().hasAll([
+          'id', 'companyId', 'companyOwnerUid', 'createdByUid', 'productId',
+          'productCode', 'productName', 'unit', 'type', 'direction', 'qty',
+          'previousStock', 'newStock', 'warehouseId', 'reason', 'operator',
+          'createdAtIso', 'createdAt'
+        ])
+        && data.keys().hasOnly([
+          'id', 'companyId', 'companyOwnerUid', 'createdByUid', 'productId',
+          'productCode', 'productName', 'unit', 'type', 'direction', 'qty',
+          'previousStock', 'newStock', 'unitCost', 'warehouseId', 'targetWarehouseId',
+          'reason', 'reference', 'invoiceId', 'invoiceNumber', 'operator',
+          'createdAtIso', 'createdAt'
+        ])
+        && data.id is string && data.id == movementId && isValidId(data.id)
+        && data.companyId is string && data.companyId == companyId && isValidId(data.companyId)
+        && data.companyOwnerUid is string && isValidId(data.companyOwnerUid)
+        && data.createdByUid is string && data.createdByUid == request.auth.uid && isValidId(data.createdByUid)
+        && data.productId is string && isValidId(data.productId)
+        && data.productCode is string && data.productCode.size() >= 1 && data.productCode.size() <= 32
+        && data.productName is string && data.productName.size() >= 1 && data.productName.size() <= 160
+        && data.unit is string && data.unit.size() >= 1 && data.unit.size() <= 16
+        && data.type is string && data.type.size() <= 32
+        && (
+          data.type == 'ENTRADA_MERCADORIA'
+          || data.type == 'SAIDA_VENDA'
+          || data.type == 'DEVOLUCAO_CLIENTE'
+          || data.type == 'AJUSTE_INVENTARIO'
+          || data.type == 'RECONCILIACAO_FISICA'
+          || data.type == 'TRANSFERENCIA_ARMAZEM'
+        )
+        && data.direction is string && data.direction.size() <= 12
+        && (data.direction == 'IN' || data.direction == 'OUT' || data.direction == 'NEUTRAL')
+        && data.qty is number && data.qty >= 0 && data.qty <= 999999999
+        && data.previousStock is number && data.previousStock >= -999999 && data.previousStock <= 999999999
+        && data.newStock is number && data.newStock >= -999999 && data.newStock <= 999999999
+        && (!('unitCost' in data) || (data.unitCost is number && data.unitCost >= 0 && data.unitCost <= 999999999))
+        && data.warehouseId is string && data.warehouseId.size() >= 1 && data.warehouseId.size() <= 64 && isValidId(data.warehouseId)
+        && (!('targetWarehouseId' in data) || (data.targetWarehouseId is string && data.targetWarehouseId.size() >= 1 && data.targetWarehouseId.size() <= 64 && isValidId(data.targetWarehouseId)))
+        && data.reason is string && data.reason.size() >= 1 && data.reason.size() <= 240
+        && (!('reference' in data) || (data.reference is string && data.reference.size() <= 80))
+        && (!('invoiceId' in data) || (data.invoiceId is string && data.invoiceId.size() <= 128 && isValidId(data.invoiceId)))
+        && (!('invoiceNumber' in data) || (data.invoiceNumber is string && data.invoiceNumber.size() <= 40))
+        && data.operator is string && data.operator.size() >= 1 && data.operator.size() <= 32
+        && data.createdAtIso is string && data.createdAtIso.size() >= 10 && data.createdAtIso.size() <= 40
+        && data.createdAt is timestamp;
+    }
+
+    function isValidCompanySupplier(data, companyId, supplierId) {
+      return data.keys().hasAll([
+          'id', 'companyId', 'companyOwnerUid', 'updatedByUid', 'name', 'nif',
+          'locality', 'active', 'createdAt', 'updatedAt'
+        ])
+        && data.keys().hasOnly([
+          'id', 'companyId', 'companyOwnerUid', 'updatedByUid', 'name', 'nif',
+          'locality', 'contactPerson', 'iban', 'paymentTermsDays', 'notes',
+          'active', 'createdAt', 'updatedAt'
+        ])
+        && data.id is string && data.id == supplierId && isValidId(data.id)
+        && data.companyId is string && data.companyId == companyId && isValidId(data.companyId)
+        && data.companyOwnerUid is string && isValidId(data.companyOwnerUid)
+        && data.updatedByUid is string && data.updatedByUid == request.auth.uid && isValidId(data.updatedByUid)
+        && data.name is string && data.name.size() >= 1 && data.name.size() <= 160
+        && data.nif is string && data.nif.size() <= 32
+        && data.locality is string && data.locality.size() <= 160
+        && (!('contactPerson' in data) || (data.contactPerson is string && data.contactPerson.size() <= 120))
+        && (!('iban' in data) || (data.iban is string && data.iban.size() <= 48))
+        && (!('paymentTermsDays' in data) || (data.paymentTermsDays is number && data.paymentTermsDays >= 0 && data.paymentTermsDays <= 3650))
+        && (!('notes' in data) || (data.notes is string && data.notes.size() <= 300))
+        && data.active is bool
+        && data.createdAt is timestamp
+        && data.updatedAt is timestamp;
+    }
+
+    function isValidCompanySupplierPrivate(data, companyId) {
+      return data.keys().hasAll([
+          'companyId', 'companyOwnerUid', 'updatedByUid', 'phone', 'email', 'address', 'updatedAt'
+        ])
+        && data.keys().hasOnly([
+          'companyId', 'companyOwnerUid', 'updatedByUid', 'phone', 'email', 'address', 'updatedAt'
+        ])
+        && data.companyId is string && data.companyId == companyId && isValidId(data.companyId)
+        && data.companyOwnerUid is string && isValidId(data.companyOwnerUid)
+        && data.updatedByUid is string && data.updatedByUid == request.auth.uid && isValidId(data.updatedByUid)
+        && data.phone is string && data.phone.size() <= 40
+        && data.email is string && data.email.size() <= 120
+        && data.address is string && data.address.size() <= 200
+        && data.updatedAt is timestamp;
+    }
+
+    function isValidCompanyPurchase(data, companyId, purchaseId) {
+      return data.keys().hasAll([
+          'id', 'companyId', 'companyOwnerUid', 'createdByUid', 'updatedByUid',
+          'number', 'supplierId', 'supplierName', 'supplierNif', 'issuedAtIso',
+          'totalAmount', 'amountPaid', 'amountDue', 'paymentMethod', 'warehouseId',
+          'updateStock', 'notes', 'operator', 'itemCount', 'status', 'createdAt', 'updatedAt'
+        ])
+        && data.keys().hasOnly([
+          'id', 'companyId', 'companyOwnerUid', 'createdByUid', 'updatedByUid',
+          'number', 'supplierInvoiceRef', 'supplierId', 'supplierName', 'supplierNif',
+          'issuedAtIso', 'dueDateIso', 'totalAmount', 'amountPaid', 'amountDue',
+          'paymentMethod', 'paymentSummary', 'reference', 'warehouseId', 'updateStock',
+          'notes', 'operator', 'itemCount', 'status', 'cancelReason', 'cancelledBy',
+          'createdAt', 'updatedAt'
+        ])
+        && data.id is string && data.id == purchaseId && isValidId(data.id)
+        && data.companyId is string && data.companyId == companyId && isValidId(data.companyId)
+        && data.companyOwnerUid is string && isValidId(data.companyOwnerUid)
+        && data.createdByUid is string && isValidId(data.createdByUid)
+        && data.updatedByUid is string && data.updatedByUid == request.auth.uid && isValidId(data.updatedByUid)
+        && data.number is string && data.number.size() >= 1 && data.number.size() <= 40
+        && (!('supplierInvoiceRef' in data) || (data.supplierInvoiceRef is string && data.supplierInvoiceRef.size() <= 60))
+        && data.supplierId is string && data.supplierId.size() >= 1 && data.supplierId.size() <= 128 && isValidId(data.supplierId)
+        && data.supplierName is string && data.supplierName.size() >= 1 && data.supplierName.size() <= 160
+        && data.supplierNif is string && data.supplierNif.size() <= 32
+        && data.issuedAtIso is string && data.issuedAtIso.size() >= 10 && data.issuedAtIso.size() <= 40
+        && (!('dueDateIso' in data) || (data.dueDateIso is string && data.dueDateIso.size() <= 40))
+        && data.totalAmount is number && data.totalAmount >= 0 && data.totalAmount <= 999999999
+        && data.amountPaid is number && data.amountPaid >= 0 && data.amountPaid <= 999999999
+        && data.amountDue is number && data.amountDue >= 0 && data.amountDue <= 999999999
+        && data.paymentMethod is string && data.paymentMethod.size() <= 24
+        && (data.paymentMethod == 'Dinheiro' || data.paymentMethod == 'Multicaixa' || data.paymentMethod == 'Transferência' || data.paymentMethod == 'Crédito')
+        && (!('paymentSummary' in data) || (data.paymentSummary is string && data.paymentSummary.size() <= 160))
+        && (!('reference' in data) || (data.reference is string && data.reference.size() <= 80))
+        && data.warehouseId is string && data.warehouseId.size() >= 1 && data.warehouseId.size() <= 64 && isValidId(data.warehouseId)
+        && data.updateStock is bool
+        && data.notes is string && data.notes.size() <= 300
+        && data.operator is string && data.operator.size() >= 1 && data.operator.size() <= 32
+        && data.itemCount is number && data.itemCount >= 1 && data.itemCount <= 200
+        && data.status is string && data.status.size() <= 16 && (data.status == 'recorded' || data.status == 'cancelled')
+        && (!('cancelReason' in data) || (data.cancelReason is string && data.cancelReason.size() >= 4 && data.cancelReason.size() <= 240))
+        && (!('cancelledBy' in data) || (data.cancelledBy is string && data.cancelledBy.size() >= 1 && data.cancelledBy.size() <= 120))
+        && data.createdAt is timestamp
+        && data.updatedAt is timestamp;
+    }
+
+    function isValidCompanyPurchaseItem(data, companyId, purchaseId, itemId) {
+      return data.keys().hasAll([
+          'id', 'purchaseId', 'companyId', 'companyOwnerUid', 'productId',
+          'code', 'name', 'unit', 'qty', 'unitCost', 'total', 'createdAt'
+        ])
+        && data.keys().hasOnly([
+          'id', 'purchaseId', 'companyId', 'companyOwnerUid', 'productId',
+          'code', 'name', 'unit', 'qty', 'unitCost', 'total', 'createdAt'
+        ])
+        && data.id is string && data.id == itemId && isValidId(data.id)
+        && data.purchaseId is string && data.purchaseId == purchaseId && isValidId(data.purchaseId)
+        && data.companyId is string && data.companyId == companyId && isValidId(data.companyId)
+        && data.companyOwnerUid is string && isValidId(data.companyOwnerUid)
+        && data.productId is string && isValidId(data.productId)
+        && data.code is string && data.code.size() >= 1 && data.code.size() <= 32
+        && data.name is string && data.name.size() >= 1 && data.name.size() <= 160
+        && data.unit is string && data.unit.size() >= 1 && data.unit.size() <= 16
+        && data.qty is number && data.qty > 0 && data.qty <= 1000000
+        && data.unitCost is number && data.unitCost >= 0 && data.unitCost <= 999999999
+        && data.total is number && data.total >= 0 && data.total <= 999999999
         && data.createdAt is timestamp;
     }
 
@@ -1318,7 +1494,7 @@ service cloud.firestore {
               && incoming().cancelReason is string
               && incoming().cancelReason.size() >= 4
               && incoming().diff(existing()).affectedKeys().hasOnly([
-                'status', 'cancelReason', 'cancelledBy', 'updatedAt'
+                'status', 'cancelReason', 'cancelledBy', 'cancelledAtIso', 'updatedAt'
               ])
             )
             || (
@@ -1327,7 +1503,8 @@ service cloud.firestore {
               && incoming().status == 'issued'
               && incoming().diff(existing()).affectedKeys().hasOnly([
                 'amountReceived', 'initialAmountReceived', 'amountDue', 'changeAmount',
-                'initialChangeAmount', 'paymentSummary', 'transferReference', 'notes', 'updatedAt'
+                'initialChangeAmount', 'paymentSummary', 'transferReference', 'notes',
+                'reprintCount', 'lastReprintedAtIso', 'lastReprintedBy', 'updatedAt'
               ])
             )
             || isPlatformAdmin()
@@ -1487,6 +1664,212 @@ service cloud.firestore {
           && incoming().companyOwnerUid == companyDocData(companyId).ownerUid;
 
         allow update, delete: if false;
+      }
+
+      // Subcollection (Append-Only Ledger): /companies/{companyId}/stock_movements/{movementId}
+      match /stock_movements/{movementId} {
+        allow get: if isVerifiedUser()
+          && isValidId(companyId)
+          && isValidId(movementId)
+          && (isCompanyAnyActiveRole(companyId) || isPlatformAdmin());
+
+        allow list: if isVerifiedUser()
+          && existing().companyId == companyId
+          && existing().companyOwnerUid == request.auth.uid;
+
+        allow create: if isVerifiedUser()
+          && isValidId(companyId)
+          && isValidId(movementId)
+          && isValidCompanyStockMovement(incoming(), companyId, movementId)
+          && incoming().createdAt == request.time
+          && canSyncCompanyCloudData(companyId)
+          && isCompanyAnyActiveRole(companyId)
+          && incoming().companyOwnerUid == companyDocData(companyId).ownerUid;
+
+        allow update, delete: if false;
+      }
+
+      // Subcollection: /companies/{companyId}/suppliers/{supplierId}
+      match /suppliers/{supplierId} {
+        allow get: if isVerifiedUser()
+          && isValidId(companyId)
+          && isValidId(supplierId)
+          && (isCompanyAnyActiveRole(companyId) || isPlatformAdmin());
+
+        allow list: if isVerifiedUser()
+          && existing().companyId == companyId
+          && existing().companyOwnerUid == request.auth.uid;
+
+        allow create: if isVerifiedUser()
+          && isValidId(companyId)
+          && isValidId(supplierId)
+          && isValidCompanySupplier(incoming(), companyId, supplierId)
+          && incoming().createdAt == request.time
+          && incoming().updatedAt == request.time
+          && canSyncCompanyCloudData(companyId)
+          && isCompanyAnyActiveRole(companyId)
+          && incoming().companyOwnerUid == companyDocData(companyId).ownerUid;
+
+        allow update: if isVerifiedUser()
+          && isValidId(companyId)
+          && isValidId(supplierId)
+          && isValidCompanySupplier(incoming(), companyId, supplierId)
+          && incoming().id == existing().id
+          && incoming().companyId == existing().companyId
+          && incoming().companyOwnerUid == existing().companyOwnerUid
+          && incoming().createdAt == existing().createdAt
+          && incoming().updatedAt == request.time
+          && (
+            (
+              canSyncCompanyCloudData(companyId)
+              && isCompanyOwnerOrManager(companyId)
+              && incoming().diff(existing()).affectedKeys().hasOnly([
+                'updatedByUid', 'name', 'nif', 'locality', 'contactPerson',
+                'iban', 'paymentTermsDays', 'notes', 'active', 'updatedAt'
+              ])
+            )
+            || isPlatformAdmin()
+          );
+
+        allow delete: if isVerifiedUser()
+          && isValidId(companyId)
+          && isValidId(supplierId)
+          && canSyncCompanyCloudData(companyId)
+          && isCompanyOwnerOrManager(companyId);
+
+        // PII Split Subcollection: /companies/{companyId}/suppliers/{supplierId}/private/{docId}
+        match /private/{docId} {
+          allow get: if isVerifiedUser()
+            && isValidId(companyId)
+            && isValidId(supplierId)
+            && docId == 'contact'
+            && (isCompanyOwnerOrManager(companyId) || isPlatformAdmin());
+
+          allow create: if isVerifiedUser()
+            && isValidId(companyId)
+            && isValidId(supplierId)
+            && docId == 'contact'
+            && isValidCompanySupplierPrivate(incoming(), companyId)
+            && incoming().updatedAt == request.time
+            && canSyncCompanyCloudData(companyId)
+            && isCompanyAnyActiveRole(companyId)
+            && incoming().companyOwnerUid == companyDocData(companyId).ownerUid
+            && existsAfter(/databases/$(database)/documents/companies/$(companyId)/suppliers/$(supplierId));
+
+          allow update: if isVerifiedUser()
+            && isValidId(companyId)
+            && isValidId(supplierId)
+            && docId == 'contact'
+            && isValidCompanySupplierPrivate(incoming(), companyId)
+            && incoming().companyId == existing().companyId
+            && incoming().companyOwnerUid == existing().companyOwnerUid
+            && incoming().updatedAt == request.time
+            && (
+              (
+                canSyncCompanyCloudData(companyId)
+                && isCompanyOwnerOrManager(companyId)
+                && incoming().diff(existing()).affectedKeys().hasOnly([
+                  'updatedByUid', 'phone', 'email', 'address', 'updatedAt'
+                ])
+              )
+              || isPlatformAdmin()
+            );
+
+          allow delete: if isVerifiedUser()
+            && isValidId(companyId)
+            && isValidId(supplierId)
+            && docId == 'contact'
+            && canSyncCompanyCloudData(companyId)
+            && isCompanyOwnerOrManager(companyId);
+        }
+      }
+
+      // Subcollection: /companies/{companyId}/purchases/{purchaseId}
+      match /purchases/{purchaseId} {
+        allow get: if isVerifiedUser()
+          && isValidId(companyId)
+          && isValidId(purchaseId)
+          && (isCompanyAnyActiveRole(companyId) || isPlatformAdmin());
+
+        allow list: if isVerifiedUser()
+          && existing().companyId == companyId
+          && existing().companyOwnerUid == request.auth.uid;
+
+        allow create: if isVerifiedUser()
+          && isValidId(companyId)
+          && isValidId(purchaseId)
+          && isValidCompanyPurchase(incoming(), companyId, purchaseId)
+          && incoming().status == 'recorded'
+          && incoming().createdByUid == request.auth.uid
+          && incoming().createdAt == request.time
+          && incoming().updatedAt == request.time
+          && canSyncCompanyCloudData(companyId)
+          && isCompanyAnyActiveRole(companyId)
+          && incoming().companyOwnerUid == companyDocData(companyId).ownerUid;
+
+        // Terminal State Locking: compras anuladas são imutáveis
+        allow update: if isVerifiedUser()
+          && isValidId(companyId)
+          && isValidId(purchaseId)
+          && isValidCompanyPurchase(incoming(), companyId, purchaseId)
+          && incoming().id == existing().id
+          && incoming().companyId == existing().companyId
+          && incoming().companyOwnerUid == existing().companyOwnerUid
+          && incoming().createdByUid == existing().createdByUid
+          && incoming().createdAt == existing().createdAt
+          && existing().status != 'cancelled'
+          && incoming().updatedAt == request.time
+          && (
+            (
+              // Action 1: Registo de pagamento / liquidação de conta a pagar ao fornecedor
+              canSyncCompanyCloudData(companyId)
+              && isCompanyAnyActiveRole(companyId)
+              && incoming().status == 'recorded'
+              && incoming().diff(existing()).affectedKeys().hasOnly([
+                'updatedByUid', 'amountPaid', 'amountDue', 'paymentMethod',
+                'paymentSummary', 'reference', 'notes', 'updatedAt'
+              ])
+            )
+            || (
+              // Action 2: Anulação auditada da compra (Owner ou Manager autorizado)
+              canSyncCompanyCloudData(companyId)
+              && isCompanyOwnerOrManager(companyId)
+              && incoming().status == 'cancelled'
+              && ('cancelReason' in incoming())
+              && incoming().cancelReason is string
+              && incoming().cancelReason.size() >= 4
+              && incoming().diff(existing()).affectedKeys().hasOnly([
+                'updatedByUid', 'status', 'cancelReason', 'cancelledBy', 'updatedAt'
+              ])
+            )
+            || isPlatformAdmin()
+          );
+
+        allow delete: if false;
+
+        match /items/{itemId} {
+          allow get: if isVerifiedUser()
+            && isValidId(companyId)
+            && isValidId(purchaseId)
+            && isValidId(itemId)
+            && (isCompanyAnyActiveRole(companyId) || isPlatformAdmin());
+
+          allow list: if isVerifiedUser()
+            && existing().companyId == companyId
+            && existing().companyOwnerUid == request.auth.uid;
+
+          allow create: if isVerifiedUser()
+            && isValidId(companyId)
+            && isValidId(purchaseId)
+            && isValidId(itemId)
+            && isValidCompanyPurchaseItem(incoming(), companyId, purchaseId, itemId)
+            && incoming().createdAt == request.time
+            && canSyncCompanyCloudData(companyId)
+            && isCompanyAnyActiveRole(companyId)
+            && existsAfter(/databases/$(database)/documents/companies/$(companyId)/purchases/$(purchaseId));
+
+          allow update, delete: if false;
+        }
       }
     }
   }

@@ -62,7 +62,7 @@
         "id": { "type": "string", "maxLength": 128, "pattern": "^[a-zA-Z0-9_\\-]+$" },
         "ownerId": { "type": "string", "maxLength": 128, "pattern": "^[a-zA-Z0-9_\\-]+$" },
         "number": { "type": "string", "maxLength": 40 },
-        "docType": { "type": "string", "enum": ["FR", "FP"], "maxLength": 8 },
+        "docType": { "type": "string", "enum": ["FR", "FP", "NC"], "maxLength": 8 },
         "issuedAtIso": { "type": "string", "maxLength": 40 },
         "cashier": { "type": "string", "maxLength": 16 },
         "operator": { "type": "string", "maxLength": 32 },
@@ -371,7 +371,7 @@
         "companyOwnerUid": { "type": "string", "maxLength": 128, "pattern": "^[a-zA-Z0-9_\\-]+$" },
         "emittedByUid": { "type": "string", "maxLength": 128, "pattern": "^[a-zA-Z0-9_\\-]+$" },
         "number": { "type": "string", "maxLength": 40 },
-        "docType": { "type": "string", "enum": ["FR", "FP"], "maxLength": 8 },
+        "docType": { "type": "string", "enum": ["FR", "FP", "NC"], "maxLength": 8 },
         "issuedAtIso": { "type": "string", "maxLength": 40 },
         "cashier": { "type": "string", "maxLength": 16 },
         "operator": { "type": "string", "maxLength": 32 },
@@ -408,6 +408,10 @@
         "status": { "type": "string", "enum": ["issued", "cancelled"], "maxLength": 16 },
         "cancelReason": { "type": "string", "maxLength": 240 },
         "cancelledBy": { "type": "string", "maxLength": 120 },
+        "cancelledAtIso": { "type": "string", "maxLength": 40 },
+        "reprintCount": { "type": "number" },
+        "lastReprintedAtIso": { "type": "string", "maxLength": 40 },
+        "lastReprintedBy": { "type": "string", "maxLength": 120 },
         "createdAt": { "type": "string", "format": "date-time" },
         "updatedAt": { "type": "string", "format": "date-time" }
       },
@@ -539,7 +543,7 @@
     },
     "CompanyCashMovement": {
       "title": "CompanyCashMovement",
-      "description": "Movimento de caixa (reforço, sangria, entrada, saída ou liquidação de dívida) isolado por empresa.",
+      "description": "Movimento de caixa e tesouraria (reforço, sangria, entrada, receita extraordinária, saída, despesa operacional ou liquidação de dívida) isolado por empresa.",
       "type": "object",
       "properties": {
         "id": { "type": "string", "maxLength": 128, "pattern": "^[a-zA-Z0-9_\\-]+$" },
@@ -550,6 +554,8 @@
         "cashier": { "type": "string", "maxLength": 16 },
         "operator": { "type": "string", "maxLength": 32 },
         "type": { "type": "string", "enum": ["REFORCO", "SANGRIA", "ENTRADA", "SAIDA", "LIQUIDACAO_DIVIDA"], "maxLength": 24 },
+        "entryKind": { "type": "string", "enum": ["DESPESA_OPERACIONAL", "RECEITA_EXTRAORDINARIA", "PAGAMENTO_FORNECEDOR", "MOVIMENTO_CAIXA"], "maxLength": 32 },
+        "category": { "type": "string", "maxLength": 64 },
         "amount": { "type": "number" },
         "paymentMethod": { "type": "string", "enum": ["Dinheiro", "Multicaixa", "Transferência"], "maxLength": 24 },
         "reason": { "type": "string", "maxLength": 240 },
@@ -557,12 +563,168 @@
         "invoiceId": { "type": "string", "maxLength": 128 },
         "invoiceNumber": { "type": "string", "maxLength": 40 },
         "customerName": { "type": "string", "maxLength": 160 },
+        "purchaseId": { "type": "string", "maxLength": 128, "pattern": "^[a-zA-Z0-9_\\-]+$" },
         "createdAtIso": { "type": "string", "maxLength": 40 },
         "createdAt": { "type": "string", "format": "date-time" }
       },
       "required": [
         "id", "companyId", "companyOwnerUid", "createdByUid", "sessionId",
         "cashier", "operator", "type", "amount", "paymentMethod", "reason", "createdAtIso", "createdAt"
+      ]
+    },
+    "CompanyStockMovement": {
+      "title": "CompanyStockMovement",
+      "description": "Movimento auditado de stock (entrada de mercadoria, saída por venda, devolução, ajuste de inventário, reconciliação física ou transferência) isolado por empresa.",
+      "type": "object",
+      "properties": {
+        "id": { "type": "string", "maxLength": 128, "pattern": "^[a-zA-Z0-9_\\-]+$" },
+        "companyId": { "type": "string", "maxLength": 128, "pattern": "^[a-zA-Z0-9_\\-]+$" },
+        "companyOwnerUid": { "type": "string", "maxLength": 128, "pattern": "^[a-zA-Z0-9_\\-]+$" },
+        "createdByUid": { "type": "string", "maxLength": 128, "pattern": "^[a-zA-Z0-9_\\-]+$" },
+        "productId": { "type": "string", "maxLength": 128, "pattern": "^[a-zA-Z0-9_\\-]+$" },
+        "productCode": { "type": "string", "maxLength": 32 },
+        "productName": { "type": "string", "maxLength": 160 },
+        "unit": { "type": "string", "maxLength": 16 },
+        "type": {
+          "type": "string",
+          "enum": [
+            "ENTRADA_MERCADORIA",
+            "SAIDA_VENDA",
+            "DEVOLUCAO_CLIENTE",
+            "AJUSTE_INVENTARIO",
+            "RECONCILIACAO_FISICA",
+            "TRANSFERENCIA_ARMAZEM"
+          ],
+          "maxLength": 32
+        },
+        "direction": { "type": "string", "enum": ["IN", "OUT", "NEUTRAL"], "maxLength": 12 },
+        "qty": { "type": "number" },
+        "previousStock": { "type": "number" },
+        "newStock": { "type": "number" },
+        "unitCost": { "type": "number" },
+        "warehouseId": { "type": "string", "maxLength": 64, "pattern": "^[a-zA-Z0-9_\\-]+$" },
+        "targetWarehouseId": { "type": "string", "maxLength": 64, "pattern": "^[a-zA-Z0-9_\\-]+$" },
+        "reason": { "type": "string", "maxLength": 240 },
+        "reference": { "type": "string", "maxLength": 80 },
+        "invoiceId": { "type": "string", "maxLength": 128, "pattern": "^[a-zA-Z0-9_\\-]+$" },
+        "invoiceNumber": { "type": "string", "maxLength": 40 },
+        "operator": { "type": "string", "maxLength": 32 },
+        "createdAtIso": { "type": "string", "maxLength": 40 },
+        "createdAt": { "type": "string", "format": "date-time" }
+      },
+      "required": [
+        "id", "companyId", "companyOwnerUid", "createdByUid", "productId",
+        "productCode", "productName", "unit", "type", "direction", "qty",
+        "previousStock", "newStock", "warehouseId", "reason", "operator",
+        "createdAtIso", "createdAt"
+      ]
+    },
+    "CompanySupplier": {
+      "title": "CompanySupplier",
+      "description": "Fornecedor comercial isolado por empresa (dados fiscais e condições de pagamento).",
+      "type": "object",
+      "properties": {
+        "id": { "type": "string", "maxLength": 128, "pattern": "^[a-zA-Z0-9_\\-]+$" },
+        "companyId": { "type": "string", "maxLength": 128, "pattern": "^[a-zA-Z0-9_\\-]+$" },
+        "companyOwnerUid": { "type": "string", "maxLength": 128, "pattern": "^[a-zA-Z0-9_\\-]+$" },
+        "updatedByUid": { "type": "string", "maxLength": 128, "pattern": "^[a-zA-Z0-9_\\-]+$" },
+        "name": { "type": "string", "minLength": 1, "maxLength": 160 },
+        "nif": { "type": "string", "maxLength": 32 },
+        "locality": { "type": "string", "maxLength": 160 },
+        "contactPerson": { "type": "string", "maxLength": 120 },
+        "iban": { "type": "string", "maxLength": 48 },
+        "paymentTermsDays": { "type": "number" },
+        "notes": { "type": "string", "maxLength": 300 },
+        "active": { "type": "boolean" },
+        "createdAt": { "type": "string", "format": "date-time" },
+        "updatedAt": { "type": "string", "format": "date-time" }
+      },
+      "required": [
+        "id", "companyId", "companyOwnerUid", "updatedByUid", "name", "nif",
+        "locality", "active", "createdAt", "updatedAt"
+      ]
+    },
+    "CompanySupplierPrivate": {
+      "title": "CompanySupplierPrivate",
+      "description": "Contactos privados (PII isolada: telefone, e-mail e endereço) do fornecedor.",
+      "type": "object",
+      "properties": {
+        "companyId": { "type": "string", "maxLength": 128, "pattern": "^[a-zA-Z0-9_\\-]+$" },
+        "companyOwnerUid": { "type": "string", "maxLength": 128, "pattern": "^[a-zA-Z0-9_\\-]+$" },
+        "updatedByUid": { "type": "string", "maxLength": 128, "pattern": "^[a-zA-Z0-9_\\-]+$" },
+        "phone": { "type": "string", "maxLength": 40 },
+        "email": { "type": "string", "maxLength": 120 },
+        "address": { "type": "string", "maxLength": 200 },
+        "updatedAt": { "type": "string", "format": "date-time" }
+      },
+      "required": ["companyId", "companyOwnerUid", "updatedByUid", "phone", "email", "address", "updatedAt"]
+    },
+    "CompanyPurchase": {
+      "title": "CompanyPurchase",
+      "description": "Registo de compra a fornecedor com controlo de contas a pagar e entrada em stock.",
+      "type": "object",
+      "properties": {
+        "id": { "type": "string", "maxLength": 128, "pattern": "^[a-zA-Z0-9_\\-]+$" },
+        "companyId": { "type": "string", "maxLength": 128, "pattern": "^[a-zA-Z0-9_\\-]+$" },
+        "companyOwnerUid": { "type": "string", "maxLength": 128, "pattern": "^[a-zA-Z0-9_\\-]+$" },
+        "createdByUid": { "type": "string", "maxLength": 128, "pattern": "^[a-zA-Z0-9_\\-]+$" },
+        "updatedByUid": { "type": "string", "maxLength": 128, "pattern": "^[a-zA-Z0-9_\\-]+$" },
+        "number": { "type": "string", "minLength": 1, "maxLength": 40 },
+        "supplierInvoiceRef": { "type": "string", "maxLength": 60 },
+        "supplierId": { "type": "string", "minLength": 1, "maxLength": 128, "pattern": "^[a-zA-Z0-9_\\-]+$" },
+        "supplierName": { "type": "string", "minLength": 1, "maxLength": 160 },
+        "supplierNif": { "type": "string", "maxLength": 32 },
+        "issuedAtIso": { "type": "string", "minLength": 10, "maxLength": 40 },
+        "dueDateIso": { "type": "string", "maxLength": 40 },
+        "totalAmount": { "type": "number" },
+        "amountPaid": { "type": "number" },
+        "amountDue": { "type": "number" },
+        "paymentMethod": {
+          "type": "string",
+          "enum": ["Dinheiro", "Multicaixa", "Transferência", "Crédito"],
+          "maxLength": 24
+        },
+        "paymentSummary": { "type": "string", "maxLength": 160 },
+        "reference": { "type": "string", "maxLength": 80 },
+        "warehouseId": { "type": "string", "minLength": 1, "maxLength": 64, "pattern": "^[a-zA-Z0-9_\\-]+$" },
+        "updateStock": { "type": "boolean" },
+        "notes": { "type": "string", "maxLength": 300 },
+        "operator": { "type": "string", "minLength": 1, "maxLength": 32 },
+        "itemCount": { "type": "number" },
+        "status": { "type": "string", "enum": ["recorded", "cancelled"], "maxLength": 16 },
+        "cancelReason": { "type": "string", "minLength": 4, "maxLength": 240 },
+        "cancelledBy": { "type": "string", "minLength": 1, "maxLength": 120 },
+        "createdAt": { "type": "string", "format": "date-time" },
+        "updatedAt": { "type": "string", "format": "date-time" }
+      },
+      "required": [
+        "id", "companyId", "companyOwnerUid", "createdByUid", "updatedByUid",
+        "number", "supplierId", "supplierName", "supplierNif", "issuedAtIso",
+        "totalAmount", "amountPaid", "amountDue", "paymentMethod", "warehouseId",
+        "updateStock", "notes", "operator", "itemCount", "status", "createdAt", "updatedAt"
+      ]
+    },
+    "CompanyPurchaseItem": {
+      "title": "CompanyPurchaseItem",
+      "description": "Linha de artigo adquirido numa compra a fornecedor.",
+      "type": "object",
+      "properties": {
+        "id": { "type": "string", "maxLength": 128, "pattern": "^[a-zA-Z0-9_\\-]+$" },
+        "purchaseId": { "type": "string", "maxLength": 128, "pattern": "^[a-zA-Z0-9_\\-]+$" },
+        "companyId": { "type": "string", "maxLength": 128, "pattern": "^[a-zA-Z0-9_\\-]+$" },
+        "companyOwnerUid": { "type": "string", "maxLength": 128, "pattern": "^[a-zA-Z0-9_\\-]+$" },
+        "productId": { "type": "string", "maxLength": 128, "pattern": "^[a-zA-Z0-9_\\-]+$" },
+        "code": { "type": "string", "minLength": 1, "maxLength": 32 },
+        "name": { "type": "string", "minLength": 1, "maxLength": 160 },
+        "unit": { "type": "string", "minLength": 1, "maxLength": 16 },
+        "qty": { "type": "number" },
+        "unitCost": { "type": "number" },
+        "total": { "type": "number" },
+        "createdAt": { "type": "string", "format": "date-time" }
+      },
+      "required": [
+        "id", "purchaseId", "companyId", "companyOwnerUid", "productId",
+        "code", "name", "unit", "qty", "unitCost", "total", "createdAt"
       ]
     }
   },
@@ -654,6 +816,26 @@
     "/companies/{companyId}/cash_movements/{movementId}": {
       "schema": { "$ref": "#/entities/CompanyCashMovement" },
       "description": "Movimentos auditados de caixa (reforços, sangrias, entradas, saídas e liquidações)."
+    },
+    "/companies/{companyId}/stock_movements/{movementId}": {
+      "schema": { "$ref": "#/entities/CompanyStockMovement" },
+      "description": "Histórico imutável de entradas, saídas, devoluções, ajustes e reconciliações físicas de stock."
+    },
+    "/companies/{companyId}/suppliers/{supplierId}": {
+      "schema": { "$ref": "#/entities/CompanySupplier" },
+      "description": "Fornecedores comerciais isolados por empresa."
+    },
+    "/companies/{companyId}/suppliers/{supplierId}/private/{docId}": {
+      "schema": { "$ref": "#/entities/CompanySupplierPrivate" },
+      "description": "Contactos privados (PII isolada) dos fornecedores da empresa."
+    },
+    "/companies/{companyId}/purchases/{purchaseId}": {
+      "schema": { "$ref": "#/entities/CompanyPurchase" },
+      "description": "Registos de compras a fornecedores e contas a pagar por empresa."
+    },
+    "/companies/{companyId}/purchases/{purchaseId}/items/{itemId}": {
+      "schema": { "$ref": "#/entities/CompanyPurchaseItem" },
+      "description": "Itens e quantidades adquiridas de cada compra por empresa."
     }
   }
 }

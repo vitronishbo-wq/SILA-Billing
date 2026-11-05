@@ -11,6 +11,10 @@ import {
   NEUTRAL_PLATFORM_PROFILE,
   normalizeCompanyNif,
 } from '../../src/core/types';
+import {
+  classifyInvoiceControlStatus,
+  summarizeDocumentControlList,
+} from '../../src/core/documentExport';
 
 function escapeHtml(raw: string): string {
   return String(raw || '')
@@ -50,10 +54,23 @@ export function renderDocumentHtml(
   format: DocumentFormat,
   company: CompanyProfile = NEUTRAL_PLATFORM_PROFILE,
   qrDataUrl = '',
-  options?: { showViralFooter?: boolean; customerAddress?: string; customerPhone?: string }
+  options?: {
+    showViralFooter?: boolean;
+    customerAddress?: string;
+    customerPhone?: string;
+    isReprint?: boolean;
+  }
 ): string {
   const dt = formatDateTimePt(invoice.issuedAtIso);
-  const titleLabel = invoice.docType === 'FP' ? 'FACTURA PROFORMA' : 'FACTURA / RECIBO';
+  const isCreditNote = invoice.docType === 'NC';
+  const titleLabel =
+    invoice.docType === 'FP'
+      ? 'FACTURA PROFORMA'
+      : isCreditNote
+        ? 'NOTA DE CRÉDITO'
+        : 'FACTURA / RECIBO';
+  const isSecondCopy = Boolean(options?.isReprint || (invoice.reprintCount || 0) > 0);
+  const cancelledDt = invoice.cancelledAtIso ? formatDateTimePt(invoice.cancelledAtIso) : null;
   const showViralFooter = Boolean(options?.showViralFooter);
   const custLoc = (invoice.customerLocality || company.cityCountry || 'Angola').trim();
   const custAddr = (options?.customerAddress || '').trim();
@@ -98,10 +115,33 @@ export function renderDocumentHtml(
 
         <div class="border-y border-black py-1.5 text-center my-2">
           <div class="font-bold text-[13px] tabular-nums">${titleLabel} N.º ${escapeHtml(invoice.number)}</div>
-          <div class="text-[11px]">Venda Directa a Retalho</div>
+          <div class="text-[11px]">${
+            isCreditNote
+              ? invoice.returnOriginNumber
+                ? `Retificação / Devolução ref. ${escapeHtml(invoice.returnOriginNumber)}`
+                : 'Devolução / Retificação Comercial'
+              : 'Venda Directa a Retalho'
+          }</div>
+          ${
+            isSecondCopy
+              ? `<div class="mt-0.5 font-semibold text-[10px] tracking-tight">2.ª VIA · REIMPRESSÃO${
+                  invoice.reprintCount && invoice.reprintCount > 1 ? ` (#${invoice.reprintCount})` : ''
+                }</div>`
+              : ''
+          }
           ${
             invoice.status === 'cancelled'
-              ? '<div class="mt-0.5 font-bold text-red-700 text-[11px]">DOCUMENTO ANULADO</div>'
+              ? `<div class="mt-0.5 font-bold text-red-700 text-[11px]">DOCUMENTO ANULADO</div>${
+                  invoice.cancelReason
+                    ? `<div class="text-[10px] text-red-700">Motivo: ${escapeHtml(invoice.cancelReason)}</div>`
+                    : ''
+                }${
+                  invoice.cancelledBy
+                    ? `<div class="text-[9.5px] text-red-700 tabular-nums">Por: ${escapeHtml(invoice.cancelledBy)}${
+                        cancelledDt ? ` · ${cancelledDt.slashDate} ${cancelledDt.time}` : ''
+                      }</div>`
+                    : ''
+                }`
               : ''
           }
         </div>
@@ -150,13 +190,13 @@ export function renderDocumentHtml(
         </div>
 
         <div class="py-2 border-b border-dashed border-black">
-          <div class="font-bold text-[13px]">TOTAL A PAGAR</div>
+          <div class="font-bold text-[13px]">${isCreditNote ? 'TOTAL A CREDITAR' : 'TOTAL A PAGAR'}</div>
           <div class="text-right font-bold text-[16px] tabular-nums">${formatKzNumber(invoice.grandTotal)} Kz</div>
           <div class="mt-1.5 text-[10.5px] font-bold leading-snug">Por extenso: ${escapeHtml(invoice.amountInWords)}</div>
         </div>
 
         <div class="py-2 border-b border-black text-[11px] space-y-0.5 tabular-nums">
-          <div class="font-bold">Meio de pagamento: ${escapeHtml(invoice.paymentMethod)}</div>
+          <div class="font-bold">${isCreditNote ? 'Modo de regularização' : 'Meio de pagamento'}: ${escapeHtml(invoice.paymentMethod)}</div>
           ${
             invoice.paymentSummary
               ? `<div class="text-[10.5px]">${escapeHtml(invoice.paymentSummary)}</div>`
@@ -169,18 +209,20 @@ export function renderDocumentHtml(
           }
           ${
             invoice.returnOriginNumber
-              ? `<div class="text-[10.5px]">Ref. Troca/Devolução: ${escapeHtml(invoice.returnOriginNumber)}${
-                  invoice.returnCreditApplied
+              ? `<div class="text-[10.5px]">${isCreditNote ? 'Fatura Retificada' : 'Ref. Troca/Devolução'}: ${escapeHtml(invoice.returnOriginNumber)}${
+                  !isCreditNote && invoice.returnCreditApplied
                     ? ` (Crédito: ${formatKzNumber(invoice.returnCreditApplied)} Kz)`
                     : ''
                 }</div>`
               : ''
           }
-          <div>Valor recebido: ${formatKzNumber(invoice.amountReceived)} Kz</div>
+          <div>${isCreditNote ? 'Valor reembolsado' : 'Valor recebido'}: ${formatKzNumber(invoice.amountReceived)} Kz</div>
           ${
-            invoice.amountDue && invoice.amountDue > 0
-              ? `<div class="font-bold">Em dívida (Conta Corrente): ${formatKzNumber(invoice.amountDue)} Kz</div>`
-              : `<div>Troco: ${formatKzNumber(invoice.changeAmount)} Kz</div>`
+            isCreditNote
+              ? ''
+              : invoice.amountDue && invoice.amountDue > 0
+                ? `<div class="font-bold">Em dívida (Conta Corrente): ${formatKzNumber(invoice.amountDue)} Kz</div>`
+                : `<div>Troco: ${formatKzNumber(invoice.changeAmount)} Kz</div>`
           }
         </div>
 
@@ -254,11 +296,39 @@ export function renderDocumentHtml(
       <div class="grid grid-cols-1 sm:grid-cols-12 gap-4 py-5">
         <div class="sm:col-span-7 space-y-3">
           <div>
-            <div class="text-lg font-bold text-blue-700 tracking-tight">${titleLabel}</div>
+            <div class="flex items-center gap-2.5 flex-wrap">
+              <div class="text-lg font-bold ${isCreditNote ? 'text-amber-700' : 'text-blue-700'} tracking-tight">${titleLabel}</div>
+              ${
+                isSecondCopy
+                  ? `<span class="text-[10.5px] font-semibold text-slate-500 tabular-nums">· 2.ª VIA (Reimpressão${
+                      invoice.reprintCount && invoice.reprintCount > 1 ? ` #${invoice.reprintCount}` : ''
+                    })</span>`
+                  : ''
+              }
+            </div>
             <div class="text-sm font-semibold text-slate-800 tabular-nums">N.º ${escapeHtml(invoice.number)}</div>
             ${
+              isCreditNote && invoice.returnOriginNumber
+                ? `<div class="mt-0.5 text-[11px] font-medium text-slate-600 tabular-nums">Documento Origem Retificado: <span class="font-mono font-semibold text-slate-900">${escapeHtml(invoice.returnOriginNumber)}</span></div>`
+                : ''
+            }
+            ${
               invoice.status === 'cancelled'
-                ? '<div class="mt-1 text-xs font-bold text-red-600">DOCUMENTO ANULADO</div>'
+                ? `<div class="mt-1 space-y-0.5">
+                    <div class="text-xs font-bold text-red-600">DOCUMENTO ANULADO</div>
+                    ${
+                      invoice.cancelReason
+                        ? `<div class="text-[11px] text-red-700">Motivo: ${escapeHtml(invoice.cancelReason)}</div>`
+                        : ''
+                    }
+                    ${
+                      invoice.cancelledBy
+                        ? `<div class="text-[10.5px] text-slate-500 tabular-nums">Anulado por ${escapeHtml(invoice.cancelledBy)}${
+                            cancelledDt ? ` em ${cancelledDt.slashDate} ${cancelledDt.time}` : ''
+                          }</div>`
+                        : ''
+                    }
+                  </div>`
                 : ''
             }
           </div>
@@ -357,8 +427,8 @@ export function renderDocumentHtml(
               <span class="font-semibold text-slate-900">${formatKzNumber(invoice.taxTotal)}</span>
             </div>
           </div>
-          <div class="bg-blue-600 px-4 py-3 text-white flex items-center justify-between">
-            <span class="font-bold text-xs">TOTAL A PAGAR</span>
+          <div class="${isCreditNote ? 'bg-amber-700' : 'bg-blue-600'} px-4 py-3 text-white flex items-center justify-between">
+            <span class="font-bold text-xs">${isCreditNote ? 'TOTAL A CREDITAR' : 'TOTAL A PAGAR'}</span>
             <span class="font-bold text-base">${formatKzNumber(invoice.grandTotal)} Kz</span>
           </div>
         </div>
@@ -372,7 +442,7 @@ export function renderDocumentHtml(
 
         <div class="grid grid-cols-3 gap-3 rounded-lg bg-slate-50 p-3 border border-slate-200/80 text-[11px] tabular-nums">
           <div>
-            <div class="text-[10px] text-slate-500">Meio de pagamento</div>
+            <div class="text-[10px] text-slate-500">${isCreditNote ? 'Modo de regularização' : 'Meio de pagamento'}</div>
             <div class="font-bold text-slate-900">${escapeHtml(invoice.paymentMethod)}</div>
             ${
               invoice.paymentSummary
@@ -386,17 +456,27 @@ export function renderDocumentHtml(
             }
             ${
               invoice.returnOriginNumber
-                ? `<div class="text-[10px] text-slate-600 mt-0.5">Troca/Dev.: ${escapeHtml(invoice.returnOriginNumber)}</div>`
+                ? `<div class="text-[10px] text-slate-600 mt-0.5">${isCreditNote ? 'Ref. Origem' : 'Troca/Dev.'}: ${escapeHtml(invoice.returnOriginNumber)}</div>`
                 : ''
             }
           </div>
           <div>
-            <div class="text-[10px] text-slate-500">Valor recebido</div>
+            <div class="text-[10px] text-slate-500">${isCreditNote ? 'Reembolsado no ato' : 'Valor recebido'}</div>
             <div class="font-bold text-slate-900">${formatKzNumber(invoice.amountReceived)} Kz</div>
           </div>
           <div>
-            <div class="text-[10px] text-slate-500">${invoice.amountDue && invoice.amountDue > 0 ? 'Em dívida (Conta Corrente)' : 'Troco'}</div>
-            <div class="font-bold ${invoice.amountDue && invoice.amountDue > 0 ? 'text-amber-700' : 'text-slate-900'}">${formatKzNumber(invoice.amountDue && invoice.amountDue > 0 ? invoice.amountDue : invoice.changeAmount)} Kz</div>
+            <div class="text-[10px] text-slate-500">${
+              isCreditNote
+                ? 'Abatimento / Crédito'
+                : invoice.amountDue && invoice.amountDue > 0
+                  ? 'Em dívida (Conta Corrente)'
+                  : 'Troco'
+            }</div>
+            <div class="font-bold ${!isCreditNote && invoice.amountDue && invoice.amountDue > 0 ? 'text-amber-700' : 'text-slate-900'}">${
+              isCreditNote
+                ? `${formatKzNumber(Math.max(0, invoice.grandTotal - (invoice.amountReceived || 0)))} Kz`
+                : `${formatKzNumber(invoice.amountDue && invoice.amountDue > 0 ? invoice.amountDue : invoice.changeAmount)} Kz`
+            }</div>
           </div>
         </div>
 
@@ -671,4 +751,129 @@ export function renderCashClosureReportHtml(
     </div>
   `;
 }
+
+export function renderHistoryControlReportHtml(
+  invoices: ReadonlyArray<InvoiceRecord>,
+  filterLabel: string,
+  company: CompanyProfile = NEUTRAL_PLATFORM_PROFILE,
+  showViralFooter = false
+): string {
+  const sum = summarizeDocumentControlList(invoices);
+  const nowDt = formatDateTimePt(new Date().toISOString());
+
+  const rowsHtml =
+    invoices.length === 0
+      ? `<tr><td colspan="9" class="py-4 px-3 text-center text-slate-500">Nenhum documento encontrado para os filtros aplicados.</td></tr>`
+      : invoices
+          .map((inv) => {
+            const dt = formatDateTimePt(inv.issuedAtIso);
+            const cls = classifyInvoiceControlStatus(inv);
+            const isCanc = inv.status === 'cancelled';
+            const isNc = inv.docType === 'NC' && !isCanc;
+            const totalPrefix = isNc ? '-' : '';
+            return `
+              <tr class="${isCanc ? 'text-slate-400' : 'text-slate-800'}">
+                <td class="py-1.5 px-2 font-mono font-semibold ${isCanc ? 'line-through text-red-600' : 'text-slate-900'}">${escapeHtml(inv.number)}</td>
+                <td class="py-1.5 px-2 font-mono">${dt.slashDate} ${dt.time}</td>
+                <td class="py-1.5 px-2 truncate max-w-[160px]">${escapeHtml(inv.customerName)}</td>
+                <td class="py-1.5 px-2 font-mono">${escapeHtml(inv.operator)} · Cx ${escapeHtml(inv.cashier)}</td>
+                <td class="py-1.5 px-2 ${
+                  isCanc
+                    ? 'text-red-600 font-semibold'
+                    : cls.state === 'PENDING' || cls.state === 'PARTIAL'
+                      ? 'text-amber-700 font-semibold'
+                      : isNc
+                        ? 'text-blue-700 font-semibold'
+                        : 'text-emerald-700 font-medium'
+                }">${escapeHtml(cls.labelPt)}${inv.returnOriginNumber ? ` (${escapeHtml(inv.returnOriginNumber)})` : ''}</td>
+                <td class="py-1.5 px-2 text-right font-mono">${isCanc ? '0,00' : `${totalPrefix}${formatKzNumber(inv.taxAmount14)}`}</td>
+                <td class="py-1.5 px-2 text-right font-mono font-semibold">${isCanc ? formatKzNumber(inv.grandTotal) : `${totalPrefix}${formatKzNumber(inv.grandTotal)}`}</td>
+                <td class="py-1.5 px-2 text-right font-mono">${formatKzNumber(cls.paidAmount)}</td>
+                <td class="py-1.5 px-2 text-right font-mono ${cls.dueAmount > 0 ? 'text-amber-700 font-semibold' : ''}">${formatKzNumber(cls.dueAmount)}</td>
+              </tr>
+              ${
+                isCanc && inv.cancelReason
+                  ? `<tr class="bg-red-50/40 text-[10px] text-red-700">
+                      <td colspan="9" class="py-1 px-2">Anulação (${escapeHtml(inv.cancelledBy || 'Operador')}): ${escapeHtml(inv.cancelReason)}</td>
+                    </tr>`
+                  : ''
+              }
+            `;
+          })
+          .join('');
+
+  return `
+    <div class="print-target mx-auto w-full max-w-[794px] bg-white p-6 sm:p-8 text-slate-900 border border-slate-200 text-xs">
+      <div class="flex items-start justify-between gap-4 pb-4 border-b border-slate-200">
+        <div>
+          <div class="text-base font-bold text-slate-900">${escapeHtml(company.shortName)} — MAPA DE CONTROLO DOCUMENTAL</div>
+          <div class="text-[11px] text-slate-600">${escapeHtml(company.legalName)} · NIF ${escapeHtml(company.nif)}</div>
+          <div class="text-[10.5px] text-slate-500 mt-0.5">${escapeHtml(filterLabel)}</div>
+        </div>
+        <div class="text-right text-[11px] font-mono tabular-nums text-slate-600 space-y-0.5">
+          <div class="font-semibold text-slate-900">Emitido: ${nowDt.slashDate} ${nowDt.time}</div>
+          <div>Registos listados: ${sum.totalDocs}</div>
+        </div>
+      </div>
+
+      <div class="grid grid-cols-4 gap-3 py-4 tabular-nums">
+        <div class="rounded-lg border border-slate-200 bg-slate-50 p-3">
+          <div class="text-[10px] text-slate-500">Faturação Líquida (FR - NC)</div>
+          <div class="text-sm font-bold font-mono text-slate-900 mt-0.5">${formatKzNumber(sum.netCommercialTotal)} Kz</div>
+          <div class="text-[10px] text-slate-500 mt-0.5">${sum.issuedFrCount} FR · ${sum.creditNoteCount} NC</div>
+        </div>
+        <div class="rounded-lg border border-slate-200 bg-slate-50 p-3">
+          <div class="text-[10px] text-slate-500">Total Recebido (Pagas + Parc.)</div>
+          <div class="text-sm font-bold font-mono text-emerald-700 mt-0.5">${formatKzNumber(sum.paidTotal)} Kz</div>
+          <div class="text-[10px] text-slate-500 mt-0.5">${sum.paidCount} pagas · ${sum.partialCount} parciais</div>
+        </div>
+        <div class="rounded-lg border border-slate-200 bg-slate-50 p-3">
+          <div class="text-[10px] text-slate-500">Saldo Pendente em Dívida</div>
+          <div class="text-sm font-bold font-mono text-amber-700 mt-0.5">${formatKzNumber(sum.dueTotal)} Kz</div>
+          <div class="text-[10px] text-slate-500 mt-0.5">${sum.pendingCount} pendentes · ${sum.partialCount} parciais</div>
+        </div>
+        <div class="rounded-lg border border-slate-200 bg-slate-50 p-3">
+          <div class="text-[10px] text-slate-500">Notas Crédito / Anuladas</div>
+          <div class="text-sm font-bold font-mono text-slate-900 mt-0.5">${formatKzNumber(sum.creditNoteTotal)} Kz</div>
+          <div class="text-[10px] text-red-600 mt-0.5">${sum.cancelledCount} anuladas (${formatKzNumber(sum.cancelledTotal)} Kz)</div>
+        </div>
+      </div>
+
+      <div class="border border-slate-200 rounded-lg overflow-hidden">
+        <table class="w-full text-left border-collapse text-[10.5px]">
+          <thead>
+            <tr class="bg-slate-900 text-white">
+              <th class="py-2 px-2 font-semibold">Documento</th>
+              <th class="py-2 px-2 font-semibold">Data/Hora</th>
+              <th class="py-2 px-2 font-semibold">Cliente</th>
+              <th class="py-2 px-2 font-semibold">Operador</th>
+              <th class="py-2 px-2 font-semibold">Estado</th>
+              <th class="py-2 px-2 font-semibold text-right">IVA 14%</th>
+              <th class="py-2 px-2 font-semibold text-right">Total</th>
+              <th class="py-2 px-2 font-semibold text-right">Pago</th>
+              <th class="py-2 px-2 font-semibold text-right">Dívida</th>
+            </tr>
+          </thead>
+          <tbody class="divide-y divide-slate-200 tabular-nums">${rowsHtml}</tbody>
+          <tfoot>
+            <tr class="bg-slate-100 font-bold text-slate-900 border-t border-slate-300 tabular-nums">
+              <td colspan="5" class="py-2 px-2">TOTAIS LÍQUIDOS VÁLIDOS (Base 14%: ${formatKzNumber(sum.taxBase14Total)} Kz · Isento 0%: ${formatKzNumber(sum.taxBase0Total)} Kz)</td>
+              <td class="py-2 px-2 text-right font-mono">${formatKzNumber(sum.taxAmount14Total)}</td>
+              <td class="py-2 px-2 text-right font-mono">${formatKzNumber(sum.netCommercialTotal)}</td>
+              <td class="py-2 px-2 text-right font-mono text-emerald-700">${formatKzNumber(sum.paidTotal)}</td>
+              <td class="py-2 px-2 text-right font-mono text-amber-700">${formatKzNumber(sum.dueTotal)}</td>
+            </tr>
+          </tfoot>
+        </table>
+      </div>
+
+      ${
+        showViralFooter
+          ? `<div class="mt-4 pt-2 border-t border-slate-100 text-center text-[10px] text-slate-400">Processado por SILA-Billing · Solução institucional VITRONIS (www.vitronis.co.ao)</div>`
+          : ''
+      }
+    </div>
+  `;
+}
+
 

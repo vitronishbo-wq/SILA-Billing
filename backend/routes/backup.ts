@@ -60,16 +60,29 @@ backupRouter.get('/', requireFirebaseAuth, async (req: AuthenticatedRequest, res
       ? ctx.db.collection('companies').doc(rawCompanyId)
       : ctx.db.collection('users').doc(user.uid);
 
-    const [productsSnap, customersSnap, invoicesSnap, cashSessionsSnap, cashMovementsSnap, settingsDoc, auditSnap] =
-      await Promise.all([
-        rootRef.collection('products').get(),
-        rootRef.collection('customers').get(),
-        rootRef.collection('invoices').get(),
-        rootRef.collection('cash_sessions').get(),
-        rootRef.collection('cash_movements').get(),
-        rootRef.collection('settings').doc('general').get(),
-        rootRef.collection('audit_logs').get(),
-      ]);
+    const [
+      productsSnap,
+      customersSnap,
+      invoicesSnap,
+      cashSessionsSnap,
+      cashMovementsSnap,
+      stockMovementsSnap,
+      suppliersSnap,
+      purchasesSnap,
+      settingsDoc,
+      auditSnap,
+    ] = await Promise.all([
+      rootRef.collection('products').get(),
+      rootRef.collection('customers').get(),
+      rootRef.collection('invoices').get(),
+      rootRef.collection('cash_sessions').get(),
+      rootRef.collection('cash_movements').get(),
+      rootRef.collection('stock_movements').get(),
+      rootRef.collection('suppliers').get(),
+      rootRef.collection('purchases').get(),
+      rootRef.collection('settings').doc('general').get(),
+      rootRef.collection('audit_logs').get(),
+    ]);
 
     const products = productsSnap.docs.map((d) => ({ id: d.id, ...d.data() }));
 
@@ -95,8 +108,31 @@ backupRouter.get('/', requireFirebaseAuth, async (req: AuthenticatedRequest, res
       })
     );
 
+    const suppliers = await Promise.all(
+      suppliersSnap.docs.map(async (d) => {
+        const privDoc = await d.ref.collection('private').doc('contact').get();
+        return {
+          id: d.id,
+          ...d.data(),
+          privateContact: privDoc.exists ? privDoc.data() : null,
+        };
+      })
+    );
+
+    const purchases = await Promise.all(
+      purchasesSnap.docs.map(async (d) => {
+        const itemsSnap = await d.ref.collection('items').get();
+        return {
+          id: d.id,
+          ...d.data(),
+          items: itemsSnap.docs.map((item) => ({ id: item.id, ...item.data() })),
+        };
+      })
+    );
+
     const cashSessions = cashSessionsSnap.docs.map((d) => ({ id: d.id, ...d.data() }));
     const cashMovements = cashMovementsSnap.docs.map((d) => ({ id: d.id, ...d.data() }));
+    const stockMovements = stockMovementsSnap.docs.map((d) => ({ id: d.id, ...d.data() }));
     const auditLogs = auditSnap.docs.map((d) => ({ id: d.id, ...d.data() }));
 
     const companySummary = membership.companyData
@@ -113,7 +149,7 @@ backupRouter.get('/', requireFirebaseAuth, async (req: AuthenticatedRequest, res
         : { id: rawCompanyId };
 
     const exportBundle = {
-      schemaVersion: '2.0.0',
+      schemaVersion: '2.2.0',
       exportedAtIso: new Date().toISOString(),
       projectId: ctx.projectId,
       firestoreDatabaseId: ctx.databaseId,
@@ -129,6 +165,9 @@ backupRouter.get('/', requireFirebaseAuth, async (req: AuthenticatedRequest, res
         invoices: invoices.length,
         cashSessions: cashSessions.length,
         cashMovements: cashMovements.length,
+        stockMovements: stockMovements.length,
+        suppliers: suppliers.length,
+        purchases: purchases.length,
         auditLogs: auditLogs.length,
       },
       data: {
@@ -138,6 +177,9 @@ backupRouter.get('/', requireFirebaseAuth, async (req: AuthenticatedRequest, res
         invoices,
         cashSessions,
         cashMovements,
+        stockMovements,
+        suppliers,
+        purchases,
         auditLogs,
       },
     };

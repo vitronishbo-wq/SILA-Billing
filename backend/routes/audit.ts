@@ -18,7 +18,7 @@ interface AuditInvoicePayload {
   id: string;
   companyId?: string;
   number: string;
-  docType: 'FR' | 'FP';
+  docType: 'FR' | 'FP' | 'NC';
   issuedAtIso: string;
   cashier: string;
   operator: string;
@@ -110,8 +110,14 @@ auditRouter.post('/invoices', requireFirebaseAuth, async (req: AuthenticatedRequ
   const amountReceived = Number.isFinite(rawReceived) && rawReceived >= 0
     ? roundKz(rawReceived)
     : netPayable;
-  const changeAmount = Math.max(0, roundKz(amountReceived - netPayable));
-  const amountDue = Math.max(0, roundKz(netPayable - amountReceived));
+  const changeAmount =
+    body.docType === 'FP' || body.docType === 'NC'
+      ? 0
+      : Math.max(0, roundKz(amountReceived - netPayable));
+  const amountDue =
+    body.docType === 'FP' || body.docType === 'NC'
+      ? 0
+      : Math.max(0, roundKz(netPayable - amountReceived));
 
   const clientTotalDelta =
     typeof body.clientGrandTotal === 'number'
@@ -177,7 +183,7 @@ auditRouter.post('/invoices', requireFirebaseAuth, async (req: AuthenticatedRequ
         const invoicePayloadBase = {
           id: safeInvoiceId,
           number: String(body.number).slice(0, 40),
-          docType: body.docType === 'FP' ? 'FP' : 'FR',
+          docType: body.docType === 'FP' ? 'FP' : body.docType === 'NC' ? 'NC' : 'FR',
           issuedAtIso: String(body.issuedAtIso || new Date().toISOString()).slice(0, 40),
           cashier: String(body.cashier || '01').slice(0, 16),
           operator: String(body.operator || '001').slice(0, 32),
