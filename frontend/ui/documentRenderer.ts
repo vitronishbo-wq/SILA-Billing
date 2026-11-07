@@ -1,5 +1,6 @@
 import QRCode from 'qrcode';
 import { formatDateTimePt, formatKzNumber } from '../../src/core/billingEngine';
+import { generateAgtQrDataUrl } from '../../src/core/fiscalQrGenerator';
 import {
   CashMovement,
   CashSession,
@@ -29,21 +30,34 @@ export async function generateInvoiceQrDataUrl(
   invoice: InvoiceRecord,
   company: CompanyProfile = NEUTRAL_PLATFORM_PROFILE
 ): Promise<string> {
-  const dt = formatDateTimePt(invoice.issuedAtIso);
-  const payload = [
-    `EMISSOR:${company.legalName}`,
-    `NIF:${company.nif}`,
-    `DOC:${invoice.number}`,
-    `DATA:${dt.date} ${dt.time}`,
-    `TOTAL:${invoice.grandTotal.toFixed(2)} AOA`,
-  ].join('|');
-
   try {
-    return await QRCode.toDataURL(payload, {
-      width: 140,
-      margin: 1,
-      color: { dark: '#000000', light: '#FFFFFF' },
-    });
+    return await generateAgtQrDataUrl(
+      {
+        companyNif: company.nif,
+        companyName: company.legalName,
+        customerNif: invoice.customerNif,
+        customerCountry: 'AO',
+        documentType: invoice.docType,
+        documentStatus: invoice.status === 'cancelled' ? 'A' : 'N',
+        documentDate: invoice.issuedAtIso,
+        documentNo: invoice.number,
+        submissionGuidOrHash: invoice.id,
+        totals: {
+          taxBaseNor: invoice.taxBase14,
+          taxAmountNor: invoice.taxAmount14,
+          taxBaseIse: invoice.taxBase0,
+          totalTax: invoice.taxTotal,
+          grandTotal: invoice.grandTotal,
+        },
+        signatureJwsPreview: invoice.id.slice(-4),
+      },
+      {
+        width: 350,
+        margin: 2,
+        errorCorrectionLevel: 'M',
+        version: 4,
+      }
+    );
   } catch {
     return '';
   }

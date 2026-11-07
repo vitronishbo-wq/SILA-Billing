@@ -10,6 +10,22 @@ import {
   roundKz,
 } from '../src/core/billingEngine';
 import {
+  AGT_DOCUMENT_TYPES,
+  AgtDocumentType,
+  AgtSeriesRecord,
+  AgtSeriesStatus,
+} from '../src/core/fiscalTypes';
+import {
+  finalizarSerie,
+  formatFiscalDocumentNo,
+  inicializarSeriesPadraoSeNecessario,
+  listarSeries,
+  obterSerieAtiva,
+  reservarProximoNumeroFiscal,
+  solicitarSerie,
+  validarPermissaoEmissaoFiscal,
+} from '../src/core/seriesManager';
+import {
   AppSettings,
   canCompanyHideViralFooter,
   canCompanyManageMultiOperatorTeam,
@@ -589,6 +605,13 @@ export class SilaBillingApp {
   // Estado Configurações / Cloud / PWA
   private settingsSavedNotice = false;
   private settingsErrorMessage: string | null = null;
+
+  // Estado Séries Fiscais AGT (Decreto Executivo n.º 683/25)
+  private showRequestAgtSeriesForm = false;
+  private agtSeriesErrorMessage: string | null = null;
+  private agtSeriesSuccessMessage: string | null = null;
+  private agtSeriesYearFilter: number = new Date().getFullYear();
+  private agtSeriesDocTypeFilter: string = 'ALL';
   private isOnline: boolean = typeof navigator !== 'undefined' ? navigator.onLine : true;
   private user: User | null = null;
   private isSyncing = false;
@@ -750,6 +773,10 @@ export class SilaBillingApp {
     this.customers = data.customers;
     this.invoices = data.invoices;
     this.settings = data.settings;
+
+    if (data.activeCompany.id) {
+      inicializarSeriesPadraoSeNecessario(data.activeCompany.id);
+    }
 
     const directCustId = getDirectCustomerIdForCompany(data.activeCompany.id);
     this.selectedCustomerId = directCustId;
@@ -3023,11 +3050,19 @@ export class SilaBillingApp {
     }
 
     const totals = calculateInvoiceTotals(this.cart, this.globalDiscountPct);
-    const nextNumber = generateNextInvoiceNumber(
-      this.invoices.map((i) => i.number),
-      this.docType,
-      this.activeCompany.baseSequence
+    const activeAgtSeries = obterSerieAtiva(
+      this.activeCompany.id,
+      this.docType as AgtDocumentType
     );
+    const nextNumber = activeAgtSeries
+      ? `${this.docType} ${activeAgtSeries.seriesCode}/${String(
+          (activeAgtSeries.lastDocumentNumber || 0) + 1
+        ).padStart(6, '0')}`
+      : generateNextInvoiceNumber(
+          this.invoices.map((i) => i.number),
+          this.docType,
+          this.activeCompany.baseSequence
+        );
     const directCustId = getDirectCustomerIdForCompany(this.activeCompany.id);
     const customer =
       this.customers.find((c) => c.id === this.selectedCustomerId) ||
@@ -3179,6 +3214,36 @@ export class SilaBillingApp {
         this.showNewCompanyModal = false;
         this.newCompanyError = null;
         this.render();
+        break;
+      }
+      case 'open-request-agt-series-form': {
+        this.showRequestAgtSeriesForm = true;
+        this.agtSeriesErrorMessage = null;
+        this.agtSeriesSuccessMessage = null;
+        this.render();
+        break;
+      }
+      case 'close-request-agt-series-form': {
+        this.showRequestAgtSeriesForm = false;
+        this.agtSeriesErrorMessage = null;
+        this.render();
+        break;
+      }
+      case 'finalize-agt-series': {
+        if (!id) break;
+        const confirmFinalize = window.confirm(
+          'Tem a certeza de que pretende finalizar formalmente esta série AGT (estado F)? Esta operação impedirá novas emissões nesta série.'
+        );
+        if (confirmFinalize) {
+          try {
+            finalizarSerie(this.activeCompany.id, id, this.operator, 'Encerramento manual de série');
+            this.agtSeriesSuccessMessage = 'Série fiscal encerrada com sucesso (estado F).';
+            this.render();
+          } catch (err: any) {
+            this.agtSeriesErrorMessage = err.message || 'Falha ao finalizar série fiscal.';
+            this.render();
+          }
+        }
         break;
       }
       case 'open-master-admin': {
@@ -8305,6 +8370,35 @@ export class SilaBillingApp {
 
       await this.persistSettings(nextSettings);
     }
+
+    if (formName === 'request-agt-series-form') {
+      this.agtSeriesErrorMessage = null;
+      this.agtSeriesSuccessMessage = null;
+      try {
+        const seriesCode = String(fd.get('seriesCode') || '').trim();
+        const documentType = String(fd.get('documentType') || 'FR').trim() as AgtDocumentType;
+        const seriesYear = parseInt(String(fd.get('seriesYear') || new Date().getFullYear()), 10);
+        const firstDocNumber = parseInt(String(fd.get('firstDocumentNumber') || '1'), 10);
+        const notes = String(fd.get('notes') || '').trim();
+
+        const created = solicitarSerie({
+          companyId: this.activeCompany.id,
+          seriesCode,
+          seriesYear,
+          documentType,
+          firstDocumentNumber: firstDocNumber,
+          notes,
+          operator: this.operator,
+        });
+
+        this.agtSeriesSuccessMessage = `Série fiscal ${created.seriesCode} (${created.documentType}) aprovada com sucesso! Código de Autorização AGT: ${created.agtAuthorizationCode}`;
+        this.showRequestAgtSeriesForm = false;
+        this.render();
+      } catch (err: any) {
+        this.agtSeriesErrorMessage = err.message || 'Erro ao submeter pedido de série fiscal à AGT.';
+        this.render();
+      }
+    }
   }
 
   private async persistSettings(nextSettings: AppSettings): Promise<void> {
@@ -8417,6 +8511,27 @@ export class SilaBillingApp {
       const draft = previewDraft;
       const now = new Date().toISOString();
       const originReturnId = this.returnOriginInvoice?.id || null;
+
+      let officialNumber = draft.number;
+      try {
+        const agtResult = reservarProximoNumeroFiscal(
+          this.activeCompany.id,
+          draft.docType as AgtDocumentType
+        );
+        officialNumber = agtResult.documentNo;
+      } catch (seriesErr: any) {
+        if (AGT_DOCUMENT_TYPES[draft.docType as AgtDocumentType]?.requiresSeries) {
+          this.isEmitting = false;
+          this.showScannerFeedback(
+            seriesErr.message || 'Emissão fiscal bloqueada: série AGT inexistente ou finalizada.',
+            true
+          );
+          this.render();
+          return;
+        }
+      }
+
+      const openSession = this.getActiveOpenCashSession();
       const maxCashierPct = this.settings.maxCashierDiscountPct ?? 5;
       const hasExcessDiscount =
         (draft.globalDiscountPct && draft.globalDiscountPct > maxCashierPct) ||
@@ -8430,6 +8545,7 @@ export class SilaBillingApp {
 
       const invoice: InvoiceRecord = {
         ...draft,
+        number: officialNumber,
         id: `inv_${Date.now()}`,
         companyId: this.activeCompany.id,
         cashier: openSession ? openSession.cashier : draft.cashier,
@@ -13834,11 +13950,17 @@ export class SilaBillingApp {
     }
 
     const ncTotals = calculateInvoiceTotals(draftItems, originInv.globalDiscountPct || 0);
-    const nextNumber = generateNextInvoiceNumber(
+    let nextNumber = generateNextInvoiceNumber(
       this.invoices.map((i) => i.number),
       'NC',
       this.activeCompany.baseSequence
     );
+    try {
+      const agtNc = reservarProximoNumeroFiscal(this.activeCompany.id, 'NC');
+      nextNumber = agtNc.documentNo;
+    } catch {
+      // Mantém fallback sequencial caso série específica NC não tenha sido inicializada
+    }
 
     const openSess = this.getActiveOpenCashSession();
     const now = new Date().toISOString();
@@ -15405,6 +15527,9 @@ export class SilaBillingApp {
             }
           </section>
 
+          <!-- Séries Fiscais AGT (Decreto Executivo n.º 683/25) -->
+          ${this.renderAgtSeriesSettingsSection()}
+
           <!-- Entidade Institucional & Recursos Empresariais -->
           <section class="space-y-3 pt-6 border-t border-slate-200">
             <div class="flex flex-col sm:flex-row sm:items-center justify-between gap-2">
@@ -15445,6 +15570,171 @@ export class SilaBillingApp {
           </section>
         </div>
       </div>
+    `;
+  }
+
+  private renderAgtSeriesSettingsSection(): string {
+    const seriesList = listarSeries({ companyId: this.activeCompany.id });
+    const canManage = this.canManageCompanySettings();
+    const currentYear = new Date().getFullYear();
+
+    return `
+      <!-- Séries Fiscais AGT (Decreto Executivo n.º 683/25) -->
+      <section class="space-y-4 pt-6 border-t border-slate-200">
+        <div class="flex flex-col sm:flex-row sm:items-center justify-between gap-3">
+          <div>
+            <div class="flex items-center gap-2">
+              <h2 class="text-xs font-semibold text-slate-900">Séries Fiscais AGT (Decreto Executivo n.º 683/25)</h2>
+              <span class="text-[10px] font-mono px-1.5 py-0.5 rounded bg-emerald-50 text-emerald-800 border border-emerald-200 font-semibold">Conformidade AGT</span>
+            </div>
+            <p class="text-xs text-slate-500">
+              Controlo estrito de séries e sequencialidade ininterrupta. Ciclo de vida: <strong>A</strong> (Ativa), <strong>U</strong> (Em Uso) e <strong>F</strong> (Finalizada).
+            </p>
+          </div>
+          ${
+            canManage
+              ? `<button
+                  type="button"
+                  data-action="open-request-agt-series-form"
+                  class="h-8 px-3 rounded-md bg-slate-900 text-white text-xs font-semibold hover:bg-slate-800 flex items-center gap-1.5 whitespace-nowrap self-start sm:self-auto transition-colors"
+                >
+                  ${ICONS.plus}
+                  <span>Solicitar Série à AGT</span>
+                </button>`
+              : ''
+          }
+        </div>
+
+        ${
+          this.agtSeriesSuccessMessage
+            ? `<div class="p-3 rounded-lg border border-emerald-200 bg-emerald-50 text-xs text-emerald-800 flex items-center justify-between">
+                <span>${escapeHtml(this.agtSeriesSuccessMessage)}</span>
+                <button type="button" data-action="close-request-agt-series-form" class="text-emerald-700 hover:text-emerald-900 font-bold ml-2">✕</button>
+              </div>`
+            : ''
+        }
+
+        ${
+          this.agtSeriesErrorMessage
+            ? `<div class="p-3 rounded-lg border border-red-200 bg-red-50 text-xs text-red-700 flex items-center justify-between">
+                <span>${escapeHtml(this.agtSeriesErrorMessage)}</span>
+                <button type="button" data-action="close-request-agt-series-form" class="text-red-700 hover:text-red-900 font-bold ml-2">✕</button>
+              </div>`
+            : ''
+        }
+
+        ${
+          this.showRequestAgtSeriesForm && canManage
+            ? `<form data-form="request-agt-series-form" class="p-4 rounded-lg border border-blue-200 bg-blue-50/50 space-y-3">
+                <div class="flex items-center justify-between border-b border-blue-200/80 pb-2">
+                  <div class="text-xs font-bold text-slate-900">Solicitação Formal de Série à AGT</div>
+                  <button type="button" data-action="close-request-agt-series-form" class="text-slate-400 hover:text-slate-700">${ICONS.close}</button>
+                </div>
+                <div class="text-[11px] text-slate-600">
+                  Nota legal: Conforme Decreto Executivo n.º 683/25, séries para novo ano fiscal só podem ser formalmente solicitadas a partir de 15 de Dezembro.
+                </div>
+                <div class="grid grid-cols-1 sm:grid-cols-12 gap-3">
+                  <div class="sm:col-span-4">
+                    <label class="block text-[10px] font-medium text-slate-700 mb-1">Tipo de Documento Fiscal</label>
+                    <select name="documentType" required class="w-full h-8 px-2 text-xs bg-white border border-slate-300 rounded focus:outline-none focus:border-blue-600">
+                      ${Object.values(AGT_DOCUMENT_TYPES)
+                        .map(
+                          (t) =>
+                            `<option value="${t.code}" ${t.code === 'FR' ? 'selected' : ''}>${t.code} — ${escapeHtml(
+                              t.shortName
+                            )}</option>`
+                        )
+                        .join('')}
+                    </select>
+                  </div>
+                  <div class="sm:col-span-3">
+                    <label class="block text-[10px] font-medium text-slate-700 mb-1">Código da Série</label>
+                    <input name="seriesCode" type="text" required maxlength="10" placeholder="Ex: A${currentYear}" value="A${currentYear}" class="w-full h-8 px-2 text-xs font-mono uppercase bg-white border border-slate-300 rounded focus:outline-none focus:border-blue-600" />
+                  </div>
+                  <div class="sm:col-span-2">
+                    <label class="block text-[10px] font-medium text-slate-700 mb-1">Ano Fiscal</label>
+                    <input name="seriesYear" type="number" required min="${currentYear}" max="${currentYear + 1}" value="${currentYear}" class="w-full h-8 px-2 text-xs font-mono bg-white border border-slate-300 rounded focus:outline-none focus:border-blue-600" />
+                  </div>
+                  <div class="sm:col-span-3">
+                    <label class="block text-[10px] font-medium text-slate-700 mb-1">1.º N.º Documento</label>
+                    <input name="firstDocumentNumber" type="number" required min="1" value="1" class="w-full h-8 px-2 text-xs font-mono bg-white border border-slate-300 rounded focus:outline-none focus:border-blue-600" />
+                  </div>
+                  <div class="sm:col-span-12 flex items-center justify-end gap-2 pt-2">
+                    <button type="button" data-action="close-request-agt-series-form" class="h-8 px-3 rounded border border-slate-300 bg-white text-xs font-medium text-slate-700 hover:bg-slate-50">Cancelar</button>
+                    <button type="submit" class="h-8 px-4 rounded bg-blue-600 text-white text-xs font-semibold hover:bg-blue-700 transition-colors">Submeter à AGT</button>
+                  </div>
+                </div>
+              </form>`
+            : ''
+        }
+
+        <div class="border border-slate-200 rounded-lg overflow-hidden">
+          <table class="w-full text-left border-collapse text-xs">
+            <thead class="bg-slate-50 border-b border-slate-200 text-[11px] text-slate-500">
+              <tr>
+                <th class="py-2.5 px-3 font-medium">Documento</th>
+                <th class="py-2.5 px-3 font-medium">Série</th>
+                <th class="py-2.5 px-3 font-medium">Ano</th>
+                <th class="py-2.5 px-3 font-medium font-mono tabular-nums">1.º N.º</th>
+                <th class="py-2.5 px-3 font-medium font-mono tabular-nums">Último Emitido</th>
+                <th class="py-2.5 px-3 font-medium">Autorização AGT</th>
+                <th class="py-2.5 px-3 font-medium">Estado</th>
+                <th class="py-2.5 px-3 font-medium text-right">Ação</th>
+              </tr>
+            </thead>
+            <tbody class="divide-y divide-slate-100 font-mono tabular-nums">
+              ${
+                seriesList.length === 0
+                  ? `<tr><td colspan="8" class="py-4 px-3 text-xs text-slate-500 text-center font-sans">Nenhuma série registada para esta empresa. Clique em "Solicitar Série à AGT" para provisionar as séries iniciais.</td></tr>`
+                  : seriesList
+                      .map((s) => {
+                        const statusBadge =
+                          s.status === 'A'
+                            ? `<span class="px-2 py-0.5 rounded text-[10px] font-bold bg-blue-50 text-blue-800 border border-blue-200 font-sans">A (Ativa)</span>`
+                            : s.status === 'U'
+                              ? `<span class="px-2 py-0.5 rounded text-[10px] font-bold bg-emerald-50 text-emerald-800 border border-emerald-200 font-sans">U (Em Uso)</span>`
+                              : `<span class="px-2 py-0.5 rounded text-[10px] font-bold bg-slate-100 text-slate-700 border border-slate-300 font-sans">F (Finalizada)</span>`;
+
+                        const docMeta = AGT_DOCUMENT_TYPES[s.documentType];
+                        const docLabel = docMeta ? `${s.documentType} - ${docMeta.shortName}` : s.documentType;
+
+                        return `
+                        <tr class="hover:bg-slate-50/50">
+                          <td class="py-2 px-3 font-sans font-medium text-slate-900">${escapeHtml(docLabel)}</td>
+                          <td class="py-2 px-3 font-bold text-slate-800">${escapeHtml(s.seriesCode)}</td>
+                          <td class="py-2 px-3 text-slate-600">${s.seriesYear}</td>
+                          <td class="py-2 px-3 text-slate-600">${String(s.firstDocumentNumber).padStart(6, '0')}</td>
+                          <td class="py-2 px-3 font-bold ${s.lastDocumentNumber > 0 ? 'text-blue-700' : 'text-slate-400'}">
+                            ${s.lastDocumentNumber > 0 ? String(s.lastDocumentNumber).padStart(6, '0') : 'Nenhum'}
+                          </td>
+                          <td class="py-2 px-3 text-[10px] text-slate-500 truncate max-w-[140px]" title="${escapeHtml(s.agtAuthorizationCode || '')}">
+                            ${escapeHtml(s.agtAuthorizationCode || '—')}
+                          </td>
+                          <td class="py-2 px-3">${statusBadge}</td>
+                          <td class="py-2 px-3 text-right font-sans">
+                            ${
+                              canManage && s.status !== 'F'
+                                ? `<button
+                                    type="button"
+                                    data-action="finalize-agt-series"
+                                    data-id="${escapeHtml(s.id)}"
+                                    class="text-[11px] text-amber-700 hover:text-amber-900 font-semibold px-2 py-1 rounded hover:bg-amber-50 transition-colors whitespace-nowrap"
+                                    title="Encerrar formalmente esta série impedindo novos documentos"
+                                  >
+                                    Finalizar ('F')
+                                  </button>`
+                                : `<span class="text-[11px] text-slate-400">—</span>`
+                            }
+                          </td>
+                        </tr>
+                      `;
+                      })
+                      .join('')
+              }
+            </tbody>
+          </table>
+        </div>
+      </section>
     `;
   }
 
