@@ -96,20 +96,131 @@ export interface AdminAuditEntry {
   createdAtIso: string;
 }
 
+export interface AdminOverviewStats {
+  totalCompanies: number;
+  activeCompanies: number;
+  suspendedCompanies: number;
+  totalInvoicesCount: number;
+  totalUsersCount: number;
+  commercialActiveCount: number;
+  baseOrganicCount: number;
+  plansBreakdown: {
+    FREE: number;
+    ESSENCIAL: number;
+    PROFISSIONAL: number;
+    ENTERPRISE: number;
+  };
+}
+
+export interface AdminCompanyDetails {
+  company: {
+    id: string;
+    legalName: string;
+    shortName: string;
+    nif: string;
+    normalizedNif: string;
+    cityCountry: string;
+    address: string;
+    phone: string;
+    email: string;
+    status: CompanyOperationalStatus;
+    planTier: PlanTier;
+    commercialActive: boolean;
+    baseSequence: number;
+    allowManagerCancel: boolean;
+    createdAtIso: string;
+    updatedAtIso: string;
+  };
+  counts: {
+    invoices: number;
+    products: number;
+    customers: number;
+    cashSessions: number;
+  };
+  members: Array<{
+    uid: string;
+    email: string;
+    role: string;
+    active: boolean;
+    allowInvoiceCancel?: boolean;
+    addedAtIso: string;
+  }>;
+  auditHistory: Array<{
+    id: string;
+    action: string;
+    adminEmail: string;
+    details: string;
+    createdAtIso: string;
+  }>;
+}
+
+export interface PlatformUserSummary {
+  uid: string;
+  email: string;
+  emailVerified: boolean;
+  isPlatformAdmin: boolean;
+  companies: Array<{
+    companyId: string;
+    companyName: string;
+    role: string;
+    active: boolean;
+  }>;
+}
+
+export interface SystemStatusResponse {
+  ok: boolean;
+  telemetry: {
+    uptimeSeconds: number;
+    nodeVersion: string;
+    memory: {
+      rssMb: number;
+      heapUsedMb: number;
+      heapTotalMb: number;
+    };
+    environment: string;
+    port: number;
+  };
+  firestore: {
+    initialized: boolean;
+    databaseId: string;
+    hasExplicitCredentials: boolean;
+    credentialSource: string;
+  };
+  services: {
+    backendApi: string;
+    cryptoEngine: string;
+    agtFiscalValidator: string;
+  };
+  timestampIso: string;
+}
+
 export interface AdminOverviewResponse {
   ok: boolean;
   statusCode?: number;
   adminEmail?: string;
   cloudPersisted?: boolean;
+  stats?: AdminOverviewStats;
   companies?: AdminCompanySummary[];
   recentLogs?: AdminAuditEntry[];
   error?: string;
 }
 
 async function getBearerHeaders(): Promise<Record<string, string>> {
-  const currentUser = auth.currentUser;
+  let currentUser = auth.currentUser;
+  if (!currentUser && typeof auth.authStateReady === 'function') {
+    try {
+      await Promise.race([
+        auth.authStateReady(),
+        new Promise((_, reject) => setTimeout(() => reject(new Error('timeout')), 2500)),
+      ]);
+      currentUser = auth.currentUser;
+    } catch {
+      // continua com utilizador atual
+    }
+  }
+
   if (!currentUser) {
-    throw new Error('Autentique-se na conta Google para aceder a serviços verificados.');
+    throw new Error('Sessão administrativa não iniciada. Inicie sessão com a conta Google para aceder ao Painel Master.');
   }
   const token = await currentUser.getIdToken();
   return {
@@ -292,18 +403,135 @@ export async function downloadCloudBackupJson(companyId: string): Promise<void> 
 export async function fetchPlatformAdminOverview(): Promise<AdminOverviewResponse> {
   try {
     const headers = await getBearerHeaders();
-    const res = await fetch(`${API_BASE}/api/admin/overview`, {
-      method: 'GET',
-      headers,
-    });
+    const controller = new AbortController();
+    const timeoutId = setTimeout(() => controller.abort(), 12000);
+
+    let res: Response;
+    try {
+      res = await fetch(`${API_BASE}/api/admin/overview`, {
+        method: 'GET',
+        headers,
+        signal: controller.signal,
+      });
+    } catch (netErr) {
+      if (API_BASE) {
+        // Tenta rota local caso o endpoint remoto esteja inacessível ou em cold start
+        res = await fetch('/api/admin/overview', {
+          method: 'GET',
+          headers,
+          signal: controller.signal,
+        });
+      } else {
+        throw netErr;
+      }
+    } finally {
+      clearTimeout(timeoutId);
+    }
+
     const json = (await res.json().catch(() => ({ ok: false }))) as AdminOverviewResponse;
     return { ...json, statusCode: res.status };
   } catch (err) {
+    const isAbort = err instanceof Error && err.name === 'AbortError';
     return {
       ok: false,
       statusCode: 0,
-      error: err instanceof Error ? err.message : 'Falha de comunicação com o servidor.',
+      error: isAbort
+        ? 'Tempo limite de resposta excedido ao contactar o servidor.'
+        : err instanceof Error
+          ? err.message
+          : 'Falha de comunicação com o servidor.',
     };
+  }
+}
+
+export async function fetchPlatformCompanyDetails(
+  companyId: string
+): Promise<{ ok: boolean; data?: AdminCompanyDetails; error?: string }> {
+  try {
+    const headers = await getBearerHeaders();
+    const res = await fetch(`${API_BASE}/api/admin/companies/${encodeURIComponent(companyId)}/details`, {
+      method: 'GET',
+      headers,
+    });
+    if (!res.ok) {
+      const errJson = await res.json().catch(() => ({}));
+      return { ok: false, error: errJson.error || `Erro ${res.status} ao obter perfil da empresa.` };
+    }
+    const json = await res.json();
+    return { ok: true, data: json };
+  } catch (err) {
+    return {
+      ok: false,
+      error: err instanceof Error ? err.message : 'Falha ao consultar detalhes da empresa.',
+    };
+  }
+}
+
+export async function createPlatformCompany(payload: {
+  shortName: string;
+  legalName?: string;
+  nif: string;
+  cityCountry?: string;
+  ownerEmail?: string;
+  planTier?: PlanTier;
+  status?: CompanyOperationalStatus;
+}): Promise<{ ok: boolean; companyId?: string; error?: string }> {
+  try {
+    const headers = await getBearerHeaders();
+    const res = await fetch(`${API_BASE}/api/admin/companies`, {
+      method: 'POST',
+      headers,
+      body: JSON.stringify(payload),
+    });
+    const json = await res.json().catch(() => ({ ok: false }));
+    if (!res.ok) {
+      return { ok: false, error: json.error || `Erro HTTP ${res.status}` };
+    }
+    return { ok: true, companyId: json.companyId };
+  } catch (err) {
+    return {
+      ok: false,
+      error: err instanceof Error ? err.message : 'Falha ao criar empresa.',
+    };
+  }
+}
+
+export async function fetchPlatformUsers(): Promise<{
+  ok: boolean;
+  users?: PlatformUserSummary[];
+  error?: string;
+}> {
+  try {
+    const headers = await getBearerHeaders();
+    const res = await fetch(`${API_BASE}/api/admin/users`, {
+      method: 'GET',
+      headers,
+    });
+    if (!res.ok) {
+      const json = await res.json().catch(() => ({}));
+      return { ok: false, error: json.error || `Erro HTTP ${res.status}` };
+    }
+    const json = await res.json();
+    return { ok: true, users: json.users };
+  } catch (err) {
+    return {
+      ok: false,
+      error: err instanceof Error ? err.message : 'Falha ao obter directório de utilizadores.',
+    };
+  }
+}
+
+export async function fetchPlatformSystemStatus(): Promise<SystemStatusResponse | null> {
+  try {
+    const headers = await getBearerHeaders();
+    const res = await fetch(`${API_BASE}/api/admin/system-status`, {
+      method: 'GET',
+      headers,
+    });
+    if (!res.ok) return null;
+    return (await res.json()) as SystemStatusResponse;
+  } catch {
+    return null;
   }
 }
 
@@ -775,3 +1003,69 @@ export async function fetchCompanyWorkspaceBackend(companyId: string): Promise<{
     return null;
   }
 }
+
+// ==================== INTEGRAÇÃO AGT (DECRETO EXECUTIVO 683/25) ====================
+
+export async function registerAgtBatchBackend(
+  documents: any[],
+  environment: 'HOMOLOGACAO' | 'PRODUCAO' = 'HOMOLOGACAO'
+): Promise<{ ok: boolean; result?: any; error?: string }> {
+  try {
+    const res = await fetch(`${API_BASE}/api/agt/invoices/register-batch`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ documents, environment }),
+    });
+    const data = await res.json();
+    return { ok: res.ok, result: data.result, error: data.error };
+  } catch (err: any) {
+    return { ok: false, error: err.message || 'Erro de rede ao comunicar com a AGT.' };
+  }
+}
+
+export async function getAgtBatchStatusBackend(
+  requestId: string,
+  submissionGUID?: string
+): Promise<{ ok: boolean; status?: any; error?: string }> {
+  try {
+    const url = new URL(`${API_BASE}/api/agt/invoices/status/${encodeURIComponent(requestId)}`, window.location.origin);
+    if (submissionGUID) url.searchParams.set('submissionGUID', submissionGUID);
+    const res = await fetch(url.toString());
+    const data = await res.json();
+    return { ok: res.ok, status: data.status, error: data.error };
+  } catch (err: any) {
+    return { ok: false, error: err.message || 'Erro ao consultar estado na AGT.' };
+  }
+}
+
+export async function queryAgtDocumentBackend(
+  documentNo: string,
+  companyTaxID: string
+): Promise<{ ok: boolean; queryRes?: any; error?: string }> {
+  try {
+    const url = new URL(`${API_BASE}/api/agt/invoices/query/${encodeURIComponent(documentNo)}`, window.location.origin);
+    url.searchParams.set('companyTaxID', companyTaxID);
+    const res = await fetch(url.toString());
+    const data = await res.json();
+    return { ok: res.ok, queryRes: data.queryRes, error: data.error };
+  } catch (err: any) {
+    return { ok: false, error: err.message || 'Erro ao consultar documento na AGT.' };
+  }
+}
+
+export async function validateAgtDocumentBackend(
+  document: any
+): Promise<{ ok: boolean; validation?: any; error?: string }> {
+  try {
+    const res = await fetch(`${API_BASE}/api/agt/invoices/validate`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(document),
+    });
+    const data = await res.json();
+    return { ok: res.ok, validation: data.validation, error: data.error };
+  } catch (err: any) {
+    return { ok: false, error: err.message || 'Erro ao validar documento junto do serviço AGT.' };
+  }
+}
+

@@ -131,17 +131,25 @@ import {
 } from '../src/services/localStore';
 import {
   AdminAuditEntry,
+  AdminCompanyDetails,
   AdminCompanySummary,
+  AdminOverviewStats,
   BackendHealthStatus,
   cancelInvoiceBackend,
+  createPlatformCompany,
   downloadCloudBackupJson,
   fetchBackendHealth,
   fetchCompanyWorkspaceBackend,
   fetchPlatformAdminOverview,
+  fetchPlatformCompanyDetails,
+  fetchPlatformSystemStatus,
+  fetchPlatformUsers,
   logPlatformSupportAccess,
+  PlatformUserSummary,
   registerCompanyBackend,
   requestEnsureAuthDomains,
   submitInvoiceAudit,
+  SystemStatusResponse,
   updatePlatformCompanyAdmin,
 } from './services/backendApi';
 import {
@@ -161,6 +169,7 @@ import { ICONS } from './ui/icons';
 import {
   formatPlanLabelPt,
   formatRoleLabelPt,
+  MasterAdminTab,
   renderCancelInvoiceModal,
   renderCompanySwitcherDropdown,
   renderFriendlyGrowthModal,
@@ -600,7 +609,16 @@ export class SilaBillingApp {
   private masterAdminSearch = '';
   private adminCloudCompanies: AdminCompanySummary[] = [];
   private adminAuditLogs: AdminAuditEntry[] = [];
+  private adminOverviewStats: AdminOverviewStats | null = null;
   private supportCompanyId: string | null = null;
+  private masterAdminTab: MasterAdminTab = 'overview';
+  private selectedCompanyDetails: AdminCompanyDetails | null = null;
+  private isLoadingCompanyDetails = false;
+  private showAdminNewCompanyModal = false;
+  private platformUsersList: PlatformUserSummary[] = [];
+  private isLoadingPlatformUsers = false;
+  private systemStatusData: SystemStatusResponse | null = null;
+  private isLoadingSystemStatus = false;
 
   // Estado Configurações / Cloud / PWA
   private settingsSavedNotice = false;
@@ -2730,6 +2748,47 @@ export class SilaBillingApp {
     } else {
       this.adminCloudCompanies = res.companies || [];
       this.adminAuditLogs = res.recentLogs || [];
+      this.adminOverviewStats = res.stats || null;
+    }
+    this.render();
+  }
+
+  private async loadPlatformUsers(): Promise<void> {
+    if (!this.user || !this.isOnline) return;
+    this.isLoadingPlatformUsers = true;
+    this.render();
+    const res = await fetchPlatformUsers();
+    this.isLoadingPlatformUsers = false;
+    if (res.ok && res.users) {
+      this.platformUsersList = res.users;
+    } else if (res.error) {
+      this.masterAdminError = res.error;
+    }
+    this.render();
+  }
+
+  private async loadSystemStatus(): Promise<void> {
+    if (!this.user || !this.isOnline) return;
+    this.isLoadingSystemStatus = true;
+    this.render();
+    const status = await fetchPlatformSystemStatus();
+    this.isLoadingSystemStatus = false;
+    if (status) {
+      this.systemStatusData = status;
+    }
+    this.render();
+  }
+
+  private async loadCompanyDetails(companyId: string): Promise<void> {
+    if (!this.user || !this.isOnline || !companyId) return;
+    this.isLoadingCompanyDetails = true;
+    this.render();
+    const res = await fetchPlatformCompanyDetails(companyId);
+    this.isLoadingCompanyDetails = false;
+    if (res.ok && res.data) {
+      this.selectedCompanyDetails = res.data;
+    } else {
+      this.masterAdminError = res.error || 'Erro ao carregar detalhes da empresa.';
     }
     this.render();
   }
@@ -3289,6 +3348,83 @@ export class SilaBillingApp {
       }
       case 'refresh-master-admin': {
         await this.refreshMasterAdminData();
+        break;
+      }
+      case 'master-switch-tab': {
+        const tab = (value as MasterAdminTab) || 'overview';
+        this.masterAdminTab = tab;
+        this.render();
+        if (tab === 'users' && this.platformUsersList.length === 0) {
+          void this.loadPlatformUsers();
+        } else if (tab === 'monitoring' && !this.systemStatusData) {
+          void this.loadSystemStatus();
+        }
+        break;
+      }
+      case 'admin-inspect-company': {
+        if (!id) break;
+        await this.loadCompanyDetails(id);
+        break;
+      }
+      case 'admin-close-company-details': {
+        this.selectedCompanyDetails = null;
+        this.render();
+        break;
+      }
+      case 'master-open-new-company': {
+        this.showAdminNewCompanyModal = true;
+        this.render();
+        break;
+      }
+      case 'master-close-new-company': {
+        this.showAdminNewCompanyModal = false;
+        this.render();
+        break;
+      }
+      case 'master-submit-new-company': {
+        const formEl = document.getElementById('master-new-company-form') as HTMLFormElement | null;
+        if (!formEl) break;
+        const formData = new FormData(formEl);
+        const shortName = String(formData.get('shortName') || '').trim();
+        const legalName = String(formData.get('legalName') || shortName).trim();
+        const nif = String(formData.get('nif') || '').trim();
+        const cityCountry = String(formData.get('cityCountry') || 'Angola').trim();
+        const ownerEmail = String(formData.get('ownerEmail') || '').trim();
+        const planTier = (formData.get('planTier') || 'FREE') as PlanTier;
+
+        if (!shortName || !nif || !ownerEmail) {
+          this.masterAdminError = 'Preencha Nome Curto, NIF e E-mail do Proprietário.';
+          this.render();
+          break;
+        }
+
+        this.masterAdminLoading = true;
+        this.render();
+        const createRes = await createPlatformCompany({
+          shortName,
+          legalName,
+          nif,
+          cityCountry,
+          ownerEmail,
+          planTier,
+          status: 'active',
+        });
+        this.masterAdminLoading = false;
+        if (!createRes.ok) {
+          this.masterAdminError = createRes.error || 'Erro ao registar nova empresa.';
+        } else {
+          this.showAdminNewCompanyModal = false;
+          await this.refreshMasterAdminData();
+        }
+        this.render();
+        break;
+      }
+      case 'master-refresh-users': {
+        await this.loadPlatformUsers();
+        break;
+      }
+      case 'master-refresh-system-status': {
+        await this.loadSystemStatus();
         break;
       }
       case 'admin-toggle-company-status': {
@@ -9373,6 +9509,15 @@ export class SilaBillingApp {
                 mergedCompanies: this.getMergedAdminCompanies(),
                 recentLogs: this.adminAuditLogs,
                 activeCompanyId: this.activeCompany.id,
+                stats: this.adminOverviewStats,
+                activeTab: this.masterAdminTab,
+                selectedCompanyDetails: this.selectedCompanyDetails,
+                isLoadingCompanyDetails: this.isLoadingCompanyDetails,
+                showNewCompanyForm: this.showAdminNewCompanyModal,
+                usersList: this.platformUsersList,
+                isLoadingUsers: this.isLoadingPlatformUsers,
+                systemStatus: this.systemStatusData,
+                isLoadingSystemStatus: this.isLoadingSystemStatus,
               })
             : ''
         }

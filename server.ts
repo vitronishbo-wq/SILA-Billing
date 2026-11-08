@@ -1,4 +1,5 @@
 import 'dotenv/config';
+import http from 'http';
 import fs from 'fs';
 import path from 'path';
 import { fileURLToPath } from 'url';
@@ -12,11 +13,15 @@ async function startServer() {
   const app = createApiApp();
   const isProd = process.env.NODE_ENV === 'production';
   const port = Number(process.env.PORT) || 3000;
+  const server = http.createServer(app);
 
   if (!isProd) {
     const { createServer: createViteServer } = await import('vite');
     const vite = await createViteServer({
-      server: { middlewareMode: true },
+      server: {
+        middlewareMode: true,
+        hmr: false,
+      },
       appType: 'spa',
     });
     app.use(vite.middlewares);
@@ -42,7 +47,7 @@ async function startServer() {
     }
   }
 
-  app.listen(port, '0.0.0.0', () => {
+  server.listen(port, '0.0.0.0', () => {
     console.log(`[SILA-Billing] Servidor ativo em http://0.0.0.0:${port} (${isProd ? 'production' : 'development'})`);
   });
 }

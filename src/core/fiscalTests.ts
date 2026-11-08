@@ -29,6 +29,13 @@ import {
   generateAgtQrSvg,
   parseAgtQrString,
 } from './fiscalQrGenerator.ts';
+import type { AgtDocumentPayload } from './fiscalTypes.ts';
+import { agtClient, MAX_AGT_BATCH_SIZE } from '../../backend/services/agtClient.ts';
+import {
+  cryptoSignerStore,
+  signAgtDocument,
+  verifyJwsCompact,
+} from '../../backend/services/cryptoSigner.ts';
 
 function assert(condition: boolean, msg: string): void {
   if (!condition) {
@@ -352,6 +359,126 @@ export async function runFiscalTests(): Promise<{ passed: number; total: number 
     });
 
     assert(typeof svg === 'string' && svg.includes('<svg') && svg.includes('</svg>'), 'Deve gerar markup SVG válido');
+  });
+
+  console.log('\n--- INICIANDO TESTES DO PIPELINE DE SUBMISSÃO E ASSINATURAS (FASE 5) ---');
+
+  const sampleDocPayload: AgtDocumentPayload = {
+    submissionGUID: '',
+    documentNo: 'FR A2026/000001',
+    series: 'A2026',
+    documentType: 'FR',
+    documentStatus: 'N',
+    documentDate: '2026-11-08',
+    systemEntryDate: new Date().toISOString(),
+    customerTaxID: '999999999',
+    customerCountry: 'AO',
+    customerName: 'Cliente Final',
+    companyName: 'JAIMONA-COMÉRCIO E SERVIÇOS',
+    companyTaxID: '5003069940',
+    softwareInfo: {
+      softwareApprovalNumber: '123/AGT/2026',
+      softwareName: 'SILA-Billing',
+      softwareVersion: '2.0.0',
+      producerTaxID: '5002571293',
+    },
+    lines: [
+      calculateAgtLineItem({
+        lineNumber: 1,
+        productCode: 'PROD_01',
+        productDescription: 'Artigo Normal',
+        quantity: 1,
+        unitPrice: 10000,
+        unitPriceIncludesTax: false,
+        taxCode: 'NOR',
+        taxPercentage: 14,
+      }),
+    ],
+    documentTotals: calculateAgtDocumentTotals([
+      calculateAgtLineItem({
+        lineNumber: 1,
+        productCode: 'PROD_01',
+        productDescription: 'Artigo Normal',
+        quantity: 1,
+        unitPrice: 10000,
+        unitPriceIncludesTax: false,
+        taxCode: 'NOR',
+        taxPercentage: 14,
+      }),
+    ]).totals,
+  };
+
+  await test('signAgtDocument gera assinaturas digitais RSA/JWS (Software, Documento e Envelope)', () => {
+    const signed = signAgtDocument(sampleDocPayload);
+
+    assert(Boolean(signed.jwsSoftwareSignature), 'Deve gerar jwsSoftwareSignature');
+    assert(Boolean(signed.jwsDocumentSignature), 'Deve gerar jwsDocumentSignature');
+    assert(Boolean(signed.jwsSignature), 'Deve gerar jwsSignature');
+    assert(signed.signaturePreview.length === 4, 'signaturePreview deve conter 4 caracteres');
+
+    // Validação da assinatura do software com a chave pública do produtor
+    const softPub = cryptoSignerStore.getSoftwareKeyPair().publicKeyPem;
+    const verifySoft = verifyJwsCompact(signed.jwsSoftwareSignature, softPub);
+    assert(verifySoft.valid === true, 'Assinatura jwsSoftwareSignature deve ser criptograficamente válida');
+
+    // Validação da assinatura do documento com a chave pública do emitente
+    const issuerPub = cryptoSignerStore.getIssuerKeyPair(sampleDocPayload.companyTaxID).publicKeyPem;
+    const verifyDoc = verifyJwsCompact(signed.jwsDocumentSignature, issuerPub);
+    assert(verifyDoc.valid === true, 'Assinatura jwsDocumentSignature deve ser criptograficamente válida');
+
+    // Violação de integridade: payload adulterado deve falhar na verificação
+    const tamperedJws = signed.jwsDocumentSignature.replace(/a/g, 'b');
+    const verifyTampered = verifyJwsCompact(tamperedJws, issuerPub);
+    assert(verifyTampered.valid === false, 'Assinatura adulterada deve ser rejeitada');
+  });
+
+  await test('agtClient.registarFactura aplica limite legal de até 30 documentos por lote', async () => {
+    const oversizedBatch: AgtDocumentPayload[] = [];
+    for (let i = 0; i < 31; i++) {
+      oversizedBatch.push({ ...sampleDocPayload, documentNo: `FR A2026/${String(i + 1).padStart(6, '0')}` });
+    }
+
+    let batchRejected = false;
+    try {
+      await agtClient.registarFactura(oversizedBatch);
+    } catch (err: any) {
+      batchRejected = true;
+      assert(err.message.includes('30 documentos'), 'Deve indicar o limite legal de 30 documentos da AGT');
+    }
+    assert(batchRejected, 'Lote com mais de 30 documentos deve ser estritamente bloqueado');
+  });
+
+  await test('agtClient.registarFactura submete lote válido e gera UUID v4 único por contribuinte', async () => {
+    const batch = [{ ...sampleDocPayload }];
+    const res = await agtClient.registarFactura(batch, 'HOMOLOGACAO');
+
+    assert(res.statusCode === 200, 'Código de status deve ser 200 para lote válido');
+    assert(Boolean(res.submissionGUID), 'Deve conter submissionGUID');
+    assert(res.submissionGUID.length === 36, 'submissionGUID deve ser UUID v4 padrão com 36 caracteres');
+    assert(Boolean(res.requestID), 'Deve persistir requestID para consulta posterior');
+    assert(res.documentValidationStates[sampleDocPayload.documentNo] === 'V', 'Documento deve ser validado com estado V');
+  });
+
+  await test('agtClient.obterEstado consulta processamento assíncrono com backoff', async () => {
+    const batch = [{ ...sampleDocPayload, documentNo: 'FR A2026/000099' }];
+    const submission = await agtClient.registarFactura(batch);
+
+    const statusRes = await agtClient.obterEstado(submission.requestID, submission.submissionGUID);
+    assert(statusRes.processStatus === 'CONCLUIDO', 'Processo deve ser concluído');
+    assert(statusRes.validationSummary.valid >= 1, 'Deve conter pelo menos um documento válido');
+    assert(statusRes.documents['FR A2026/000099'] === 'V', 'Documento deve estar validado (V)');
+  });
+
+  await test('agtClient.validarDocumento audita integridade de assinaturas JWS', async () => {
+    const docToValidate = { ...sampleDocPayload, documentNo: 'FA A2026/000010' };
+    const sigs = signAgtDocument(docToValidate);
+    docToValidate.jwsSoftwareSignature = sigs.jwsSoftwareSignature;
+    docToValidate.jwsDocumentSignature = sigs.jwsDocumentSignature;
+
+    const validation = await agtClient.validarDocumento(docToValidate);
+    assert(validation.valid === true, 'Documento com assinaturas válidas deve ser aprovado');
+    assert(validation.verificationDetails?.softwareSignatureValid === true, 'Software signature deve ser válida');
+    assert(validation.verificationDetails?.documentSignatureValid === true, 'Document signature deve ser válida');
   });
 
   console.log(`\nTODOS OS ${passed}/${total} TESTES FISCAIS PASSARAM COM SUCESSO!\n`);

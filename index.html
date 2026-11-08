@@ -276,8 +276,18 @@
 
         window.addEventListener('error', function (evt) {
           if (!window.__SILA_BOOTED__) {
-            var msg = evt && evt.message ? evt.message : 'Falha ao carregar módulo principal.';
-            showCompatFallback(msg);
+            var msg = evt && (evt.message || (evt.error && evt.error.message)) ? String(evt.message || evt.error.message) : '';
+            if (msg.indexOf('WebSocket') !== -1 || msg.indexOf('@vite/client') !== -1 || msg.indexOf('vite') !== -1) {
+              return;
+            }
+            showCompatFallback(msg || 'Falha ao carregar módulo principal.');
+          }
+        });
+
+        window.addEventListener('unhandledrejection', function (evt) {
+          var reason = evt && evt.reason ? String(evt.reason.message || evt.reason) : '';
+          if (reason.indexOf('WebSocket') !== -1 || reason.indexOf('@vite/client') !== -1 || reason.indexOf('vite') !== -1) {
+            if (evt.preventDefault) evt.preventDefault();
           }
         });
 
