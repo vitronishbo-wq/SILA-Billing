@@ -159,6 +159,7 @@ import {
   summarizeDocumentControlList,
   triggerBrowserDownload,
 } from '../src/core/documentExport';
+import { generateSaftAoXml } from '../src/core/saftGenerator';
 import {
   generateInvoiceQrDataUrl,
   renderCashClosureReportHtml,
@@ -3351,7 +3352,8 @@ export class SilaBillingApp {
         break;
       }
       case 'master-switch-tab': {
-        const tab = (value as MasterAdminTab) || 'overview';
+        const rawTab = target.dataset.tab || target.dataset.value || value || 'overview';
+        const tab = (rawTab as MasterAdminTab) || 'overview';
         this.masterAdminTab = tab;
         this.render();
         if (tab === 'users' && this.platformUsersList.length === 0) {
@@ -4702,7 +4704,7 @@ export class SilaBillingApp {
         break;
       }
       case 'export-history-control': {
-        if (value === 'PDF' || value === 'EXCEL' || value === 'CSV') {
+        if (value === 'PDF' || value === 'EXCEL' || value === 'CSV' || value === 'SAFT') {
           this.exportHistoryControl(value);
         }
         break;
@@ -14326,7 +14328,7 @@ export class SilaBillingApp {
     }
   }
 
-  private exportHistoryControl(format: 'PDF' | 'EXCEL' | 'CSV'): void {
+  private exportHistoryControl(format: 'PDF' | 'EXCEL' | 'CSV' | 'SAFT'): void {
     const { filtered } = this.getFilteredHistoryInvoices();
     if (filtered.length === 0) {
       this.showHistoryNotice('Não existem documentos no filtro atual para exportar.');
@@ -14339,6 +14341,28 @@ export class SilaBillingApp {
     const safeComp = (this.settings.company.shortName || 'empresa')
       .toLowerCase()
       .replace(/[^a-z0-9_-]+/g, '-');
+
+    if (format === 'SAFT') {
+      const saftRes = generateSaftAoXml({
+        company: this.settings.company,
+        invoices: filtered,
+        products: this.products,
+        customers: this.customers,
+        suppliers: this.suppliers,
+      });
+      triggerBrowserDownload(
+        saftRes.xml,
+        saftRes.filename,
+        'application/xml;charset=utf-8'
+      );
+      const warnCount = saftRes.validation.issues.filter((i) => i.level === 'warning').length;
+      const warnSuffix = warnCount > 0 ? ` (${warnCount} notas de validação)` : '';
+      this.showHistoryNotice(
+        `Ficheiro oficial SAF-T (AO) exportado: "${saftRes.filename}" (${saftRes.summary.totalSalesInvoices} faturas, ${saftRes.summary.totalWorkingDocuments} proformas). Prazo legal de submissão à AGT: ${saftRes.summary.submissionDeadline}${warnSuffix}.`
+      );
+      this.render();
+      return;
+    }
 
     if (format === 'PDF') {
       this.triggerHistoryControlReportPrint(filtered, filterLabel);
@@ -14855,8 +14879,15 @@ export class SilaBillingApp {
                   data-action="export-history-control"
                   data-value="CSV"
                   title="Exportar documentos filtrados para CSV"
-                  class="h-9 px-2.5 rounded-md border border-slate-200 bg-white hover:bg-slate-50 text-[11px] font-semibold text-slate-700 whitespace-nowrap"
+                  class="cursor-pointer h-9 px-2.5 rounded-md border border-slate-200 bg-white hover:bg-slate-50 text-[11px] font-semibold text-slate-700 whitespace-nowrap"
                 >CSV</button>
+                <button
+                  type="button"
+                  data-action="export-history-control"
+                  data-value="SAFT"
+                  title="Exportar ficheiro oficial SAF-T (AO) XML para submissão à AGT (Dec. Executivo 312/18)"
+                  class="cursor-pointer h-9 px-2.5 rounded-md border border-blue-600 bg-blue-50 hover:bg-blue-100 text-[11px] font-bold text-blue-800 whitespace-nowrap flex items-center gap-1 shadow-2xs transition-colors"
+                >SAF-T (AO)</button>
               </div>
             </div>
 

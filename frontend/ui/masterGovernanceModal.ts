@@ -203,10 +203,11 @@ export function renderMasterGovernanceModal(params: MasterGovernanceModalParams)
                   type="button"
                   data-action="master-switch-tab"
                   data-tab="overview"
-                  class="px-3 py-1.5 rounded-md font-semibold transition-colors flex items-center gap-1.5 whitespace-nowrap ${
+                  data-value="overview"
+                  class="cursor-pointer px-3 py-1.5 rounded-md font-semibold transition-all flex items-center gap-1.5 whitespace-nowrap ${
                     activeTab === 'overview'
-                      ? 'bg-white text-slate-900 border border-slate-200 shadow-xs'
-                      : 'text-slate-600 hover:text-slate-900 hover:bg-slate-100'
+                      ? 'bg-blue-600 text-white font-bold shadow-xs'
+                      : 'text-slate-600 hover:text-slate-900 hover:bg-slate-200/70'
                   }"
                 >
                   <span>1. Visão Global</span>
@@ -215,23 +216,27 @@ export function renderMasterGovernanceModal(params: MasterGovernanceModalParams)
                   type="button"
                   data-action="master-switch-tab"
                   data-tab="companies"
-                  class="px-3 py-1.5 rounded-md font-semibold transition-colors flex items-center gap-1.5 whitespace-nowrap ${
+                  data-value="companies"
+                  class="cursor-pointer px-3 py-1.5 rounded-md font-semibold transition-all flex items-center gap-1.5 whitespace-nowrap ${
                     activeTab === 'companies'
-                      ? 'bg-white text-slate-900 border border-slate-200 shadow-xs'
-                      : 'text-slate-600 hover:text-slate-900 hover:bg-slate-100'
+                      ? 'bg-blue-600 text-white font-bold shadow-xs'
+                      : 'text-slate-600 hover:text-slate-900 hover:bg-slate-200/70'
                   }"
                 >
                   <span>2. Empresas</span>
-                  <span class="px-1.5 py-0.2 rounded-full text-[10px] bg-slate-200 text-slate-700 font-mono">${mergedCompanies.length}</span>
+                  <span class="px-1.5 py-0.2 rounded-full text-[10px] ${
+                    activeTab === 'companies' ? 'bg-blue-700 text-white' : 'bg-slate-200 text-slate-700'
+                  } font-mono">${mergedCompanies.length}</span>
                 </button>
                 <button
                   type="button"
                   data-action="master-switch-tab"
                   data-tab="plans"
-                  class="px-3 py-1.5 rounded-md font-semibold transition-colors flex items-center gap-1.5 whitespace-nowrap ${
+                  data-value="plans"
+                  class="cursor-pointer px-3 py-1.5 rounded-md font-semibold transition-all flex items-center gap-1.5 whitespace-nowrap ${
                     activeTab === 'plans'
-                      ? 'bg-white text-slate-900 border border-slate-200 shadow-xs'
-                      : 'text-slate-600 hover:text-slate-900 hover:bg-slate-100'
+                      ? 'bg-blue-600 text-white font-bold shadow-xs'
+                      : 'text-slate-600 hover:text-slate-900 hover:bg-slate-200/70'
                   }"
                 >
                   <span>3. Planos Comerciais</span>
@@ -240,23 +245,27 @@ export function renderMasterGovernanceModal(params: MasterGovernanceModalParams)
                   type="button"
                   data-action="master-switch-tab"
                   data-tab="users"
-                  class="px-3 py-1.5 rounded-md font-semibold transition-colors flex items-center gap-1.5 whitespace-nowrap ${
+                  data-value="users"
+                  class="cursor-pointer px-3 py-1.5 rounded-md font-semibold transition-all flex items-center gap-1.5 whitespace-nowrap ${
                     activeTab === 'users'
-                      ? 'bg-white text-slate-900 border border-slate-200 shadow-xs'
-                      : 'text-slate-600 hover:text-slate-900 hover:bg-slate-100'
+                      ? 'bg-blue-600 text-white font-bold shadow-xs'
+                      : 'text-slate-600 hover:text-slate-900 hover:bg-slate-200/70'
                   }"
                 >
                   <span>4. Utilizadores</span>
-                  <span class="px-1.5 py-0.2 rounded-full text-[10px] bg-slate-200 text-slate-700 font-mono">${totalUsers}</span>
+                  <span class="px-1.5 py-0.2 rounded-full text-[10px] ${
+                    activeTab === 'users' ? 'bg-blue-700 text-white' : 'bg-slate-200 text-slate-700'
+                  } font-mono">${totalUsers}</span>
                 </button>
                 <button
                   type="button"
                   data-action="master-switch-tab"
                   data-tab="monitoring"
-                  class="px-3 py-1.5 rounded-md font-semibold transition-colors flex items-center gap-1.5 whitespace-nowrap ${
+                  data-value="monitoring"
+                  class="cursor-pointer px-3 py-1.5 rounded-md font-semibold transition-all flex items-center gap-1.5 whitespace-nowrap ${
                     activeTab === 'monitoring'
-                      ? 'bg-white text-slate-900 border border-slate-200 shadow-xs'
-                      : 'text-slate-600 hover:text-slate-900 hover:bg-slate-100'
+                      ? 'bg-blue-600 text-white font-bold shadow-xs'
+                      : 'text-slate-600 hover:text-slate-900 hover:bg-slate-200/70'
                   }"
                 >
                   <span>5. Monitorização</span>
@@ -265,14 +274,17 @@ export function renderMasterGovernanceModal(params: MasterGovernanceModalParams)
                   type="button"
                   data-action="master-switch-tab"
                   data-tab="audit"
-                  class="px-3 py-1.5 rounded-md font-semibold transition-colors flex items-center gap-1.5 whitespace-nowrap ${
+                  data-value="audit"
+                  class="cursor-pointer px-3 py-1.5 rounded-md font-semibold transition-all flex items-center gap-1.5 whitespace-nowrap ${
                     activeTab === 'audit'
-                      ? 'bg-white text-slate-900 border border-slate-200 shadow-xs'
-                      : 'text-slate-600 hover:text-slate-900 hover:bg-slate-100'
+                      ? 'bg-blue-600 text-white font-bold shadow-xs'
+                      : 'text-slate-600 hover:text-slate-900 hover:bg-slate-200/70'
                   }"
                 >
                   <span>6. Auditoria</span>
-                  <span class="px-1.5 py-0.2 rounded-full text-[10px] bg-slate-200 text-slate-700 font-mono">${recentLogs.length}</span>
+                  <span class="px-1.5 py-0.2 rounded-full text-[10px] ${
+                    activeTab === 'audit' ? 'bg-blue-700 text-white' : 'bg-slate-200 text-slate-700'
+                  } font-mono">${recentLogs.length}</span>
                 </button>
               </div>
 
@@ -280,7 +292,7 @@ export function renderMasterGovernanceModal(params: MasterGovernanceModalParams)
                 <button
                   type="button"
                   data-action="refresh-master-admin"
-                  class="h-7 px-2.5 rounded border border-slate-200 bg-white text-[11px] font-medium text-slate-700 hover:bg-slate-100 flex items-center gap-1 shrink-0"
+                  class="cursor-pointer h-7 px-2.5 rounded border border-slate-200 bg-white text-[11px] font-medium text-slate-700 hover:bg-slate-100 flex items-center gap-1 shrink-0 transition-colors"
                   title="Atualizar dados do servidor"
                 >
                   ${ICONS.refresh}
@@ -295,39 +307,81 @@ export function renderMasterGovernanceModal(params: MasterGovernanceModalParams)
                 errorMessage
                   ? `<div class="p-3 rounded-lg border border-amber-200 bg-amber-50 text-xs text-amber-800 flex items-start justify-between gap-3">
                       <div>${escapeHtml(errorMessage)}</div>
-                      <button type="button" data-action="refresh-master-admin" class="font-semibold text-amber-900 underline text-[11px] shrink-0">Tentar de novo</button>
+                      <button type="button" data-action="refresh-master-admin" class="cursor-pointer font-semibold text-amber-900 underline text-[11px] shrink-0">Tentar de novo</button>
                     </div>`
                   : ''
               }
 
-              <!-- Resumo Quantitativo Consistente (Sempre visível nos domínios) -->
+              <!-- Resumo Quantitativo Interativo (Navegação Rápida nos 6 Domínios) -->
               <div class="grid grid-cols-2 sm:grid-cols-3 lg:grid-cols-6 gap-2.5 tabular-nums">
-                <div class="p-2.5 rounded-lg border border-slate-200 bg-slate-50/70">
+                <button
+                  type="button"
+                  data-action="master-switch-tab"
+                  data-tab="companies"
+                  data-value="companies"
+                  class="cursor-pointer text-left p-2.5 rounded-lg border border-slate-200 bg-slate-50/70 hover:bg-white hover:border-blue-400 hover:shadow-xs transition-all"
+                  title="Clique para gerir empresas"
+                >
                   <div class="text-[10.5px] text-slate-500 font-medium">Empresas registadas</div>
                   <div class="text-base font-bold font-mono text-slate-900 mt-0.5">${stats?.totalCompanies ?? mergedCompanies.length}</div>
-                </div>
-                <div class="p-2.5 rounded-lg border border-slate-200 bg-slate-50/70">
+                </button>
+                <button
+                  type="button"
+                  data-action="master-switch-tab"
+                  data-tab="companies"
+                  data-value="companies"
+                  class="cursor-pointer text-left p-2.5 rounded-lg border border-slate-200 bg-slate-50/70 hover:bg-white hover:border-blue-400 hover:shadow-xs transition-all"
+                  title="Clique para ver empresas ativas"
+                >
                   <div class="text-[10.5px] text-slate-500 font-medium">Operação ativa</div>
                   <div class="text-base font-bold font-mono text-emerald-700 mt-0.5">${activeCount}</div>
-                </div>
-                <div class="p-2.5 rounded-lg border border-slate-200 bg-slate-50/70">
+                </button>
+                <button
+                  type="button"
+                  data-action="master-switch-tab"
+                  data-tab="companies"
+                  data-value="companies"
+                  class="cursor-pointer text-left p-2.5 rounded-lg border border-slate-200 bg-slate-50/70 hover:bg-white hover:border-blue-400 hover:shadow-xs transition-all"
+                  title="Clique para ver empresas suspensas"
+                >
                   <div class="text-[10.5px] text-slate-500 font-medium">Suspensas</div>
                   <div class="text-base font-bold font-mono text-slate-700 mt-0.5">${suspendedCount}</div>
-                </div>
-                <div class="p-2.5 rounded-lg border border-slate-200 bg-slate-50/70">
+                </button>
+                <button
+                  type="button"
+                  data-action="master-switch-tab"
+                  data-tab="plans"
+                  data-value="plans"
+                  class="cursor-pointer text-left p-2.5 rounded-lg border border-slate-200 bg-slate-50/70 hover:bg-white hover:border-blue-400 hover:shadow-xs transition-all"
+                  title="Clique para gerir subscrições comerciais"
+                >
                   <div class="text-[10.5px] text-slate-500 font-medium">Subscrições pagas</div>
                   <div class="text-base font-bold font-mono text-blue-700 mt-0.5">${commercialCount}</div>
                   <div class="text-[9.5px] text-blue-600 truncate">Essencial/Prof/Ent</div>
-                </div>
-                <div class="p-2.5 rounded-lg border border-slate-200 bg-slate-50/70">
+                </button>
+                <button
+                  type="button"
+                  data-action="master-switch-tab"
+                  data-tab="plans"
+                  data-value="plans"
+                  class="cursor-pointer text-left p-2.5 rounded-lg border border-slate-200 bg-slate-50/70 hover:bg-white hover:border-blue-400 hover:shadow-xs transition-all"
+                  title="Clique para gerir Base Orgânico"
+                >
                   <div class="text-[10.5px] text-slate-500 font-medium">Base Orgânico</div>
                   <div class="text-base font-bold font-mono text-amber-700 mt-0.5">${organicCount}</div>
                   <div class="text-[9.5px] text-amber-600 truncate">Até 40 docs/mês</div>
-                </div>
-                <div class="p-2.5 rounded-lg border border-slate-200 bg-slate-50/70">
+                </button>
+                <button
+                  type="button"
+                  data-action="master-switch-tab"
+                  data-tab="companies"
+                  data-value="companies"
+                  class="cursor-pointer text-left p-2.5 rounded-lg border border-slate-200 bg-slate-50/70 hover:bg-white hover:border-blue-400 hover:shadow-xs transition-all"
+                  title="Clique para ver faturas por empresa"
+                >
                   <div class="text-[10.5px] text-slate-500 font-medium">Faturas consolidadas</div>
                   <div class="text-base font-bold font-mono text-slate-900 mt-0.5">${totalInvoices}</div>
-                </div>
+                </button>
               </div>
 
               <!-- Conteúdo Específico de Cada Aba -->
@@ -435,7 +489,8 @@ function renderOverviewTab(params: {
                 type="button"
                 data-action="master-switch-tab"
                 data-tab="audit"
-                class="text-[11px] font-semibold text-blue-600 hover:text-blue-800"
+                data-value="audit"
+                class="cursor-pointer text-[11px] font-semibold text-blue-600 hover:text-blue-800 transition-colors"
               >Ver tudo &rarr;</button>
             </div>
             <div class="divide-y divide-slate-100 text-[11px]">
@@ -472,7 +527,8 @@ function renderOverviewTab(params: {
                 type="button"
                 data-action="master-switch-tab"
                 data-tab="monitoring"
-                class="text-[11px] font-semibold text-blue-600 hover:text-blue-800"
+                data-value="monitoring"
+                class="cursor-pointer text-[11px] font-semibold text-blue-600 hover:text-blue-800 transition-colors"
               >Diagnóstico &rarr;</button>
             </div>
             <div class="space-y-2.5 text-xs">
@@ -601,7 +657,7 @@ function renderCompaniesTab(params: {
                                 type="button"
                                 data-action="admin-inspect-company"
                                 data-id="${escapeHtml(comp.id)}"
-                                class="h-8 px-2.5 rounded-md border border-slate-200 text-[11px] font-semibold text-slate-700 hover:bg-slate-100 whitespace-nowrap"
+                                class="cursor-pointer h-8 px-2.5 rounded-md border border-slate-200 bg-white text-[11px] font-semibold text-slate-700 hover:bg-slate-100 active:scale-95 transition-all shadow-2xs whitespace-nowrap"
                                 title="Ver ficha completa, membros e auditoria"
                               >Inspecionar</button>
                               <button
@@ -609,17 +665,17 @@ function renderCompaniesTab(params: {
                                 data-action="admin-toggle-company-status"
                                 data-id="${escapeHtml(comp.id)}"
                                 data-value="${nextStatus}"
-                                class="h-8 px-2.5 rounded-md border border-slate-200 text-[11px] font-medium ${
+                                class="cursor-pointer h-8 px-2.5 rounded-md border border-slate-200 bg-white text-[11px] font-medium ${
                                   isSusp
-                                    ? 'text-emerald-700 hover:bg-emerald-50'
-                                    : 'text-red-600 hover:bg-red-50'
-                                } whitespace-nowrap"
+                                    ? 'text-emerald-700 hover:bg-emerald-50 border-emerald-200'
+                                    : 'text-red-600 hover:bg-red-50 border-red-200'
+                                } active:scale-95 transition-all shadow-2xs whitespace-nowrap"
                               >${isSusp ? 'Reativar' : 'Suspender'}</button>
                               <button
                                 type="button"
                                 data-action="admin-support-switch"
                                 data-id="${escapeHtml(comp.id)}"
-                                class="h-8 px-2.5 rounded-md bg-slate-900 text-white text-[11px] font-semibold hover:bg-slate-800 whitespace-nowrap"
+                                class="cursor-pointer h-8 px-2.5 rounded-md bg-slate-900 text-white text-[11px] font-semibold hover:bg-slate-800 active:scale-95 transition-all shadow-2xs whitespace-nowrap"
                               >${isCurrent ? 'Em uso' : 'Suporte'}</button>
                             </div>
                           </td>
@@ -771,7 +827,7 @@ function renderUsersTab(params: {
         <button
           type="button"
           data-action="master-refresh-users"
-          class="h-8 px-3 rounded-lg border border-slate-200 text-xs font-medium text-slate-700 hover:bg-slate-50 flex items-center gap-1.5 whitespace-nowrap"
+          class="cursor-pointer h-8 px-3 rounded-lg border border-slate-200 bg-white text-xs font-semibold text-slate-700 hover:bg-slate-100 active:scale-95 transition-all shadow-2xs flex items-center gap-1.5 whitespace-nowrap"
         >
           ${ICONS.refresh}
           <span>Atualizar directório</span>
@@ -872,7 +928,7 @@ function renderMonitoringTab(params: {
         <button
           type="button"
           data-action="master-refresh-system-status"
-          class="h-8 px-3 rounded-lg border border-slate-200 text-xs font-medium text-slate-700 hover:bg-slate-50 flex items-center gap-1.5 whitespace-nowrap"
+          class="cursor-pointer h-8 px-3 rounded-lg border border-slate-200 bg-white text-xs font-semibold text-slate-700 hover:bg-slate-100 active:scale-95 transition-all shadow-2xs flex items-center gap-1.5 whitespace-nowrap"
         >
           ${ICONS.refresh}
           <span>Diagnosticar agora</span>
@@ -925,7 +981,7 @@ function renderMonitoringTab(params: {
       <!-- Serviços Fiscais AGT -->
       <div class="border border-slate-200 rounded-lg p-4 bg-white">
         <h4 class="text-xs font-bold text-slate-900 mb-2">Prontidão dos Componentes do Decreto Executivo n.º 683/25</h4>
-        <div class="grid grid-cols-1 sm:grid-cols-3 gap-3 text-xs">
+        <div class="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-4 gap-3 text-xs">
           <div class="p-3 rounded-lg border border-slate-100 bg-slate-50 flex items-start gap-2.5">
             <span class="text-emerald-600 font-bold mt-0.5">&#10003;</span>
             <div>
@@ -945,6 +1001,13 @@ function renderMonitoringTab(params: {
             <div>
               <div class="font-semibold text-slate-800">Regras de Séries e Ano</div>
               <div class="text-[10.5px] text-slate-500">Regra de 15/Dezembro e estados A, U e F</div>
+            </div>
+          </div>
+          <div class="p-3 rounded-lg border border-slate-100 bg-slate-50 flex items-start gap-2.5">
+            <span class="text-emerald-600 font-bold mt-0.5">&#10003;</span>
+            <div>
+              <div class="font-semibold text-slate-800">SAF-T (AO) XML v1.01_01</div>
+              <div class="text-[10.5px] text-slate-500">Dec. Executivo 312/18 e esquema oficial XSD</div>
             </div>
           </div>
         </div>
@@ -1047,7 +1110,7 @@ function renderCompanyDetailsDrawer(params: {
           <button
             type="button"
             data-action="admin-close-company-details"
-            class="h-8 w-8 rounded-lg bg-slate-800 hover:bg-slate-700 text-slate-300 flex items-center justify-center"
+            class="cursor-pointer h-8 w-8 rounded-lg bg-slate-800 hover:bg-slate-700 text-slate-300 flex items-center justify-center transition-colors"
           >
             ${ICONS.close}
           </button>
@@ -1061,7 +1124,7 @@ function renderCompanyDetailsDrawer(params: {
               type="button"
               data-action="admin-support-switch"
               data-id="${escapeHtml(c.id)}"
-              class="h-8 px-3 rounded-lg bg-slate-900 text-white font-semibold hover:bg-slate-800 flex items-center gap-1.5"
+              class="cursor-pointer h-8 px-3 rounded-lg bg-slate-900 text-white font-semibold hover:bg-slate-800 active:scale-95 transition-all shadow-2xs flex items-center gap-1.5"
             >
               <span>${isCurrent ? 'Contexto Ativo' : 'Aceder em Modo Suporte'}</span>
             </button>
@@ -1070,9 +1133,9 @@ function renderCompanyDetailsDrawer(params: {
               data-action="admin-toggle-company-status"
               data-id="${escapeHtml(c.id)}"
               data-value="${isSusp ? 'active' : 'suspended'}"
-              class="h-8 px-3 rounded-lg border border-slate-200 font-medium ${
-                isSusp ? 'text-emerald-700 hover:bg-emerald-50' : 'text-red-600 hover:bg-red-50'
-              }"
+              class="cursor-pointer h-8 px-3 rounded-lg border border-slate-200 bg-white font-medium ${
+                isSusp ? 'text-emerald-700 hover:bg-emerald-50 border-emerald-200' : 'text-red-600 hover:bg-red-50 border-red-200'
+              } active:scale-95 transition-all shadow-2xs"
             >
               ${isSusp ? 'Reativar Empresa' : 'Suspender Empresa'}
             </button>
