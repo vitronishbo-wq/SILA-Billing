@@ -56,6 +56,25 @@ export interface CompanyProfile {
   phone: string;
   email: string;
   tagline: string;
+  // Contactos complementares
+  mobile?: string;
+  whatsapp?: string;
+  website?: string;
+  province?: string;
+  postalCode?: string;
+  // Logótipo
+  logoUrl?: string;
+  // Dados Fiscais e Jurídicos
+  taxRegime?: 'GERAL' | 'SIMPLIFICADO' | 'EXCLUSAO';
+  taxOffice?: string;
+  commercialRegistry?: string;
+  shareCapital?: string;
+  defaultWithholdingTax?: number;
+  // Coordenadas Bancárias
+  bankName1?: string;
+  iban1?: string;
+  bankName2?: string;
+  iban2?: string;
 }
 
 export const NEUTRAL_PLATFORM_PROFILE: CompanyProfile = {

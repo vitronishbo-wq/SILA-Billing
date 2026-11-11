@@ -111,12 +111,28 @@ export function renderDocumentHtml(
     return `
       <div class="print-target mx-auto w-full max-w-[330px] bg-white p-4 text-[12px] leading-snug text-black font-sans border border-slate-200">
         <div class="text-center space-y-0.5">
+          ${
+            company.logoUrl
+              ? `<div class="mb-2 flex justify-center"><img src="${escapeHtml(company.logoUrl)}" class="max-h-12 max-w-[140px] object-contain" alt="Logótipo" /></div>`
+              : ''
+          }
           <div class="font-bold text-[11px] tracking-tight">MODELO — SEM VALIDADE FISCAL</div>
           <div class="font-bold text-[13px] leading-tight">${escapeHtml(company.legalName)}</div>
           <div class="text-[11px]">${escapeHtml(company.address)}</div>
-          <div class="text-[11px]">Tel.: ${escapeHtml(company.phone)}</div>
-          <div class="text-[11px]">${escapeHtml(company.email)}</div>
+          <div class="text-[11px]">Tel.: ${escapeHtml(company.phone)}${company.mobile ? ` / ${escapeHtml(company.mobile)}` : ''}</div>
+          ${company.email ? `<div class="text-[11px]">${escapeHtml(company.email)}</div>` : ''}
           <div class="text-[11px]">Contribuinte: ${escapeHtml(company.nif)}</div>
+          ${
+            company.taxRegime
+              ? `<div class="text-[10px] text-slate-700">${
+                  company.taxRegime === 'SIMPLIFICADO'
+                    ? 'Regime Simplificado (7%)'
+                    : company.taxRegime === 'EXCLUSAO'
+                      ? 'Regime de Exclusão'
+                      : 'Regime Geral (14%)'
+                }</div>`
+              : ''
+          }
         </div>
 
         ${
@@ -288,7 +304,11 @@ export function renderDocumentHtml(
     <div class="print-target mx-auto w-full max-w-[794px] bg-white p-6 sm:p-8 text-slate-900 border border-slate-200 text-xs">
       <div class="flex flex-col sm:flex-row sm:items-start justify-between gap-4 pb-5 border-b border-slate-200">
         <div class="flex items-center gap-3.5">
-          <div class="flex h-14 w-14 shrink-0 items-center justify-center rounded-full border-2 border-blue-600 bg-slate-900 text-white font-bold text-lg tracking-tight">${escapeHtml(deriveCompanyInitials(company))}</div>
+          ${
+            company.logoUrl
+              ? `<img src="${escapeHtml(company.logoUrl)}" class="h-14 w-auto max-w-[130px] object-contain rounded" alt="Logótipo" />`
+              : `<div class="flex h-14 w-14 shrink-0 items-center justify-center rounded-full border-2 border-blue-600 bg-slate-900 text-white font-bold text-lg tracking-tight">${escapeHtml(deriveCompanyInitials(company))}</div>`
+          }
           <div>
             <div class="text-base font-bold tracking-tight text-slate-900">${escapeHtml(company.shortName)}</div>
             <div class="text-[11px] font-medium text-slate-600">${escapeHtml(company.legalName)}</div>
@@ -297,13 +317,24 @@ export function renderDocumentHtml(
                 ? 'Qualidade · Confiança · Soluções'
                 : escapeHtml(company.tagline || company.cityCountry || 'Comércio & Serviços')
             }</div>
+            ${
+              company.taxRegime || company.commercialRegistry
+                ? `<div class="text-[9.5px] text-slate-500 mt-0.5">
+                    ${company.taxRegime ? `Regime: ${company.taxRegime === 'SIMPLIFICADO' ? 'Simplificado' : company.taxRegime === 'EXCLUSAO' ? 'Exclusão' : 'Geral (IVA)'}` : ''}
+                    ${company.commercialRegistry ? ` · CRC: ${escapeHtml(company.commercialRegistry)}` : ''}
+                    ${company.shareCapital ? ` · Cap. Social: ${escapeHtml(company.shareCapital)}` : ''}
+                  </div>`
+                : ''
+            }
           </div>
         </div>
         <div class="text-[11px] text-slate-600 space-y-0.5 sm:text-right tabular-nums">
-          <div>${escapeHtml(company.address)}</div>
-          <div>Tel.: ${escapeHtml(company.phone)}</div>
-          <div>${escapeHtml(company.email)}</div>
-          <div class="font-semibold text-slate-900">Contribuinte: ${escapeHtml(company.nif)}</div>
+          <div>${escapeHtml(company.address)}${company.postalCode ? ` · CP ${escapeHtml(company.postalCode)}` : ''}</div>
+          <div>${escapeHtml(company.cityCountry || 'Angola')}</div>
+          <div>Tel.: ${escapeHtml(company.phone)}${company.mobile ? ` / ${escapeHtml(company.mobile)}` : ''}</div>
+          ${company.email ? `<div>${escapeHtml(company.email)}</div>` : ''}
+          ${company.website ? `<div>${escapeHtml(company.website)}</div>` : ''}
+          <div class="font-semibold text-slate-900">Contribuinte / NIF: ${escapeHtml(company.nif)}</div>
         </div>
       </div>
 
@@ -499,6 +530,24 @@ export function renderDocumentHtml(
             ? `<div class="text-[11px] text-slate-600">
                 <span class="font-semibold text-slate-800">Observações: </span>
                 ${escapeHtml(invoice.notes)}
+              </div>`
+            : ''
+        }
+
+        ${
+          company.iban1
+            ? `<div class="p-2.5 rounded-lg bg-slate-50 border border-slate-200 text-[10.5px] text-slate-700 flex flex-col sm:flex-row sm:items-center justify-between gap-1.5 tabular-nums">
+                <div>
+                  <span class="font-semibold text-slate-900">Coordenadas Bancárias:</span>
+                  <span>${escapeHtml(company.bankName1 || 'Banco Principal')} · IBAN: <strong class="font-mono text-slate-900">${escapeHtml(company.iban1)}</strong></span>
+                </div>
+                ${
+                  company.iban2
+                    ? `<div>
+                        <span>${escapeHtml(company.bankName2 || 'Banco Secundário')} · IBAN: <strong class="font-mono text-slate-900">${escapeHtml(company.iban2)}</strong></span>
+                      </div>`
+                    : ''
+                }
               </div>`
             : ''
         }
