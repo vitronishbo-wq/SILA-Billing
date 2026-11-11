@@ -5,13 +5,27 @@
  * 1. Decreto Executivo n.º 312/18 (Regulamento do SAF-T AO)
  * 2. Portaria n.º 321-A/2013 (Especificação do Algoritmo de Assinatura RSA-SHA1)
  * 3. XSD Oficial AGT Versão 1.01_01
+ * 4. Decreto Executivo n.º 683/25 (Assinaturas Digitais JWS / RS256)
  * 
- * Especificação Criptográfica:
- * - Algoritmo: RSA com SHA-1 e padding PKCS#1 v1.5
- * - Tamanho da Chave: 1024 bits (módulo de 128 bytes)
- * - Codificação: Base64 padrão com exatamente 172 caracteres (incluindo padding '=')
- * - Cadeia Canónica: "Data;DataHoraGravacao;NumeroDocumento;TotalIliquido;HashAnterior"
- * - HashControl: Versão da chave privada (padrão '1')
+ * ARQUITETURA CRIPTOGRÁFICA TRIPARTIDA:
+ * 
+ * 1. HASH SAF-T (Decreto Executivo n.º 312/18 - Implementado neste módulo):
+ *    - Algoritmo: RSA-SHA1 com PKCS#1 v1.5 (Chave de 1024-bits, 128 bytes binários)
+ *    - Formato: Exatamente 172 caracteres em Base64 padrão com '='
+ *    - Cadeia Canónica: "Data;DataHoraGravacao;NumeroDocumento;TotalIliquido;HashAnterior"
+ *    - Aplicação: Ficheiro oficial XML SAF-T (AO) nos nós <Hash> e <HashControl>
+ * 
+ * 2. JWS DO DOCUMENTO FISCAL (Decreto Executivo n.º 683/25 - cryptoSigner.ts):
+ *    - Algoritmo: RS256 (RSA-SHA256) JWS Compact Serialization (RFC 7515)
+ *    - Chave: Chave privada RSA de 2048-bits do Contribuinte Emitente (NIF Empresa)
+ *    - Cadeia Canónica: "companyTaxID|docNo|date|status|customerTaxID|...|lines"
+ *    - Aplicação: Campo 'Q' do QR Code Oficial e transmissão webservice AGT
+ * 
+ * 3. JWS DO SOFTWARE DO PRODUTOR (Decreto Executivo n.º 683/25 - cryptoSigner.ts):
+ *    - Algoritmo: RS256 (RSA-SHA256) JWS Compact Serialization (RFC 7515)
+ *    - Chave: Chave privada RSA de 2048-bits da Software House (VITRONIS - NIF 5002571293)
+ *    - Cadeia Canónica: "softwareApprovalNumber|softwareName|softwareVersion|producerTaxID"
+ *    - Aplicação: Certificação do software e envelope consolidado (jwsSignature)
  */
 
 export const DEFAULT_SAFT_PUBLIC_KEY = `-----BEGIN PUBLIC KEY-----

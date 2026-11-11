@@ -165,17 +165,20 @@ export function normalizeTaxIdForSaft(rawNif?: string | null): string {
 }
 
 /**
- * Calcula o prazo legal oficial de submissão do SAF-T mensal à AGT
- * Regra: Até ao dia 15 do mês seguinte ao período reportado.
+ * Calcula o prazo legal oficial de submissão do ficheiro SAF-T (AO) mensal à AGT
+ * Regra Geral do Decreto Presidencial / Decreto Executivo n.º 312/18:
+ * Submissão até ao último dia do mês seguinte ao período de tributação/faturação a que os dados respeitam.
  */
 export function calculateLegalSubmissionDeadline(year: number, month: number): string {
   const nextMonth = month === 12 ? 1 : month + 1;
   const nextYear = month === 12 ? year + 1 : year;
+  // O dia 0 do mês seguinte ao nextMonth calcula o último dia desse mês
+  const lastDayOfNextMonth = new Date(nextYear, nextMonth, 0).getDate();
   const monthNames = [
     'Janeiro', 'Fevereiro', 'Março', 'Abril', 'Maio', 'Junho',
     'Julho', 'Agosto', 'Setembro', 'Outubro', 'Novembro', 'Dezembro'
   ];
-  return `15 de ${monthNames[nextMonth - 1]} de ${nextYear}`;
+  return `${lastDayOfNextMonth} de ${monthNames[nextMonth - 1]} de ${nextYear}`;
 }
 
 /**
@@ -567,7 +570,7 @@ export function generateSaftAoXml(params: GenerateSaftParams): SaftExportResult 
 
       const rateNum = Number(l.ivaRate) || 0;
       const isZeroRate = rateNum === 0;
-      const taxCode = isZeroRate ? 'ISE' : rateNum === 5 ? 'RED' : rateNum === 7 ? 'INT' : 'NOR';
+      const taxCode = isZeroRate ? 'ISE' : rateNum === 5 ? 'RED' : (rateNum === 1 || rateNum === 7) ? 'INT' : 'NOR';
       const taxPercentage = rateNum.toFixed(2);
       const exemptionCode = (l as any).exemptionCode || 'M10';
       const exemptionReason = getIvaExemptionReason(exemptionCode);
@@ -645,12 +648,12 @@ export function generateSaftAoXml(params: GenerateSaftParams): SaftExportResult 
         <CustomerID>${escapeXml(customerId)}</CustomerID>
         ${linesXmlChunks.join('\n        ')}
         <DocumentTotals>
-          <TaxPayable>${isCancelled ? '0.00' : inv.taxTotal.toFixed(2)}</TaxPayable>
-          <NetTotal>${isCancelled ? '0.00' : netAmount.toFixed(2)}</NetTotal>
-          <GrossTotal>${isCancelled ? '0.00' : inv.grandTotal.toFixed(2)}</GrossTotal>
+          <TaxPayable>${inv.taxTotal.toFixed(2)}</TaxPayable>
+          <NetTotal>${netAmount.toFixed(2)}</NetTotal>
+          <GrossTotal>${inv.grandTotal.toFixed(2)}</GrossTotal>
           <Payment>
             <PaymentMechanism>${mapPaymentMethodToSaft(inv.paymentMethod)}</PaymentMechanism>
-            <PaymentAmount>${isCancelled ? '0.00' : inv.grandTotal.toFixed(2)}</PaymentAmount>
+            <PaymentAmount>${inv.grandTotal.toFixed(2)}</PaymentAmount>
             <PaymentDate>${invDate}</PaymentDate>
           </Payment>
         </DocumentTotals>
@@ -726,9 +729,9 @@ export function generateSaftAoXml(params: GenerateSaftParams): SaftExportResult 
           <CustomerID>${escapeXml(customerId)}</CustomerID>
           ${fpLinesXml.join('\n          ')}
           <DocumentTotals>
-            <TaxPayable>${isCancelled ? '0.00' : fp.taxTotal.toFixed(2)}</TaxPayable>
-            <NetTotal>${isCancelled ? '0.00' : netAmount.toFixed(2)}</NetTotal>
-            <GrossTotal>${isCancelled ? '0.00' : fp.grandTotal.toFixed(2)}</GrossTotal>
+            <TaxPayable>${fp.taxTotal.toFixed(2)}</TaxPayable>
+            <NetTotal>${netAmount.toFixed(2)}</NetTotal>
+            <GrossTotal>${fp.grandTotal.toFixed(2)}</GrossTotal>
           </DocumentTotals>
         </WorkDocument>
     `.trim());
@@ -814,8 +817,8 @@ export function generateSaftAoXml(params: GenerateSaftParams): SaftExportResult 
         <TaxType>IVA</TaxType>
         <TaxCountryRegion>AO-CAB</TaxCountryRegion>
         <TaxCode>INT</TaxCode>
-        <Description>Taxa Intermédia (7%) - Regime Especial da Província de Cabinda (Lei 18/14)</Description>
-        <TaxPercentage>7.00</TaxPercentage>
+        <Description>Taxa Especial para a Província de Cabinda (1%) - Artigo 15.º do CIVA / Lei n.º 14/23</Description>
+        <TaxPercentage>1.00</TaxPercentage>
       </TaxTableEntry>
       <TaxTableEntry>
         <TaxType>IVA</TaxType>

@@ -168,6 +168,11 @@ import {
 } from './ui/documentRenderer';
 import { ICONS } from './ui/icons';
 import {
+  renderMobileOperationalView,
+  MobileTab,
+  MobileCheckoutStep,
+} from './ui/mobileOperationalView';
+import {
   formatPlanLabelPt,
   formatRoleLabelPt,
   MasterAdminTab,
@@ -262,6 +267,15 @@ export class SilaBillingApp {
   private activeModule: ActiveModule = 'NEW_POS';
   private sidebarState: SidebarState =
     typeof window !== 'undefined' && window.innerWidth >= 1024 ? 'EXPANDED' : 'ICONS';
+
+  // Experiência Operacional Mobile-First
+  private mobileTab: MobileTab = 'HOME';
+  private mobileCheckoutStep: MobileCheckoutStep = 'CART';
+  private mobileProductSearchInput = '';
+  private mobileDocsSearchQuery = '';
+  private showMobileCustomerPicker = false;
+  private showMobileQuickCompanyModal = false;
+  private forceDesktopView = false;
 
   // Contexto Multiempresa e Dados Persistentes (IndexedDB v2 + Firestore)
   private activeCompany: CompanyRecord = UNASSIGNED_TENANT_RECORD;
@@ -3246,6 +3260,252 @@ export class SilaBillingApp {
     const value = target.dataset.value || '';
 
     switch (action) {
+      // ===== AÇÕES OPERACIONAIS MOBILE-FIRST =====
+      case 'mobile-nav-tab': {
+        const tab = target.dataset.tab as MobileTab;
+        if (tab) {
+          this.mobileTab = tab;
+          this.render();
+        }
+        break;
+      }
+      case 'mobile-go-sale': {
+        this.mobileTab = 'SALE';
+        this.mobileCheckoutStep = 'CART';
+        this.render();
+        break;
+      }
+      case 'mobile-open-quick-product': {
+        this.showQuickProductForm = true;
+        this.render();
+        break;
+      }
+      case 'mobile-open-quick-customer': {
+        this.showQuickCustomerForm = true;
+        this.render();
+        break;
+      }
+      case 'mobile-open-quick-company': {
+        this.showMobileQuickCompanyModal = true;
+        this.render();
+        break;
+      }
+      case 'mobile-go-docs': {
+        this.mobileTab = 'DOCS';
+        this.render();
+        break;
+      }
+      case 'mobile-tab-home': {
+        this.mobileTab = 'HOME';
+        this.render();
+        break;
+      }
+      case 'mobile-tab-sale': {
+        this.mobileTab = 'SALE';
+        this.render();
+        break;
+      }
+      case 'mobile-tab-docs': {
+        this.mobileTab = 'DOCS';
+        this.render();
+        break;
+      }
+      case 'mobile-tab-customers': {
+        this.mobileTab = 'CUSTOMERS';
+        this.render();
+        break;
+      }
+      case 'mobile-tab-more': {
+        this.mobileTab = 'MORE';
+        this.render();
+        break;
+      }
+      case 'mobile-cart-clear': {
+        this.cart = [];
+        this.render();
+        break;
+      }
+      case 'mobile-open-customer-picker': {
+        this.showMobileCustomerPicker = true;
+        this.render();
+        break;
+      }
+      case 'mobile-choose-customer': {
+        const custId = target.dataset.customerId;
+        if (custId) {
+          this.selectedCustomerId = custId;
+          this.showMobileCustomerPicker = false;
+          this.render();
+        }
+        break;
+      }
+      case 'mobile-select-customer-and-sale': {
+        const custId = target.dataset.customerId;
+        if (custId) {
+          this.selectedCustomerId = custId;
+          this.mobileTab = 'SALE';
+          this.mobileCheckoutStep = 'CART';
+          this.render();
+        }
+        break;
+      }
+      case 'mobile-add-product': {
+        const prodId = target.dataset.productId;
+        const prod = this.products.find((p) => p.id === prodId);
+        if (prod) {
+          this.addProductToCart(prod);
+          this.mobileProductSearchInput = '';
+          this.render();
+        }
+        break;
+      }
+      case 'mobile-clear-product-search': {
+        this.mobileProductSearchInput = '';
+        this.render();
+        break;
+      }
+      case 'mobile-qty-decrement': {
+        const prodId = target.dataset.productId;
+        const item = this.cart.find((c) => c.productId === prodId);
+        if (item) {
+          if (item.qty > 1) {
+            item.qty = roundKz(item.qty - 1);
+          } else {
+            this.cart = this.cart.filter((c) => c.productId !== prodId);
+          }
+          this.render();
+        }
+        break;
+      }
+      case 'mobile-qty-increment': {
+        const prodId = target.dataset.productId;
+        const item = this.cart.find((c) => c.productId === prodId);
+        if (item) {
+          item.qty = roundKz(item.qty + 1);
+          this.render();
+        }
+        break;
+      }
+      case 'mobile-cart-remove': {
+        const prodId = target.dataset.productId;
+        this.cart = this.cart.filter((c) => c.productId !== prodId);
+        this.render();
+        break;
+      }
+      case 'mobile-go-checkout': {
+        if (this.cart.length > 0) {
+          this.mobileCheckoutStep = 'PAYMENT';
+          const totals = calculateInvoiceTotals(this.cart, 0);
+          this.amountReceivedInput = String(totals.grandTotal);
+          this.render();
+        }
+        break;
+      }
+      case 'mobile-back-to-cart': {
+        this.mobileCheckoutStep = 'CART';
+        this.render();
+        break;
+      }
+      case 'mobile-select-payment': {
+        const pay = target.dataset.value as PaymentMethod;
+        if (pay) {
+          this.paymentMethod = pay;
+          this.render();
+        }
+        break;
+      }
+      case 'mobile-set-received': {
+        const val = target.dataset.value;
+        if (val) {
+          this.amountReceivedInput = val;
+          this.render();
+        }
+        break;
+      }
+      case 'mobile-add-received': {
+        const add = parseFloat(target.dataset.value || '0') || 0;
+        const cur = parseFloat(this.amountReceivedInput.replace(/\s/g, '').replace(',', '.')) || 0;
+        this.amountReceivedInput = String(roundKz(cur + add));
+        this.render();
+        break;
+      }
+      case 'mobile-select-doctype': {
+        const dt = target.dataset.value as DocumentType;
+        if (dt) {
+          this.docType = dt;
+          this.render();
+        }
+        break;
+      }
+      case 'mobile-confirm-emit': {
+        await this.emitCurrentInvoice(false);
+        this.mobileCheckoutStep = 'SUCCESS';
+        this.render();
+        break;
+      }
+      case 'mobile-print-receipt': {
+        const invId = target.dataset.invoiceId;
+        const inv = this.invoices.find((i) => i.id === invId) || this.lastEmitted;
+        if (inv) {
+          await this.triggerPrint(inv, 'POS');
+        }
+        break;
+      }
+      case 'mobile-print-a4': {
+        const invId = target.dataset.invoiceId;
+        const inv = this.invoices.find((i) => i.id === invId) || this.lastEmitted;
+        if (inv) {
+          await this.triggerPrint(inv, 'A4');
+        }
+        break;
+      }
+      case 'mobile-start-new-sale': {
+        this.cart = [];
+        this.mobileCheckoutStep = 'CART';
+        this.mobileTab = 'SALE';
+        this.render();
+        break;
+      }
+      case 'mobile-clear-docs-search': {
+        this.mobileDocsSearchQuery = '';
+        this.render();
+        break;
+      }
+      case 'mobile-close-modals': {
+        this.showQuickProductForm = false;
+        this.showQuickCustomerForm = false;
+        this.showMobileQuickCompanyModal = false;
+        this.showMobileCustomerPicker = false;
+        this.render();
+        break;
+      }
+      case 'mobile-open-saft': {
+        this.exportHistoryControl('SAFT');
+        break;
+      }
+      case 'mobile-open-cash': {
+        this.activeModule = 'CASH';
+        this.forceDesktopView = true;
+        this.render();
+        break;
+      }
+      case 'mobile-open-sync': {
+        this.activeModule = 'SYNC';
+        this.forceDesktopView = true;
+        this.render();
+        break;
+      }
+      case 'mobile-switch-to-desktop': {
+        this.forceDesktopView = true;
+        this.render();
+        break;
+      }
+      case 'mobile-switch-to-mobile': {
+        this.forceDesktopView = false;
+        this.render();
+        break;
+      }
+
       case 'toggle-company-dropdown': {
         this.showCompanyDropdown = !this.showCompanyDropdown;
         this.render();
@@ -6269,6 +6529,39 @@ export class SilaBillingApp {
     const el = e.target as HTMLInputElement;
     if (!el) return;
 
+    if (el.id === 'mobile-product-search-input') {
+      this.mobileProductSearchInput = el.value;
+      this.render();
+      const inputEl = document.getElementById('mobile-product-search-input') as HTMLInputElement;
+      if (inputEl) {
+        inputEl.focus();
+        inputEl.setSelectionRange(inputEl.value.length, inputEl.value.length);
+      }
+      return;
+    }
+
+    if (el.id === 'mobile-amount-received-input') {
+      this.amountReceivedInput = el.value;
+      this.render();
+      const inputEl = document.getElementById('mobile-amount-received-input') as HTMLInputElement;
+      if (inputEl) {
+        inputEl.focus();
+        inputEl.setSelectionRange(inputEl.value.length, inputEl.value.length);
+      }
+      return;
+    }
+
+    if (el.id === 'mobile-docs-search-input') {
+      this.mobileDocsSearchQuery = el.value;
+      this.render();
+      const inputEl = document.getElementById('mobile-docs-search-input') as HTMLInputElement;
+      if (inputEl) {
+        inputEl.focus();
+        inputEl.setSelectionRange(inputEl.value.length, inputEl.value.length);
+      }
+      return;
+    }
+
     // Preserva em memória os campos em edição (sem re-renderizar o DOM a cada tecla)
     // para que eventos assíncronos de rede/auth nunca limpem o formulário do utilizador.
     const parentForm = el.closest<HTMLFormElement>('form[data-form]');
@@ -6995,11 +7288,125 @@ export class SilaBillingApp {
 
   private async handleSubmit(e: SubmitEvent): Promise<void> {
     const form = e.target as HTMLFormElement;
-    const formName = form.dataset.form;
-    if (!formName) return;
     e.preventDefault();
 
     const fd = new FormData(form);
+
+    if (form.id === 'mobile-quick-product-form') {
+      const name = String(fd.get('name') || '').trim();
+      const rawPrice = String(fd.get('price') || '').trim();
+      const unit = String(fd.get('unit') || 'un').trim();
+      const ivaRate = (parseInt(String(fd.get('ivaRate') || '14'), 10) || 14) as TaxRate;
+      const price = parseFloat(rawPrice.replace(/\s/g, '').replace(',', '.')) || 0;
+
+      if (!name || price <= 0) {
+        alert('Por favor informe o nome e um preço válido para o artigo.');
+        return;
+      }
+
+      const now = new Date().toISOString();
+      const newProd: Product = {
+        id: `prod_${Date.now()}_${Math.random().toString(36).substring(2, 7)}`,
+        companyId: this.activeCompany.id,
+        code: `ART${String(this.products.length + 1).padStart(4, '0')}`,
+        name,
+        category: 'Geral',
+        unit,
+        price,
+        ivaRate,
+        exemptionReason: ivaRate === 0 ? 'M02' : '',
+        trackStock: false,
+        active: true,
+        synced: false,
+        syncState: 'pending',
+        createdAtIso: now,
+        updatedAtIso: now,
+      };
+
+      await localDb.saveProduct(newProd, this.activeCompany.id);
+      this.products = [newProd, ...this.products];
+      this.addProductToCart(newProd);
+      this.showQuickProductForm = false;
+      this.render();
+
+      if (this.user && this.isOnline && canCompanySyncCloudData(this.activeCompany)) {
+        try {
+          await upsertProductCloud(newProd, true, this.activeCompany);
+        } catch {
+          // Mantém pendente local
+        }
+      }
+      return;
+    }
+
+    if (form.id === 'mobile-quick-customer-form') {
+      const name = String(fd.get('name') || '').trim();
+      const nif = String(fd.get('nif') || '999999999').trim();
+      const phone = String(fd.get('phone') || '').trim();
+      const locality = String(fd.get('locality') || 'Luanda').trim();
+
+      if (!name) {
+        alert('Por favor informe o nome do cliente.');
+        return;
+      }
+
+      const now = new Date().toISOString();
+      const newCust: Customer = {
+        id: `cust_${Date.now()}_${Math.random().toString(36).substring(2, 7)}`,
+        companyId: this.activeCompany.id,
+        name,
+        nif,
+        phone,
+        address: locality || 'Luanda',
+        locality,
+        synced: false,
+        syncState: 'pending',
+        createdAtIso: now,
+        updatedAtIso: now,
+      };
+
+      await localDb.saveCustomer(newCust, this.activeCompany.id);
+      this.customers = [newCust, ...this.customers];
+      this.selectedCustomerId = newCust.id;
+      this.showQuickCustomerForm = false;
+      this.render();
+
+      if (this.user && this.isOnline && canCompanySyncCloudData(this.activeCompany)) {
+        try {
+          await upsertCustomerCloud(newCust, this.activeCompany);
+        } catch {
+          // Mantém pendente local
+        }
+      }
+      return;
+    }
+
+    if (form.id === 'mobile-quick-company-form') {
+      const shortName = String(fd.get('shortName') || '').trim();
+      const name = String(fd.get('name') || '').trim();
+      const nif = String(fd.get('nif') || '').trim();
+      const locality = String(fd.get('locality') || '').trim();
+      const phone = String(fd.get('phone') || '').trim();
+
+      if (!name || !nif) {
+        alert('Nome e NIF da empresa são obrigatórios.');
+        return;
+      }
+
+      this.settings.company.shortName = shortName || name;
+      this.settings.company.legalName = name;
+      this.settings.company.nif = nif;
+      if (locality) this.settings.company.cityCountry = locality;
+      if (phone) this.settings.company.phone = phone;
+
+      await localDb.saveSettings(this.settings, this.activeCompany.id);
+      this.showMobileQuickCompanyModal = false;
+      this.render();
+      return;
+    }
+
+    const formName = form.dataset.form;
+    if (!formName) return;
 
     if (formName === 'new-company-form') {
       if (this.isCreatingCompany) return;
@@ -9334,7 +9741,43 @@ export class SilaBillingApp {
     const monthlyUsage = isUnassigned ? null : this.getMonthlyInvoiceUsage();
 
     this.root.innerHTML = `
-      <div class="no-print h-dvh w-screen flex flex-col overflow-hidden bg-slate-50 text-slate-900">
+      ${
+        !this.forceDesktopView
+          ? `<div class="no-print flex md:hidden h-dvh w-screen flex-col overflow-hidden">
+              ${renderMobileOperationalView({
+                activeCompany: this.activeCompany,
+                settings: this.settings,
+                isOnline: this.isOnline,
+                user: this.user,
+                mobileTab: this.mobileTab,
+                mobileCheckoutStep: this.mobileCheckoutStep,
+                cart: this.cart,
+                products: this.products,
+                customers: this.customers,
+                invoices: this.invoices,
+                selectedCustomerId: this.selectedCustomerId,
+                docType: this.docType,
+                paymentMethod: this.paymentMethod,
+                amountReceivedInput: this.amountReceivedInput,
+                mobileSearchQuery: this.mobileDocsSearchQuery,
+                mobileProductSearchInput: this.mobileProductSearchInput,
+                lastEmittedInvoice: this.lastEmitted,
+                showQuickProductModal: this.showQuickProductForm,
+                showQuickCustomerModal: this.showQuickCustomerForm,
+                showQuickCompanyModal: this.showMobileQuickCompanyModal,
+                showCustomerPickerModal: this.showMobileCustomerPicker,
+                operator: this.operator,
+              })}
+            </div>`
+          : `<div class="no-print md:hidden bg-blue-900 text-white px-3 py-2 text-xs flex justify-between items-center z-50">
+              <span class="font-medium">Modo Gestão Desktop activo</span>
+              <button type="button" data-action="mobile-switch-to-mobile" class="px-2.5 py-1 rounded bg-blue-700 hover:bg-blue-600 font-bold text-white text-xs">
+                Mudar para Telemóvel
+              </button>
+            </div>`
+      }
+
+      <div class="no-print h-dvh w-screen ${this.forceDesktopView ? 'flex' : 'hidden md:flex'} flex-col overflow-hidden bg-slate-50 text-slate-900">
         <!-- Top Bar Limpa (3 Zonas) com suporte a Safe Area em iPhone / iPad Standalone -->
         <header class="min-h-12 py-1.5 px-3 safe-area-top bg-slate-900 text-white border-b border-slate-800 flex items-center justify-between gap-4 shrink-0">
           <div class="flex items-center gap-2 shrink-0">

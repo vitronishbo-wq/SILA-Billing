@@ -512,7 +512,7 @@ export function runSaftTests(): { passed: number; total: number } {
   // ==========================================
   // PONTO 6: TAXTABLE COMPLETA
   // ==========================================
-  test('6.1: TaxTable inclui quadro exaustivo de taxas angolanas (NOR, RED, INT, ISE, OUT, S01, S02, S00)', () => {
+  test('6.1: TaxTable inclui quadro exaustivo de taxas angolanas (NOR 14%, RED 5%, INT 1% Cabinda Lei 14/23, ISE 0%, OUT, S01, S02, S00)', () => {
     const res = generateSaftAoXml({
       company: taxpayerCompany,
       invoices: sampleInvoices,
@@ -520,7 +520,7 @@ export function runSaftTests(): { passed: number; total: number } {
 
     assert(res.xml.includes('<TaxCode>NOR</TaxCode>') && res.xml.includes('<TaxPercentage>14.00</TaxPercentage>'), 'Deve incluir IVA Normal 14%');
     assert(res.xml.includes('<TaxCode>RED</TaxCode>') && res.xml.includes('<TaxPercentage>5.00</TaxPercentage>'), 'Deve incluir IVA Reduzido 5%');
-    assert(res.xml.includes('<TaxCode>INT</TaxCode>') && res.xml.includes('<TaxPercentage>7.00</TaxPercentage>'), 'Deve incluir IVA Intermédio 7% Cabinda');
+    assert(res.xml.includes('<TaxCode>INT</TaxCode>') && res.xml.includes('<TaxPercentage>1.00</TaxPercentage>'), 'Deve incluir IVA Especial Cabinda 1% conforme Lei n.º 14/23');
     assert(res.xml.includes('<TaxCode>ISE</TaxCode>') && res.xml.includes('<TaxPercentage>0.00</TaxPercentage>'), 'Deve incluir Isenção de IVA 0%');
     assert(res.xml.includes('<TaxCode>OUT</TaxCode>') && res.xml.includes('<TaxPercentage>0.00</TaxPercentage>'), 'Deve incluir Outras Operações 0%');
     assert(res.xml.includes('<TaxCode>S01</TaxCode>') && res.xml.includes('<TaxPercentage>1.00</TaxPercentage>'), 'Deve incluir Imposto do Selo 1%');
@@ -550,7 +550,7 @@ export function runSaftTests(): { passed: number; total: number } {
   // ==========================================
   // PONTO 8: EXPORTAÇÃO MENSAL E RECONCILIAÇÃO LEGAL
   // ==========================================
-  test('8.1: generateMonthlySaftAoXml circunscreve estritamente o mês de Janeiro e calcula prazo legal de 15 de Fevereiro', () => {
+  test('8.1: generateMonthlySaftAoXml circunscreve estritamente o mês de Janeiro e calcula prazo legal do último dia do mês seguinte (28 de Fevereiro)', () => {
     const res = generateMonthlySaftAoXml({
       company: taxpayerCompany,
       invoices: sampleInvoices,
@@ -561,7 +561,7 @@ export function runSaftTests(): { passed: number; total: number } {
     assert(res.summary.startDate === '2026-01-01', 'StartDate deve ser 2026-01-01');
     assert(res.summary.endDate === '2026-01-31', 'EndDate deve ser 2026-01-31');
     assert(res.summary.period === 1, 'Period deve ser 1');
-    assert(res.summary.submissionDeadline === '15 de Fevereiro de 2026', 'Prazo legal deve ser 15 de Fevereiro de 2026');
+    assert(res.summary.submissionDeadline === '28 de Fevereiro de 2026', `Prazo legal deve ser 28 de Fevereiro de 2026, obtido: ${res.summary.submissionDeadline}`);
   });
 
   test('8.2: TotalCredit e TotalDebit conciliam matematicamente com os documentos fiscais emitidos', () => {
@@ -590,6 +590,76 @@ export function runSaftTests(): { passed: number; total: number } {
     assert(Boolean(frAudit), 'Deve auditar a série de FR');
     assert(frAudit!.isContinuous === true, 'Série de FR (1, 2) deve ser contínua');
     assert(frAudit!.missingNumbers.length === 0, 'Não deve haver números em falta na série');
+  });
+
+  test('8.4: Anulações preservam valores originais em DocumentTotals garantindo rastreabilidade e histórico fiscal', () => {
+    const cancelledInvoice: InvoiceRecord = {
+      id: 'inv_canc',
+      number: 'FR 2026/99',
+      docType: 'FR',
+      issuedAtIso: '2026-01-25T11:00:00.000Z',
+      createdAtIso: '2026-01-25T11:00:00.000Z',
+      updatedAtIso: '2026-01-25T11:30:00.000Z',
+      cancelledAtIso: '2026-01-25T11:30:00.000Z',
+      cashier: 'Operador 1',
+      operator: 'Operador 1',
+      paymentMethod: 'Dinheiro',
+      customerId: '999999999',
+      customerName: 'Consumidor Final',
+      customerNif: '999999999',
+      customerLocality: 'Luanda',
+      merchandiseTotal: 50000,
+      discountTotal: 0,
+      taxBase14: 43859.65,
+      taxAmount14: 6140.35,
+      taxBase0: 0,
+      taxAmount0: 0,
+      taxTotal: 6140.35,
+      grandTotal: 50000,
+      amountInWords: 'Cinquenta mil Kwanzas',
+      amountReceived: 50000,
+      changeAmount: 0,
+      notes: 'Fatura anulada por erro de faturação',
+      cancelReason: 'Engano no meio de pagamento',
+      status: 'cancelled',
+      lines: [
+        {
+          id: 'lc1',
+          productId: 'p_server',
+          code: 'SRV-01',
+          description: 'Servidor Local POS SILA',
+          unit: 'UN',
+          qty: 1,
+          unitPrice: 50000,
+          discountPct: 0,
+          ivaRate: 14,
+          lineGross: 50000,
+          lineDiscount: 0,
+          lineNet: 50000,
+          lineBase: 43859.65,
+          lineTax: 6140.35,
+          lineTotal: 50000,
+        },
+      ],
+    };
+
+    const res = generateSaftAoXml({
+      company: taxpayerCompany,
+      invoices: [...sampleInvoices, cancelledInvoice],
+    });
+
+    // Inspeciona o bloco da fatura anulada
+    const hasCancelledStatus = res.xml.includes('<InvoiceStatus>A</InvoiceStatus>');
+    assert(hasCancelledStatus, 'Fatura anulada deve conter InvoiceStatus A');
+
+    // DocumentTotals deve preservar os valores históricos originais da fatura (NÃO zerados)
+    const cancelledSectionMatch = res.xml.match(/<Invoice>[\s\S]*?<InvoiceNo>FR 2026\/99<\/InvoiceNo>[\s\S]*?<\/Invoice>/);
+    assert(Boolean(cancelledSectionMatch), 'Secção da fatura FR 2026/99 deve existir no XML');
+    const invXml = cancelledSectionMatch![0];
+
+    assert(invXml.includes('<TaxPayable>6140.35</TaxPayable>'), 'DocumentTotals da fatura anulada deve preservar TaxPayable original');
+    assert(invXml.includes('<GrossTotal>50000.00</GrossTotal>'), 'DocumentTotals da fatura anulada deve preservar GrossTotal original');
+    assert(invXml.includes('<NetTotal>43859.65</NetTotal>'), 'DocumentTotals da fatura anulada deve preservar NetTotal original');
   });
 
   console.log(`\nTODAS AS ${passed}/${total} ASSERÇÕES DE AUDITORIA SAF-T (AO) PASSARAM COM SUCESSO!`);
