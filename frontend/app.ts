@@ -275,6 +275,7 @@ export class SilaBillingApp {
   private mobileDocsSearchQuery = '';
   private showMobileCustomerPicker = false;
   private showMobileQuickCompanyModal = false;
+  private editingMobileProduct: Product | null = null;
   private forceDesktopView = false;
 
   // Contexto Multiempresa e Dados Persistentes (IndexedDB v2 + Firestore)
@@ -3275,9 +3276,36 @@ export class SilaBillingApp {
         this.render();
         break;
       }
+      case 'mobile-go-products': {
+        this.mobileTab = 'PRODUCTS';
+        this.render();
+        break;
+      }
       case 'mobile-open-quick-product': {
+        this.editingMobileProduct = null;
         this.showQuickProductForm = true;
         this.render();
+        break;
+      }
+      case 'mobile-edit-product': {
+        const prodId = target.dataset.productId;
+        this.editingMobileProduct = this.products.find((p) => p.id === prodId) || null;
+        this.showQuickProductForm = true;
+        this.render();
+        break;
+      }
+      case 'mobile-toggle-product-active': {
+        const prodId = target.dataset.productId;
+        const prod = this.products.find((p) => p.id === prodId);
+        if (prod) {
+          prod.active = prod.active === false ? true : false;
+          prod.updatedAtIso = new Date().toISOString();
+          await localDb.saveProduct(prod, this.activeCompany.id);
+          this.render();
+          if (this.user && this.isOnline && canCompanySyncCloudData(this.activeCompany)) {
+            void upsertProductCloud(prod, false, this.activeCompany).catch(() => null);
+          }
+        }
         break;
       }
       case 'mobile-open-quick-customer': {
@@ -3473,6 +3501,7 @@ export class SilaBillingApp {
       }
       case 'mobile-close-modals': {
         this.showQuickProductForm = false;
+        this.editingMobileProduct = null;
         this.showQuickCustomerForm = false;
         this.showMobileQuickCompanyModal = false;
         this.showMobileCustomerPicker = false;
@@ -6562,6 +6591,48 @@ export class SilaBillingApp {
       return;
     }
 
+    if (el.id === 'mobile-product-cost-input' || el.id === 'mobile-product-price-input') {
+      const costEl = document.getElementById('mobile-product-cost-input') as HTMLInputElement | null;
+      const priceEl = document.getElementById('mobile-product-price-input') as HTMLInputElement | null;
+      const readout = document.getElementById('mobile-product-margin-readout');
+      if (costEl && priceEl && readout) {
+        const cost = parseFloat((costEl.value || '').replace(/\s/g, '').replace(',', '.')) || 0;
+        const price = parseFloat((priceEl.value || '').replace(/\s/g, '').replace(',', '.')) || 0;
+        if (cost > 0) {
+          const profit = roundKz(price - cost);
+          const marginPct = price > 0 ? roundKz((profit / price) * 100) : 0;
+          const markupPct = cost > 0 ? roundKz((profit / cost) * 100) : 0;
+          const isBelow = price < cost;
+          readout.className = `p-3 rounded-xl ${isBelow ? 'bg-red-950/50 border border-red-900/60' : 'bg-emerald-950/40 border border-emerald-900/60'} flex items-center justify-between`;
+          readout.innerHTML = `
+            <div>
+              <span class="text-[10px] text-slate-400 block uppercase tracking-wider">Lucro Unitário Estimado</span>
+              <span class="text-sm font-bold font-mono tabular-nums ${isBelow ? 'text-red-400' : 'text-emerald-400'}">
+                ${profit >= 0 ? '+' : ''}${formatKzNumber(profit)} Kz
+              </span>
+            </div>
+            <div class="text-right">
+              <span class="text-[10px] text-slate-400 block uppercase tracking-wider">Margem s/ Venda</span>
+              <span class="text-xs font-mono font-bold ${isBelow ? 'text-red-400' : 'text-emerald-300'}">
+                ${marginPct.toFixed(1)}% · Markup: ${markupPct.toFixed(1)}%
+              </span>
+            </div>
+          `;
+        } else {
+          readout.className = 'p-3 rounded-xl bg-slate-950/60 border border-slate-800 flex items-center justify-between';
+          readout.innerHTML = `
+            <div>
+              <span class="text-[10px] text-slate-400 block uppercase tracking-wider">Lucro Unitário Estimado</span>
+              <span class="text-sm font-bold font-mono tabular-nums text-slate-400">
+                Indique custo para calcular lucro
+              </span>
+            </div>
+          `;
+        }
+      }
+      return;
+    }
+
     // Preserva em memória os campos em edição (sem re-renderizar o DOM a cada tecla)
     // para que eventos assíncronos de rede/auth nunca limpem o formulário do utilizador.
     const parentForm = el.closest<HTMLFormElement>('form[data-form]');
@@ -6933,6 +7004,34 @@ export class SilaBillingApp {
 
   private async handleChange(e: Event): Promise<void> {
     const el = e.target as HTMLInputElement | HTMLSelectElement;
+    if (el && el.id === 'mobile-product-ivarate-select') {
+      const container = document.getElementById('mobile-product-exemption-container');
+      if (container) {
+        if (el.value === '0') {
+          container.classList.remove('hidden');
+          container.classList.add('block');
+        } else {
+          container.classList.remove('block');
+          container.classList.add('hidden');
+        }
+      }
+      return;
+    }
+
+    if (el && el.id === 'mobile-product-trackstock-checkbox') {
+      const fields = document.getElementById('mobile-product-stock-fields');
+      if (fields) {
+        if ((el as HTMLInputElement).checked) {
+          fields.classList.remove('hidden');
+          fields.classList.add('grid');
+        } else {
+          fields.classList.remove('grid');
+          fields.classList.add('hidden');
+        }
+      }
+      return;
+    }
+
     if (el && this.editingProduct && el.closest('form[data-form="product-form"]')) {
       if (el.name === 'ivaRate') {
         this.editingProduct.ivaRate = Number(el.value) === 0 ? 0 : 14;
@@ -7293,30 +7392,93 @@ export class SilaBillingApp {
     const fd = new FormData(form);
 
     if (form.id === 'mobile-quick-product-form') {
+      const productId = String(fd.get('productId') || '').trim();
       const name = String(fd.get('name') || '').trim();
-      const rawPrice = String(fd.get('price') || '').trim();
+      const code = String(fd.get('code') || '').trim() || `ART${String(this.products.length + 1).padStart(4, '0')}`;
+      const barcode = String(fd.get('barcode') || '').trim();
+      const category = String(fd.get('category') || 'Geral').trim();
       const unit = String(fd.get('unit') || 'un').trim();
-      const ivaRate = (parseInt(String(fd.get('ivaRate') || '14'), 10) || 14) as TaxRate;
+
+      const rawCost = String(fd.get('costPrice') || '').trim();
+      const costPrice = rawCost ? parseFloat(rawCost.replace(/\s/g, '').replace(',', '.')) : undefined;
+
+      const rawPrice = String(fd.get('price') || '').trim();
       const price = parseFloat(rawPrice.replace(/\s/g, '').replace(',', '.')) || 0;
 
+      const ivaRate = (parseInt(String(fd.get('ivaRate') || '14'), 10) || 14) as TaxRate;
+      const exemptionReason = ivaRate === 0 ? String(fd.get('exemptionReason') || DEFAULT_IVA_EXEMPTION_REASONS[0]).trim() : '';
+      const active = fd.get('active') !== 'false';
+      const trackStock = fd.get('trackStock') === 'on' || fd.get('trackStock') === 'true';
+      const rawStockQty = String(fd.get('stockQty') || '').trim();
+      const stockQty = trackStock ? (parseFloat(rawStockQty.replace(',', '.')) || 0) : undefined;
+      const rawMinStock = String(fd.get('minStockQty') || '').trim();
+      const minStockQty = trackStock ? (parseFloat(rawMinStock.replace(',', '.')) || 5) : undefined;
+
       if (!name || price <= 0) {
-        alert('Por favor informe o nome e um preço válido para o artigo.');
+        alert('Por favor informe o nome e um preço de venda válido para o artigo.');
         return;
       }
 
       const now = new Date().toISOString();
+
+      if (productId) {
+        // Modo Edição de Artigo Existente
+        const existing = this.products.find((p) => p.id === productId);
+        if (existing) {
+          const updated: Product = {
+            ...existing,
+            name,
+            code,
+            barcode: barcode || undefined,
+            category,
+            unit,
+            costPrice,
+            price,
+            ivaRate,
+            exemptionReason,
+            active,
+            trackStock,
+            stockQty,
+            minStockQty,
+            synced: false,
+            syncState: 'pending',
+            updatedAtIso: now,
+          };
+
+          await localDb.saveProduct(updated, this.activeCompany.id);
+          this.products = this.products.map((p) => (p.id === productId ? updated : p));
+          this.editingMobileProduct = null;
+          this.showQuickProductForm = false;
+          this.render();
+
+          if (this.user && this.isOnline && canCompanySyncCloudData(this.activeCompany)) {
+            try {
+              await upsertProductCloud(updated, true, this.activeCompany);
+            } catch {
+              // Mantém pendente local
+            }
+          }
+          return;
+        }
+      }
+
+      // Modo Criação de Novo Artigo
       const newProd: Product = {
         id: `prod_${Date.now()}_${Math.random().toString(36).substring(2, 7)}`,
         companyId: this.activeCompany.id,
-        code: `ART${String(this.products.length + 1).padStart(4, '0')}`,
+        code,
+        barcode: barcode || undefined,
         name,
-        category: 'Geral',
+        category,
         unit,
+        costPrice,
         price,
         ivaRate,
-        exemptionReason: ivaRate === 0 ? 'M02' : '',
-        trackStock: false,
-        active: true,
+        exemptionReason,
+        active,
+        trackStock,
+        stockQty,
+        minStockQty,
         synced: false,
         syncState: 'pending',
         createdAtIso: now,
@@ -7325,7 +7487,10 @@ export class SilaBillingApp {
 
       await localDb.saveProduct(newProd, this.activeCompany.id);
       this.products = [newProd, ...this.products];
-      this.addProductToCart(newProd);
+      if (this.mobileTab === 'SALE') {
+        this.addProductToCart(newProd);
+      }
+      this.editingMobileProduct = null;
       this.showQuickProductForm = false;
       this.render();
 
@@ -9766,6 +9931,7 @@ export class SilaBillingApp {
                 showQuickCustomerModal: this.showQuickCustomerForm,
                 showQuickCompanyModal: this.showMobileQuickCompanyModal,
                 showCustomerPickerModal: this.showMobileCustomerPicker,
+                editingMobileProduct: this.editingMobileProduct,
                 operator: this.operator,
               })}
             </div>`

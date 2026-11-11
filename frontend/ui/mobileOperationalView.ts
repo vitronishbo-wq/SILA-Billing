@@ -9,6 +9,9 @@ import {
   CartDraftItem,
   CompanyRecord,
   Customer,
+  DEFAULT_IVA_EXEMPTION_REASONS,
+  DEFAULT_PRODUCT_CATEGORIES,
+  DEFAULT_PRODUCT_UNITS,
   DocumentType,
   InvoiceRecord,
   PaymentMethod,
@@ -17,7 +20,7 @@ import {
 } from '../../src/core/types';
 import { ICONS } from './icons';
 
-export type MobileTab = 'HOME' | 'SALE' | 'DOCS' | 'CUSTOMERS' | 'MORE';
+export type MobileTab = 'HOME' | 'SALE' | 'DOCS' | 'CUSTOMERS' | 'MORE' | 'PRODUCTS';
 export type MobileCheckoutStep = 'CART' | 'PAYMENT' | 'SUCCESS';
 
 export interface MobileOperationalProps {
@@ -42,6 +45,7 @@ export interface MobileOperationalProps {
   showQuickCustomerModal: boolean;
   showQuickCompanyModal: boolean;
   showCustomerPickerModal: boolean;
+  editingMobileProduct: Product | null;
   operator: string;
 }
 
@@ -72,10 +76,16 @@ export function renderMobileOperationalView(props: MobileOperationalProps): stri
     case 'CUSTOMERS':
       mainContent = renderMobileCustomers(props);
       break;
+    case 'PRODUCTS':
+      mainContent = renderMobileProducts(props);
+      break;
     case 'MORE':
       mainContent = renderMobileMore(props);
       break;
   }
+
+  // Auto-geração de código sugerido para novo artigo
+  const nextSku = `ART${String(props.products.length + 1).padStart(4, '0')}`;
 
   return `
     <div class="h-dvh w-screen flex flex-col bg-slate-950 text-slate-100 overflow-hidden select-none">
@@ -87,8 +97,12 @@ export function renderMobileOperationalView(props: MobileOperationalProps): stri
       <!-- Barra de Navegação Inferior Fixa (Thumb Zone - 5 destinos) -->
       ${renderMobileBottomNav(mobileTab, cartItemCount)}
 
-      <!-- Modais Simplificados Mobile -->
-      ${props.showQuickProductModal ? renderMobileQuickProductModal() : ''}
+      <!-- Modais Operacionais Mobile -->
+      ${
+        props.showQuickProductModal
+          ? renderMobileProductModal(props.editingMobileProduct, nextSku)
+          : ''
+      }
       ${props.showQuickCustomerModal ? renderMobileQuickCustomerModal() : ''}
       ${props.showQuickCompanyModal ? renderMobileQuickCompanyModal(props) : ''}
       ${props.showCustomerPickerModal ? renderMobileCustomerPickerModal(props) : ''}
@@ -99,9 +113,22 @@ export function renderMobileOperationalView(props: MobileOperationalProps): stri
 // ==================== 1. ECRÃ PRINCIPAL (HOME HUB) ====================
 function renderMobileHome(props: MobileOperationalProps): string {
   const { activeCompany, settings, isOnline, invoices } = props;
-  const companyName = settings.company.shortName || settings.company.legalName || activeCompany.profile?.shortName || activeCompany.profile?.legalName || 'JAIMONA';
-  const locality = settings.company.cityCountry || settings.company.address || activeCompany.profile?.cityCountry || 'Bela Vista';
-  const nif = settings.company.nif || activeCompany.profile?.nif || activeCompany.normalizedNif || '001';
+  const companyName =
+    settings.company.shortName ||
+    settings.company.legalName ||
+    activeCompany.profile?.shortName ||
+    activeCompany.profile?.legalName ||
+    'JAIMONA';
+  const locality =
+    settings.company.cityCountry ||
+    settings.company.address ||
+    activeCompany.profile?.cityCountry ||
+    'Bela Vista';
+  const nif =
+    settings.company.nif ||
+    activeCompany.profile?.nif ||
+    activeCompany.normalizedNif ||
+    '001';
 
   // Métricas rápidas do dia
   const todayPrefix = new Date().toISOString().slice(0, 10);
@@ -132,7 +159,7 @@ function renderMobileHome(props: MobileOperationalProps): string {
         </button>
       </header>
 
-      <!-- Cartão da Empresa Activa (Estilo exato da imagem de referência) -->
+      <!-- Cartão da Empresa Activa -->
       <section class="bg-slate-900/90 border border-slate-800 rounded-2xl p-4 shadow-sm flex items-center justify-between">
         <div>
           <span class="text-xs text-slate-400 font-medium block">Empresa activa</span>
@@ -170,10 +197,10 @@ function renderMobileHome(props: MobileOperationalProps): string {
             </div>
           </button>
 
-          <!-- PRODUTOS -->
+          <!-- PRODUTOS (Gestão Completa de Artigos e Stock) -->
           <button
             type="button"
-            data-action="mobile-open-quick-product"
+            data-action="mobile-go-products"
             class="bg-slate-900 hover:bg-slate-850 active:scale-[0.98] rounded-2xl p-4 flex flex-col justify-between min-h-[116px] text-left border border-slate-800/90 transition-all"
           >
             <div class="h-8 w-8 rounded-lg bg-slate-800 flex items-center justify-center text-slate-200">
@@ -181,14 +208,14 @@ function renderMobileHome(props: MobileOperationalProps): string {
             </div>
             <div>
               <span class="text-base font-bold text-white tracking-wide block">PRODUTOS</span>
-              <span class="text-xs text-slate-400 mt-0.5 block">Cadastrar artigos</span>
+              <span class="text-xs text-slate-400 mt-0.5 block">Catálogo & Artigos (${props.products.length})</span>
             </div>
           </button>
 
           <!-- CLIENTES -->
           <button
             type="button"
-            data-action="mobile-open-quick-customer"
+            data-action="mobile-tab-customers"
             class="bg-slate-900 hover:bg-slate-850 active:scale-[0.98] rounded-2xl p-4 flex flex-col justify-between min-h-[116px] text-left border border-slate-800/90 transition-all"
           >
             <div class="h-8 w-8 rounded-lg bg-slate-800 flex items-center justify-center text-slate-200">
@@ -196,7 +223,7 @@ function renderMobileHome(props: MobileOperationalProps): string {
             </div>
             <div>
               <span class="text-base font-bold text-white tracking-wide block">CLIENTES</span>
-              <span class="text-xs text-slate-400 mt-0.5 block">Novo cliente</span>
+              <span class="text-xs text-slate-400 mt-0.5 block">Novo cliente / Lista</span>
             </div>
           </button>
 
@@ -250,7 +277,205 @@ function renderMobileHome(props: MobileOperationalProps): string {
   `;
 }
 
-// ==================== 2. ECRÃ DE FATURAÇÃO OPERACIONAL (MOBILE POS) ====================
+// ==================== 2. ECRÃ COMPLETO DE PRODUTOS & STOCK (NOVO) ====================
+function renderMobileProducts(props: MobileOperationalProps): string {
+  const { products, mobileProductSearchInput } = props;
+  const query = (mobileProductSearchInput || '').trim().toLowerCase();
+
+  const filtered = query
+    ? products.filter(
+        (p) =>
+          p.name.toLowerCase().includes(query) ||
+          p.code.toLowerCase().includes(query) ||
+          (p.barcode && p.barcode.toLowerCase().includes(query)) ||
+          (p.category && p.category.toLowerCase().includes(query))
+      )
+    : products;
+
+  return `
+    <div class="p-3.5 flex flex-col gap-3 max-w-lg mx-auto">
+      <!-- Top Bar: Voltar + Título + Cadastrar Novo Artigo -->
+      <div class="flex items-center justify-between pb-1 border-b border-slate-800">
+        <div class="flex items-center gap-2">
+          <button
+            type="button"
+            data-action="mobile-tab-home"
+            class="h-9 w-9 rounded-lg bg-slate-900 border border-slate-800 flex items-center justify-center text-slate-300 hover:text-white active:scale-95"
+            title="Voltar ao início"
+          >
+            ${ICONS.home}
+          </button>
+          <div>
+            <h2 class="text-base font-bold text-white leading-tight">Artigos & Stock</h2>
+            <span class="text-xs text-slate-400 font-mono tabular-nums">${products.length} cadastrados</span>
+          </div>
+        </div>
+
+        <button
+          type="button"
+          data-action="mobile-open-quick-product"
+          class="h-9 px-3 rounded-xl bg-blue-600 hover:bg-blue-500 text-white text-xs font-bold flex items-center gap-1.5 shadow-md shadow-blue-600/30 active:scale-95"
+        >
+          ${ICONS.plus}
+          <span>Novo Artigo</span>
+        </button>
+      </div>
+
+      <!-- Barra de Pesquisa de Artigos -->
+      <div class="relative">
+        <input
+          type="text"
+          id="mobile-product-search-input"
+          value="${escapeHtml(mobileProductSearchInput)}"
+          placeholder="Pesquisar por SKU, barras ou nome..."
+          class="w-full h-11 pl-10 pr-9 rounded-xl bg-slate-900 border border-slate-800 text-sm text-white placeholder-slate-500 focus:outline-none focus:border-blue-500"
+        />
+        <span class="absolute left-3 top-3 text-slate-500 pointer-events-none">${ICONS.search}</span>
+        ${
+          mobileProductSearchInput
+            ? `<button
+                type="button"
+                data-action="mobile-clear-product-search"
+                class="absolute right-3 top-3 text-slate-400 hover:text-white"
+              >${ICONS.close}</button>`
+            : ''
+        }
+      </div>
+
+      <!-- Lista de Artigos com Dados Completos -->
+      <div class="flex flex-col gap-2.5">
+        ${
+          filtered.length === 0
+            ? `<div class="p-8 text-center text-xs text-slate-500 bg-slate-900/40 rounded-2xl border border-slate-800/80">
+                Nenhum artigo encontrado. Clique em "+ Novo Artigo" para cadastrar.
+              </div>`
+            : filtered.map((p) => {
+                const cost = p.costPrice || 0;
+                const profit = cost > 0 ? roundKz(p.price - cost) : 0;
+                const marginPct = cost > 0 && p.price > 0 ? roundKz((profit / p.price) * 100) : 0;
+                const markupPct = cost > 0 ? roundKz((profit / cost) * 100) : 0;
+                const isBelowCost = cost > 0 && p.price < cost;
+
+                return `
+                  <div class="bg-slate-900 border ${
+                    p.active === false ? 'border-red-950/60 opacity-70' : 'border-slate-800'
+                  } rounded-2xl p-3.5 flex flex-col gap-2.5 shadow-sm">
+                    <!-- Linha 1: SKU, Código de Barras, Categoria e Estado Activo -->
+                    <div class="flex items-center justify-between gap-2 text-xs">
+                      <div class="flex items-center gap-1.5 flex-wrap min-w-0">
+                        <span class="font-mono font-bold text-white bg-slate-800 px-2 py-0.5 rounded text-[11px]">
+                          ${escapeHtml(p.code)}
+                        </span>
+                        ${
+                          p.barcode
+                            ? `<span class="font-mono text-slate-400 text-[10px] bg-slate-800/60 px-1.5 py-0.5 rounded truncate max-w-[120px]">
+                                ${escapeHtml(p.barcode)}
+                              </span>`
+                            : ''
+                        }
+                        <span class="text-slate-400 text-[11px] truncate">· ${escapeHtml(p.category || 'Geral')}</span>
+                      </div>
+
+                      <button
+                        type="button"
+                        data-action="mobile-toggle-product-active"
+                        data-product-id="${escapeHtml(p.id)}"
+                        class="text-[10px] font-semibold px-2 py-0.5 rounded transition-colors shrink-0 ${
+                          p.active !== false
+                            ? 'bg-emerald-950/70 border border-emerald-800/70 text-emerald-400'
+                            : 'bg-red-950/70 border border-red-900/70 text-red-400'
+                        }"
+                      >
+                        ${p.active !== false ? 'Activo' : 'Inactivo'}
+                      </button>
+                    </div>
+
+                    <!-- Linha 2: Nome do Produto e Unidade -->
+                    <div>
+                      <h3 class="text-sm font-bold text-white leading-snug">${escapeHtml(p.name)}</h3>
+                      <p class="text-[11px] text-slate-400 mt-0.5">
+                        Unidade: <strong class="text-slate-300 font-mono">${escapeHtml(p.unit)}</strong> · Regime: <strong class="text-slate-300">${p.ivaRate}% ${p.ivaRate === 0 ? `(${escapeHtml(p.exemptionReason || 'Isento')})` : 'IVA'}</strong>
+                      </p>
+                    </div>
+
+                    <!-- Linha 3: Preço de Venda, Preço de Custo e Margem de Lucro -->
+                    <div class="bg-slate-950/80 rounded-xl p-2.5 flex items-center justify-between text-xs border border-slate-800/70">
+                      <div>
+                        <span class="text-[10px] text-slate-400 block uppercase tracking-wider">Venda (Kz)</span>
+                        <span class="text-base font-extrabold text-blue-400 font-mono tabular-nums">
+                          ${formatKzNumber(p.price)} Kz
+                        </span>
+                      </div>
+
+                      ${
+                        cost > 0
+                          ? `
+                          <div class="text-right">
+                            <span class="text-[10px] text-slate-400 block uppercase tracking-wider">Custo: ${formatKzNumber(cost)} Kz</span>
+                            <span class="text-xs font-bold font-mono tabular-nums ${
+                              isBelowCost ? 'text-red-400' : 'text-emerald-400'
+                            }">
+                              ${profit >= 0 ? '+' : ''}${formatKzNumber(profit)} Kz (${marginPct.toFixed(1)}% margem)
+                            </span>
+                          </div>
+                        `
+                          : `
+                          <div class="text-right text-[11px] text-slate-500">
+                            Sem custo registado
+                          </div>
+                        `
+                      }
+                    </div>
+
+                    <!-- Linha 4: Informação de Stock e Ações -->
+                    <div class="flex items-center justify-between pt-1 border-t border-slate-800/80 text-xs">
+                      <div>
+                        ${
+                          p.trackStock
+                            ? `<span class="text-[11px] font-mono tabular-nums ${
+                                (p.stockQty || 0) <= (p.minStockQty || 0)
+                                  ? 'text-amber-400 font-semibold'
+                                  : 'text-slate-300'
+                              }">
+                                Stock: <strong>${p.stockQty || 0}</strong> ${escapeHtml(p.unit)}
+                                ${(p.stockQty || 0) <= (p.minStockQty || 0) ? ' · ⚠️ Baixo' : ''}
+                              </span>`
+                            : `<span class="text-[11px] text-slate-500">Sem controlo de stock</span>`
+                        }
+                      </div>
+
+                      <div class="flex items-center gap-2">
+                        <button
+                          type="button"
+                          data-action="mobile-edit-product"
+                          data-product-id="${escapeHtml(p.id)}"
+                          class="h-8 px-3 rounded-lg bg-slate-800 hover:bg-slate-700 text-slate-200 text-xs font-medium flex items-center gap-1 active:scale-95"
+                        >
+                          ${ICONS.edit}
+                          <span>Editar</span>
+                        </button>
+
+                        <button
+                          type="button"
+                          data-action="mobile-add-product"
+                          data-product-id="${escapeHtml(p.id)}"
+                          class="h-8 px-3 rounded-lg bg-blue-600 hover:bg-blue-500 text-white text-xs font-semibold flex items-center gap-1 active:scale-95"
+                        >
+                          ${ICONS.plus}
+                          <span>Vender</span>
+                        </button>
+                      </div>
+                    </div>
+                  </div>
+                `;
+              }).join('')
+        }
+      </div>
+    </div>
+  `;
+}
+
+// ==================== 3. ECRÃ DE FATURAÇÃO OPERACIONAL (MOBILE POS) ====================
 function renderMobileSaleWorkspace(props: MobileOperationalProps): string {
   const { mobileCheckoutStep } = props;
   if (mobileCheckoutStep === 'PAYMENT') {
@@ -269,7 +494,6 @@ function renderMobileCartStep(props: MobileOperationalProps): string {
     customers,
     selectedCustomerId,
     mobileProductSearchInput,
-    isOnline,
   } = props;
 
   const totals = calculateInvoiceTotals(cart, 0);
@@ -287,14 +511,15 @@ function renderMobileCartStep(props: MobileOperationalProps): string {
     ? products
         .filter(
           (p) =>
-            p.name.toLowerCase().includes(query) ||
-            p.code.toLowerCase().includes(query) ||
-            (p.barcode && p.barcode.toLowerCase().includes(query))
+            p.active !== false &&
+            (p.name.toLowerCase().includes(query) ||
+              p.code.toLowerCase().includes(query) ||
+              (p.barcode && p.barcode.toLowerCase().includes(query)))
         )
         .slice(0, 10)
     : [];
 
-  const popularProducts = !query ? products.slice(0, 6) : [];
+  const popularProducts = !query ? products.filter((p) => p.active !== false).slice(0, 6) : [];
 
   return `
     <div class="p-3.5 flex flex-col gap-3.5 max-w-lg mx-auto">
@@ -494,7 +719,7 @@ function renderMobileCartStep(props: MobileOperationalProps): string {
             : `
             <div class="flex flex-col gap-2">
               ${cart
-                .map((item, index) => {
+                .map((item) => {
                   const lineTotal = roundKz(item.qty * item.unitPrice * (1 - (item.discountPct || 0) / 100));
                   return `
                     <div class="bg-slate-900 border border-slate-800 rounded-xl p-3 flex items-center justify-between gap-2 shadow-sm">
@@ -577,7 +802,7 @@ function renderMobileCartStep(props: MobileOperationalProps): string {
       }
     </div>
 
-    <!-- BOTÃO FINALIZAR VENDA FIXO NA PARTE INFERIOR (Conforme requisitos do cliente e consultor) -->
+    <!-- BOTÃO FINALIZAR VENDA FIXO NA PARTE INFERIOR -->
     <div class="fixed bottom-16 left-0 right-0 p-3 bg-gradient-to-t from-slate-950 via-slate-950/95 to-transparent z-30">
       <div class="max-w-lg mx-auto flex items-center gap-3">
         <div class="flex-1 bg-slate-900 border border-slate-800 rounded-xl px-3.5 py-2">
@@ -604,7 +829,7 @@ function renderMobileCartStep(props: MobileOperationalProps): string {
   `;
 }
 
-// ==================== 3. ETAPA DE PAGAMENTO (CHECKOUT FOCADO) ====================
+// ==================== 4. ETAPA DE PAGAMENTO (CHECKOUT FOCADO) ====================
 function renderMobilePaymentStep(props: MobileOperationalProps): string {
   const { cart, paymentMethod, docType, amountReceivedInput } = props;
   const totals = calculateInvoiceTotals(cart, 0);
@@ -801,9 +1026,9 @@ function renderMobilePaymentStep(props: MobileOperationalProps): string {
   `;
 }
 
-// ==================== 4. ETAPA DE SUCESSO DA VENDA ====================
+// ==================== 5. ETAPA DE SUCESSO DA VENDA ====================
 function renderMobileSuccessStep(props: MobileOperationalProps): string {
-  const { lastEmittedInvoice, activeCompany, settings } = props;
+  const { lastEmittedInvoice } = props;
   const invoice = lastEmittedInvoice;
 
   if (!invoice) {
@@ -881,7 +1106,7 @@ function renderMobileSuccessStep(props: MobileOperationalProps): string {
   `;
 }
 
-// ==================== 5. ECRÃ DE DOCUMENTOS (HISTÓRICO) ====================
+// ==================== 6. ECRÃ DE DOCUMENTOS (HISTÓRICO) ====================
 function renderMobileDocs(props: MobileOperationalProps): string {
   const { invoices, mobileSearchQuery } = props;
   const query = (mobileSearchQuery || '').trim().toLowerCase();
@@ -979,7 +1204,7 @@ function renderMobileDocs(props: MobileOperationalProps): string {
   `;
 }
 
-// ==================== 6. ECRÃ DE CLIENTES ====================
+// ==================== 7. ECRÃ DE CLIENTES ====================
 function renderMobileCustomers(props: MobileOperationalProps): string {
   const { customers } = props;
 
@@ -1022,9 +1247,9 @@ function renderMobileCustomers(props: MobileOperationalProps): string {
   `;
 }
 
-// ==================== 7. MENU "MAIS" ====================
+// ==================== 8. MENU "MAIS" ====================
 function renderMobileMore(props: MobileOperationalProps): string {
-  const { activeCompany, settings, operator } = props;
+  const { operator, products } = props;
 
   return `
     <div class="p-3.5 flex flex-col gap-3 max-w-lg mx-auto">
@@ -1034,10 +1259,10 @@ function renderMobileMore(props: MobileOperationalProps): string {
       </div>
 
       <div class="flex flex-col gap-2">
-        <!-- Cadastrar Artigo -->
+        <!-- Catálogo de Artigos & Stock -->
         <button
           type="button"
-          data-action="mobile-open-quick-product"
+          data-action="mobile-go-products"
           class="bg-slate-900 hover:bg-slate-850 rounded-xl p-3.5 flex items-center justify-between border border-slate-800 text-left active:scale-[0.98]"
         >
           <div class="flex items-center gap-3">
@@ -1045,8 +1270,26 @@ function renderMobileMore(props: MobileOperationalProps): string {
               ${ICONS.package}
             </div>
             <div>
+              <span class="text-sm font-bold text-white block">Catálogo de Artigos & Stock (${products.length})</span>
+              <span class="text-xs text-slate-400 block">Preços, SKU, margem e inventário completo</span>
+            </div>
+          </div>
+          <span class="text-slate-500">${ICONS.chevronRight}</span>
+        </button>
+
+        <!-- Cadastrar Artigo Rápido -->
+        <button
+          type="button"
+          data-action="mobile-open-quick-product"
+          class="bg-slate-900 hover:bg-slate-850 rounded-xl p-3.5 flex items-center justify-between border border-slate-800 text-left active:scale-[0.98]"
+        >
+          <div class="flex items-center gap-3">
+            <div class="h-8 w-8 rounded-lg bg-emerald-900/60 text-emerald-400 flex items-center justify-center shrink-0">
+              ${ICONS.plus}
+            </div>
+            <div>
               <span class="text-sm font-bold text-white block">Cadastrar Novo Artigo</span>
-              <span class="text-xs text-slate-400 block">Adicionar produtos com preço e IVA</span>
+              <span class="text-xs text-slate-400 block">Ficha operacional completa</span>
             </div>
           </div>
           <span class="text-slate-500">${ICONS.chevronRight}</span>
@@ -1059,7 +1302,7 @@ function renderMobileMore(props: MobileOperationalProps): string {
           class="bg-slate-900 hover:bg-slate-850 rounded-xl p-3.5 flex items-center justify-between border border-slate-800 text-left active:scale-[0.98]"
         >
           <div class="flex items-center gap-3">
-            <div class="h-8 w-8 rounded-lg bg-emerald-900/60 text-emerald-400 flex items-center justify-center shrink-0">
+            <div class="h-8 w-8 rounded-lg bg-indigo-900/60 text-indigo-400 flex items-center justify-center shrink-0">
               ${ICONS.building}
             </div>
             <div>
@@ -1146,7 +1389,7 @@ function renderMobileMore(props: MobileOperationalProps): string {
   `;
 }
 
-// ==================== 8. BARRA DE NAVEGAÇÃO INFERIOR FIXA ====================
+// ==================== 9. BARRA DE NAVEGAÇÃO INFERIOR FIXA ====================
 function renderMobileBottomNav(activeTab: MobileTab, cartItemCount: number): string {
   const tabs: { id: MobileTab; label: string; icon: string; badge?: number }[] = [
     { id: 'HOME', label: 'Início', icon: ICONS.home },
@@ -1160,7 +1403,7 @@ function renderMobileBottomNav(activeTab: MobileTab, cartItemCount: number): str
     <nav class="fixed bottom-0 left-0 right-0 z-40 bg-slate-900/95 backdrop-blur-md border-t border-slate-800 flex items-center justify-around h-16 safe-area-bottom">
       ${tabs
         .map((t) => {
-          const isActive = activeTab === t.id;
+          const isActive = activeTab === t.id || (t.id === 'MORE' && activeTab === 'PRODUCTS');
           return `
             <button
               type="button"
@@ -1190,86 +1433,322 @@ function renderMobileBottomNav(activeTab: MobileTab, cartItemCount: number): str
   `;
 }
 
-// ==================== 9. MODAIS SIMPLIFICADOS (CADASTRO RÁPIDO) ====================
+// ==================== 10. MODAL COMPLETO DE CADASTRAMENTO E EDIÇÃO DE PRODUTOS ====================
+function renderMobileProductModal(editingProduct: Product | null, nextSku: string): string {
+  const isEditing = Boolean(editingProduct);
+  const p = editingProduct;
 
-function renderMobileQuickProductModal(): string {
+  const currentCode = p ? p.code : nextSku;
+  const currentBarcode = p?.barcode || '';
+  const currentName = p?.name || '';
+  const currentCategory = p?.category || 'Geral';
+  const currentUnit = p?.unit || 'un';
+  const currentCost = p?.costPrice ? String(p.costPrice) : '';
+  const currentPrice = p?.price ? String(p.price) : '';
+  const currentIva = p ? p.ivaRate : 14;
+  const currentExemption = p?.exemptionReason || DEFAULT_IVA_EXEMPTION_REASONS[0];
+  const currentActive = p ? p.active !== false : true;
+  const currentTrackStock = p?.trackStock || false;
+  const currentStockQty = p?.stockQty ? String(p.stockQty) : '0';
+  const currentMinStock = p?.minStockQty ? String(p.minStockQty) : '5';
+
+  // Pré-cálculo da margem de lucro
+  const numCost = parseFloat(currentCost.replace(',', '.')) || 0;
+  const numPrice = parseFloat(currentPrice.replace(',', '.')) || 0;
+  const profit = numCost > 0 ? roundKz(numPrice - numCost) : 0;
+  const marginPct = numCost > 0 && numPrice > 0 ? roundKz((profit / numPrice) * 100) : 0;
+  const markupPct = numCost > 0 ? roundKz((profit / numCost) * 100) : 0;
+  const isBelowCost = numCost > 0 && numPrice < numCost;
+
   return `
-    <div class="fixed inset-0 z-50 bg-black/70 backdrop-blur-sm flex items-end sm:items-center justify-center p-0 sm:p-4 animate-in fade-in">
-      <div class="bg-slate-900 border border-slate-800 w-full max-w-md rounded-t-3xl sm:rounded-2xl p-5 flex flex-col gap-4 max-h-[90dvh] overflow-y-auto">
-        <div class="flex items-center justify-between pb-2 border-b border-slate-800">
-          <h3 class="text-base font-bold text-white flex items-center gap-2">
-            ${ICONS.package}
-            <span>Cadastrar Artigo</span>
-          </h3>
-          <button type="button" data-action="mobile-close-modals" class="text-slate-400 hover:text-white p-1">
+    <div class="fixed inset-0 z-50 bg-black/80 backdrop-blur-sm flex items-end sm:items-center justify-center p-0 sm:p-4 animate-in fade-in">
+      <div class="bg-slate-900 border border-slate-800 w-full max-w-lg rounded-t-3xl sm:rounded-2xl flex flex-col max-h-[92dvh] overflow-hidden shadow-2xl">
+        <!-- Header do Modal com SKU e Botão Fechar -->
+        <div class="px-5 py-3.5 border-b border-slate-800 flex items-center justify-between shrink-0 bg-slate-900/95">
+          <div class="flex items-center gap-2">
+            <div class="h-8 w-8 rounded-lg bg-blue-600/20 text-blue-400 flex items-center justify-center">
+              ${ICONS.package}
+            </div>
+            <div>
+              <h3 class="text-sm font-bold text-white leading-tight">
+                ${isEditing ? `Editar Artigo: ${escapeHtml(currentCode)}` : 'Cadastrar Novo Artigo'}
+              </h3>
+              <p class="text-[11px] text-slate-400">Ficha operacional completa (9 requisitos fiscais)</p>
+            </div>
+          </div>
+          <button
+            type="button"
+            data-action="mobile-close-modals"
+            class="h-8 w-8 rounded-lg text-slate-400 hover:text-white hover:bg-slate-800 flex items-center justify-center active:scale-95"
+          >
             ${ICONS.close}
           </button>
         </div>
 
-        <form id="mobile-quick-product-form" class="flex flex-col gap-3">
-          <div>
-            <label class="text-xs font-medium text-slate-300 block mb-1">Nome do Artigo *</label>
-            <input
-              type="text"
-              name="name"
-              required
-              placeholder="Ex.: Água Mineral 1.5L"
-              class="w-full h-11 px-3 rounded-xl bg-slate-950 border border-slate-700 text-sm text-white focus:outline-none focus:border-blue-500"
-            />
-          </div>
+        <!-- Formulário Scrollável com as 9 Áreas -->
+        <form id="mobile-quick-product-form" class="flex-1 overflow-y-auto p-5 flex flex-col gap-4 text-xs">
+          ${isEditing ? `<input type="hidden" name="productId" value="${escapeHtml(p!.id)}" />` : ''}
 
-          <div class="grid grid-cols-2 gap-2">
+          <!-- SEÇÃO 1: Identificação (Nome, SKU, Código de Barras, Tipo/Categoria) -->
+          <div class="flex flex-col gap-2.5">
+            <span class="text-[11px] font-bold text-blue-400 uppercase tracking-wider">
+              1. Identificação & Códigos (SKU / Barras)
+            </span>
+
             <div>
-              <label class="text-xs font-medium text-slate-300 block mb-1">Preço Venda (Kz) *</label>
+              <label class="font-medium text-slate-300 block mb-1">Nome / Descrição do Artigo *</label>
               <input
                 type="text"
-                inputmode="decimal"
-                name="price"
+                name="name"
                 required
-                placeholder="Ex.: 2500"
-                class="w-full h-11 px-3 rounded-xl bg-slate-950 border border-slate-700 text-sm text-white font-mono tabular-nums focus:outline-none focus:border-blue-500"
+                value="${escapeHtml(currentName)}"
+                placeholder="Ex.: Água Mineral Cuca 1.5L ou Consultoria Técnica"
+                class="w-full h-11 px-3.5 rounded-xl bg-slate-950 border border-slate-700 text-sm text-white focus:outline-none focus:border-blue-500 font-medium"
               />
             </div>
-            <div>
-              <label class="text-xs font-medium text-slate-300 block mb-1">Unidade</label>
+
+            <div class="grid grid-cols-2 gap-2.5">
+              <div>
+                <label class="font-medium text-slate-300 block mb-1">Código Interno / SKU *</label>
+                <div class="relative">
+                  <input
+                    type="text"
+                    name="code"
+                    required
+                    value="${escapeHtml(currentCode)}"
+                    placeholder="Ex.: ART001"
+                    class="w-full h-11 px-3 rounded-xl bg-slate-950 border border-slate-700 font-mono font-bold text-white focus:outline-none focus:border-blue-500"
+                  />
+                </div>
+              </div>
+              <div>
+                <label class="font-medium text-slate-300 block mb-1">Código de Barras (EAN / Leitor)</label>
+                <div class="relative">
+                  <input
+                    type="text"
+                    name="barcode"
+                    value="${escapeHtml(currentBarcode)}"
+                    placeholder="Ex.: 5601234567890"
+                    class="w-full h-11 px-3 rounded-xl bg-slate-950 border border-slate-700 font-mono text-white focus:outline-none focus:border-blue-500"
+                  />
+                </div>
+              </div>
+            </div>
+
+            <div class="grid grid-cols-2 gap-2.5">
+              <div>
+                <label class="font-medium text-slate-300 block mb-1">Tipo de Artigo / Categoria</label>
+                <select
+                  name="category"
+                  class="w-full h-11 px-3 rounded-xl bg-slate-950 border border-slate-700 text-white focus:outline-none focus:border-blue-500"
+                >
+                  <option value="Mercadoria Física" ${currentCategory === 'Mercadoria Física' || currentCategory === 'Geral' ? 'selected' : ''}>Mercadoria Física</option>
+                  <option value="Serviços" ${currentCategory === 'Serviços' ? 'selected' : ''}>Serviço (Mão de Obra)</option>
+                  <option value="Kit / Produto Composto" ${currentCategory === 'Kit / Produto Composto' ? 'selected' : ''}>Produto Composto (Kit)</option>
+                  ${DEFAULT_PRODUCT_CATEGORIES.filter((c) => c !== 'Geral' && c !== 'Serviços').map(
+                    (cat) => `<option value="${escapeHtml(cat)}" ${currentCategory === cat ? 'selected' : ''}>${escapeHtml(cat)}</option>`
+                  ).join('')}
+                </select>
+              </div>
+
+              <div>
+                <label class="font-medium text-slate-300 block mb-1">Unidade de Medida</label>
+                <select
+                  name="unit"
+                  class="w-full h-11 px-3 rounded-xl bg-slate-950 border border-slate-700 text-white font-mono focus:outline-none focus:border-blue-500"
+                >
+                  <option value="un" ${currentUnit === 'un' ? 'selected' : ''}>un (Unidade)</option>
+                  <option value="kg" ${currentUnit === 'kg' ? 'selected' : ''}>kg (Quilograma)</option>
+                  <option value="g" ${currentUnit === 'g' ? 'selected' : ''}>g (Grama)</option>
+                  <option value="lt" ${currentUnit === 'lt' ? 'selected' : ''}>lt (Litro)</option>
+                  <option value="cx" ${currentUnit === 'cx' ? 'selected' : ''}>cx (Caixa)</option>
+                  <option value="pct" ${currentUnit === 'pct' ? 'selected' : ''}>pct (Pacote)</option>
+                  <option value="hr" ${currentUnit === 'hr' ? 'selected' : ''}>hr (Hora de Serviço)</option>
+                  <option value="serv" ${currentUnit === 'serv' ? 'selected' : ''}>serv (Serviço)</option>
+                  <option value="mês" ${currentUnit === 'mês' ? 'selected' : ''}>mês (Mensalidade)</option>
+                </select>
+              </div>
+            </div>
+          </div>
+
+          <!-- SEÇÃO 2: Preço, Custo & Margem de Lucro -->
+          <div class="flex flex-col gap-2.5 pt-2 border-t border-slate-800">
+            <span class="text-[11px] font-bold text-emerald-400 uppercase tracking-wider">
+              2. Preço de Venda, Custo & Margem de Lucro
+            </span>
+
+            <div class="grid grid-cols-2 gap-2.5">
+              <div>
+                <label class="font-medium text-slate-300 block mb-1">Preço de Custo / Aquisição (Kz)</label>
+                <input
+                  type="text"
+                  inputmode="decimal"
+                  id="mobile-product-cost-input"
+                  name="costPrice"
+                  value="${escapeHtml(currentCost)}"
+                  placeholder="Ex.: 1500"
+                  class="w-full h-11 px-3 rounded-xl bg-slate-950 border border-slate-700 font-mono tabular-nums text-white focus:outline-none focus:border-blue-500"
+                />
+              </div>
+
+              <div>
+                <label class="font-medium text-slate-300 block mb-1">Preço de Venda ao Público *</label>
+                <input
+                  type="text"
+                  inputmode="decimal"
+                  id="mobile-product-price-input"
+                  name="price"
+                  required
+                  value="${escapeHtml(currentPrice)}"
+                  placeholder="Ex.: 2500"
+                  class="w-full h-11 px-3 rounded-xl bg-slate-950 border border-slate-700 font-mono tabular-nums font-bold text-blue-400 focus:outline-none focus:border-blue-500 text-sm"
+                />
+              </div>
+            </div>
+
+            <!-- Painel Dinâmico de Margem de Lucro em Tempo Real -->
+            <div id="mobile-product-margin-readout" class="p-3 rounded-xl ${
+              numCost > 0
+                ? isBelowCost
+                  ? 'bg-red-950/50 border border-red-900/60'
+                  : 'bg-emerald-950/40 border border-emerald-900/60'
+                : 'bg-slate-950/60 border border-slate-800'
+            } flex items-center justify-between">
+              <div>
+                <span class="text-[10px] text-slate-400 block uppercase tracking-wider">Lucro Unitário Estimado</span>
+                <span class="text-sm font-bold font-mono tabular-nums ${
+                  numCost > 0
+                    ? isBelowCost
+                      ? 'text-red-400'
+                      : 'text-emerald-400'
+                    : 'text-slate-400'
+                }">
+                  ${
+                    numCost > 0
+                      ? `${profit >= 0 ? '+' : ''}${formatKzNumber(profit)} Kz`
+                      : 'Indique custo para calcular lucro'
+                  }
+                </span>
+              </div>
+              ${
+                numCost > 0
+                  ? `<div class="text-right">
+                      <span class="text-[10px] text-slate-400 block uppercase tracking-wider">Margem s/ Venda</span>
+                      <span class="text-xs font-mono font-bold ${isBelowCost ? 'text-red-400' : 'text-emerald-300'}">
+                        ${marginPct.toFixed(1)}% · Markup: ${markupPct.toFixed(1)}%
+                      </span>
+                    </div>`
+                  : ''
+              }
+            </div>
+          </div>
+
+          <!-- SEÇÃO 3: Fiscalidade & Regime de IVA (Conformidade AGT) -->
+          <div class="flex flex-col gap-2.5 pt-2 border-t border-slate-800">
+            <span class="text-[11px] font-bold text-amber-400 uppercase tracking-wider">
+              3. Fiscalidade, Regime de IVA & Isenção
+            </span>
+
+            <div class="grid grid-cols-2 gap-2.5">
+              <div>
+                <label class="font-medium text-slate-300 block mb-1">Taxa de IVA Aplicável</label>
+                <select
+                  id="mobile-product-ivarate-select"
+                  name="ivaRate"
+                  class="w-full h-11 px-3 rounded-xl bg-slate-950 border border-slate-700 text-white font-medium focus:outline-none focus:border-blue-500"
+                >
+                  <option value="14" ${currentIva === 14 ? 'selected' : ''}>14% - Taxa Geral (IVA)</option>
+                  <option value="0" ${currentIva === 0 ? 'selected' : ''}>0% - Isento (Cesta Básica / CIVA)</option>
+                  <option value="7" ${currentIva === 7 ? 'selected' : ''}>7% - Regime Especial</option>
+                  <option value="5" ${currentIva === 5 ? 'selected' : ''}>5% - Taxa Reduzida</option>
+                  <option value="1" ${currentIva === 1 ? 'selected' : ''}>1% - Cabinda (Lei n.º 14/23)</option>
+                </select>
+              </div>
+
+              <div>
+                <label class="font-medium text-slate-300 block mb-1">Estado do Registo</label>
+                <select
+                  name="active"
+                  class="w-full h-11 px-3 rounded-xl bg-slate-950 border border-slate-700 text-white font-medium focus:outline-none focus:border-blue-500"
+                >
+                  <option value="true" ${currentActive ? 'selected' : ''}>✅ Activo (Visível nas vendas)</option>
+                  <option value="false" ${!currentActive ? 'selected' : ''}>❌ Inactivo (Ocultar no POS)</option>
+                </select>
+              </div>
+            </div>
+
+            <!-- Campo de Motivo de Isenção (CIVA) -->
+            <div id="mobile-product-exemption-container" class="${currentIva === 0 ? 'block' : 'hidden'}">
+              <label class="font-medium text-amber-300 block mb-1">Motivo de Isenção Legal (CIVA) *</label>
               <select
-                name="unit"
-                class="w-full h-11 px-3 rounded-xl bg-slate-950 border border-slate-700 text-sm text-white focus:outline-none focus:border-blue-500"
+                name="exemptionReason"
+                class="w-full h-11 px-3 rounded-xl bg-slate-950 border border-amber-900/80 text-white focus:outline-none focus:border-amber-500"
               >
-                <option value="un">un (Unidade)</option>
-                <option value="kg">kg (Quilograma)</option>
-                <option value="lt">lt (Litro)</option>
-                <option value="cx">cx (Caixa)</option>
-                <option value="pc">pc (Pacote)</option>
+                ${DEFAULT_IVA_EXEMPTION_REASONS.map(
+                  (reason) => `<option value="${escapeHtml(reason)}" ${currentExemption === reason ? 'selected' : ''}>${escapeHtml(reason)}</option>`
+                ).join('')}
               </select>
             </div>
           </div>
 
-          <div>
-            <label class="text-xs font-medium text-slate-300 block mb-1">Taxa de IVA</label>
-            <select
-              name="ivaRate"
-              class="w-full h-11 px-3 rounded-xl bg-slate-950 border border-slate-700 text-sm text-white focus:outline-none focus:border-blue-500"
-            >
-              <option value="14">14% - Taxa Geral (IVA)</option>
-              <option value="0">0% - Isento (Cesta Básica / M02)</option>
-              <option value="7">7% - Regime Especial</option>
-              <option value="5">5% - Taxa Reduzida</option>
-              <option value="1">1% - Cabinda (Lei n.º 14/23)</option>
-            </select>
+          <!-- SEÇÃO 4: Gestão de Inventário & Stock -->
+          <div class="flex flex-col gap-2.5 pt-2 border-t border-slate-800">
+            <div class="flex items-center justify-between">
+              <span class="text-[11px] font-bold text-purple-400 uppercase tracking-wider">
+                4. Controlo de Stock & Inventário
+              </span>
+              <label class="inline-flex items-center gap-1.5 cursor-pointer">
+                <input
+                  type="checkbox"
+                  id="mobile-product-trackstock-checkbox"
+                  name="trackStock"
+                  ${currentTrackStock ? 'checked' : ''}
+                  class="h-4 w-4 rounded border-slate-700 bg-slate-950 text-blue-600 focus:ring-0"
+                />
+                <span class="text-xs text-slate-300">Controlar Stock</span>
+              </label>
+            </div>
+
+            <div id="mobile-product-stock-fields" class="grid grid-cols-2 gap-2.5 ${currentTrackStock ? 'block' : 'hidden'}">
+              <div>
+                <label class="font-medium text-slate-300 block mb-1">Qtd em Stock Atual</label>
+                <input
+                  type="text"
+                  inputmode="numeric"
+                  name="stockQty"
+                  value="${escapeHtml(currentStockQty)}"
+                  placeholder="0"
+                  class="w-full h-11 px-3 rounded-xl bg-slate-950 border border-slate-700 font-mono text-white focus:outline-none focus:border-blue-500"
+                />
+              </div>
+
+              <div>
+                <label class="font-medium text-slate-300 block mb-1">Stock Mínimo (Alerta)</label>
+                <input
+                  type="text"
+                  inputmode="numeric"
+                  name="minStockQty"
+                  value="${escapeHtml(currentMinStock)}"
+                  placeholder="5"
+                  class="w-full h-11 px-3 rounded-xl bg-slate-950 border border-slate-700 font-mono text-white focus:outline-none focus:border-blue-500"
+                />
+              </div>
+            </div>
           </div>
 
-          <div class="pt-2 flex gap-2">
+          <!-- Botões Finais de Ação -->
+          <div class="pt-4 border-t border-slate-800 flex gap-2.5">
             <button
               type="submit"
-              class="flex-1 h-12 rounded-xl bg-blue-600 hover:bg-blue-500 text-white font-bold text-sm shadow-md active:scale-[0.98]"
+              class="flex-1 h-[52px] rounded-xl bg-blue-600 hover:bg-blue-500 text-white font-bold text-sm tracking-wide shadow-lg shadow-blue-600/30 active:scale-[0.98] transition-all flex items-center justify-center gap-2"
             >
-              Guardar Artigo
+              ${ICONS.check}
+              <span>${isEditing ? 'Actualizar Artigo' : 'Guardar Artigo'}</span>
             </button>
             <button
               type="button"
               data-action="mobile-close-modals"
-              class="h-12 px-4 rounded-xl bg-slate-800 text-slate-300 text-xs font-medium"
+              class="h-[52px] px-5 rounded-xl bg-slate-800 hover:bg-slate-700 text-slate-300 font-semibold text-xs active:scale-95"
             >
               Cancelar
             </button>
@@ -1280,9 +1759,11 @@ function renderMobileQuickProductModal(): string {
   `;
 }
 
+// ==================== 11. MODAIS AUXILIARES (CLIENTE, EMPRESA, SELETOR) ====================
+
 function renderMobileQuickCustomerModal(): string {
   return `
-    <div class="fixed inset-0 z-50 bg-black/70 backdrop-blur-sm flex items-end sm:items-center justify-center p-0 sm:p-4 animate-in fade-in">
+    <div class="fixed inset-0 z-50 bg-black/80 backdrop-blur-sm flex items-end sm:items-center justify-center p-0 sm:p-4 animate-in fade-in">
       <div class="bg-slate-900 border border-slate-800 w-full max-w-md rounded-t-3xl sm:rounded-2xl p-5 flex flex-col gap-4 max-h-[90dvh] overflow-y-auto">
         <div class="flex items-center justify-between pb-2 border-b border-slate-800">
           <h3 class="text-base font-bold text-white flex items-center gap-2">
@@ -1359,11 +1840,11 @@ function renderMobileQuickCustomerModal(): string {
 }
 
 function renderMobileQuickCompanyModal(props: MobileOperationalProps): string {
-  const { settings, activeCompany } = props;
+  const { settings } = props;
   const company = settings.company;
 
   return `
-    <div class="fixed inset-0 z-50 bg-black/70 backdrop-blur-sm flex items-end sm:items-center justify-center p-0 sm:p-4 animate-in fade-in">
+    <div class="fixed inset-0 z-50 bg-black/80 backdrop-blur-sm flex items-end sm:items-center justify-center p-0 sm:p-4 animate-in fade-in">
       <div class="bg-slate-900 border border-slate-800 w-full max-w-md rounded-t-3xl sm:rounded-2xl p-5 flex flex-col gap-4 max-h-[90dvh] overflow-y-auto">
         <div class="flex items-center justify-between pb-2 border-b border-slate-800">
           <h3 class="text-base font-bold text-white flex items-center gap-2">
@@ -1460,7 +1941,7 @@ function renderMobileCustomerPickerModal(props: MobileOperationalProps): string 
   const { customers } = props;
 
   return `
-    <div class="fixed inset-0 z-50 bg-black/70 backdrop-blur-sm flex items-end sm:items-center justify-center p-0 sm:p-4 animate-in fade-in">
+    <div class="fixed inset-0 z-50 bg-black/80 backdrop-blur-sm flex items-end sm:items-center justify-center p-0 sm:p-4 animate-in fade-in">
       <div class="bg-slate-900 border border-slate-800 w-full max-w-md rounded-t-3xl sm:rounded-2xl p-5 flex flex-col gap-3 max-h-[85dvh] overflow-hidden">
         <div class="flex items-center justify-between pb-2 border-b border-slate-800">
           <h3 class="text-base font-bold text-white flex items-center gap-2">

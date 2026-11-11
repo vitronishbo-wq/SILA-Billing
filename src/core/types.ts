@@ -1,4 +1,4 @@
-export type TaxRate = 0 | 14;
+export type TaxRate = 0 | 1 | 5 | 7 | 14;
 export type DirectPaymentMethod = 'Dinheiro' | 'Multicaixa' | 'Transferência';
 export type PaymentMethod = DirectPaymentMethod | 'Crédito' | 'Combinado';
 export type DocumentType = 'FR' | 'FP' | 'NC';
