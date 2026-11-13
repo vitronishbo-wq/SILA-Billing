@@ -16,12 +16,17 @@
  */
 
 import {
+  evaluateCompanyMasterCompleteness,
+} from './companyValidator.ts';
+import {
   AGT_DOCUMENT_TYPES,
   isSeriesCreationAllowedForYear,
   type AgtDocumentType,
+  type AgtSeriesEnvironment,
   type AgtSeriesRecord,
   type AgtSeriesStatus,
 } from './fiscalTypes.ts';
+import type { CompanyProfile } from './types.ts';
 
 export interface SolicitarSerieInput {
   companyId: string;
@@ -29,7 +34,11 @@ export interface SolicitarSerieInput {
   seriesYear: number; // Ex: 2026
   documentType: AgtDocumentType;
   firstDocumentNumber?: number; // Padrão 1
-  environment?: 'TESTE' | 'PRODUCAO';
+  environment?: AgtSeriesEnvironment | 'TESTE';
+  establishmentId?: string;
+  establishmentCode?: string;
+  agtAuthorizationCode?: string;
+  companyProfile?: CompanyProfile; // Quando fornecido em PRODUCAO, valida completude da ficha mestre
   notes?: string;
   operator: string;
 }
@@ -39,6 +48,13 @@ export interface ListarSeriesFilter {
   seriesYear?: number;
   documentType?: AgtDocumentType;
   status?: AgtSeriesStatus;
+  environment?: AgtSeriesEnvironment;
+  establishmentId?: string;
+}
+
+export interface SeriesResolutionOptions {
+  environment?: AgtSeriesEnvironment;
+  establishmentId?: string;
 }
 
 export interface ProximoNumeroFiscalResult {
@@ -47,6 +63,18 @@ export interface ProximoNumeroFiscalResult {
   sequenceNumber: number; // 1
   seriesId: string;
   status: AgtSeriesStatus; // 'U'
+  environment: AgtSeriesEnvironment;
+  establishmentId?: string;
+  establishmentCode?: string;
+  agtAuthorizationCode?: string;
+}
+
+export function normalizeSeriesEnvironment(env?: string | null): AgtSeriesEnvironment {
+  return String(env || '').trim().toUpperCase() === 'PRODUCAO' ? 'PRODUCAO' : 'SIMULACAO';
+}
+
+export function isProductionSeries(series: Pick<AgtSeriesRecord, 'environment'>): boolean {
+  return normalizeSeriesEnvironment(series.environment) === 'PRODUCAO';
 }
 
 const STORAGE_PREFIX = 'sila_agt_series_';
@@ -69,8 +97,12 @@ class SeriesStorage {
         if (raw) {
           const parsed = JSON.parse(raw);
           if (Array.isArray(parsed)) {
-            this.cache.set(companyId, parsed);
-            return parsed;
+            const normalized = parsed.map((rec: AgtSeriesRecord) => ({
+              ...rec,
+              environment: normalizeSeriesEnvironment(rec.environment),
+            }));
+            this.cache.set(companyId, normalized);
+            return normalized;
           }
         }
       }
@@ -84,10 +116,14 @@ class SeriesStorage {
   }
 
   saveSeries(companyId: string, records: AgtSeriesRecord[]): void {
-    this.cache.set(companyId, records);
+    const normalized = records.map((rec) => ({
+      ...rec,
+      environment: normalizeSeriesEnvironment(rec.environment),
+    }));
+    this.cache.set(companyId, normalized);
     try {
       if (typeof window !== 'undefined' && window.localStorage) {
-        window.localStorage.setItem(this.getStorageKey(companyId), JSON.stringify(records));
+        window.localStorage.setItem(this.getStorageKey(companyId), JSON.stringify(normalized));
       }
     } catch (err) {
       console.warn('[SeriesStorage] Erro ao persistir séries:', err);
@@ -151,8 +187,9 @@ export function parseFiscalDocumentNo(documentNo: string): {
 }
 
 /**
- * Solicita uma nova série fiscal junto da AGT (ou homologa localmente em modo offline).
- * Respeita a regra de 15 de Dezembro e o ciclo de vida inicial no estado 'A' (Ativa).
+ * Solicita uma nova série fiscal junto da AGT (ou homologa localmente em modo simulação).
+ * Respeita a regra de 15 de Dezembro, a separação estrita SIMULACAO vs PRODUCAO
+ * e o ciclo de vida inicial no estado 'A' (Ativa).
  */
 export function solicitarSerie(input: SolicitarSerieInput): AgtSeriesRecord {
   const companyId = String(input.companyId || '').trim();
@@ -170,6 +207,22 @@ export function solicitarSerie(input: SolicitarSerieInput): AgtSeriesRecord {
     throw new Error(`Tipo de documento fiscal '${docType}' não reconhecido pela AGT.`);
   }
 
+  const environment = normalizeSeriesEnvironment(input.environment);
+  if (environment === 'PRODUCAO' && input.companyProfile) {
+    const check = evaluateCompanyMasterCompleteness(input.companyProfile);
+    if (!check.readyForProductionEmission) {
+      const reasons = [
+        ...check.blockingIssues.map((i) => i.message),
+        ...(check.fieldStatus.taxOffice !== 'ok'
+          ? ['Informe a Repartição Fiscal de domicílio na Ficha Mestre.']
+          : []),
+      ];
+      throw new Error(
+        `Não é permitido solicitar série de PRODUÇÃO com a ficha da empresa incompleta: ${reasons.join(' ')}`
+      );
+    }
+  }
+
   const seriesYear = Math.floor(input.seriesYear || new Date().getFullYear());
   const dateCheck = isSeriesCreationAllowedForYear(seriesYear);
   if (!dateCheck.allowed) {
@@ -180,7 +233,10 @@ export function solicitarSerie(input: SolicitarSerieInput): AgtSeriesRecord {
   }
 
   const firstDocNumber = Math.max(1, Math.floor(input.firstDocumentNumber || 1));
-  const seriesId = `${companyId}_${seriesCode}_${seriesYear}_${docType}`;
+  const seriesId =
+    environment === 'PRODUCAO'
+      ? `${companyId}_${seriesCode}_${seriesYear}_${docType}_PROD`
+      : `${companyId}_${seriesCode}_${seriesYear}_${docType}`;
 
   const currentRecords = seriesStorage.loadSeries(companyId);
 
@@ -188,28 +244,36 @@ export function solicitarSerie(input: SolicitarSerieInput): AgtSeriesRecord {
   const existingSameId = currentRecords.find((s) => s.id === seriesId);
   if (existingSameId) {
     throw new Error(
-      `Já existe a série '${seriesCode}' (${seriesYear}) registada para o documento ${docType} com estado '${existingSameId.status}'.`
+      `Já existe a série '${seriesCode}' (${seriesYear}, ${environment}) registada para o documento ${docType} com estado '${existingSameId.status}'.`
     );
   }
 
-  // Verifica se já existe outra série ativa ('A' ou 'U') para o mesmo tipo e ano com o mesmo código
+  // Verifica colisão de código ativo no mesmo ambiente e estabelecimento
+  const normalizedEstablishmentId = input.establishmentId?.trim() || undefined;
+  const normalizedEstablishmentCode = input.establishmentCode?.trim().toUpperCase().slice(0, 16) || undefined;
   const existingActive = currentRecords.find(
     (s) =>
       s.documentType === docType &&
       s.seriesYear === seriesYear &&
       s.seriesCode === seriesCode &&
+      normalizeSeriesEnvironment(s.environment) === environment &&
+      (s.establishmentId || undefined) === normalizedEstablishmentId &&
       (s.status === 'A' || s.status === 'U')
   );
   if (existingActive) {
     throw new Error(
-      `Já existe uma série em vigor (${existingActive.seriesCode}) para ${docType}/${seriesYear}.`
+      `Já existe uma série em vigor (${existingActive.seriesCode} · ${environment}) para ${docType}/${seriesYear}.`
     );
   }
 
   const now = new Date().toISOString();
-  // Simulação / Emissão do código oficial de autorização da AGT
   const randomSuffix = Math.random().toString(36).substring(2, 8).toUpperCase();
-  const agtAuthCode = `AGT-AUT-${seriesYear}-${docType}-${randomSuffix}`;
+  const customAuth = String(input.agtAuthorizationCode || '').trim().slice(0, 64);
+  const agtAuthCode =
+    customAuth ||
+    (environment === 'PRODUCAO'
+      ? `AGT-PRD-${seriesYear}-${docType}-${randomSuffix}`
+      : `AGT-AUT-${seriesYear}-${docType}-${randomSuffix}`);
 
   const newRecord: AgtSeriesRecord = {
     id: seriesId,
@@ -220,10 +284,17 @@ export function solicitarSerie(input: SolicitarSerieInput): AgtSeriesRecord {
     firstDocumentNumber: firstDocNumber,
     lastDocumentNumber: 0, // Nenhum documento emitido ainda
     status: 'A', // Ativa, pronta para o primeiro documento
+    environment,
+    ...(normalizedEstablishmentId ? { establishmentId: normalizedEstablishmentId } : {}),
+    ...(normalizedEstablishmentCode ? { establishmentCode: normalizedEstablishmentCode } : {}),
     agtAuthorizationCode: agtAuthCode,
     requestedAtIso: now,
     authorizedAtIso: now,
-    notes: input.notes?.trim() || `Autorizada via SILA-Billing pelo operador ${input.operator || 'Admin'}`,
+    notes:
+      input.notes?.trim() ||
+      (environment === 'PRODUCAO'
+        ? `Série de Produção autorizada pelo operador ${input.operator || 'Admin'}`
+        : `Autorizada via SILA-Billing (Simulação) pelo operador ${input.operator || 'Admin'}`),
   };
 
   currentRecords.push(newRecord);
@@ -250,35 +321,63 @@ export function listarSeries(filter: ListarSeriesFilter): AgtSeriesRecord[] {
   if (filter.status) {
     list = list.filter((s) => s.status === filter.status);
   }
+  if (filter.environment) {
+    list = list.filter((s) => normalizeSeriesEnvironment(s.environment) === filter.environment);
+  }
+  if (filter.establishmentId) {
+    list = list.filter((s) => !s.establishmentId || s.establishmentId === filter.establishmentId);
+  }
 
   return list;
 }
 
 /**
  * Obtém a série fiscal ativa ('A' ou 'U') para um determinado tipo de documento e ano.
+ * Quando `options.environment` é informado, nunca mistura séries SIMULACAO e PRODUCAO.
+ * Quando `options.establishmentId` é informado, prioriza séries dedicadas ao estabelecimento
+ * e só recai para séries globais da empresa (sem establishmentId) do mesmo ambiente.
  */
 export function obterSerieAtiva(
   companyId: string,
   docType: AgtDocumentType,
-  year?: number
+  year?: number,
+  options?: SeriesResolutionOptions
 ): AgtSeriesRecord | null {
   const targetYear = year || new Date().getFullYear();
-  const list = listarSeries({ companyId, documentType: docType, seriesYear: targetYear });
-  // Prioridade: série já 'U' (em uso) ou 'A' (ativa)
-  const inUse = list.find((s) => s.status === 'U');
-  if (inUse) return inUse;
-  const active = list.find((s) => s.status === 'A');
-  return active || null;
+  const baseList = listarSeries({
+    companyId,
+    documentType: docType,
+    seriesYear: targetYear,
+    ...(options?.environment ? { environment: options.environment } : {}),
+  });
+
+  const pickBest = (candidates: AgtSeriesRecord[]): AgtSeriesRecord | null => {
+    const inUse = candidates.find((s) => s.status === 'U');
+    if (inUse) return inUse;
+    const active = candidates.find((s) => s.status === 'A');
+    return active || null;
+  };
+
+  if (options?.establishmentId) {
+    const dedicated = baseList.filter((s) => s.establishmentId === options.establishmentId);
+    const dedicatedMatch = pickBest(dedicated);
+    if (dedicatedMatch) return dedicatedMatch;
+    const companyWide = baseList.filter((s) => !s.establishmentId);
+    return pickBest(companyWide);
+  }
+
+  return pickBest(baseList);
 }
 
 /**
  * Valida se é permitida a emissão fiscal para o tipo de documento.
- * Se o tipo exigir série AGT e não houver série autorizada nos estados 'A' ou 'U', lança erro.
+ * Em ambiente 'PRODUCAO', bloqueia qualquer tentativa de emitir usando série de 'SIMULACAO'.
  */
 export function validarPermissaoEmissaoFiscal(
   companyId: string,
   docType: AgtDocumentType,
-  year?: number
+  year?: number,
+  options?: SeriesResolutionOptions
 ): {
   allowed: boolean;
   series?: AgtSeriesRecord;
@@ -297,9 +396,15 @@ export function validarPermissaoEmissaoFiscal(
   }
 
   const targetYear = year || new Date().getFullYear();
-  const activeSeries = obterSerieAtiva(companyId, docType, targetYear);
+  const activeSeries = obterSerieAtiva(companyId, docType, targetYear, options);
 
   if (!activeSeries) {
+    if (options?.environment === 'PRODUCAO') {
+      return {
+        allowed: false,
+        error: `Emissão fiscal em Produção bloqueada: Não existe nenhuma série autorizada de PRODUÇÃO (estado 'A' ou 'U') para '${meta.fullName} (${docType})' no ano ${targetYear}. Séries de simulação não podem emitir documentos fiscais reais.`,
+      };
+    }
     return {
       allowed: false,
       error: `Emissão fiscal bloqueada: Não existe nenhuma série autorizada pela AGT (estado 'A' ou 'U') para '${meta.fullName} (${docType})' no ano ${targetYear}. Solicite a série à AGT no menu de Séries Fiscais antes de emitir.`,
@@ -318,9 +423,10 @@ export function reservarProximoNumeroFiscal(
   companyId: string,
   docType: AgtDocumentType,
   year?: number,
-  preferredSeriesCode?: string
+  preferredSeriesCode?: string,
+  options?: SeriesResolutionOptions
 ): ProximoNumeroFiscalResult {
-  const validation = validarPermissaoEmissaoFiscal(companyId, docType, year);
+  const validation = validarPermissaoEmissaoFiscal(companyId, docType, year, options);
   if (!validation.allowed || !validation.series) {
     throw new Error(validation.error || 'Emissão bloqueada por falta de série AGT válida.');
   }
@@ -331,7 +437,13 @@ export function reservarProximoNumeroFiscal(
       companyId,
       documentType: docType,
       seriesYear: year || new Date().getFullYear(),
-    }).find((s) => s.seriesCode === preferredSeriesCode && (s.status === 'A' || s.status === 'U'));
+      ...(options?.environment ? { environment: options.environment } : {}),
+    }).find(
+      (s) =>
+        s.seriesCode === preferredSeriesCode &&
+        (s.status === 'A' || s.status === 'U') &&
+        (!options?.establishmentId || !s.establishmentId || s.establishmentId === options.establishmentId)
+    );
 
     if (specific) {
       return aplicarIncrementoNaSerie(companyId, specific);
@@ -370,6 +482,10 @@ function aplicarIncrementoNaSerie(companyId: string, series: AgtSeriesRecord): P
     sequenceNumber: nextSeq,
     seriesId: target.id,
     status: newStatus,
+    environment: normalizeSeriesEnvironment(target.environment),
+    establishmentId: target.establishmentId,
+    establishmentCode: target.establishmentCode,
+    agtAuthorizationCode: target.agtAuthorizationCode,
   };
 }
 
@@ -406,8 +522,76 @@ export function finalizarSerie(
 }
 
 /**
- * Inicializa automaticamente séries homologadas para empresas existentes ou novas empresas
- * garantindo que operações normais não sofram bloqueio inicial no ambiente de trabalho.
+ * Mescla séries recebidas da Cloud com o histórico local preservando o maior número emitido
+ * e impedindo regressão de estados ('F' > 'U' > 'A').
+ */
+export function mergeSeriesFromCloud(
+  companyId: string,
+  cloudSeries: AgtSeriesRecord[]
+): AgtSeriesRecord[] {
+  const localRecords = seriesStorage.loadSeries(companyId);
+  const byId = new Map<string, AgtSeriesRecord>();
+  const statusRank: Record<AgtSeriesStatus, number> = { A: 1, U: 2, F: 3 };
+
+  for (const loc of localRecords) {
+    byId.set(loc.id, {
+      ...loc,
+      environment: normalizeSeriesEnvironment(loc.environment),
+    });
+  }
+
+  for (const rawCloud of cloudSeries) {
+    const cloud: AgtSeriesRecord = {
+      ...rawCloud,
+      environment: normalizeSeriesEnvironment(rawCloud.environment),
+    };
+    const existing = byId.get(cloud.id);
+    if (!existing) {
+      byId.set(cloud.id, cloud);
+    } else {
+      const mergedStatus =
+        statusRank[cloud.status] >= statusRank[existing.status] ? cloud.status : existing.status;
+      byId.set(cloud.id, {
+        ...existing,
+        ...cloud,
+        lastDocumentNumber: Math.max(
+          existing.lastDocumentNumber || 0,
+          cloud.lastDocumentNumber || 0
+        ),
+        status: mergedStatus,
+        closedAtIso: cloud.closedAtIso || existing.closedAtIso,
+      });
+    }
+  }
+
+  const merged = Array.from(byId.values());
+  seriesStorage.saveSeries(companyId, merged);
+  return merged;
+}
+
+/**
+ * Resume o parque de séries por ambiente operacional (SIMULACAO vs PRODUCAO).
+ */
+export function getSeriesSummaryByEnvironment(companyId: string): {
+  simulacaoTotal: number;
+  simulacaoAtivas: number;
+  producaoTotal: number;
+  producaoAtivas: number;
+} {
+  const all = seriesStorage.loadSeries(companyId);
+  const sim = all.filter((s) => normalizeSeriesEnvironment(s.environment) === 'SIMULACAO');
+  const prod = all.filter((s) => normalizeSeriesEnvironment(s.environment) === 'PRODUCAO');
+  return {
+    simulacaoTotal: sim.length,
+    simulacaoAtivas: sim.filter((s) => s.status === 'A' || s.status === 'U').length,
+    producaoTotal: prod.length,
+    producaoAtivas: prod.filter((s) => s.status === 'A' || s.status === 'U').length,
+  };
+}
+
+/**
+ * Inicializa automaticamente séries de simulação para empresas existentes ou novas empresas
+ * garantindo que o onboarding não sofra bloqueio inicial. Nunca cria séries de PRODUÇÃO automaticamente.
  */
 export function inicializarSeriesPadraoSeNecessario(
   companyId: string,
@@ -417,7 +601,7 @@ export function inicializarSeriesPadraoSeNecessario(
   const existing = seriesStorage.loadSeries(companyId);
   const forYear = existing.filter((s) => s.seriesYear === year);
 
-  // Documentos primários comerciais que devem ter série ativa imediata
+  // Documentos primários comerciais que devem ter série ativa imediata em simulação
   const primaryDocTypes: AgtDocumentType[] = ['FR', 'FA', 'FT', 'TV', 'NC', 'RC'];
   const created: AgtSeriesRecord[] = [];
 
@@ -434,8 +618,9 @@ export function inicializarSeriesPadraoSeNecessario(
           seriesYear: year,
           documentType: docType,
           firstDocumentNumber: 1,
+          environment: 'SIMULACAO',
           operator,
-          notes: `Série inicial homologada para o ano fiscal ${year} (${docType})`,
+          notes: `Série inicial de simulação/homologação para o ano fiscal ${year} (${docType})`,
         });
         created.push(newSeries);
       } catch (err) {

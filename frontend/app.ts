@@ -24,9 +24,15 @@ import {
   reservarProximoNumeroFiscal,
   solicitarSerie,
   validarPermissaoEmissaoFiscal,
+  type ProximoNumeroFiscalResult,
 } from '../src/core/seriesManager';
 import {
+  resolveActiveEstablishment,
+  validateEstablishmentRecord,
+} from '../src/core/companyValidator';
+import {
   AppSettings,
+  buildInvoiceIssuerSnapshot,
   canCompanyHideViralFooter,
   canCompanyManageMultiOperatorTeam,
   canCompanySyncCloudData,
@@ -40,6 +46,7 @@ import {
   CLOUD_PROTECTION_NUDGE_RECORDS,
   CompanyMember,
   CompanyOperationalStatus,
+  CompanyProfile,
   CompanyRecord,
   CompanyRole,
   Customer,
@@ -53,6 +60,7 @@ import {
   DirectPaymentMethod,
   DocumentFormat,
   DocumentType,
+  EstablishmentRecord,
   FinancialEntryKind,
   FREE_COURTESY_BUFFER,
   FREE_MONTHLY_INVOICE_LIMIT,
@@ -82,6 +90,7 @@ import {
   SuspendedSale,
   TaxRate,
   VITRONIS_INSTITUTIONAL,
+  WarehouseRecord,
 } from '../src/core/types';
 import {
   filterCustomersSmart,
@@ -107,6 +116,7 @@ import {
   upsertCashSessionCloud,
   upsertCompanyMemberCloud,
   upsertCustomerCloud,
+  upsertFiscalSeriesCloud,
   upsertProductCloud,
   upsertPurchaseCloud,
   upsertSettingsCloud,
@@ -159,7 +169,7 @@ import {
   summarizeDocumentControlList,
   triggerBrowserDownload,
 } from '../src/core/documentExport';
-import { generateSaftAoXml } from '../src/core/saftGenerator';
+import { computeDocumentSaftHash4, generateSaftAoXml } from '../src/core/saftGenerator';
 import {
   generateInvoiceQrDataUrl,
   renderCashClosureReportHtml,
@@ -172,6 +182,12 @@ import {
   MobileTab,
   MobileCheckoutStep,
 } from './ui/mobileOperationalView';
+import {
+  CompanyMasterSectionTab,
+  extractSettingsFromFormData,
+  renderCompanyMasterSection,
+  resizeImageFileToLogoDataUrl,
+} from './ui/companyMasterForm';
 import {
   formatPlanLabelPt,
   formatRoleLabelPt,
@@ -636,12 +652,22 @@ export class SilaBillingApp {
   private systemStatusData: SystemStatusResponse | null = null;
   private isLoadingSystemStatus = false;
 
-  // Estado Configurações / Cloud / PWA
+  // Estado Configurações / Ficha Mestre / Cloud / PWA
   private settingsSavedNotice = false;
   private settingsErrorMessage: string | null = null;
+  private companyMasterSection: CompanyMasterSectionTab = 'ALL';
+  private companyMasterDraftProfile: CompanyProfile | null = null;
+  private companyMasterDraftSettings: Partial<AppSettings> | null = null;
+  private showEstablishmentForm = false;
+  private editingEstablishment: Partial<EstablishmentRecord> | null = null;
+  private establishmentError: string | null = null;
+  private showWarehouseForm = false;
+  private editingWarehouse: Partial<WarehouseRecord> | null = null;
+  private warehouseError: string | null = null;
 
   // Estado Séries Fiscais AGT (Decreto Executivo n.º 683/25)
   private showRequestAgtSeriesForm = false;
+  private confirmFinalizeSeriesId: string | null = null;
   private agtSeriesErrorMessage: string | null = null;
   private agtSeriesSuccessMessage: string | null = null;
   private agtSeriesYearFilter: number = new Date().getFullYear();
@@ -938,6 +964,19 @@ export class SilaBillingApp {
     this.posQuickCashReason = '';
     this.posQuickCashError = null;
     this.settingsErrorMessage = null;
+    this.settingsSavedNotice = false;
+    this.companyMasterDraftProfile = null;
+    this.companyMasterDraftSettings = null;
+    this.showEstablishmentForm = false;
+    this.editingEstablishment = null;
+    this.establishmentError = null;
+    this.showWarehouseForm = false;
+    this.editingWarehouse = null;
+    this.warehouseError = null;
+    this.showRequestAgtSeriesForm = false;
+    this.confirmFinalizeSeriesId = null;
+    this.agtSeriesErrorMessage = null;
+    this.agtSeriesSuccessMessage = null;
     this.memberFormError = null;
     this.growthModalReason = null;
     this.growthModalNotice = null;
@@ -3073,6 +3112,7 @@ export class SilaBillingApp {
         unitPrice: prod.price,
         discountPct: 0,
         ivaRate: prod.ivaRate,
+        ...(prod.exemptionCode ? { exemptionCode: prod.exemptionCode } : {}),
       });
     }
     if (prod.trackStock) {
@@ -3100,8 +3140,13 @@ export class SilaBillingApp {
     }
   }
 
+  private getInvoiceQrCacheKey(inv: InvoiceRecord): string {
+    const issuerNif = inv.issuerSnapshot?.nif || this.settings.company.nif;
+    return `${inv.number}|${inv.grandTotal.toFixed(2)}|${issuerNif}|${inv.saftHash4 || ''}`;
+  }
+
   private async ensureQrForInvoice(inv: InvoiceRecord): Promise<string> {
-    const cacheKey = `${inv.number}|${inv.grandTotal.toFixed(2)}|${this.settings.company.nif}`;
+    const cacheKey = this.getInvoiceQrCacheKey(inv);
     const existing = this.qrCache.get(cacheKey);
     if (existing) return existing;
 
@@ -3125,9 +3170,17 @@ export class SilaBillingApp {
     }
 
     const totals = calculateInvoiceTotals(this.cart, this.globalDiscountPct);
+    const activeEnv =
+      this.activeCompany.profile.agtEnvironment || this.settings.agtEnvironment || 'SIMULACAO';
+    const activeEst = resolveActiveEstablishment(
+      this.settings.company,
+      this.settings.defaultEstablishmentId
+    );
     const activeAgtSeries = obterSerieAtiva(
       this.activeCompany.id,
-      this.docType as AgtDocumentType
+      this.docType as AgtDocumentType,
+      undefined,
+      { environment: activeEnv, establishmentId: activeEst.id }
     );
     const nextNumber = activeAgtSeries
       ? `${this.docType} ${activeAgtSeries.seriesCode}/${String(
@@ -3192,6 +3245,11 @@ export class SilaBillingApp {
           )));
 
     const now = new Date().toISOString();
+    const previewSnapshot = buildInvoiceIssuerSnapshot(this.settings.company, {
+      companyId: this.activeCompany.id,
+      establishment: activeEst,
+      capturedAtIso: now,
+    });
 
     return {
       id: 'preview_draft',
@@ -3216,11 +3274,36 @@ export class SilaBillingApp {
         : {}),
       taxBase14: totals.taxBase14,
       taxAmount14: totals.taxAmount14,
+      ...(typeof totals.taxBaseIntermediate === 'number'
+        ? { taxBaseIntermediate: totals.taxBaseIntermediate }
+        : {}),
+      ...(typeof totals.taxAmountIntermediate === 'number'
+        ? { taxAmountIntermediate: totals.taxAmountIntermediate }
+        : {}),
+      ...(typeof totals.taxBaseReduced === 'number'
+        ? { taxBaseReduced: totals.taxBaseReduced }
+        : {}),
+      ...(typeof totals.taxAmountReduced === 'number'
+        ? { taxAmountReduced: totals.taxAmountReduced }
+        : {}),
       taxBase0: totals.taxBase0,
       taxAmount0: 0,
       taxTotal: totals.taxTotal,
       grandTotal: totals.grandTotal,
       amountInWords: totals.amountInWords,
+      issuerSnapshot: previewSnapshot,
+      establishmentId: activeEst.id,
+      establishmentCode: activeEst.code,
+      establishmentName: activeEst.name,
+      ...(activeAgtSeries
+        ? {
+            seriesCode: activeAgtSeries.seriesCode,
+            seriesEnvironment: activeAgtSeries.environment,
+            ...(activeAgtSeries.agtAuthorizationCode
+              ? { agtAuthorizationCode: activeAgtSeries.agtAuthorizationCode }
+              : {}),
+          }
+        : {}),
       amountReceived: numericReceived,
       changeAmount,
       ...(amountDue > 0 ? { amountDue } : {}),
@@ -3314,6 +3397,10 @@ export class SilaBillingApp {
         break;
       }
       case 'mobile-open-quick-company': {
+        this.settingsErrorMessage = null;
+        this.settingsSavedNotice = false;
+        this.companyMasterDraftProfile = null;
+        this.companyMasterDraftSettings = null;
         this.showMobileQuickCompanyModal = true;
         this.render();
         break;
@@ -3505,6 +3592,15 @@ export class SilaBillingApp {
         this.showQuickCustomerForm = false;
         this.showMobileQuickCompanyModal = false;
         this.showMobileCustomerPicker = false;
+        this.companyMasterDraftProfile = null;
+        this.companyMasterDraftSettings = null;
+        this.showEstablishmentForm = false;
+        this.editingEstablishment = null;
+        this.establishmentError = null;
+        this.showWarehouseForm = false;
+        this.editingWarehouse = null;
+        this.warehouseError = null;
+        this.confirmFinalizeSeriesId = null;
         this.render();
         break;
       }
@@ -3565,7 +3661,147 @@ export class SilaBillingApp {
         this.render();
         break;
       }
+      case 'master-select-section': {
+        const sec = (target.dataset.section as CompanyMasterSectionTab) || 'ALL';
+        this.captureActiveCompanyMasterFormDraft();
+        this.companyMasterSection = sec;
+        this.render();
+        break;
+      }
+      case 'remove-company-logo': {
+        if (!this.canManageCompanySettings()) break;
+        this.captureActiveCompanyMasterFormDraft();
+        const base = this.companyMasterDraftProfile || this.settings.company;
+        this.companyMasterDraftProfile = { ...base, logoUrl: undefined };
+        this.settingsErrorMessage = null;
+        this.render();
+        break;
+      }
+      case 'open-establishment-form': {
+        if (!this.canManageCompanySettings()) break;
+        this.captureActiveCompanyMasterFormDraft();
+        this.showEstablishmentForm = true;
+        this.editingEstablishment = null;
+        this.establishmentError = null;
+        this.render();
+        break;
+      }
+      case 'close-establishment-form': {
+        this.showEstablishmentForm = false;
+        this.editingEstablishment = null;
+        this.establishmentError = null;
+        this.render();
+        break;
+      }
+      case 'edit-establishment': {
+        if (!this.canManageCompanySettings() || !id) break;
+        this.captureActiveCompanyMasterFormDraft();
+        const profile = this.companyMasterDraftProfile || this.settings.company;
+        const list = profile.establishments || [resolveActiveEstablishment(profile)];
+        const found = list.find((e) => e.id === id);
+        if (found) {
+          this.editingEstablishment = { ...found };
+          this.showEstablishmentForm = true;
+          this.establishmentError = null;
+          this.render();
+        }
+        break;
+      }
+      case 'set-default-establishment': {
+        if (!this.canManageCompanySettings() || !id) break;
+        this.captureActiveCompanyMasterFormDraft();
+        const currentProfile = this.companyMasterDraftProfile || this.settings.company;
+        const currentEsts = currentProfile.establishments || [resolveActiveEstablishment(currentProfile)];
+        if (!currentEsts.some((e) => e.id === id && e.active)) break;
+        const baseSettings = this.companyMasterDraftSettings
+          ? { ...this.settings, ...this.companyMasterDraftSettings }
+          : this.settings;
+        const nextSettings: AppSettings = {
+          ...baseSettings,
+          companyId: this.activeCompany.id,
+          company: {
+            ...currentProfile,
+            defaultEstablishmentId: id,
+          },
+          defaultEstablishmentId: id,
+          syncState: 'pending',
+          synced: false,
+          updatedAtIso: new Date().toISOString(),
+        };
+        await this.persistSettings(nextSettings);
+        break;
+      }
+      case 'toggle-establishment-active': {
+        if (!this.canManageCompanySettings() || !id) break;
+        this.captureActiveCompanyMasterFormDraft();
+        const currentProfile = this.companyMasterDraftProfile || this.settings.company;
+        const currentEsts = currentProfile.establishments || [resolveActiveEstablishment(currentProfile)];
+        const targetEst = currentEsts.find((e) => e.id === id);
+        if (!targetEst) break;
+        const activeCount = currentEsts.filter((e) => e.active).length;
+        if (targetEst.active && activeCount <= 1) {
+          this.establishmentError = 'A empresa deve manter pelo menos 1 estabelecimento activo.';
+          this.render();
+          break;
+        }
+        const nextEsts = currentEsts.map((e) =>
+          e.id === id ? { ...e, active: !e.active } : e
+        );
+        const nextDefaultId =
+          currentProfile.defaultEstablishmentId === id && targetEst.active
+            ? nextEsts.find((e) => e.active)?.id
+            : currentProfile.defaultEstablishmentId;
+        this.establishmentError = null;
+        const baseSettings = this.companyMasterDraftSettings
+          ? { ...this.settings, ...this.companyMasterDraftSettings }
+          : this.settings;
+        const nextSettings: AppSettings = {
+          ...baseSettings,
+          companyId: this.activeCompany.id,
+          company: {
+            ...currentProfile,
+            establishments: nextEsts,
+            defaultEstablishmentId: nextDefaultId,
+          },
+          defaultEstablishmentId: nextDefaultId,
+          syncState: 'pending',
+          synced: false,
+          updatedAtIso: new Date().toISOString(),
+        };
+        await this.persistSettings(nextSettings);
+        break;
+      }
+      case 'open-warehouse-form': {
+        if (!this.canManageCompanySettings()) break;
+        this.captureActiveCompanyMasterFormDraft();
+        this.showWarehouseForm = true;
+        this.editingWarehouse = null;
+        this.warehouseError = null;
+        this.render();
+        break;
+      }
+      case 'close-warehouse-form': {
+        this.showWarehouseForm = false;
+        this.editingWarehouse = null;
+        this.warehouseError = null;
+        this.render();
+        break;
+      }
+      case 'edit-warehouse': {
+        if (!this.canManageCompanySettings() || !id) break;
+        this.captureActiveCompanyMasterFormDraft();
+        const profile = this.companyMasterDraftProfile || this.settings.company;
+        const found = (profile.warehouses || []).find((w) => w.id === id);
+        if (found) {
+          this.editingWarehouse = { ...found };
+          this.showWarehouseForm = true;
+          this.warehouseError = null;
+          this.render();
+        }
+        break;
+      }
       case 'open-request-agt-series-form': {
+        this.captureActiveCompanyMasterFormDraft();
         this.showRequestAgtSeriesForm = true;
         this.agtSeriesErrorMessage = null;
         this.agtSeriesSuccessMessage = null;
@@ -3573,25 +3809,45 @@ export class SilaBillingApp {
         break;
       }
       case 'close-request-agt-series-form': {
+        this.captureActiveCompanyMasterFormDraft();
         this.showRequestAgtSeriesForm = false;
         this.agtSeriesErrorMessage = null;
+        this.agtSeriesSuccessMessage = null;
         this.render();
         break;
       }
       case 'finalize-agt-series': {
         if (!id) break;
-        const confirmFinalize = window.confirm(
-          'Tem a certeza de que pretende finalizar formalmente esta série AGT (estado F)? Esta operação impedirá novas emissões nesta série.'
-        );
-        if (confirmFinalize) {
-          try {
-            finalizarSerie(this.activeCompany.id, id, this.operator, 'Encerramento manual de série');
-            this.agtSeriesSuccessMessage = 'Série fiscal encerrada com sucesso (estado F).';
-            this.render();
-          } catch (err: any) {
-            this.agtSeriesErrorMessage = err.message || 'Falha ao finalizar série fiscal.';
-            this.render();
+        this.captureActiveCompanyMasterFormDraft();
+        this.confirmFinalizeSeriesId = id;
+        this.agtSeriesErrorMessage = null;
+        this.render();
+        break;
+      }
+      case 'cancel-finalize-agt-series': {
+        this.confirmFinalizeSeriesId = null;
+        this.render();
+        break;
+      }
+      case 'confirm-finalize-agt-series': {
+        if (!id) break;
+        try {
+          const finalized = finalizarSerie(
+            this.activeCompany.id,
+            id,
+            this.operator,
+            'Encerramento manual de série'
+          );
+          this.confirmFinalizeSeriesId = null;
+          this.agtSeriesSuccessMessage = `Série ${finalized.seriesCode} (${finalized.documentType}) encerrada com sucesso (estado F).`;
+          if (this.user && this.isOnline && canCompanySyncCloudData(this.activeCompany)) {
+            void upsertFiscalSeriesCloud(finalized, this.activeCompany).catch(() => null);
           }
+          this.render();
+        } catch (err: any) {
+          this.confirmFinalizeSeriesId = null;
+          this.agtSeriesErrorMessage = err?.message || 'Falha ao finalizar série fiscal.';
+          this.render();
         }
         break;
       }
@@ -7004,6 +7260,25 @@ export class SilaBillingApp {
 
   private async handleChange(e: Event): Promise<void> {
     const el = e.target as HTMLInputElement | HTMLSelectElement;
+    if (el && el.dataset.action === 'upload-company-logo') {
+      const file = (el as HTMLInputElement).files?.[0];
+      if (!file) return;
+      if (!this.canManageCompanySettings()) return;
+      this.captureActiveCompanyMasterFormDraft();
+      try {
+        const dataUrl = await resizeImageFileToLogoDataUrl(file);
+        const base = this.companyMasterDraftProfile || this.settings.company;
+        this.companyMasterDraftProfile = { ...base, logoUrl: dataUrl };
+        this.settingsErrorMessage = null;
+        this.render();
+      } catch (err) {
+        this.settingsErrorMessage =
+          err instanceof Error ? err.message : 'Erro ao processar o ficheiro de logótipo.';
+        this.render();
+      }
+      return;
+    }
+
     if (el && el.id === 'mobile-product-ivarate-select') {
       const container = document.getElementById('mobile-product-exemption-container');
       if (container) {
@@ -7547,26 +7822,17 @@ export class SilaBillingApp {
     }
 
     if (form.id === 'mobile-quick-company-form') {
-      const shortName = String(fd.get('shortName') || '').trim();
-      const name = String(fd.get('name') || '').trim();
-      const nif = String(fd.get('nif') || '').trim();
-      const locality = String(fd.get('locality') || '').trim();
-      const phone = String(fd.get('phone') || '').trim();
-
-      if (!name || !nif) {
-        alert('Nome e NIF da empresa são obrigatórios.');
-        return;
-      }
-
-      this.settings.company.shortName = shortName || name;
-      this.settings.company.legalName = name;
-      this.settings.company.nif = nif;
-      if (locality) this.settings.company.cityCountry = locality;
-      if (phone) this.settings.company.phone = phone;
-
-      await localDb.saveSettings(this.settings, this.activeCompany.id);
-      this.showMobileQuickCompanyModal = false;
-      this.render();
+      if (!this.canManageCompanySettings()) return;
+      const canCleanFooter = canCompanyHideViralFooter(this.activeCompany);
+      const nextSettings = extractSettingsFromFormData(fd, {
+        companyId: this.activeCompany.id,
+        currentSettings: this.companyMasterDraftSettings
+          ? { ...this.settings, ...this.companyMasterDraftSettings }
+          : this.settings,
+        currentProfile: this.companyMasterDraftProfile || this.settings.company,
+        canCleanFooter,
+      });
+      await this.persistSettings(nextSettings);
       return;
     }
 
@@ -9042,54 +9308,194 @@ export class SilaBillingApp {
     if (formName === 'settings-form') {
       if (!this.canManageCompanySettings()) return;
       const canCleanFooter = canCompanyHideViralFooter(this.activeCompany);
+      const nextSettings = extractSettingsFromFormData(fd, {
+        companyId: this.activeCompany.id,
+        currentSettings: this.companyMasterDraftSettings
+          ? { ...this.settings, ...this.companyMasterDraftSettings }
+          : this.settings,
+        currentProfile: this.companyMasterDraftProfile || this.settings.company,
+        canCleanFooter,
+      });
+
+      await this.persistSettings(nextSettings);
+    }
+
+    if (formName === 'save-establishment-form') {
+      if (!this.canManageCompanySettings()) return;
+      this.establishmentError = null;
+      this.captureActiveCompanyMasterFormDraft();
+      const currentProfile = this.companyMasterDraftProfile || this.settings.company;
+      const currentEsts = [...(currentProfile.establishments || [resolveActiveEstablishment(currentProfile)])];
+      const estId = String(fd.get('establishmentId') || '').trim();
+      const code = String(fd.get('code') || '').trim().toUpperCase().slice(0, 16);
+      const name = String(fd.get('name') || '').trim().slice(0, 80);
+      const address = String(fd.get('address') || '').trim().slice(0, 160);
+      const municipality = String(fd.get('municipality') || '').trim().slice(0, 80) || undefined;
+      const province = String(fd.get('province') || '').trim().slice(0, 80) || undefined;
+      const phone = String(fd.get('phone') || '').trim().slice(0, 40) || undefined;
+      const email = String(fd.get('email') || '').trim().slice(0, 120) || undefined;
+      const defaultCashierCode = String(fd.get('defaultCashierCode') || '01').trim().slice(0, 16) || '01';
+      const isHeadquarters = fd.get('isHeadquarters') === 'on';
+      const active = fd.get('active') === 'on';
+
+      const candidate: EstablishmentRecord = {
+        id: estId || `est_${Date.now()}_${Math.random().toString(36).slice(2, 6)}`,
+        code,
+        name,
+        isHeadquarters,
+        address,
+        municipality,
+        province,
+        phone,
+        email,
+        defaultCashierCode,
+        active,
+      };
+
+      const estCheck = validateEstablishmentRecord(candidate);
+      if (!estCheck.valid) {
+        this.establishmentError = estCheck.errors.join(' ');
+        this.render();
+        return;
+      }
+
+      const dupCode = currentEsts.find(
+        (e) => e.code.trim().toUpperCase() === code && e.id !== candidate.id
+      );
+      if (dupCode) {
+        this.establishmentError = `Já existe outro estabelecimento com o código '${code}'.`;
+        this.render();
+        return;
+      }
+
+      let updatedEsts = currentEsts.some((e) => e.id === candidate.id)
+        ? currentEsts.map((e) => (e.id === candidate.id ? candidate : e))
+        : [...currentEsts, candidate];
+
+      if (candidate.isHeadquarters) {
+        updatedEsts = updatedEsts.map((e) =>
+          e.id === candidate.id ? e : { ...e, isHeadquarters: false }
+        );
+      } else if (!updatedEsts.some((e) => e.isHeadquarters)) {
+        updatedEsts[0] = { ...updatedEsts[0]!, isHeadquarters: true };
+      }
+
+      if (!updatedEsts.some((e) => e.active)) {
+        this.establishmentError = 'Pelo menos 1 estabelecimento tem de permanecer activo.';
+        this.render();
+        return;
+      }
+
+      const defaultEstablishmentId =
+        currentProfile.defaultEstablishmentId &&
+        updatedEsts.some((e) => e.id === currentProfile.defaultEstablishmentId && e.active)
+          ? currentProfile.defaultEstablishmentId
+          : candidate.active
+            ? candidate.id
+            : updatedEsts.find((e) => e.active)?.id;
+
+      const baseSettings = this.companyMasterDraftSettings
+        ? { ...this.settings, ...this.companyMasterDraftSettings }
+        : this.settings;
       const nextSettings: AppSettings = {
+        ...baseSettings,
         companyId: this.activeCompany.id,
         company: {
-          legalName: String(fd.get('legalName') || '').trim() || this.settings.company.legalName,
-          shortName: String(fd.get('shortName') || '').trim() || this.settings.company.shortName,
-          nif: String(fd.get('nif') || '').trim() || this.settings.company.nif,
-          address: String(fd.get('address') || '').trim() || this.settings.company.address,
-          cityCountry:
-            String(fd.get('cityCountry') || '').trim() ||
-            this.settings.company.cityCountry ||
-            'Angola',
-          phone: String(fd.get('phone') || '').trim(),
-          email: String(fd.get('email') || '').trim(),
-          tagline: String(fd.get('tagline') || '').trim(),
+          ...currentProfile,
+          establishments: updatedEsts,
+          defaultEstablishmentId,
         },
-        defaultCashier: String(fd.get('defaultCashier') || '01').trim() || '01',
-        defaultOperator: String(fd.get('defaultOperator') || '001').trim() || '001',
-        defaultDocType: fd.get('defaultDocType') === 'FP' ? 'FP' : 'FR',
-        defaultFormat: fd.get('defaultFormat') === 'A4' ? 'A4' : 'POS',
-        defaultNotes: String(fd.get('defaultNotes') || '').trim(),
-        autoPrintOnEmit: fd.get('autoPrintOnEmit') === 'on',
-        hidePromotionalFooter: canCleanFooter ? fd.get('hidePromotionalFooter') === 'on' : false,
-        allowCashierPriceEdit: fd.get('allowCashierPriceEdit') === 'on',
-        maxCashierDiscountPct: Math.min(
-          100,
-          Math.max(
-            0,
-            parseFloat(String(fd.get('maxCashierDiscountPct') || '5').replace(',', '.')) || 5
-          )
-        ),
-        supervisorPin: String(fd.get('supervisorPin') || '').trim().slice(0, 16),
+        defaultEstablishmentId,
         syncState: 'pending',
         synced: false,
         updatedAtIso: new Date().toISOString(),
       };
 
+      this.showEstablishmentForm = false;
+      this.editingEstablishment = null;
       await this.persistSettings(nextSettings);
+      return;
+    }
+
+    if (formName === 'save-warehouse-form') {
+      if (!this.canManageCompanySettings()) return;
+      this.warehouseError = null;
+      this.captureActiveCompanyMasterFormDraft();
+      const currentProfile = this.companyMasterDraftProfile || this.settings.company;
+      const currentWarehouses = [...(currentProfile.warehouses || [])];
+      const warehouseId = String(fd.get('warehouseId') || '').trim();
+      const code = String(fd.get('code') || '').trim().toUpperCase().slice(0, 16);
+      const name = String(fd.get('name') || '').trim().slice(0, 80);
+      const establishmentId =
+        String(fd.get('establishmentId') || '').trim() ||
+        resolveActiveEstablishment(currentProfile).id;
+
+      if (!code || !name) {
+        this.warehouseError = 'Informe o código e a designação do armazém.';
+        this.render();
+        return;
+      }
+
+      const nextWarehouse: WarehouseRecord = {
+        id: warehouseId || `arm_${Date.now()}_${Math.random().toString(36).slice(2, 6)}`,
+        code,
+        name,
+        establishmentId,
+        active: true,
+      };
+
+      const updatedWarehouses = currentWarehouses.some((w) => w.id === nextWarehouse.id)
+        ? currentWarehouses.map((w) => (w.id === nextWarehouse.id ? nextWarehouse : w))
+        : [...currentWarehouses, nextWarehouse];
+
+      const baseSettings = this.companyMasterDraftSettings
+        ? { ...this.settings, ...this.companyMasterDraftSettings }
+        : this.settings;
+      const nextSettings: AppSettings = {
+        ...baseSettings,
+        companyId: this.activeCompany.id,
+        company: {
+          ...currentProfile,
+          warehouses: updatedWarehouses,
+        },
+        syncState: 'pending',
+        synced: false,
+        updatedAtIso: new Date().toISOString(),
+      };
+
+      this.showWarehouseForm = false;
+      this.editingWarehouse = null;
+      await this.persistSettings(nextSettings);
+      return;
     }
 
     if (formName === 'request-agt-series-form') {
       this.agtSeriesErrorMessage = null;
       this.agtSeriesSuccessMessage = null;
+      this.captureActiveCompanyMasterFormDraft();
       try {
         const seriesCode = String(fd.get('seriesCode') || '').trim();
         const documentType = String(fd.get('documentType') || 'FR').trim() as AgtDocumentType;
         const seriesYear = parseInt(String(fd.get('seriesYear') || new Date().getFullYear()), 10);
         const firstDocNumber = parseInt(String(fd.get('firstDocumentNumber') || '1'), 10);
         const notes = String(fd.get('notes') || '').trim();
+        const activeProfile = this.companyMasterDraftProfile || this.settings.company;
+        const requestedEnv =
+          String(
+            fd.get('environment') ||
+              activeProfile.agtEnvironment ||
+              this.settings.agtEnvironment ||
+              'SIMULACAO'
+          )
+            .trim()
+            .toUpperCase() === 'PRODUCAO'
+            ? 'PRODUCAO'
+            : 'SIMULACAO';
+        const requestedEstId = String(fd.get('establishmentId') || '').trim();
+        const resolvedEst = requestedEstId
+          ? (activeProfile.establishments || []).find((e) => e.id === requestedEstId) ||
+            resolveActiveEstablishment(activeProfile, requestedEstId)
+          : null;
 
         const created = solicitarSerie({
           companyId: this.activeCompany.id,
@@ -9097,11 +9503,19 @@ export class SilaBillingApp {
           seriesYear,
           documentType,
           firstDocumentNumber: firstDocNumber,
+          environment: requestedEnv,
+          establishmentId: requestedEstId || undefined,
+          establishmentCode: resolvedEst?.code,
+          companyProfile: activeProfile,
           notes,
           operator: this.operator,
         });
 
-        this.agtSeriesSuccessMessage = `Série fiscal ${created.seriesCode} (${created.documentType}) aprovada com sucesso! Código de Autorização AGT: ${created.agtAuthorizationCode}`;
+        if (this.user && this.isOnline && canCompanySyncCloudData(this.activeCompany)) {
+          void upsertFiscalSeriesCloud(created, this.activeCompany).catch(() => null);
+        }
+
+        this.agtSeriesSuccessMessage = `Série fiscal ${created.seriesCode} (${created.documentType} · ${created.environment}) aprovada com sucesso! Código de Autorização AGT: ${created.agtAuthorizationCode}`;
         this.showRequestAgtSeriesForm = false;
         this.render();
       } catch (err: any) {
@@ -9109,6 +9523,26 @@ export class SilaBillingApp {
         this.render();
       }
     }
+  }
+
+  private captureActiveCompanyMasterFormDraft(): void {
+    const formEl =
+      (document.querySelector('form[data-form="settings-form"]') as HTMLFormElement | null) ||
+      (document.getElementById('mobile-quick-company-form') as HTMLFormElement | null);
+    if (!formEl) return;
+    const fd = new FormData(formEl);
+    const currentProfile = this.companyMasterDraftProfile || this.settings.company;
+    const currentSettings = this.companyMasterDraftSettings
+      ? { ...this.settings, ...this.companyMasterDraftSettings }
+      : this.settings;
+    const extracted = extractSettingsFromFormData(fd, {
+      companyId: this.activeCompany.id,
+      currentSettings,
+      currentProfile,
+      canCleanFooter: canCompanyHideViralFooter(this.activeCompany),
+    });
+    this.companyMasterDraftProfile = extracted.company;
+    this.companyMasterDraftSettings = extracted;
   }
 
   private async persistSettings(nextSettings: AppSettings): Promise<void> {
@@ -9119,40 +9553,53 @@ export class SilaBillingApp {
       this.companies = this.companies.map((c) =>
         c.id === updatedCompany.id ? updatedCompany : c
       );
-      this.settings = nextSettings;
-      this.cashier = nextSettings.defaultCashier;
-      this.operator = nextSettings.defaultOperator;
-      this.docType = nextSettings.defaultDocType;
-      this.notes = nextSettings.defaultNotes;
+      const savedSettings: AppSettings = {
+        ...nextSettings,
+        company: updatedCompany.profile,
+        defaultEstablishmentId: updatedCompany.profile.defaultEstablishmentId,
+        agtEnvironment: updatedCompany.profile.agtEnvironment,
+      };
+      this.settings = savedSettings;
+      this.companyMasterDraftProfile = null;
+      this.companyMasterDraftSettings = null;
+      this.cashier = savedSettings.defaultCashier;
+      this.operator = savedSettings.defaultOperator;
+      this.docType = savedSettings.defaultDocType;
+      this.notes = savedSettings.defaultNotes;
       this.settingsSavedNotice = true;
       if (typeof document !== 'undefined') {
-        document.title = `SILA-Billing — ${nextSettings.company.shortName}`;
+        document.title = `SILA-Billing — ${savedSettings.company.shortName}`;
       }
       this.render();
     } catch (err) {
       this.settingsErrorMessage =
-        err instanceof Error ? err.message : 'Erro ao validar o NIF da empresa.';
+        err instanceof Error ? err.message : 'Erro ao validar a Ficha Mestre da empresa.';
       this.render();
       return;
     }
 
     setTimeout(() => {
       this.settingsSavedNotice = false;
-      if (this.activeModule === 'SETTINGS') this.render();
-    }, 2000);
+      if (this.activeModule === 'SETTINGS' || this.showMobileQuickCompanyModal) this.render();
+    }, 2200);
 
     if (this.user && this.isOnline) {
       try {
         await ensureCompanyRegisteredCloud(this.activeCompany, true);
         if (canCompanySyncCloudData(this.activeCompany)) {
-          await upsertSettingsCloud(nextSettings, this.activeCompany);
-          const synced: AppSettings = { ...nextSettings, syncState: 'synced', synced: true };
+          await upsertSettingsCloud(this.settings, this.activeCompany);
+          const synced: AppSettings = { ...this.settings, syncState: 'synced', synced: true };
           const syncedCompany = await localDb.saveSettings(synced, this.activeCompany.id);
           this.activeCompany = syncedCompany;
           this.companies = this.companies.map((c) =>
             c.id === syncedCompany.id ? syncedCompany : c
           );
-          this.settings = synced;
+          this.settings = {
+            ...synced,
+            company: syncedCompany.profile,
+            defaultEstablishmentId: syncedCompany.profile.defaultEstablishmentId,
+            agtEnvironment: syncedCompany.profile.agtEnvironment,
+          };
           this.render();
         }
       } catch {
@@ -9222,13 +9669,24 @@ export class SilaBillingApp {
       const now = new Date().toISOString();
       const originReturnId = this.returnOriginInvoice?.id || null;
 
+      const activeEnv =
+        this.activeCompany.profile.agtEnvironment || this.settings.agtEnvironment || 'SIMULACAO';
+      const activeEst = resolveActiveEstablishment(
+        this.settings.company,
+        this.settings.defaultEstablishmentId
+      );
+
       let officialNumber = draft.number;
+      let reservedSeriesMeta: ProximoNumeroFiscalResult | null = null;
       try {
-        const agtResult = reservarProximoNumeroFiscal(
+        reservedSeriesMeta = reservarProximoNumeroFiscal(
           this.activeCompany.id,
-          draft.docType as AgtDocumentType
+          draft.docType as AgtDocumentType,
+          undefined,
+          undefined,
+          { environment: activeEnv, establishmentId: activeEst.id }
         );
-        officialNumber = agtResult.documentNo;
+        officialNumber = reservedSeriesMeta.documentNo;
       } catch (seriesErr: any) {
         if (AGT_DOCUMENT_TYPES[draft.docType as AgtDocumentType]?.requiresSeries) {
           this.isEmitting = false;
@@ -9253,6 +9711,17 @@ export class SilaBillingApp {
         ? `${formatRoleLabelPt(this.getEffectiveRole())} (${openSession ? openSession.operator : draft.operator})`
         : undefined;
 
+      const issuerSnapshot = buildInvoiceIssuerSnapshot(this.settings.company, {
+        companyId: this.activeCompany.id,
+        establishment: activeEst,
+        capturedAtIso: now,
+      });
+      const saftHash4 = computeDocumentSaftHash4({
+        issuedAtIso: now,
+        number: officialNumber,
+        grandTotal: draft.grandTotal,
+      }).hash4;
+
       const invoice: InvoiceRecord = {
         ...draft,
         number: officialNumber,
@@ -9260,6 +9729,20 @@ export class SilaBillingApp {
         companyId: this.activeCompany.id,
         cashier: openSession ? openSession.cashier : draft.cashier,
         operator: openSession ? openSession.operator : draft.operator,
+        issuerSnapshot,
+        establishmentId: reservedSeriesMeta?.establishmentId || activeEst.id,
+        establishmentCode: reservedSeriesMeta?.establishmentCode || activeEst.code,
+        establishmentName: activeEst.name,
+        ...(reservedSeriesMeta
+          ? {
+              seriesCode: reservedSeriesMeta.seriesCode,
+              seriesEnvironment: reservedSeriesMeta.environment,
+              ...(reservedSeriesMeta.agtAuthorizationCode
+                ? { agtAuthorizationCode: reservedSeriesMeta.agtAuthorizationCode }
+                : {}),
+            }
+          : { seriesEnvironment: activeEnv }),
+        saftHash4,
         ...(discountAuth ? { discountAuthorizedBy: discountAuth } : {}),
         ...(draft.docType === 'FR'
           ? {
@@ -9335,6 +9818,14 @@ export class SilaBillingApp {
           await ensureCompanyRegisteredCloud(this.activeCompany);
           if (canCompanySyncCloudData(this.activeCompany)) {
             await createInvoiceCloud(invoice, this.activeCompany);
+            if (reservedSeriesMeta) {
+              const updatedSeries = listarSeries({ companyId: this.activeCompany.id }).find(
+                (s) => s.id === reservedSeriesMeta!.seriesId
+              );
+              if (updatedSeries) {
+                await upsertFiscalSeriesCloud(updatedSeries, this.activeCompany).catch(() => null);
+              }
+            }
             const syncedInv: InvoiceRecord = { ...invoice, syncState: 'synced', synced: true };
             await localDb.saveInvoice(syncedInv, this.activeCompany.id);
             this.invoices = this.invoices.map((i) => (i.id === syncedInv.id ? syncedInv : i));
@@ -9912,6 +10403,23 @@ export class SilaBillingApp {
               ${renderMobileOperationalView({
                 activeCompany: this.activeCompany,
                 settings: this.settings,
+                companyMasterDraftProfile: this.companyMasterDraftProfile,
+                companyMasterDraftSettings: this.companyMasterDraftSettings,
+                companyMasterSection: this.companyMasterSection,
+                companySeries: listarSeries({ companyId: this.activeCompany.id }),
+                canManageCompanySettings: this.canManageCompanySettings(),
+                companyFormError: this.settingsErrorMessage,
+                companyFormSavedNotice: this.settingsSavedNotice,
+                showRequestAgtSeriesForm: this.showRequestAgtSeriesForm,
+                confirmFinalizeSeriesId: this.confirmFinalizeSeriesId,
+                agtSeriesErrorMessage: this.agtSeriesErrorMessage,
+                agtSeriesSuccessMessage: this.agtSeriesSuccessMessage,
+                showEstablishmentForm: this.showEstablishmentForm,
+                editingEstablishment: this.editingEstablishment,
+                establishmentError: this.establishmentError,
+                showWarehouseForm: this.showWarehouseForm,
+                editingWarehouse: this.editingWarehouse,
+                warehouseError: this.warehouseError,
                 isOnline: this.isOnline,
                 user: this.user,
                 mobileTab: this.mobileTab,
@@ -10378,7 +10886,7 @@ export class SilaBillingApp {
 
     const matchingCustomers = filterCustomersSmart(this.customers, this.posCustomerSearch);
 
-    const cacheKey = `${liveInvoice.number}|${liveInvoice.grandTotal.toFixed(2)}|${this.settings.company.nif}`;
+    const cacheKey = this.getInvoiceQrCacheKey(liveInvoice);
     const cachedQr = this.qrCache.get(cacheKey) || '';
     if (liveInvoice.lines.length > 0 && !cachedQr) {
       this.ensureQrForInvoice(liveInvoice);
@@ -14695,6 +15203,7 @@ export class SilaBillingApp {
           unitPrice: item.line.unitPrice,
           discountPct: item.line.discountPct,
           ivaRate: item.line.ivaRate,
+          ...(item.line.exemptionCode ? { exemptionCode: item.line.exemptionCode } : {}),
         });
       }
     }
@@ -14706,14 +15215,30 @@ export class SilaBillingApp {
     }
 
     const ncTotals = calculateInvoiceTotals(draftItems, originInv.globalDiscountPct || 0);
+    const activeEnv =
+      originInv.seriesEnvironment ||
+      this.activeCompany.profile.agtEnvironment ||
+      this.settings.agtEnvironment ||
+      'SIMULACAO';
+    const activeEst = resolveActiveEstablishment(
+      this.settings.company,
+      originInv.establishmentId || this.settings.defaultEstablishmentId
+    );
     let nextNumber = generateNextInvoiceNumber(
       this.invoices.map((i) => i.number),
       'NC',
       this.activeCompany.baseSequence
     );
+    let reservedNcSeries: ProximoNumeroFiscalResult | null = null;
     try {
-      const agtNc = reservarProximoNumeroFiscal(this.activeCompany.id, 'NC');
-      nextNumber = agtNc.documentNo;
+      reservedNcSeries = reservarProximoNumeroFiscal(
+        this.activeCompany.id,
+        'NC',
+        undefined,
+        undefined,
+        { environment: activeEnv, establishmentId: activeEst.id }
+      );
+      nextNumber = reservedNcSeries.documentNo;
     } catch {
       // Mantém fallback sequencial caso série específica NC não tenha sido inicializada
     }
@@ -14744,6 +15269,17 @@ export class SilaBillingApp {
       summaryParts.push(`Crédito cliente: ${formatKzNumber(remainderAfterDebt)} Kz`);
     }
 
+    const ncSnapshot = buildInvoiceIssuerSnapshot(this.settings.company, {
+      companyId: this.activeCompany.id,
+      establishment: activeEst,
+      capturedAtIso: now,
+    });
+    const ncHash4 = computeDocumentSaftHash4({
+      issuedAtIso: now,
+      number: nextNumber,
+      grandTotal: ncTotals.grandTotal,
+    }).hash4;
+
     const ncInvoice: InvoiceRecord = {
       id: `inv_nc_${Date.now()}_${Math.random().toString(36).slice(2, 6)}`,
       companyId: this.activeCompany.id,
@@ -14768,11 +15304,37 @@ export class SilaBillingApp {
         : {}),
       taxBase14: ncTotals.taxBase14,
       taxAmount14: ncTotals.taxAmount14,
+      ...(typeof ncTotals.taxBaseIntermediate === 'number'
+        ? { taxBaseIntermediate: ncTotals.taxBaseIntermediate }
+        : {}),
+      ...(typeof ncTotals.taxAmountIntermediate === 'number'
+        ? { taxAmountIntermediate: ncTotals.taxAmountIntermediate }
+        : {}),
+      ...(typeof ncTotals.taxBaseReduced === 'number'
+        ? { taxBaseReduced: ncTotals.taxBaseReduced }
+        : {}),
+      ...(typeof ncTotals.taxAmountReduced === 'number'
+        ? { taxAmountReduced: ncTotals.taxAmountReduced }
+        : {}),
       taxBase0: ncTotals.taxBase0,
       taxAmount0: 0,
       taxTotal: ncTotals.taxTotal,
       grandTotal: ncTotals.grandTotal,
       amountInWords: ncTotals.amountInWords,
+      issuerSnapshot: ncSnapshot,
+      establishmentId: reservedNcSeries?.establishmentId || activeEst.id,
+      establishmentCode: reservedNcSeries?.establishmentCode || activeEst.code,
+      establishmentName: activeEst.name,
+      ...(reservedNcSeries
+        ? {
+            seriesCode: reservedNcSeries.seriesCode,
+            seriesEnvironment: reservedNcSeries.environment,
+            ...(reservedNcSeries.agtAuthorizationCode
+              ? { agtAuthorizationCode: reservedNcSeries.agtAuthorizationCode }
+              : {}),
+          }
+        : { seriesEnvironment: activeEnv }),
+      saftHash4: ncHash4,
       amountReceived: refundedNow,
       changeAmount: 0,
       ...(refText ? { transferReference: refText } : {}),
@@ -14878,6 +15440,14 @@ export class SilaBillingApp {
       try {
         await ensureCompanyRegisteredCloud(this.activeCompany);
         await createInvoiceCloud(ncInvoice, this.activeCompany);
+        if (reservedNcSeries) {
+          const updatedNcSeries = listarSeries({ companyId: this.activeCompany.id }).find(
+            (s) => s.id === reservedNcSeries!.seriesId
+          );
+          if (updatedNcSeries) {
+            await upsertFiscalSeriesCloud(updatedNcSeries, this.activeCompany).catch(() => null);
+          }
+        }
         await submitInvoiceAudit(ncInvoice, this.activeCompany.id).catch(() => null);
         const syncedNc: InvoiceRecord = { ...ncInvoice, syncState: 'synced', synced: true };
         await localDb.saveInvoice(syncedNc, this.activeCompany.id);
@@ -15345,7 +15915,7 @@ export class SilaBillingApp {
     const active = filtered.find((i) => i.id === this.selectedHistoryId) || filtered[0] || null;
     let cachedQr = '';
     if (active && this.historyRightTab === 'PREVIEW') {
-      const key = `${active.number}|${active.grandTotal.toFixed(2)}|${this.settings.company.nif}`;
+      const key = this.getInvoiceQrCacheKey(active);
       cachedQr = this.qrCache.get(key) || '';
       if (!cachedQr) this.ensureQrForInvoice(active);
     }
@@ -15934,7 +16504,6 @@ export class SilaBillingApp {
   // ==================== 6. CONFIGURAÇÕES, EQUIPA (RBAC) & PLANO COMERCIAL ====================
 
   private renderSettingsWorkspace(): string {
-    const c = this.settings.company;
     const canManage = this.canManageCompanySettings();
     const maxRole = this.getVerifiedMaxRole();
     const effectiveRole = this.getEffectiveRole();
@@ -15944,185 +16513,74 @@ export class SilaBillingApp {
         : maxRole === 'manager'
           ? ['manager', 'cashier']
           : ['cashier'];
+    const companySeries = listarSeries({ companyId: this.activeCompany.id });
 
     return `
       <div class="h-full overflow-y-auto bg-white p-4 sm:p-6">
-        <div class="max-w-3xl space-y-8">
-          <form data-form="settings-form" class="space-y-6">
-            <div class="flex items-center justify-between gap-3 pb-3 border-b border-slate-200">
-              <div>
-                <h1 class="text-sm font-bold text-slate-900">Configurações da Empresa</h1>
-                <p class="text-xs text-slate-500">Identidade fiscal, série documental e predefinições POS / A4.</p>
-              </div>
-              <div class="flex items-center gap-2 shrink-0">
-                <button
-                  type="button"
-                  data-action="reset-settings"
-                  ${!canManage ? 'disabled' : ''}
-                  class="h-9 px-3 rounded-lg border border-slate-200 text-xs font-medium text-slate-600 hover:bg-slate-50 disabled:opacity-40 flex items-center gap-1.5 whitespace-nowrap"
-                >
-                  ${ICONS.reset}
-                  <span>Repor padrão</span>
-                </button>
-                <button
-                  type="submit"
-                  ${!canManage ? 'disabled' : ''}
-                  class="h-9 px-4 rounded-lg bg-slate-900 text-white text-xs font-semibold hover:bg-slate-800 disabled:opacity-40 flex items-center gap-1.5 whitespace-nowrap"
-                >
-                  ${ICONS.check}
-                  <span>${this.settingsSavedNotice ? 'Guardado' : 'Guardar'}</span>
-                </button>
-              </div>
+        <div class="max-w-5xl space-y-6">
+          <div class="flex flex-col sm:flex-row sm:items-center justify-between gap-3 pb-3 border-b border-slate-200">
+            <div>
+              <h1 class="text-sm font-bold text-slate-900">Ficha Mestre da Empresa</h1>
+              <p class="text-xs text-slate-500">
+                Identificação jurídica, enquadramento fiscal AGT, endereço, contactos, logótipo, séries, dados bancários, estabelecimentos e responsáveis.
+              </p>
             </div>
+            <div class="flex items-center gap-2 shrink-0">
+              <button
+                type="button"
+                data-action="reset-settings"
+                ${!canManage ? 'disabled' : ''}
+                class="h-9 px-3 rounded-lg border border-slate-200 text-xs font-medium text-slate-600 hover:bg-slate-50 disabled:opacity-40 flex items-center gap-1.5 whitespace-nowrap"
+              >
+                ${ICONS.reset}
+                <span>Repor padrão</span>
+              </button>
+              <button
+                type="submit"
+                form="settings-form"
+                ${!canManage ? 'disabled' : ''}
+                class="h-9 px-4 rounded-lg bg-slate-900 text-white text-xs font-semibold hover:bg-slate-800 disabled:opacity-40 flex items-center gap-1.5 whitespace-nowrap"
+              >
+                ${ICONS.check}
+                <span>${this.settingsSavedNotice ? 'Guardado' : 'Guardar Ficha Mestre'}</span>
+              </button>
+            </div>
+          </div>
 
-            ${
-              this.settingsErrorMessage
-                ? `<div class="p-3 rounded-lg border border-red-200 bg-red-50 text-xs text-red-700">${escapeHtml(
-                    this.settingsErrorMessage
-                  )}</div>`
-                : ''
-            }
+          ${
+            !canManage
+              ? `<div class="p-3 rounded-lg border border-slate-200 bg-slate-50 text-xs text-slate-600">
+                  Modo de leitura para o perfil <strong>${escapeHtml(
+                    formatRoleLabelPt(effectiveRole)
+                  )}</strong>. Apenas o Proprietário pode alterar os dados fiscais da empresa.
+                </div>`
+              : ''
+          }
 
-            ${
-              !canManage
-                ? `<div class="p-3 rounded-lg border border-slate-200 bg-slate-50 text-xs text-slate-600">
-                    Modo de leitura para o perfil <strong>${escapeHtml(
-                      formatRoleLabelPt(effectiveRole)
-                    )}</strong>. Apenas o Proprietário pode alterar os dados fiscais da empresa.
-                  </div>`
-                : ''
-            }
-
-            <section class="space-y-3">
-              <h2 class="text-xs font-semibold text-slate-900">Identidade Empresarial (1 NIF = 1 Empresa)</h2>
-              <div class="grid grid-cols-1 sm:grid-cols-12 gap-3">
-                <div class="sm:col-span-8">
-                  <label class="block text-[11px] font-medium text-slate-600 mb-1">Designação Social</label>
-                  <input name="legalName" type="text" required maxlength="160" ${!canManage ? 'disabled' : ''} value="${escapeHtml(c.legalName)}" class="w-full h-9 px-2.5 text-xs bg-slate-50 border border-slate-200 rounded-md focus:outline-none focus:border-blue-600 disabled:opacity-60" />
-                </div>
-                <div class="sm:col-span-4">
-                  <label class="block text-[11px] font-medium text-slate-600 mb-1">Nome Curto / Marca</label>
-                  <input name="shortName" type="text" required maxlength="64" ${!canManage ? 'disabled' : ''} value="${escapeHtml(c.shortName)}" class="w-full h-9 px-2.5 text-xs bg-slate-50 border border-slate-200 rounded-md focus:outline-none focus:border-blue-600 disabled:opacity-60" />
-                </div>
-                <div class="sm:col-span-4">
-                  <label class="block text-[11px] font-medium text-slate-600 mb-1">NIF (Contribuinte Único)</label>
-                  <input name="nif" type="text" required maxlength="32" ${!canManage ? 'disabled' : ''} value="${escapeHtml(c.nif)}" class="w-full h-9 px-2.5 text-xs font-mono tabular-nums bg-slate-50 border border-slate-200 rounded-md focus:outline-none focus:border-blue-600 disabled:opacity-60" />
-                </div>
-                <div class="sm:col-span-4">
-                  <label class="block text-[11px] font-medium text-slate-600 mb-1">Telefone</label>
-                  <input name="phone" type="text" maxlength="40" ${!canManage ? 'disabled' : ''} value="${escapeHtml(c.phone)}" class="w-full h-9 px-2.5 text-xs font-mono tabular-nums bg-slate-50 border border-slate-200 rounded-md focus:outline-none focus:border-blue-600 disabled:opacity-60" />
-                </div>
-                <div class="sm:col-span-4">
-                  <label class="block text-[11px] font-medium text-slate-600 mb-1">Email</label>
-                  <input name="email" type="email" maxlength="120" ${!canManage ? 'disabled' : ''} value="${escapeHtml(c.email)}" class="w-full h-9 px-2.5 text-xs bg-slate-50 border border-slate-200 rounded-md focus:outline-none focus:border-blue-600 disabled:opacity-60" />
-                </div>
-                <div class="sm:col-span-5">
-                  <label class="block text-[11px] font-medium text-slate-600 mb-1">Endereço Fiscal</label>
-                  <input name="address" type="text" required maxlength="160" ${!canManage ? 'disabled' : ''} value="${escapeHtml(c.address)}" class="w-full h-9 px-2.5 text-xs bg-slate-50 border border-slate-200 rounded-md focus:outline-none focus:border-blue-600 disabled:opacity-60" />
-                </div>
-                <div class="sm:col-span-3">
-                  <label class="block text-[11px] font-medium text-slate-600 mb-1">Localidade / País</label>
-                  <input name="cityCountry" type="text" required maxlength="80" ${!canManage ? 'disabled' : ''} value="${escapeHtml(c.cityCountry || 'Angola')}" class="w-full h-9 px-2.5 text-xs bg-slate-50 border border-slate-200 rounded-md focus:outline-none focus:border-blue-600 disabled:opacity-60" />
-                </div>
-                <div class="sm:col-span-4">
-                  <label class="block text-[11px] font-medium text-slate-600 mb-1">Assinatura / Rodapé</label>
-                  <input name="tagline" type="text" maxlength="120" ${!canManage ? 'disabled' : ''} value="${escapeHtml(c.tagline)}" class="w-full h-9 px-2.5 text-xs bg-slate-50 border border-slate-200 rounded-md focus:outline-none focus:border-blue-600 disabled:opacity-60" />
-                </div>
-              </div>
-            </section>
-
-            <section class="space-y-3 pt-4 border-t border-slate-200">
-              <h2 class="text-xs font-semibold text-slate-900">Caixa e Emissão</h2>
-              <div class="grid grid-cols-2 sm:grid-cols-12 gap-3">
-                <div class="col-span-1 sm:col-span-3">
-                  <label class="block text-[11px] font-medium text-slate-600 mb-1">Caixa Padrão</label>
-                  <input name="defaultCashier" type="text" required maxlength="16" ${!canManage ? 'disabled' : ''} value="${escapeHtml(this.settings.defaultCashier)}" class="w-full h-9 px-2.5 text-xs font-mono bg-slate-50 border border-slate-200 rounded-md focus:outline-none focus:border-blue-600 disabled:opacity-60" />
-                </div>
-                <div class="col-span-1 sm:col-span-3">
-                  <label class="block text-[11px] font-medium text-slate-600 mb-1">Operador(a) Padrão</label>
-                  <input name="defaultOperator" type="text" required maxlength="32" ${!canManage ? 'disabled' : ''} value="${escapeHtml(this.settings.defaultOperator)}" class="w-full h-9 px-2.5 text-xs font-mono bg-slate-50 border border-slate-200 rounded-md focus:outline-none focus:border-blue-600 disabled:opacity-60" />
-                </div>
-                <div class="col-span-1 sm:col-span-3">
-                  <label class="block text-[11px] font-medium text-slate-600 mb-1">Tipo de Documento</label>
-                  <select name="defaultDocType" ${!canManage ? 'disabled' : ''} class="w-full h-9 px-2.5 text-xs bg-slate-50 border border-slate-200 rounded-md focus:outline-none focus:border-blue-600 disabled:opacity-60">
-                    <option value="FR" ${this.settings.defaultDocType === 'FR' ? 'selected' : ''}>Factura / Recibo</option>
-                    <option value="FP" ${this.settings.defaultDocType === 'FP' ? 'selected' : ''}>Factura Proforma</option>
-                  </select>
-                </div>
-                <div class="col-span-1 sm:col-span-3">
-                  <label class="block text-[11px] font-medium text-slate-600 mb-1">Formato Preferencial</label>
-                  <select name="defaultFormat" ${!canManage ? 'disabled' : ''} class="w-full h-9 px-2.5 text-xs bg-slate-50 border border-slate-200 rounded-md focus:outline-none focus:border-blue-600 disabled:opacity-60">
-                    <option value="POS" ${this.settings.defaultFormat === 'POS' ? 'selected' : ''}>POS Térmico 80mm</option>
-                    <option value="A4" ${this.settings.defaultFormat === 'A4' ? 'selected' : ''}>Fatura A4</option>
-                  </select>
-                </div>
-                <div class="col-span-2 sm:col-span-8">
-                  <label class="block text-[11px] font-medium text-slate-600 mb-1">Observação Padrão</label>
-                  <input name="defaultNotes" type="text" maxlength="300" ${!canManage ? 'disabled' : ''} value="${escapeHtml(this.settings.defaultNotes)}" class="w-full h-9 px-2.5 text-xs bg-slate-50 border border-slate-200 rounded-md focus:outline-none focus:border-blue-600 disabled:opacity-60" />
-                </div>
-                <div class="col-span-2 sm:col-span-4 flex items-end">
-                  <label class="flex items-center gap-2 h-9 text-xs text-slate-700 cursor-pointer select-none">
-                    <input name="autoPrintOnEmit" type="checkbox" ${!canManage ? 'disabled' : ''} ${this.settings.autoPrintOnEmit ? 'checked' : ''} class="h-4 w-4 rounded border-slate-300 text-blue-600" />
-                    <span>Imprimir ao clicar em Emitir</span>
-                  </label>
-                </div>
-                <div class="col-span-1 sm:col-span-6">
-                  <label class="block text-[11px] font-medium text-slate-600 mb-1">
-                    Limite Máximo de Desconto para Caixa (%)
-                  </label>
-                  <input
-                    name="maxCashierDiscountPct"
-                    type="number"
-                    min="0"
-                    max="100"
-                    step="0.5"
-                    ${!canManage ? 'disabled' : ''}
-                    value="${this.settings.maxCashierDiscountPct ?? 5}"
-                    class="w-full h-9 px-2.5 text-xs font-mono bg-slate-50 border border-slate-200 rounded-md focus:outline-none focus:border-blue-600 disabled:opacity-60"
-                  />
-                  <span class="text-[10px] text-slate-500">Descontos de linha ou globais acima deste valor exigem autorização com PIN de Supervisor.</span>
-                </div>
-                <div class="col-span-1 sm:col-span-6">
-                  <label class="block text-[11px] font-medium text-slate-600 mb-1">
-                    Código PIN do Supervisor
-                  </label>
-                  <input
-                    name="supervisorPin"
-                    type="password"
-                    maxlength="16"
-                    placeholder="Ex: 1234 (Predefinido: 1234)"
-                    ${!canManage ? 'disabled' : ''}
-                    value="${escapeHtml(this.settings.supervisorPin || '')}"
-                    class="w-full h-9 px-2.5 text-xs font-mono tracking-widest bg-slate-50 border border-slate-200 rounded-md focus:outline-none focus:border-blue-600 disabled:opacity-60"
-                  />
-                  <span class="text-[10px] text-slate-500">Utilizado para autorizar descontos especiais e anulações quando operado por caixas.</span>
-                </div>
-                <div class="col-span-2 sm:col-span-12 pt-1 space-y-2">
-                  <label class="flex items-center gap-2 text-xs text-slate-700 cursor-pointer select-none">
-                    <input
-                      name="allowCashierPriceEdit"
-                      type="checkbox"
-                      ${!canManage ? 'disabled' : ''}
-                      ${this.settings.allowCashierPriceEdit ? 'checked' : ''}
-                      class="h-4 w-4 rounded border-slate-300 text-blue-600"
-                    />
-                    <span>Autorizar Operadores de Caixa a alterar o preço unitário no POS (por defeito apenas Proprietário e Gerente)</span>
-                  </label>
-                  <label class="flex items-center gap-2 text-xs text-slate-700 cursor-pointer select-none">
-                    <input
-                      name="hidePromotionalFooter"
-                      type="checkbox"
-                      data-field="toggle-clean-footer"
-                      ${!canManage ? 'disabled' : ''}
-                      ${!shouldShowViralDocumentFooter(this.activeCompany, this.settings) ? 'checked' : ''}
-                      class="h-4 w-4 rounded border-slate-300 text-blue-600"
-                    />
-                    <span>Emitir talões POS 80mm e faturas A4 sem a linha institucional "Processado por SILA-Billing · VITRONIS"</span>
-                  </label>
-                </div>
-              </div>
-            </section>
-          </form>
+          ${renderCompanyMasterSection({
+            mode: 'DESKTOP',
+            company: this.activeCompany,
+            settings: this.settings,
+            draftProfile: this.companyMasterDraftProfile,
+            draftSettings: this.companyMasterDraftSettings,
+            series: companySeries,
+            canManage,
+            activeSection: this.companyMasterSection,
+            formId: 'settings-form',
+            showRequestAgtSeriesForm: this.showRequestAgtSeriesForm,
+            confirmFinalizeSeriesId: this.confirmFinalizeSeriesId,
+            agtSeriesErrorMessage: this.agtSeriesErrorMessage,
+            agtSeriesSuccessMessage: this.agtSeriesSuccessMessage,
+            showEstablishmentForm: this.showEstablishmentForm,
+            editingEstablishment: this.editingEstablishment,
+            establishmentError: this.establishmentError,
+            showWarehouseForm: this.showWarehouseForm,
+            editingWarehouse: this.editingWarehouse,
+            warehouseError: this.warehouseError,
+            errorMessage: this.settingsErrorMessage,
+            savedNotice: this.settingsSavedNotice,
+            operator: this.operator,
+          })}
 
           <!-- Permissões por Empresa e Perfil Operacional no Terminal -->
           <section class="space-y-4 pt-6 border-t border-slate-200">
@@ -16312,9 +16770,6 @@ export class SilaBillingApp {
             }
           </section>
 
-          <!-- Séries Fiscais AGT (Decreto Executivo n.º 683/25) -->
-          ${this.renderAgtSeriesSettingsSection()}
-
           <!-- Entidade Institucional & Recursos Empresariais -->
           <section class="space-y-3 pt-6 border-t border-slate-200">
             <div class="flex flex-col sm:flex-row sm:items-center justify-between gap-2">
@@ -16355,171 +16810,6 @@ export class SilaBillingApp {
           </section>
         </div>
       </div>
-    `;
-  }
-
-  private renderAgtSeriesSettingsSection(): string {
-    const seriesList = listarSeries({ companyId: this.activeCompany.id });
-    const canManage = this.canManageCompanySettings();
-    const currentYear = new Date().getFullYear();
-
-    return `
-      <!-- Séries Fiscais AGT (Decreto Executivo n.º 683/25) -->
-      <section class="space-y-4 pt-6 border-t border-slate-200">
-        <div class="flex flex-col sm:flex-row sm:items-center justify-between gap-3">
-          <div>
-            <div class="flex items-center gap-2">
-              <h2 class="text-xs font-semibold text-slate-900">Séries Fiscais AGT (Decreto Executivo n.º 683/25)</h2>
-              <span class="text-[10px] font-mono px-1.5 py-0.5 rounded bg-emerald-50 text-emerald-800 border border-emerald-200 font-semibold">Conformidade AGT</span>
-            </div>
-            <p class="text-xs text-slate-500">
-              Controlo estrito de séries e sequencialidade ininterrupta. Ciclo de vida: <strong>A</strong> (Ativa), <strong>U</strong> (Em Uso) e <strong>F</strong> (Finalizada).
-            </p>
-          </div>
-          ${
-            canManage
-              ? `<button
-                  type="button"
-                  data-action="open-request-agt-series-form"
-                  class="h-8 px-3 rounded-md bg-slate-900 text-white text-xs font-semibold hover:bg-slate-800 flex items-center gap-1.5 whitespace-nowrap self-start sm:self-auto transition-colors"
-                >
-                  ${ICONS.plus}
-                  <span>Solicitar Série à AGT</span>
-                </button>`
-              : ''
-          }
-        </div>
-
-        ${
-          this.agtSeriesSuccessMessage
-            ? `<div class="p-3 rounded-lg border border-emerald-200 bg-emerald-50 text-xs text-emerald-800 flex items-center justify-between">
-                <span>${escapeHtml(this.agtSeriesSuccessMessage)}</span>
-                <button type="button" data-action="close-request-agt-series-form" class="text-emerald-700 hover:text-emerald-900 font-bold ml-2">✕</button>
-              </div>`
-            : ''
-        }
-
-        ${
-          this.agtSeriesErrorMessage
-            ? `<div class="p-3 rounded-lg border border-red-200 bg-red-50 text-xs text-red-700 flex items-center justify-between">
-                <span>${escapeHtml(this.agtSeriesErrorMessage)}</span>
-                <button type="button" data-action="close-request-agt-series-form" class="text-red-700 hover:text-red-900 font-bold ml-2">✕</button>
-              </div>`
-            : ''
-        }
-
-        ${
-          this.showRequestAgtSeriesForm && canManage
-            ? `<form data-form="request-agt-series-form" class="p-4 rounded-lg border border-blue-200 bg-blue-50/50 space-y-3">
-                <div class="flex items-center justify-between border-b border-blue-200/80 pb-2">
-                  <div class="text-xs font-bold text-slate-900">Solicitação Formal de Série à AGT</div>
-                  <button type="button" data-action="close-request-agt-series-form" class="text-slate-400 hover:text-slate-700">${ICONS.close}</button>
-                </div>
-                <div class="text-[11px] text-slate-600">
-                  Nota legal: Conforme Decreto Executivo n.º 683/25, séries para novo ano fiscal só podem ser formalmente solicitadas a partir de 15 de Dezembro.
-                </div>
-                <div class="grid grid-cols-1 sm:grid-cols-12 gap-3">
-                  <div class="sm:col-span-4">
-                    <label class="block text-[10px] font-medium text-slate-700 mb-1">Tipo de Documento Fiscal</label>
-                    <select name="documentType" required class="w-full h-8 px-2 text-xs bg-white border border-slate-300 rounded focus:outline-none focus:border-blue-600">
-                      ${Object.values(AGT_DOCUMENT_TYPES)
-                        .map(
-                          (t) =>
-                            `<option value="${t.code}" ${t.code === 'FR' ? 'selected' : ''}>${t.code} — ${escapeHtml(
-                              t.shortName
-                            )}</option>`
-                        )
-                        .join('')}
-                    </select>
-                  </div>
-                  <div class="sm:col-span-3">
-                    <label class="block text-[10px] font-medium text-slate-700 mb-1">Código da Série</label>
-                    <input name="seriesCode" type="text" required maxlength="10" placeholder="Ex: A${currentYear}" value="A${currentYear}" class="w-full h-8 px-2 text-xs font-mono uppercase bg-white border border-slate-300 rounded focus:outline-none focus:border-blue-600" />
-                  </div>
-                  <div class="sm:col-span-2">
-                    <label class="block text-[10px] font-medium text-slate-700 mb-1">Ano Fiscal</label>
-                    <input name="seriesYear" type="number" required min="${currentYear}" max="${currentYear + 1}" value="${currentYear}" class="w-full h-8 px-2 text-xs font-mono bg-white border border-slate-300 rounded focus:outline-none focus:border-blue-600" />
-                  </div>
-                  <div class="sm:col-span-3">
-                    <label class="block text-[10px] font-medium text-slate-700 mb-1">1.º N.º Documento</label>
-                    <input name="firstDocumentNumber" type="number" required min="1" value="1" class="w-full h-8 px-2 text-xs font-mono bg-white border border-slate-300 rounded focus:outline-none focus:border-blue-600" />
-                  </div>
-                  <div class="sm:col-span-12 flex items-center justify-end gap-2 pt-2">
-                    <button type="button" data-action="close-request-agt-series-form" class="h-8 px-3 rounded border border-slate-300 bg-white text-xs font-medium text-slate-700 hover:bg-slate-50">Cancelar</button>
-                    <button type="submit" class="h-8 px-4 rounded bg-blue-600 text-white text-xs font-semibold hover:bg-blue-700 transition-colors">Submeter à AGT</button>
-                  </div>
-                </div>
-              </form>`
-            : ''
-        }
-
-        <div class="border border-slate-200 rounded-lg overflow-hidden">
-          <table class="w-full text-left border-collapse text-xs">
-            <thead class="bg-slate-50 border-b border-slate-200 text-[11px] text-slate-500">
-              <tr>
-                <th class="py-2.5 px-3 font-medium">Documento</th>
-                <th class="py-2.5 px-3 font-medium">Série</th>
-                <th class="py-2.5 px-3 font-medium">Ano</th>
-                <th class="py-2.5 px-3 font-medium font-mono tabular-nums">1.º N.º</th>
-                <th class="py-2.5 px-3 font-medium font-mono tabular-nums">Último Emitido</th>
-                <th class="py-2.5 px-3 font-medium">Autorização AGT</th>
-                <th class="py-2.5 px-3 font-medium">Estado</th>
-                <th class="py-2.5 px-3 font-medium text-right">Ação</th>
-              </tr>
-            </thead>
-            <tbody class="divide-y divide-slate-100 font-mono tabular-nums">
-              ${
-                seriesList.length === 0
-                  ? `<tr><td colspan="8" class="py-4 px-3 text-xs text-slate-500 text-center font-sans">Nenhuma série registada para esta empresa. Clique em "Solicitar Série à AGT" para provisionar as séries iniciais.</td></tr>`
-                  : seriesList
-                      .map((s) => {
-                        const statusBadge =
-                          s.status === 'A'
-                            ? `<span class="px-2 py-0.5 rounded text-[10px] font-bold bg-blue-50 text-blue-800 border border-blue-200 font-sans">A (Ativa)</span>`
-                            : s.status === 'U'
-                              ? `<span class="px-2 py-0.5 rounded text-[10px] font-bold bg-emerald-50 text-emerald-800 border border-emerald-200 font-sans">U (Em Uso)</span>`
-                              : `<span class="px-2 py-0.5 rounded text-[10px] font-bold bg-slate-100 text-slate-700 border border-slate-300 font-sans">F (Finalizada)</span>`;
-
-                        const docMeta = AGT_DOCUMENT_TYPES[s.documentType];
-                        const docLabel = docMeta ? `${s.documentType} - ${docMeta.shortName}` : s.documentType;
-
-                        return `
-                        <tr class="hover:bg-slate-50/50">
-                          <td class="py-2 px-3 font-sans font-medium text-slate-900">${escapeHtml(docLabel)}</td>
-                          <td class="py-2 px-3 font-bold text-slate-800">${escapeHtml(s.seriesCode)}</td>
-                          <td class="py-2 px-3 text-slate-600">${s.seriesYear}</td>
-                          <td class="py-2 px-3 text-slate-600">${String(s.firstDocumentNumber).padStart(6, '0')}</td>
-                          <td class="py-2 px-3 font-bold ${s.lastDocumentNumber > 0 ? 'text-blue-700' : 'text-slate-400'}">
-                            ${s.lastDocumentNumber > 0 ? String(s.lastDocumentNumber).padStart(6, '0') : 'Nenhum'}
-                          </td>
-                          <td class="py-2 px-3 text-[10px] text-slate-500 truncate max-w-[140px]" title="${escapeHtml(s.agtAuthorizationCode || '')}">
-                            ${escapeHtml(s.agtAuthorizationCode || '—')}
-                          </td>
-                          <td class="py-2 px-3">${statusBadge}</td>
-                          <td class="py-2 px-3 text-right font-sans">
-                            ${
-                              canManage && s.status !== 'F'
-                                ? `<button
-                                    type="button"
-                                    data-action="finalize-agt-series"
-                                    data-id="${escapeHtml(s.id)}"
-                                    class="text-[11px] text-amber-700 hover:text-amber-900 font-semibold px-2 py-1 rounded hover:bg-amber-50 transition-colors whitespace-nowrap"
-                                    title="Encerrar formalmente esta série impedindo novos documentos"
-                                  >
-                                    Finalizar ('F')
-                                  </button>`
-                                : `<span class="text-[11px] text-slate-400">—</span>`
-                            }
-                          </td>
-                        </tr>
-                      `;
-                      })
-                      .join('')
-              }
-            </tbody>
-          </table>
-        </div>
-      </section>
     `;
   }
 

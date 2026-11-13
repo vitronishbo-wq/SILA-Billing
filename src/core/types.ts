@@ -1,9 +1,16 @@
+import type { AgtIvaExemptionCode, AgtIvaTaxCode, AgtSeriesEnvironment } from './fiscalTypes.ts';
+
 export type TaxRate = 0 | 1 | 5 | 7 | 14;
 export type DirectPaymentMethod = 'Dinheiro' | 'Multicaixa' | 'Transferência';
 export type PaymentMethod = DirectPaymentMethod | 'Crédito' | 'Combinado';
-export type DocumentType = 'FR' | 'FP' | 'NC';
+export type DocumentType = 'FR' | 'FA' | 'FP' | 'NC' | 'ND' | 'RC' | 'FT' | 'CS';
 export type DocumentFormat = 'POS' | 'A4';
 export type InvoiceStatus = 'issued' | 'cancelled';
+
+export type AngolaTaxRegime = 'GERAL' | 'SIMPLIFICADO' | 'EXCLUSAO';
+export type AngolaLegalNature = 'LDA' | 'SU_LDA' | 'SA' | 'ENI' | 'COOP' | 'OUTRA';
+export type AgtOperationEnvironment = 'SIMULACAO' | 'PRODUCAO';
+export type AngolaTaxTerritory = 'AO' | 'AO-CAB';
 
 export interface PaymentSplit {
   method: DirectPaymentMethod;
@@ -47,34 +54,135 @@ export type GrowthTriggerReason =
   | 'clean_footer'
   | 'team_access';
 
-export interface CompanyProfile {
+export interface EstablishmentRecord {
+  id: string;
+  code: string; // Ex: '001', 'MATRIZ', 'FILIAL_01'
+  name: string;
+  isHeadquarters: boolean;
+  address: string;
+  municipality?: string;
+  province?: string;
+  phone?: string;
+  email?: string;
+  defaultCashierCode?: string;
+  defaultWarehouseId?: string;
+  active: boolean;
+}
+
+export interface WarehouseRecord {
+  id: string;
+  code: string;
+  name: string;
+  establishmentId: string;
+  address?: string;
+  active: boolean;
+}
+
+export interface InvoiceIssuerSnapshot {
+  companyId: string;
   legalName: string;
   shortName: string;
   nif: string;
-  address: string;
-  cityCountry: string;
-  phone: string;
-  email: string;
-  tagline: string;
-  // Contactos complementares
-  mobile?: string;
-  whatsapp?: string;
-  website?: string;
-  province?: string;
-  postalCode?: string;
-  // Logótipo
-  logoUrl?: string;
-  // Dados Fiscais e Jurídicos
-  taxRegime?: 'GERAL' | 'SIMPLIFICADO' | 'EXCLUSAO';
+  taxRegime: AngolaTaxRegime;
   taxOffice?: string;
   commercialRegistry?: string;
   shareCapital?: string;
-  defaultWithholdingTax?: number;
-  // Coordenadas Bancárias
+  cae?: string;
+  address: string;
+  municipality?: string;
+  province?: string;
+  cityCountry: string;
+  postalCode?: string;
+  phone: string;
+  mobile?: string;
+  whatsapp?: string;
+  email: string;
+  billingEmail?: string;
+  website?: string;
+  tagline: string;
+  logoUrl?: string;
+  showLogoOnPos?: boolean;
+  showLogoOnA4?: boolean;
   bankName1?: string;
   iban1?: string;
+  accountHolder1?: string;
+  swift1?: string;
   bankName2?: string;
   iban2?: string;
+  accountHolder2?: string;
+  swift2?: string;
+  multicaixaExpressPhone?: string;
+  establishmentId?: string;
+  establishmentCode?: string;
+  establishmentName?: string;
+  establishmentAddress?: string;
+  legalRepresentativeName?: string;
+  legalRepresentativeRole?: string;
+  capturedAtIso: string;
+}
+
+export interface CompanyProfile {
+  // 1. Identificação Jurídica e Comercial
+  legalName: string;
+  shortName: string;
+  legalNature?: AngolaLegalNature;
+  cae?: string;
+  commercialRegistry?: string;
+  shareCapital?: string;
+  tagline: string;
+  // 2. Identificação e Enquadramento Fiscal Angolano
+  nif: string;
+  taxRegime?: AngolaTaxRegime;
+  taxOffice?: string;
+  taxEntity?: string;
+  defaultExemptionCode?: AgtIvaExemptionCode;
+  isVatRetentionAgent?: boolean;
+  defaultWithholdingTax?: number;
+  specialTaxTerritory?: AngolaTaxTerritory;
+  agtEnvironment?: AgtOperationEnvironment;
+  activityStartDate?: string;
+  // 3. Endereço Fiscal e Comercial
+  address: string;
+  municipality?: string;
+  province?: string;
+  cityCountry: string;
+  postalCode?: string;
+  country?: string;
+  // 4. Contactos Institucionais
+  phone: string;
+  mobile?: string;
+  whatsapp?: string;
+  email: string;
+  billingEmail?: string;
+  website?: string;
+  // 5. Identidade Visual
+  logoUrl?: string;
+  showLogoOnPos?: boolean;
+  showLogoOnA4?: boolean;
+  // 6. Dados Bancários e Meios de Pagamento
+  bankName1?: string;
+  iban1?: string;
+  accountHolder1?: string;
+  swift1?: string;
+  bankName2?: string;
+  iban2?: string;
+  accountHolder2?: string;
+  swift2?: string;
+  multicaixaExpressPhone?: string;
+  defaultPaymentTermsDays?: number;
+  // 7. Estabelecimentos, Caixas e Armazéns
+  establishments?: EstablishmentRecord[];
+  warehouses?: WarehouseRecord[];
+  defaultEstablishmentId?: string;
+  // 8. Representantes e Responsáveis
+  legalRepresentativeName?: string;
+  legalRepresentativeRole?: string;
+  legalRepresentativeNif?: string;
+  legalRepresentativePhone?: string;
+  accountantName?: string;
+  accountantOcpcaNumber?: string;
+  accountantEmail?: string;
+  accountantPhone?: string;
 }
 
 export const NEUTRAL_PLATFORM_PROFILE: CompanyProfile = {
@@ -83,21 +191,183 @@ export const NEUTRAL_PLATFORM_PROFILE: CompanyProfile = {
   nif: '---',
   address: 'Angola',
   cityCountry: 'Luanda - Angola',
+  country: 'AO',
   phone: '',
   email: '',
   tagline: 'Obrigado pela preferência',
+  taxRegime: 'GERAL',
+  agtEnvironment: 'SIMULACAO',
 };
 
 export const JAIMONA_COMPANY: CompanyProfile = {
   legalName: 'JAIMONA-COMÉRCIO E SERVIÇOS, (SU) LDA',
   shortName: 'JAIMONA',
+  legalNature: 'SU_LDA',
   nif: '5003069940',
+  taxRegime: 'GERAL',
   address: 'Rua Fapla, Bairro Verde A – Saurimo',
+  municipality: 'Saurimo',
+  province: 'Lunda Sul',
   cityCountry: 'Saurimo - Angola',
+  country: 'AO',
   phone: '(+244) 943671515',
   email: JAIMONA_OWNER_EMAIL,
   tagline: 'Servimos com Qualidade',
+  agtEnvironment: 'SIMULACAO',
 };
+
+export function createDefaultEstablishmentForCompany(
+  profile: Pick<CompanyProfile, 'address' | 'municipality' | 'province' | 'cityCountry' | 'phone' | 'email' | 'shortName'>,
+  establishmentId = 'est_matriz'
+): EstablishmentRecord {
+  const fallbackCity = profile.cityCountry
+    ? profile.cityCountry.split('-')[0]!.trim()
+    : 'Luanda';
+  return {
+    id: establishmentId,
+    code: '001',
+    name: `${(profile.shortName || 'Sede').trim()} · Sede / Loja Principal`,
+    isHeadquarters: true,
+    address: profile.address || 'Angola',
+    municipality: profile.municipality || fallbackCity,
+    province: profile.province || fallbackCity,
+    phone: profile.phone || '',
+    email: profile.email || '',
+    defaultCashierCode: '01',
+    defaultWarehouseId: 'armazem_principal',
+    active: true,
+  };
+}
+
+export function buildInvoiceIssuerSnapshot(
+  profile: CompanyProfile,
+  options?: {
+    companyId?: string;
+    establishment?: EstablishmentRecord | null;
+    capturedAtIso?: string;
+  }
+): InvoiceIssuerSnapshot {
+  const est =
+    options?.establishment ||
+    profile.establishments?.find((e) => e.id === profile.defaultEstablishmentId) ||
+    profile.establishments?.find((e) => e.isHeadquarters && e.active) ||
+    profile.establishments?.find((e) => e.active) ||
+    createDefaultEstablishmentForCompany(profile);
+
+  return {
+    companyId: options?.companyId || '',
+    legalName: profile.legalName,
+    shortName: profile.shortName,
+    nif: profile.nif,
+    taxRegime: profile.taxRegime || 'GERAL',
+    taxOffice: profile.taxOffice,
+    commercialRegistry: profile.commercialRegistry,
+    shareCapital: profile.shareCapital,
+    cae: profile.cae,
+    address: profile.address,
+    municipality: profile.municipality,
+    province: profile.province,
+    cityCountry: profile.cityCountry,
+    postalCode: profile.postalCode,
+    phone: profile.phone,
+    mobile: profile.mobile,
+    whatsapp: profile.whatsapp,
+    email: profile.email,
+    billingEmail: profile.billingEmail,
+    website: profile.website,
+    tagline: profile.tagline,
+    logoUrl: profile.logoUrl,
+    showLogoOnPos: profile.showLogoOnPos,
+    showLogoOnA4: profile.showLogoOnA4,
+    bankName1: profile.bankName1,
+    iban1: profile.iban1,
+    accountHolder1: profile.accountHolder1,
+    swift1: profile.swift1,
+    bankName2: profile.bankName2,
+    iban2: profile.iban2,
+    accountHolder2: profile.accountHolder2,
+    swift2: profile.swift2,
+    multicaixaExpressPhone: profile.multicaixaExpressPhone,
+    establishmentId: est.id,
+    establishmentCode: est.code,
+    establishmentName: est.name,
+    establishmentAddress: est.address,
+    legalRepresentativeName: profile.legalRepresentativeName,
+    legalRepresentativeRole: profile.legalRepresentativeRole,
+    capturedAtIso: options?.capturedAtIso || new Date().toISOString(),
+  };
+}
+
+export function formatDocumentTypeLabelPt(docType: DocumentType | string): string {
+  switch (String(docType || '').toUpperCase()) {
+    case 'FR':
+      return 'Factura / Recibo';
+    case 'FA':
+      return 'Factura';
+    case 'FP':
+      return 'Factura Proforma';
+    case 'NC':
+      return 'Nota de Crédito';
+    case 'ND':
+      return 'Nota de Débito';
+    case 'RC':
+      return 'Recibo';
+    case 'FT':
+      return 'Factura de Transporte / Guia';
+    case 'CS':
+      return 'Comprovativo de Saída';
+    default:
+      return 'Factura / Recibo';
+  }
+}
+
+export function resolveCompanyProfileFromSnapshot(
+  invoice?: Pick<InvoiceRecord, 'issuerSnapshot'> | null,
+  fallbackCompany: CompanyProfile = NEUTRAL_PLATFORM_PROFILE
+): CompanyProfile {
+  const snap = invoice?.issuerSnapshot;
+  if (!snap || !snap.legalName || !snap.nif) {
+    return fallbackCompany;
+  }
+
+  return {
+    ...fallbackCompany,
+    legalName: snap.legalName,
+    shortName: snap.shortName || snap.legalName,
+    nif: snap.nif,
+    taxRegime: snap.taxRegime || fallbackCompany.taxRegime || 'GERAL',
+    taxOffice: snap.taxOffice,
+    commercialRegistry: snap.commercialRegistry,
+    shareCapital: snap.shareCapital,
+    cae: snap.cae,
+    address: snap.address,
+    municipality: snap.municipality,
+    province: snap.province,
+    cityCountry: snap.cityCountry || fallbackCompany.cityCountry,
+    postalCode: snap.postalCode,
+    phone: snap.phone,
+    mobile: snap.mobile,
+    whatsapp: snap.whatsapp,
+    email: snap.email,
+    billingEmail: snap.billingEmail,
+    website: snap.website,
+    tagline: snap.tagline,
+    logoUrl: snap.logoUrl,
+    showLogoOnPos: snap.showLogoOnPos,
+    showLogoOnA4: snap.showLogoOnA4,
+    bankName1: snap.bankName1,
+    iban1: snap.iban1,
+    accountHolder1: snap.accountHolder1,
+    swift1: snap.swift1,
+    bankName2: snap.bankName2,
+    iban2: snap.iban2,
+    accountHolder2: snap.accountHolder2,
+    swift2: snap.swift2,
+    multicaixaExpressPhone: snap.multicaixaExpressPhone,
+    legalRepresentativeName: snap.legalRepresentativeName,
+    legalRepresentativeRole: snap.legalRepresentativeRole,
+  };
+}
 
 export function isPlatformAdminEmail(email?: string | null): boolean {
   return String(email || '').trim().toLowerCase() === PLATFORM_ADMIN_EMAIL;
@@ -280,6 +550,8 @@ export interface AppSettings {
   defaultDocType: DocumentType;
   defaultNotes: string;
   autoPrintOnEmit: boolean;
+  defaultEstablishmentId?: string;
+  agtEnvironment?: AgtOperationEnvironment;
   hidePromotionalFooter?: boolean;
   allowCashierPriceEdit?: boolean;
   maxCashierDiscountPct?: number; // Limite máx. de desconto permitido a operador de caixa sem PIN de supervisor (ex: 5%)
@@ -362,17 +634,21 @@ export interface ProductPriceChange {
   changedBy: string;
 }
 
+export type ProductType = 'P' | 'S' | 'K'; // P = Produto/Mercadoria, S = Serviço, K = Kit/Composto
+
 export interface Product {
   id: string;
   companyId?: string;
   code: string; // Código interno / SKU
   barcode?: string; // Código de barras EAN / UPC / QR comercial
   name: string;
+  productType?: ProductType;
   category: string;
   unit: string;
   costPrice?: number; // Preço de aquisição em Kwanzas (Kz)
   price: number; // Preço unitário de venda em Kwanzas (Kz)
   ivaRate: TaxRate;
+  exemptionCode?: AgtIvaExemptionCode;
   exemptionReason: string;
   active: boolean;
   trackStock?: boolean;
@@ -411,6 +687,7 @@ export interface CartDraftItem {
   unitPrice: number;
   discountPct: number;
   ivaRate: TaxRate;
+  exemptionCode?: AgtIvaExemptionCode;
 }
 
 export interface CalculatedLineItem extends CartDraftItem {
@@ -423,6 +700,13 @@ export interface CalculatedLineItem extends CartDraftItem {
   lineTotal: number; // Valor final da linha
 }
 
+export interface TaxBreakdownItem {
+  taxCode: AgtIvaTaxCode;
+  rate: TaxRate;
+  base: number;
+  amount: number;
+}
+
 export interface InvoiceTotals {
   lines: CalculatedLineItem[];
   merchandiseTotal: number;
@@ -433,8 +717,13 @@ export interface InvoiceTotals {
   discountTotal: number;
   taxBase14: number;
   taxAmount14: number;
+  taxBaseIntermediate?: number; // 7% ou 1% Cabinda (INT)
+  taxAmountIntermediate?: number;
+  taxBaseReduced?: number; // 5% (RED)
+  taxAmountReduced?: number;
   taxBase0: number;
   taxAmount0: number;
+  taxBreakdown?: TaxBreakdownItem[];
   taxTotal: number;
   grandTotal: number;
   amountInWords: string;
@@ -459,11 +748,23 @@ export interface InvoiceRecord {
   globalDiscountAmount?: number;
   taxBase14: number;
   taxAmount14: number;
+  taxBaseIntermediate?: number;
+  taxAmountIntermediate?: number;
+  taxBaseReduced?: number;
+  taxAmountReduced?: number;
   taxBase0: number;
   taxAmount0: number;
   taxTotal: number;
   grandTotal: number;
   amountInWords: string;
+  issuerSnapshot?: InvoiceIssuerSnapshot;
+  establishmentId?: string;
+  establishmentCode?: string;
+  establishmentName?: string;
+  seriesCode?: string;
+  seriesEnvironment?: AgtSeriesEnvironment;
+  agtAuthorizationCode?: string;
+  saftHash4?: string;
   sessionId?: string;
   amountReceived: number;
   initialAmountReceived?: number;

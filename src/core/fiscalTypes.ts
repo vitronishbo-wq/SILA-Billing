@@ -304,6 +304,8 @@ export type AgtSeriesStatus =
   | 'U' // Utilizada / Em Uso: Série que já possui documentos emitidos na sequência corrente
   | 'F'; // Finalizada / Fechada: Série esgotada ou encerrada formalmente no final do ano civil
 
+export type AgtSeriesEnvironment = 'SIMULACAO' | 'PRODUCAO';
+
 export interface AgtSeriesRecord {
   id: string; // `${companyId}_${seriesCode}_${seriesYear}_${documentType}`
   companyId: string;
@@ -313,6 +315,9 @@ export interface AgtSeriesRecord {
   firstDocumentNumber: number; // Geralmente 1
   lastDocumentNumber: number; // Número do último documento emitido nesta série
   status: AgtSeriesStatus;
+  environment?: AgtSeriesEnvironment; // Separação estrita: SIMULACAO vs PRODUCAO
+  establishmentId?: string; // Estabelecimento associado à série
+  establishmentCode?: string; // Código curto do estabelecimento (ex: '001')
   agtAuthorizationCode?: string; // Código de autorização fornecido pela AGT
   requestedAtIso: string;
   authorizedAtIso?: string;
@@ -390,9 +395,9 @@ export const AGT_IVA_TAX_CODES: Readonly<Record<AgtIvaTaxCode, AgtIvaTaxMetadata
   },
   INT: {
     code: 'INT',
-    descriptionPt: 'Taxa Intermédia de IVA (7% ou 5%)',
+    descriptionPt: 'Taxa Intermédia / Especial (7% ou 1% Cabinda - Lei n.º 14/23)',
     standardPercentage: 7,
-    allowedPercentages: [7, 5],
+    allowedPercentages: [7, 5, 1],
     requiresExemptionCode: false,
   },
   RED: {

@@ -273,6 +273,18 @@ export function signSaftDocumentHash(
 }
 
 /**
+ * Extrai os 4 caracteres canónicos de controlo da assinatura SAF-T (posições 1, 11, 21, 31)
+ * para exibição em impressões fiscais A4/POS e campo Q do QR Code quando aplicável.
+ */
+export function extractSaftHash4(hashBase64: string): string {
+  const clean = String(hashBase64 || '').trim();
+  if (clean.length < 31) {
+    return (clean + '0000').slice(0, 4);
+  }
+  return `${clean[0]}${clean[10]}${clean[20]}${clean[30]}`;
+}
+
+/**
  * Converte Base64 para Uint8Array
  */
 function base64ToUint8Array(b64: string): Uint8Array {

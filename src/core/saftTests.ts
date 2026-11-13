@@ -662,6 +662,154 @@ export function runSaftTests(): { passed: number; total: number } {
     assert(invXml.includes('<NetTotal>43859.65</NetTotal>'), 'DocumentTotals da fatura anulada deve preservar NetTotal original');
   });
 
+  test('8.5: SAF-T reconcilia faturas multi-taxa (1% Cabinda, 5% RED, 14% NOR, 0% ISE), mapeia FA->FT e ProductType S/P', () => {
+    const richCompany: CompanyProfile = {
+      ...taxpayerCompany,
+      municipality: 'Cabinda',
+      province: 'Cabinda',
+      postalCode: '0001',
+      taxEntity: 'Sede Cabinda',
+    };
+
+    const serviceProduct: Product = {
+      id: 'p_serv_ti',
+      code: 'SRV-TI',
+      name: 'Consultoria Fiscal Especializada',
+      productType: 'S',
+      category: 'Serviços',
+      unit: 'HR',
+      price: 11400,
+      ivaRate: 14,
+      exemptionReason: '',
+      active: true,
+      createdAtIso: '2026-01-01T00:00:00.000Z',
+      updatedAtIso: '2026-01-01T00:00:00.000Z',
+    };
+
+    const multiRateFa: InvoiceRecord = {
+      id: 'inv_fa_multi',
+      number: 'FA 2026/1',
+      docType: 'FA',
+      issuedAtIso: '2026-01-28T15:00:00.000Z',
+      createdAtIso: '2026-01-28T15:00:00.000Z',
+      updatedAtIso: '2026-01-28T15:00:00.000Z',
+      cashier: '01',
+      operator: 'Gestor',
+      paymentMethod: 'Transferência',
+      customerId: 'cli_1',
+      customerName: 'Cliente Corporativo Alfa, S.A.',
+      customerNif: '5009876543',
+      customerLocality: 'Cabinda',
+      merchandiseTotal: 15000,
+      discountTotal: 0,
+      taxBase14: 10000,
+      taxAmount14: 1400,
+      taxBaseIntermediate: 2000,
+      taxAmountIntermediate: 20,
+      taxBaseReduced: 1000,
+      taxAmountReduced: 50,
+      taxBase0: 2000,
+      taxAmount0: 0,
+      taxTotal: 1470,
+      grandTotal: 16470,
+      amountInWords: 'Dezasseis mil quatrocentos e setenta Kwanzas',
+      amountReceived: 0,
+      changeAmount: 0,
+      notes: '',
+      status: 'issued',
+      lines: [
+        {
+          id: 'lm1',
+          productId: 'p_serv_ti',
+          code: 'SRV-TI',
+          description: 'Consultoria Fiscal Especializada',
+          unit: 'HR',
+          qty: 1,
+          unitPrice: 11400,
+          discountPct: 0,
+          ivaRate: 14,
+          lineGross: 11400,
+          lineDiscount: 0,
+          lineNet: 11400,
+          lineBase: 10000,
+          lineTax: 1400,
+          lineTotal: 11400,
+        },
+        {
+          id: 'lm2',
+          productId: 'p_cab',
+          code: 'CAB-01',
+          description: 'Artigo Regime Especial Cabinda 1%',
+          unit: 'UN',
+          qty: 1,
+          unitPrice: 2020,
+          discountPct: 0,
+          ivaRate: 1,
+          lineGross: 2020,
+          lineDiscount: 0,
+          lineNet: 2020,
+          lineBase: 2000,
+          lineTax: 20,
+          lineTotal: 2020,
+        },
+        {
+          id: 'lm3',
+          productId: 'p_red',
+          code: 'RED-01',
+          description: 'Insumo Taxa Reduzida 5%',
+          unit: 'UN',
+          qty: 1,
+          unitPrice: 1050,
+          discountPct: 0,
+          ivaRate: 5,
+          lineGross: 1050,
+          lineDiscount: 0,
+          lineNet: 1050,
+          lineBase: 1000,
+          lineTax: 50,
+          lineTotal: 1050,
+        },
+        {
+          id: 'lm4',
+          productId: 'p_arroz',
+          code: 'ARR-01',
+          description: 'Arroz Agulha 5Kg Cesta Básica',
+          unit: 'KG',
+          qty: 1,
+          unitPrice: 2000,
+          discountPct: 0,
+          ivaRate: 0,
+          lineGross: 2000,
+          lineDiscount: 0,
+          lineNet: 2000,
+          lineBase: 2000,
+          lineTax: 0,
+          lineTotal: 2000,
+          exemptionCode: 'M10',
+        },
+      ],
+    };
+
+    const res = generateSaftAoXml({
+      company: richCompany,
+      invoices: [multiRateFa],
+      products: [...sampleProducts, serviceProduct],
+      customers: sampleCustomers,
+      suppliers: sampleSuppliers,
+    });
+
+    assert(res.validation.valid === true, `Dataset multi-taxa deve validar sem erros: ${res.validation.issues.map((i) => i.message).join('; ')}`);
+    assert(res.validation.taxAuditDifference === 0, `Diferença de auditoria esperada 0, obtida ${res.validation.taxAuditDifference}`);
+    assert(res.summary.totalCredit === 15000, `TotalCredit multi-taxa esperado 15000, obtido ${res.summary.totalCredit}`);
+    assert(res.xml.includes('<InvoiceType>FT</InvoiceType>'), 'Documento FA deve mapear para InvoiceType FT no SAF-T');
+    assert(res.xml.includes('<ProductType>S</ProductType>'), 'Artigo de serviço deve mapear para ProductType S');
+    assert(res.xml.includes('<TaxCountryRegion>AO-CAB</TaxCountryRegion>'), 'Linha com taxa 1% Cabinda deve usar região AO-CAB');
+    assert(res.xml.includes('<TaxCode>RED</TaxCode>') && res.xml.includes('<TaxPercentage>5.00</TaxPercentage>'), 'Linha 5% deve mapear para TaxCode RED');
+    assert(res.xml.includes('<PostalCode>0001</PostalCode>'), 'Header deve usar postalCode real do perfil da empresa');
+    assert(res.xml.includes('<Province>Cabinda</Province>'), 'Header deve usar province real do perfil da empresa');
+    assert(res.xml.includes('<TaxEntity>Sede Cabinda</TaxEntity>'), 'Header deve usar taxEntity real do perfil da empresa');
+  });
+
   console.log(`\nTODAS AS ${passed}/${total} ASSERÇÕES DE AUDITORIA SAF-T (AO) PASSARAM COM SUCESSO!`);
   return { passed, total };
 }

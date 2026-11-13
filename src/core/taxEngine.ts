@@ -93,6 +93,10 @@ export function calculateAgtLineItem(input: TaxLineInput): AgtDocumentLineItem {
     taxCode = 'ISE';
   } else if (taxPercentage === 14 && taxCode !== 'NOR') {
     taxCode = 'NOR';
+  } else if (taxPercentage === 5 && taxCode !== 'RED' && taxCode !== 'INT') {
+    taxCode = 'RED';
+  } else if ((taxPercentage === 7 || taxPercentage === 1) && taxCode !== 'INT') {
+    taxCode = 'INT';
   }
 
   // Desconto e Preço Bruto
@@ -246,7 +250,7 @@ export function calculateAgtDocumentTotals(
     }
   }
 
-  // Aplicação do desconto financeiro global (se houver) proporcionalmente
+  // Aplicação do desconto financeiro global (se houver) proporcionalmente mantendo a taxa efectiva de cada linha
   if (globalPct > 0) {
     const globalDiscountAmount = roundKz(merchandiseTotalNet * (globalPct / 100));
     totalDiscounts = roundKz(totalDiscounts + globalDiscountAmount);
@@ -255,11 +259,24 @@ export function calculateAgtDocumentTotals(
     totalTaxBaseNOR = roundKz(totalTaxBaseNOR * globalFactor);
     totalTaxAmountNOR = roundUpToCent(totalTaxBaseNOR * 0.14);
 
-    totalTaxBaseINT = roundKz(totalTaxBaseINT * globalFactor);
-    totalTaxAmountINT = roundUpToCent(totalTaxBaseINT * 0.07);
-
-    totalTaxBaseRED = roundKz(totalTaxBaseRED * globalFactor);
-    totalTaxAmountRED = roundUpToCent(totalTaxBaseRED * 0.05);
+    totalTaxBaseINT = 0;
+    totalTaxAmountINT = 0;
+    totalTaxBaseRED = 0;
+    totalTaxAmountRED = 0;
+    for (const line of lines) {
+      const discountedBase = roundKz(line.taxableBase * globalFactor);
+      if (line.taxCode === 'INT') {
+        totalTaxBaseINT = roundKz(totalTaxBaseINT + discountedBase);
+        totalTaxAmountINT = roundKz(
+          totalTaxAmountINT + roundUpToCent(discountedBase * (line.taxPercentage / 100))
+        );
+      } else if (line.taxCode === 'RED') {
+        totalTaxBaseRED = roundKz(totalTaxBaseRED + discountedBase);
+        totalTaxAmountRED = roundKz(
+          totalTaxAmountRED + roundUpToCent(discountedBase * (line.taxPercentage / 100))
+        );
+      }
+    }
 
     totalTaxBaseISE = roundKz(totalTaxBaseISE * globalFactor);
     totalStampTax = roundKz(totalStampTax * globalFactor);
@@ -391,7 +408,16 @@ export function convertCartItemsToAgtLines(
   defaultExemptionCode: AgtIvaExemptionCode = 'M80'
 ): AgtDocumentLineItem[] {
   return cartItems.map((item, idx) => {
-    const isIva14 = item.ivaRate === 14;
+    const rate = Number(item.ivaRate) || 0;
+    let taxCode: AgtIvaTaxCode = 'NOR';
+    if (rate === 0) taxCode = 'ISE';
+    else if (rate === 5) taxCode = 'RED';
+    else if (rate === 1 || rate === 7) taxCode = 'INT';
+    else taxCode = 'NOR';
+
+    const exemptionCode =
+      rate === 0 ? item.exemptionCode || defaultExemptionCode : undefined;
+
     return calculateAgtLineItem({
       lineNumber: idx + 1,
       productCode: item.code || `P${idx + 1}`,
@@ -401,9 +427,9 @@ export function convertCartItemsToAgtLines(
       unitPrice: item.unitPrice,
       unitPriceIncludesTax: true, // No POS retalhista da JAIMONA/SILA os preços de prateleira incluem IVA
       discountPercentage: item.discountPct,
-      taxCode: isIva14 ? 'NOR' : 'ISE',
-      taxPercentage: isIva14 ? 14 : 0,
-      exemptionCode: !isIva14 ? defaultExemptionCode : undefined,
+      taxCode,
+      taxPercentage: rate,
+      exemptionCode,
     });
   });
 }

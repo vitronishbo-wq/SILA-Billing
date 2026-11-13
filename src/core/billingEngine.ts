@@ -1,4 +1,5 @@
 import { kwanzaToWords } from './extenso.ts';
+import type { AgtIvaTaxCode } from './fiscalTypes.ts';
 import type {
   CalculatedLineItem,
   CartDraftItem,
@@ -8,6 +9,8 @@ import type {
   DocumentType,
   InvoiceRecord,
   InvoiceTotals,
+  TaxBreakdownItem,
+  TaxRate,
 } from './types.ts';
 
 export function roundKz(val: number): number {
@@ -45,14 +48,21 @@ export function formatDateTimePt(iso: string): { date: string; time: string; sla
   };
 }
 
+function mapRateToAgtTaxCode(rate: number): AgtIvaTaxCode {
+  if (rate === 0) return 'ISE';
+  if (rate === 5) return 'RED';
+  if (rate === 1 || rate === 7) return 'INT';
+  return 'NOR';
+}
+
 /**
- * Motor unificado de cálculo fiscal (IVA Angolano 14% ou Isento 0%).
- * Segue rigorosamente o modelo JAIMONA-COMÉRCIO E SERVIÇOS:
- * - Cada linha apresenta Total Bruto da Linha = Qtd × Preço Unit. (ex: 2×700 = 1.400,00)
- * - Para artigos sujeitos a IVA 14%, extrai-se a Base Tributável (Líquido / 1,14) e aplica-se 14% de IVA
- *   (ex: 5.350,00 / 1,14 ≈ 4.695,65 Base; IVA 14% ≈ 657,40)
- * - Para artigos Isentos (0%), Base 0% = valor líquido da linha, IVA = 0,00
- * - Total de mercadorias + Total de impostos - Desconto comercial = TOTAL A PAGAR em Kwanzas (Kz)
+ * Motor unificado de cálculo fiscal multi-taxa (IVA Angolano: 14%, 7%, 5%, 1% Cabinda ou Isento 0%).
+ * Preserva integralmente a consistência do modelo JAIMONA/SILA:
+ * - Para artigos tributados (14%, 7%, 5%, 1%), extrai-se a Base Tributável (Líquido / (1 + taxa/100))
+ *   e calcula-se o IVA correspondente.
+ * - Para artigos Isentos (0%), Base 0% = valor líquido da linha, IVA = 0,00.
+ * - Consolida taxBase14/taxAmount14, taxBaseIntermediate/taxAmountIntermediate (1% e 7%),
+ *   taxBaseReduced/taxAmountReduced (5%), taxBase0 e taxBreakdown[] completo.
  */
 export function calculateInvoiceTotals(
   draftItems: CartDraftItem[],
@@ -62,14 +72,16 @@ export function calculateInvoiceTotals(
     const qty = Math.max(0.01, roundKz(item.qty));
     const unitPrice = Math.max(0, roundKz(item.unitPrice));
     const discountPct = Math.min(100, Math.max(0, roundKz(item.discountPct || 0)));
+    const rate = Math.max(0, Number(item.ivaRate) || 0) as TaxRate;
 
     const lineGross = roundKz(qty * unitPrice);
     const lineDiscount = roundKz(lineGross * (discountPct / 100));
     const afterDiscount = roundKz(lineGross - lineDiscount);
 
-    // Base de cálculo para resumo de impostos (extração de IVA 14% sobre PVP comercial)
-    const lineBase = item.ivaRate === 14 ? roundKz(afterDiscount / 1.14) : afterDiscount;
-    const lineTax = item.ivaRate === 14 ? roundKz(lineBase * 0.14) : 0;
+    // Base de cálculo para resumo de impostos (extracção de IVA sobre PVP comercial)
+    const lineBase =
+      rate > 0 ? roundKz(afterDiscount / (1 + rate / 100)) : afterDiscount;
+    const lineTax = rate > 0 ? roundKz(lineBase * (rate / 100)) : 0;
     const lineNet = afterDiscount;
 
     return {
@@ -97,21 +109,54 @@ export function calculateInvoiceTotals(
     clampedGlobalPct > 0 ? roundKz(subtotalAfterLineDiscounts * (clampedGlobalPct / 100)) : 0;
   const discountTotal = roundKz(lineDiscountTotal + globalDiscountAmount);
 
-  const rawNet14Sum = roundKz(
-    lines.filter((l) => l.ivaRate === 14).reduce((acc, l) => acc + l.lineNet, 0)
-  );
-  const net14Sum = clampedGlobalPct > 0 ? roundKz(rawNet14Sum * globalFactor) : rawNet14Sum;
-  const taxBase14 = net14Sum > 0 ? roundKz(net14Sum / 1.14) : 0;
-  const taxAmount14 = taxBase14 > 0 ? roundKz(taxBase14 * 0.14) : 0;
+  const calcBucket = (targetRate: number): { base: number; amount: number } => {
+    const rawNetSum = roundKz(
+      lines.filter((l) => Number(l.ivaRate) === targetRate).reduce((acc, l) => acc + l.lineNet, 0)
+    );
+    const netSum = clampedGlobalPct > 0 ? roundKz(rawNetSum * globalFactor) : rawNetSum;
+    if (netSum <= 0) return { base: 0, amount: 0 };
+    if (targetRate <= 0) return { base: netSum, amount: 0 };
+    const base = roundKz(netSum / (1 + targetRate / 100));
+    const amount = roundKz(base * (targetRate / 100));
+    return { base, amount };
+  };
 
-  const rawTaxBase0 = roundKz(
-    lines.filter((l) => l.ivaRate === 0).reduce((acc, l) => acc + l.lineNet, 0)
-  );
-  const taxBase0 = clampedGlobalPct > 0 ? roundKz(rawTaxBase0 * globalFactor) : rawTaxBase0;
+  const bucket14 = calcBucket(14);
+  const bucket7 = calcBucket(7);
+  const bucket5 = calcBucket(5);
+  const bucket1 = calcBucket(1);
+  const bucket0 = calcBucket(0);
+
+  const taxBase14 = bucket14.base;
+  const taxAmount14 = bucket14.amount;
+  const taxBaseIntermediate = roundKz(bucket7.base + bucket1.base);
+  const taxAmountIntermediate = roundKz(bucket7.amount + bucket1.amount);
+  const taxBaseReduced = bucket5.base;
+  const taxAmountReduced = bucket5.amount;
+  const taxBase0 = bucket0.base;
   const taxAmount0 = 0;
 
+  const taxBreakdown: TaxBreakdownItem[] = [];
+  const rateBuckets: Array<{ rate: TaxRate; base: number; amount: number }> = [
+    { rate: 14, ...bucket14 },
+    { rate: 7, ...bucket7 },
+    { rate: 5, ...bucket5 },
+    { rate: 1, ...bucket1 },
+    { rate: 0, ...bucket0 },
+  ];
+  for (const rb of rateBuckets) {
+    if (rb.base > 0) {
+      taxBreakdown.push({
+        taxCode: mapRateToAgtTaxCode(rb.rate),
+        rate: rb.rate,
+        base: rb.base,
+        amount: rb.amount,
+      });
+    }
+  }
+
   const merchandiseTotal = Math.max(0, roundKz(grossItemsTotal - discountTotal));
-  const taxTotal = taxAmount14;
+  const taxTotal = roundKz(taxAmount14 + taxAmountIntermediate + taxAmountReduced);
   const grandTotal = roundKz(merchandiseTotal + taxTotal);
 
   return {
@@ -124,8 +169,13 @@ export function calculateInvoiceTotals(
     discountTotal,
     taxBase14,
     taxAmount14,
+    taxBaseIntermediate,
+    taxAmountIntermediate,
+    taxBaseReduced,
+    taxAmountReduced,
     taxBase0,
     taxAmount0,
+    taxBreakdown,
     taxTotal,
     grandTotal,
     amountInWords: kwanzaToWords(grandTotal),
@@ -138,8 +188,18 @@ export function generateNextInvoiceNumber(
   baseSequence = 0
 ): string {
   const year = new Date().getFullYear();
-  const prefix =
-    docType === 'FP' ? `FP ${year}/` : docType === 'NC' ? `NC ${year}/` : `FV ${year}/`;
+  const safePrefix: DocumentType =
+    docType === 'FR' ||
+    docType === 'FA' ||
+    docType === 'FP' ||
+    docType === 'NC' ||
+    docType === 'ND' ||
+    docType === 'RC' ||
+    docType === 'FT' ||
+    docType === 'CS'
+      ? docType
+      : 'FR';
+  const prefix = `${safePrefix} ${year}/`;
   let maxSeq = Math.max(0, Math.floor(baseSequence));
 
   for (const num of existingNumbers) {

@@ -1,5 +1,5 @@
 import { formatDateTimePt, formatKzNumber, roundKz } from './billingEngine';
-import { CompanyProfile, InvoiceRecord } from './types';
+import { CompanyProfile, formatDocumentTypeLabelPt, InvoiceRecord } from './types';
 
 export type DocumentControlState =
   | 'PAID'
@@ -19,12 +19,7 @@ export interface InvoiceControlClassification {
 }
 
 export function classifyInvoiceControlStatus(inv: InvoiceRecord): InvoiceControlClassification {
-  const docTypeLabelPt =
-    inv.docType === 'NC'
-      ? 'Nota de Crédito'
-      : inv.docType === 'FP'
-        ? 'Fatura Proforma'
-        : 'Fatura / Recibo';
+  const docTypeLabelPt = formatDocumentTypeLabelPt(inv.docType);
 
   if (inv.status === 'cancelled') {
     return {
@@ -48,10 +43,10 @@ export function classifyInvoiceControlStatus(inv: InvoiceRecord): InvoiceControl
     };
   }
 
-  if (inv.docType === 'FP') {
+  if (inv.docType === 'FP' || inv.docType === 'CS') {
     return {
       state: 'PROFORMA',
-      labelPt: 'Proforma',
+      labelPt: inv.docType === 'CS' ? 'Comprovativo de Saída' : 'Proforma',
       docTypeLabelPt,
       payableAmount: roundKz(inv.grandTotal),
       paidAmount: 0,
@@ -113,7 +108,12 @@ export interface DocumentControlAggregateSummary {
   cancelledTotal: number;
   taxBase14Total: number;
   taxAmount14Total: number;
+  taxBaseIntermediateTotal: number;
+  taxAmountIntermediateTotal: number;
+  taxBaseReducedTotal: number;
+  taxAmountReducedTotal: number;
   taxBase0Total: number;
+  taxTotalAllRates: number;
 }
 
 export function summarizeDocumentControlList(
@@ -133,7 +133,12 @@ export function summarizeDocumentControlList(
   let cancelledTotal = 0;
   let taxBase14Total = 0;
   let taxAmount14Total = 0;
+  let taxBaseIntermediateTotal = 0;
+  let taxAmountIntermediateTotal = 0;
+  let taxBaseReducedTotal = 0;
+  let taxAmountReducedTotal = 0;
   let taxBase0Total = 0;
+  let taxTotalAllRates = 0;
 
   for (const inv of invoices) {
     const cls = classifyInvoiceControlStatus(inv);
@@ -147,7 +152,12 @@ export function summarizeDocumentControlList(
       creditNoteTotal = roundKz(creditNoteTotal + inv.grandTotal);
       taxBase14Total = roundKz(taxBase14Total - inv.taxBase14);
       taxAmount14Total = roundKz(taxAmount14Total - inv.taxAmount14);
+      taxBaseIntermediateTotal = roundKz(taxBaseIntermediateTotal - (inv.taxBaseIntermediate || 0));
+      taxAmountIntermediateTotal = roundKz(taxAmountIntermediateTotal - (inv.taxAmountIntermediate || 0));
+      taxBaseReducedTotal = roundKz(taxBaseReducedTotal - (inv.taxBaseReduced || 0));
+      taxAmountReducedTotal = roundKz(taxAmountReducedTotal - (inv.taxAmountReduced || 0));
       taxBase0Total = roundKz(taxBase0Total - inv.taxBase0);
+      taxTotalAllRates = roundKz(taxTotalAllRates - (inv.taxTotal || 0));
       continue;
     }
     if (cls.state === 'PROFORMA') {
@@ -161,7 +171,12 @@ export function summarizeDocumentControlList(
     dueTotal = roundKz(dueTotal + cls.dueAmount);
     taxBase14Total = roundKz(taxBase14Total + inv.taxBase14);
     taxAmount14Total = roundKz(taxAmount14Total + inv.taxAmount14);
+    taxBaseIntermediateTotal = roundKz(taxBaseIntermediateTotal + (inv.taxBaseIntermediate || 0));
+    taxAmountIntermediateTotal = roundKz(taxAmountIntermediateTotal + (inv.taxAmountIntermediate || 0));
+    taxBaseReducedTotal = roundKz(taxBaseReducedTotal + (inv.taxBaseReduced || 0));
+    taxAmountReducedTotal = roundKz(taxAmountReducedTotal + (inv.taxAmountReduced || 0));
     taxBase0Total = roundKz(taxBase0Total + inv.taxBase0);
+    taxTotalAllRates = roundKz(taxTotalAllRates + (inv.taxTotal || 0));
 
     if (cls.state === 'PAID') paidCount += 1;
     else if (cls.state === 'PARTIAL') partialCount += 1;
@@ -185,7 +200,12 @@ export function summarizeDocumentControlList(
     cancelledTotal,
     taxBase14Total,
     taxAmount14Total,
+    taxBaseIntermediateTotal,
+    taxAmountIntermediateTotal,
+    taxBaseReducedTotal,
+    taxAmountReducedTotal,
     taxBase0Total,
+    taxTotalAllRates,
   };
 }
 
@@ -233,7 +253,10 @@ export function buildInvoicesCsvContent(
     'Meio Pagamento',
     'Base IVA 14% (Kz)',
     'IVA 14% (Kz)',
+    'Base Interm./Red. (Kz)',
+    'IVA Interm./Red. (Kz)',
     'Base Isenta 0% (Kz)',
+    'Total Impostos (Kz)',
     'Desconto (Kz)',
     'Total Documento (Kz)',
     'Valor Pago (Kz)',
@@ -253,6 +276,8 @@ export function buildInvoicesCsvContent(
       inv.status === 'cancelled'
         ? inv.cancelReason || inv.notes || ''
         : inv.notes || '';
+    const baseIntRed = roundKz(((inv.taxBaseIntermediate || 0) + (inv.taxBaseReduced || 0)) * sign);
+    const taxIntRed = roundKz(((inv.taxAmountIntermediate || 0) + (inv.taxAmountReduced || 0)) * sign);
 
     return [
       inv.number,
@@ -267,7 +292,10 @@ export function buildInvoicesCsvContent(
       inv.paymentMethod,
       formatKzNumber(roundKz(inv.taxBase14 * sign)),
       formatKzNumber(roundKz(inv.taxAmount14 * sign)),
+      formatKzNumber(baseIntRed),
+      formatKzNumber(taxIntRed),
       formatKzNumber(roundKz(inv.taxBase0 * sign)),
+      formatKzNumber(roundKz((inv.taxTotal || 0) * sign)),
       formatKzNumber(inv.discountTotal || 0),
       formatKzNumber(roundKz(inv.grandTotal * sign)),
       formatKzNumber(cls.paidAmount),
@@ -282,8 +310,8 @@ export function buildInvoicesCsvContent(
   const footerRows = [
     [],
     [
-      'RESUMO LÍQUIDO (FR - NC)',
-      `${sum.issuedFrCount} FR / ${sum.creditNoteCount} NC / ${sum.cancelledCount} Anul.`,
+      'RESUMO LÍQUIDO (Docs - NC)',
+      `${sum.issuedFrCount} Docs / ${sum.creditNoteCount} NC / ${sum.cancelledCount} Anul.`,
       '',
       '',
       '',
@@ -294,7 +322,10 @@ export function buildInvoicesCsvContent(
       '',
       formatKzNumber(sum.taxBase14Total),
       formatKzNumber(sum.taxAmount14Total),
+      formatKzNumber(roundKz(sum.taxBaseIntermediateTotal + sum.taxBaseReducedTotal)),
+      formatKzNumber(roundKz(sum.taxAmountIntermediateTotal + sum.taxAmountReducedTotal)),
       formatKzNumber(sum.taxBase0Total),
+      formatKzNumber(sum.taxTotalAllRates),
       '',
       formatKzNumber(sum.netCommercialTotal),
       formatKzNumber(sum.paidTotal),
@@ -333,6 +364,8 @@ export function buildInvoicesExcelXml(
     'Meio Pagamento',
     'Base IVA 14% (Kz)',
     'IVA 14% (Kz)',
+    'Base Interm./Red. (Kz)',
+    'Total Impostos (Kz)',
     'Base Isenta 0% (Kz)',
     'Desconto (Kz)',
     'Total Documento (Kz)',
@@ -359,6 +392,7 @@ export function buildInvoicesExcelXml(
         inv.status === 'cancelled'
           ? `ANULADO: ${inv.cancelReason || ''}`
           : inv.notes || '';
+      const baseIntRed = roundKz(((inv.taxBaseIntermediate || 0) + (inv.taxBaseReduced || 0)) * sign);
 
       return `<Row>
         <Cell ss:StyleID="${txtStyle}"><Data ss:Type="String">${escapeXml(inv.number)}</Data></Cell>
@@ -372,6 +406,8 @@ export function buildInvoicesExcelXml(
         <Cell ss:StyleID="${txtStyle}"><Data ss:Type="String">${escapeXml(inv.paymentMethod)}</Data></Cell>
         <Cell ss:StyleID="${numStyle}"><Data ss:Type="Number">${isCancelled ? 0 : roundKz(inv.taxBase14 * sign)}</Data></Cell>
         <Cell ss:StyleID="${numStyle}"><Data ss:Type="Number">${isCancelled ? 0 : roundKz(inv.taxAmount14 * sign)}</Data></Cell>
+        <Cell ss:StyleID="${numStyle}"><Data ss:Type="Number">${isCancelled ? 0 : baseIntRed}</Data></Cell>
+        <Cell ss:StyleID="${numStyle}"><Data ss:Type="Number">${isCancelled ? 0 : roundKz((inv.taxTotal || 0) * sign)}</Data></Cell>
         <Cell ss:StyleID="${numStyle}"><Data ss:Type="Number">${isCancelled ? 0 : roundKz(inv.taxBase0 * sign)}</Data></Cell>
         <Cell ss:StyleID="${numStyle}"><Data ss:Type="Number">${isCancelled ? 0 : roundKz(inv.discountTotal || 0)}</Data></Cell>
         <Cell ss:StyleID="${numStyle}"><Data ss:Type="Number">${isCancelled ? 0 : roundKz(inv.grandTotal * sign)}</Data></Cell>
@@ -440,8 +476,8 @@ export function buildInvoicesExcelXml(
       <Row>${headerCellsXml}</Row>
       ${dataRowsXml}
       <Row>
-        <Cell ss:StyleID="sTotalLabel"><Data ss:Type="String">TOTAL LÍQUIDO VÁLIDO (FR - NC)</Data></Cell>
-        <Cell ss:StyleID="sTotalLabel"><Data ss:Type="String">${escapeXml(`${sum.issuedFrCount} FR | ${sum.creditNoteCount} NC | ${sum.cancelledCount} Anul.`)}</Data></Cell>
+        <Cell ss:StyleID="sTotalLabel"><Data ss:Type="String">TOTAL LÍQUIDO VÁLIDO (Docs - NC)</Data></Cell>
+        <Cell ss:StyleID="sTotalLabel"><Data ss:Type="String">${escapeXml(`${sum.issuedFrCount} Docs | ${sum.creditNoteCount} NC | ${sum.cancelledCount} Anul.`)}</Data></Cell>
         <Cell ss:StyleID="sTotalLabel"><Data ss:Type="String"></Data></Cell>
         <Cell ss:StyleID="sTotalLabel"><Data ss:Type="String"></Data></Cell>
         <Cell ss:StyleID="sTotalLabel"><Data ss:Type="String"></Data></Cell>
@@ -451,6 +487,8 @@ export function buildInvoicesExcelXml(
         <Cell ss:StyleID="sTotalLabel"><Data ss:Type="String"></Data></Cell>
         <Cell ss:StyleID="sTotalNum"><Data ss:Type="Number">${sum.taxBase14Total}</Data></Cell>
         <Cell ss:StyleID="sTotalNum"><Data ss:Type="Number">${sum.taxAmount14Total}</Data></Cell>
+        <Cell ss:StyleID="sTotalNum"><Data ss:Type="Number">${roundKz(sum.taxBaseIntermediateTotal + sum.taxBaseReducedTotal)}</Data></Cell>
+        <Cell ss:StyleID="sTotalNum"><Data ss:Type="Number">${sum.taxTotalAllRates}</Data></Cell>
         <Cell ss:StyleID="sTotalNum"><Data ss:Type="Number">${sum.taxBase0Total}</Data></Cell>
         <Cell ss:StyleID="sTotalLabel"><Data ss:Type="String"></Data></Cell>
         <Cell ss:StyleID="sTotalNum"><Data ss:Type="Number">${sum.netCommercialTotal}</Data></Cell>

@@ -15,6 +15,7 @@ import {
 } from './fiscalTypes.ts';
 import {
   buildSaftCanonicalString,
+  extractSaftHash4,
   signSaftDocumentHash,
   verifySaftDocumentHash,
   DEFAULT_SAFT_PUBLIC_KEY,
@@ -201,7 +202,7 @@ export function getIvaExemptionReason(code?: string): string {
  * Formato padrão oficial: 172 caracteres em Base64 gerados a partir da cadeia canónica.
  */
 export function generateChainedDocumentHash(
-  inv: InvoiceRecord,
+  inv: Pick<InvoiceRecord, 'issuedAtIso' | 'number' | 'grandTotal'>,
   previousHash: string,
   customPrivateKeyPem?: string
 ): string {
@@ -222,6 +223,20 @@ export function generateChainedDocumentHash(
   // Assinatura RSA-SHA1 autêntica
   return signSaftDocumentHash(canonicalString, customPrivateKeyPem);
 }
+
+export function computeDocumentSaftHash4(
+  inv: Pick<InvoiceRecord, 'issuedAtIso' | 'number' | 'grandTotal'>,
+  previousHash = '',
+  customPrivateKeyPem?: string
+): { fullHash: string; hash4: string } {
+  const fullHash = generateChainedDocumentHash(inv, previousHash, customPrivateKeyPem);
+  return {
+    fullHash,
+    hash4: extractSaftHash4(fullHash),
+  };
+}
+
+export { extractSaftHash4 };
 
 /**
  * Validador pré-exportação de integridade fiscal e auditoria de continuidade sequencial de séries
@@ -273,9 +288,17 @@ export function validateSaftDataset(
       });
     }
 
-    // Totais de débito e crédito
+    // Totais de débito e crédito (todas as faixas tributáveis: 14%, 7%/1%, 5%, 0%)
+    const totalBaseAllRates =
+      Math.round(
+        ((inv.taxBase14 || 0) +
+          (inv.taxBaseIntermediate || 0) +
+          (inv.taxBaseReduced || 0) +
+          (inv.taxBase0 || 0)) *
+          100
+      ) / 100;
     if (inv.status !== 'cancelled') {
-      const netAmount = Math.max(0, inv.taxBase14 + inv.taxBase0);
+      const netAmount = Math.max(0, totalBaseAllRates);
       if (inv.docType === 'NC') {
         totalDebit += netAmount;
       } else {
@@ -284,13 +307,13 @@ export function validateSaftDataset(
     }
 
     // Conferência matemática: NetTotal + TaxPayable == GrossTotal
-    const calculatedGross = Math.round((inv.taxBase14 + inv.taxBase0 + inv.taxTotal) * 100) / 100;
+    const calculatedGross = Math.round((totalBaseAllRates + (inv.taxTotal || 0)) * 100) / 100;
     const diff = Math.abs(calculatedGross - inv.grandTotal);
     if (diff > 0.05) {
       taxDifference += diff;
       issues.push({
         level: 'error',
-        message: `Divergência matemática na fatura: Base (${inv.taxBase14 + inv.taxBase0}) + IVA (${inv.taxTotal}) != Total (${inv.grandTotal})`,
+        message: `Divergência matemática na fatura: Base (${totalBaseAllRates}) + IVA (${inv.taxTotal}) != Total (${inv.grandTotal})`,
         invoiceNumber: inv.number,
       });
     }
@@ -399,9 +422,17 @@ export function generateSaftAoXml(params: GenerateSaftParams): SaftExportResult 
   const { company, invoices, products = [], customers = [], suppliers = [], options = {} } = params;
 
   // 1. Separação Estrita dos Documentos:
-  // - SalesInvoices: Documentos fiscais com eficácia tributária (FT, FR, NC, ND)
+  // - SalesInvoices: Documentos fiscais com eficácia tributária (FA->FT, FT, FR, TV->FR, NC, ND)
   // - WorkingDocuments: Proformas (FP) e orçamentos (DC, NE, OR)
-  const fiscalInvoices = invoices.filter((i) => i.docType === 'FR' || i.docType === 'NC' || i.docType === ('FT' as any) || i.docType === ('ND' as any));
+  const fiscalInvoices = invoices.filter(
+    (i) =>
+      i.docType === 'FR' ||
+      i.docType === 'FA' ||
+      i.docType === 'NC' ||
+      i.docType === 'FT' ||
+      i.docType === 'ND' ||
+      (i.docType as string) === 'TV'
+  );
   const workingInvoices = invoices.filter((i) => i.docType === 'FP');
 
   // 2. Definição do Período Fiscal
@@ -495,7 +526,7 @@ export function generateSaftAoXml(params: GenerateSaftParams): SaftExportResult 
       code,
       description: p.name || 'Artigo Comercial',
       group: p.category || 'Geral',
-      type: 'P',
+      type: p.productType === 'S' ? 'S' : 'P',
     });
   }
 
@@ -539,8 +570,24 @@ export function generateSaftAoXml(params: GenerateSaftParams): SaftExportResult 
       isCancelled ? inv.cancelledAtIso || inv.issuedAtIso : inv.issuedAtIso
     );
 
-    const invoiceType = inv.docType === 'NC' ? 'NC' : (inv.docType as any) === 'FT' ? 'FT' : 'FR';
-    const netAmount = Math.max(0, inv.taxBase14 + inv.taxBase0);
+    const invoiceType =
+      inv.docType === 'NC'
+        ? 'NC'
+        : inv.docType === 'ND'
+          ? 'ND'
+          : inv.docType === 'FA' || inv.docType === 'FT'
+            ? 'FT'
+            : 'FR';
+    const netAmount = Math.max(
+      0,
+      Math.round(
+        ((inv.taxBase14 || 0) +
+          (inv.taxBaseIntermediate || 0) +
+          (inv.taxBaseReduced || 0) +
+          (inv.taxBase0 || 0)) *
+          100
+      ) / 100
+    );
 
     if (!isCancelled) {
       if (invoiceType === 'NC') {
@@ -571,11 +618,12 @@ export function generateSaftAoXml(params: GenerateSaftParams): SaftExportResult 
       const rateNum = Number(l.ivaRate) || 0;
       const isZeroRate = rateNum === 0;
       const taxCode = isZeroRate ? 'ISE' : rateNum === 5 ? 'RED' : (rateNum === 1 || rateNum === 7) ? 'INT' : 'NOR';
+      const taxCountryRegion = rateNum === 1 ? 'AO-CAB' : 'AO';
       const taxPercentage = rateNum.toFixed(2);
-      const exemptionCode = (l as any).exemptionCode || 'M10';
+      const exemptionCode = (l as any).exemptionCode || company.defaultExemptionCode || 'M10';
       const exemptionReason = getIvaExemptionReason(exemptionCode);
 
-      // Débito para Notas de Crédito, Crédito para Faturas/Recibo e Faturas
+      // Débito para Notas de Crédito, Crédito para Faturas/Recibo, Faturas e Notas de Débito
       const amountTag = invoiceType === 'NC'
         ? `<DebitAmount>${lineBase.toFixed(2)}</DebitAmount>`
         : `<CreditAmount>${lineBase.toFixed(2)}</CreditAmount>`;
@@ -583,7 +631,7 @@ export function generateSaftAoXml(params: GenerateSaftParams): SaftExportResult 
       const taxSection = `
           <Tax>
             <TaxType>IVA</TaxType>
-            <TaxCountryRegion>AO</TaxCountryRegion>
+            <TaxCountryRegion>${taxCountryRegion}</TaxCountryRegion>
             <TaxCode>${taxCode}</TaxCode>
             <TaxPercentage>${taxPercentage}</TaxPercentage>
           </Tax>
@@ -670,7 +718,16 @@ export function generateSaftAoXml(params: GenerateSaftParams): SaftExportResult 
     const fpDate = formatSaftDate(fp.issuedAtIso);
     const systemEntryDate = formatSaftDateTime(fp.issuedAtIso);
     const isCancelled = fp.status === 'cancelled';
-    const netAmount = Math.max(0, fp.taxBase14 + fp.taxBase0);
+    const netAmount = Math.max(
+      0,
+      Math.round(
+        ((fp.taxBase14 || 0) +
+          (fp.taxBaseIntermediate || 0) +
+          (fp.taxBaseReduced || 0) +
+          (fp.taxBase0 || 0)) *
+          100
+      ) / 100
+    );
     if (!isCancelled) totalWorkingCredit += netAmount;
 
     const customerId = fp.customerId || normalizeTaxIdForSaft(fp.customerNif);
@@ -685,9 +742,13 @@ export function generateSaftAoXml(params: GenerateSaftParams): SaftExportResult 
       const qty = Math.max(0.001, Number(l.qty) || 1);
       const unitPrice = Math.max(0, Number(l.unitPrice) || 0);
       const lineBase = Math.round((l.lineBase || qty * unitPrice) * 100) / 100;
-      const isZeroRate = l.ivaRate === 0;
-      const taxCode = isZeroRate ? 'ISE' : 'NOR';
-      const taxPercentage = (l.ivaRate || 14).toFixed(2);
+      const rateNum = Number(l.ivaRate) || 0;
+      const isZeroRate = rateNum === 0;
+      const taxCode = isZeroRate ? 'ISE' : rateNum === 5 ? 'RED' : (rateNum === 1 || rateNum === 7) ? 'INT' : 'NOR';
+      const taxCountryRegion = rateNum === 1 ? 'AO-CAB' : 'AO';
+      const taxPercentage = rateNum.toFixed(2);
+      const exemptionCode = (l as any).exemptionCode || company.defaultExemptionCode || 'M10';
+      const exemptionReason = getIvaExemptionReason(exemptionCode);
 
       fpLinesXml.push(`
           <Line>
@@ -702,10 +763,16 @@ export function generateSaftAoXml(params: GenerateSaftParams): SaftExportResult 
             <CreditAmount>${lineBase.toFixed(2)}</CreditAmount>
             <Tax>
               <TaxType>IVA</TaxType>
-              <TaxCountryRegion>AO</TaxCountryRegion>
+              <TaxCountryRegion>${taxCountryRegion}</TaxCountryRegion>
               <TaxCode>${taxCode}</TaxCode>
               <TaxPercentage>${taxPercentage}</TaxPercentage>
-            </Tax>
+            </Tax>${
+              isZeroRate
+                ? `
+            <TaxExemptionReason>${escapeXml(exemptionReason)}</TaxExemptionReason>
+            <TaxExemptionCode>${escapeXml(exemptionCode)}</TaxExemptionCode>`
+                : ''
+            }
           </Line>
       `.trim());
     }
@@ -858,13 +925,17 @@ export function generateSaftAoXml(params: GenerateSaftParams): SaftExportResult 
     </TaxTable>
   `.trim();
 
-  // 14. Contactos da Empresa Utilizadora (NUNCA misturados com a software house VITRONIS)
-  const companyCity = company.cityCountry
+  // 14. Contactos e Endereço da Empresa Utilizadora (NUNCA misturados com a software house VITRONIS)
+  const fallbackCity = company.cityCountry
     ? company.cityCountry.split('-')[0].trim()
     : 'Luanda';
+  const companyCity = (company.municipality || fallbackCity || 'Luanda').trim();
+  const companyProvince = (company.province || companyCity || 'Luanda').trim();
+  const companyPostalCode = (company.postalCode || 'Desconhecido').trim();
   const companyAddress = company.address || 'Angola';
-  const companyPhone = company.phone ? escapeXml(company.phone) : 'Desconhecido';
-  const companyEmail = company.email ? escapeXml(company.email) : 'Desconhecido';
+  const companyTaxEntity = (company.taxEntity || 'Global').trim();
+  const companyPhone = escapeXml(company.phone || company.mobile || 'Desconhecido');
+  const companyEmail = escapeXml(company.email || company.billingEmail || 'Desconhecido');
 
   // 15. Bloco <WorkingDocuments> condicional
   const workingDocumentsSection = workingDocsXmlChunks.length > 0
@@ -890,8 +961,8 @@ export function generateSaftAoXml(params: GenerateSaftParams): SaftExportResult 
     <CompanyAddress>
       <AddressDetail>${escapeXml(companyAddress)}</AddressDetail>
       <City>${escapeXml(companyCity)}</City>
-      <PostalCode>Desconhecido</PostalCode>
-      <Province>${escapeXml(companyCity)}</Province>
+      <PostalCode>${escapeXml(companyPostalCode)}</PostalCode>
+      <Province>${escapeXml(companyProvince)}</Province>
       <Country>AO</Country>
     </CompanyAddress>
     <FiscalYear>${fiscalYear}</FiscalYear>
@@ -899,7 +970,7 @@ export function generateSaftAoXml(params: GenerateSaftParams): SaftExportResult 
     <EndDate>${endDate}</EndDate>
     <CurrencyCode>AOA</CurrencyCode>
     <DateCreated>${formatSaftDate(now.toISOString())}</DateCreated>
-    <TaxEntity>Global</TaxEntity>
+    <TaxEntity>${escapeXml(companyTaxEntity)}</TaxEntity>
     <ProductCompanyTaxID>${escapeXml(productCompanyTaxId)}</ProductCompanyTaxID>
     <SoftwareCertificateNumber>${escapeXml(softwareCertificateNumber)}</SoftwareCertificateNumber>
     <ProductID>${escapeXml(productId)}</ProductID>

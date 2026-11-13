@@ -5,19 +5,30 @@ import {
   roundKz,
 } from '../../src/core/billingEngine';
 import {
+  resolveActiveEstablishment,
+} from '../../src/core/companyValidator';
+import type { AgtSeriesRecord } from '../../src/core/fiscalTypes';
+import {
   AppSettings,
   CartDraftItem,
+  CompanyProfile,
   CompanyRecord,
   Customer,
   DEFAULT_IVA_EXEMPTION_REASONS,
   DEFAULT_PRODUCT_CATEGORIES,
   DEFAULT_PRODUCT_UNITS,
   DocumentType,
+  EstablishmentRecord,
   InvoiceRecord,
   PaymentMethod,
   Product,
   TaxRate,
+  WarehouseRecord,
 } from '../../src/core/types';
+import {
+  CompanyMasterSectionTab,
+  renderCompanyMasterSection,
+} from './companyMasterForm';
 import { ICONS } from './icons';
 
 export type MobileTab = 'HOME' | 'SALE' | 'DOCS' | 'CUSTOMERS' | 'MORE' | 'PRODUCTS';
@@ -26,6 +37,23 @@ export type MobileCheckoutStep = 'CART' | 'PAYMENT' | 'SUCCESS';
 export interface MobileOperationalProps {
   activeCompany: CompanyRecord;
   settings: AppSettings;
+  companyMasterDraftProfile: CompanyProfile | null;
+  companyMasterDraftSettings: Partial<AppSettings> | null;
+  companyMasterSection: CompanyMasterSectionTab;
+  companySeries: AgtSeriesRecord[];
+  canManageCompanySettings: boolean;
+  companyFormError: string | null;
+  companyFormSavedNotice: boolean;
+  showRequestAgtSeriesForm: boolean;
+  confirmFinalizeSeriesId: string | null;
+  agtSeriesErrorMessage: string | null;
+  agtSeriesSuccessMessage: string | null;
+  showEstablishmentForm: boolean;
+  editingEstablishment: Partial<EstablishmentRecord> | null;
+  establishmentError: string | null;
+  showWarehouseForm: boolean;
+  editingWarehouse: Partial<WarehouseRecord> | null;
+  warehouseError: string | null;
   isOnline: boolean;
   user: { email?: string | null } | null;
   mobileTab: MobileTab;
@@ -113,22 +141,26 @@ export function renderMobileOperationalView(props: MobileOperationalProps): stri
 // ==================== 1. ECRÃ PRINCIPAL (HOME HUB) ====================
 function renderMobileHome(props: MobileOperationalProps): string {
   const { activeCompany, settings, isOnline, invoices } = props;
+  const profile = settings.company;
   const companyName =
-    settings.company.shortName ||
-    settings.company.legalName ||
+    profile.shortName ||
+    profile.legalName ||
     activeCompany.profile?.shortName ||
     activeCompany.profile?.legalName ||
-    'JAIMONA';
+    'Nova Empresa';
+  const activeEst = resolveActiveEstablishment(profile);
   const locality =
-    settings.company.cityCountry ||
-    settings.company.address ||
+    profile.municipality ||
+    profile.cityCountry ||
+    profile.address ||
     activeCompany.profile?.cityCountry ||
-    'Bela Vista';
+    'Angola';
   const nif =
-    settings.company.nif ||
+    profile.nif ||
     activeCompany.profile?.nif ||
     activeCompany.normalizedNif ||
-    '001';
+    '---';
+  const envLabel = profile.agtEnvironment === 'PRODUCAO' ? 'Produção AGT' : 'Simulação';
 
   // Métricas rápidas do dia
   const todayPrefix = new Date().toISOString().slice(0, 10);
@@ -160,19 +192,19 @@ function renderMobileHome(props: MobileOperationalProps): string {
       </header>
 
       <!-- Cartão da Empresa Activa -->
-      <section class="bg-slate-900/90 border border-slate-800 rounded-2xl p-4 shadow-sm flex items-center justify-between">
-        <div>
-          <span class="text-xs text-slate-400 font-medium block">Empresa activa</span>
-          <h2 class="text-lg font-bold text-white tracking-tight mt-0.5">${escapeHtml(companyName)}</h2>
-          <p class="text-xs text-slate-400 mt-0.5">${escapeHtml(locality)} · NIF ${escapeHtml(nif)}</p>
+      <section class="bg-slate-900/90 border border-slate-800 rounded-2xl p-4 shadow-sm flex items-center justify-between gap-2">
+        <div class="min-w-0">
+          <span class="text-xs text-slate-400 font-medium block">Empresa activa · ${escapeHtml(envLabel)}</span>
+          <h2 class="text-lg font-bold text-white tracking-tight mt-0.5 truncate">${escapeHtml(companyName)}</h2>
+          <p class="text-xs text-slate-400 mt-0.5 font-mono tabular-nums truncate">${escapeHtml(activeEst.code)} · ${escapeHtml(locality)} · NIF ${escapeHtml(nif)}</p>
         </div>
         <button
           type="button"
           data-action="mobile-open-quick-company"
-          class="h-9 px-2.5 rounded-lg bg-slate-800 hover:bg-slate-700 text-xs text-slate-300 flex items-center gap-1 active:scale-95 transition-all"
+          class="h-10 px-3 rounded-lg bg-slate-800 hover:bg-slate-700 text-xs text-slate-200 flex items-center gap-1.5 active:scale-95 transition-all shrink-0"
         >
           ${ICONS.building}
-          <span>Editar</span>
+          <span>Ficha</span>
         </button>
       </section>
 
@@ -1306,8 +1338,8 @@ function renderMobileMore(props: MobileOperationalProps): string {
               ${ICONS.building}
             </div>
             <div>
-              <span class="text-sm font-bold text-white block">Configuração da Empresa</span>
-              <span class="text-xs text-slate-400 block">Nome, NIF, morada e séries</span>
+              <span class="text-sm font-bold text-white block">Ficha Mestre da Empresa</span>
+              <span class="text-xs text-slate-400 block">Dados fiscais, logótipo, bancos, estabelecimentos e séries</span>
             </div>
           </div>
           <span class="text-slate-500">${ICONS.chevronRight}</span>
@@ -1840,98 +1872,96 @@ function renderMobileQuickCustomerModal(): string {
 }
 
 function renderMobileQuickCompanyModal(props: MobileOperationalProps): string {
-  const { settings } = props;
-  const company = settings.company;
+  const {
+    activeCompany,
+    settings,
+    companyMasterDraftProfile,
+    companyMasterDraftSettings,
+    companyMasterSection,
+    companySeries,
+    canManageCompanySettings,
+    companyFormError,
+    companyFormSavedNotice,
+    showRequestAgtSeriesForm,
+    confirmFinalizeSeriesId,
+    agtSeriesErrorMessage,
+    agtSeriesSuccessMessage,
+    showEstablishmentForm,
+    editingEstablishment,
+    establishmentError,
+    showWarehouseForm,
+    editingWarehouse,
+    warehouseError,
+    operator,
+  } = props;
 
   return `
     <div class="fixed inset-0 z-50 bg-black/80 backdrop-blur-sm flex items-end sm:items-center justify-center p-0 sm:p-4 animate-in fade-in">
-      <div class="bg-slate-900 border border-slate-800 w-full max-w-md rounded-t-3xl sm:rounded-2xl p-5 flex flex-col gap-4 max-h-[90dvh] overflow-y-auto">
-        <div class="flex items-center justify-between pb-2 border-b border-slate-800">
-          <h3 class="text-base font-bold text-white flex items-center gap-2">
-            ${ICONS.building}
-            <span>Configuração da Empresa</span>
-          </h3>
-          <button type="button" data-action="mobile-close-modals" class="text-slate-400 hover:text-white p-1">
+      <div class="bg-slate-950 border border-slate-800 w-full max-w-lg rounded-t-3xl sm:rounded-2xl flex flex-col max-h-[94dvh] overflow-hidden shadow-2xl">
+        <div class="px-4 py-3 border-b border-slate-800 bg-slate-900 flex items-center justify-between shrink-0">
+          <div class="flex items-center gap-2 min-w-0">
+            <div class="h-8 w-8 rounded-lg bg-blue-600/20 text-blue-400 flex items-center justify-center shrink-0">
+              ${ICONS.building}
+            </div>
+            <div class="min-w-0">
+              <h3 class="text-sm font-bold text-white truncate">Ficha Mestre da Empresa</h3>
+              <p class="text-[11px] text-slate-400 truncate">9 secções fiscais e operacionais · Paridade total</p>
+            </div>
+          </div>
+          <button
+            type="button"
+            data-action="mobile-close-modals"
+            class="h-9 w-9 rounded-lg text-slate-400 hover:text-white hover:bg-slate-800 flex items-center justify-center shrink-0"
+          >
             ${ICONS.close}
           </button>
         </div>
 
-        <form id="mobile-quick-company-form" class="flex flex-col gap-3">
-          <div>
-            <label class="text-xs font-medium text-slate-300 block mb-1">Nome Comercial (Curto) *</label>
-            <input
-              type="text"
-              name="shortName"
-              required
-              value="${escapeHtml(company.shortName || company.legalName || '')}"
-              placeholder="Ex.: JAIMONA"
-              class="w-full h-11 px-3 rounded-xl bg-slate-950 border border-slate-700 text-sm text-white focus:outline-none focus:border-blue-500"
-            />
-          </div>
+        <div class="flex-1 overflow-y-auto overscroll-contain p-4">
+          ${renderCompanyMasterSection({
+            mode: 'MOBILE',
+            company: activeCompany,
+            settings,
+            draftProfile: companyMasterDraftProfile,
+            draftSettings: companyMasterDraftSettings,
+            series: companySeries,
+            canManage: canManageCompanySettings,
+            activeSection: companyMasterSection,
+            formId: 'mobile-quick-company-form',
+            showRequestAgtSeriesForm,
+            confirmFinalizeSeriesId,
+            agtSeriesErrorMessage,
+            agtSeriesSuccessMessage,
+            showEstablishmentForm,
+            editingEstablishment,
+            establishmentError,
+            showWarehouseForm,
+            editingWarehouse,
+            warehouseError,
+            errorMessage: companyFormError,
+            savedNotice: companyFormSavedNotice,
+            operator,
+          })}
+        </div>
 
-          <div>
-            <label class="text-xs font-medium text-slate-300 block mb-1">Razão Social Completa *</label>
-            <input
-              type="text"
-              name="name"
-              required
-              value="${escapeHtml(company.legalName || '')}"
-              placeholder="Ex.: Jaimona Comercial & Serviços Lda"
-              class="w-full h-11 px-3 rounded-xl bg-slate-950 border border-slate-700 text-sm text-white focus:outline-none focus:border-blue-500"
-            />
-          </div>
-
-          <div>
-            <label class="text-xs font-medium text-slate-300 block mb-1">NIF da Empresa *</label>
-            <input
-              type="text"
-              name="nif"
-              required
-              value="${escapeHtml(company.nif || '')}"
-              placeholder="Ex.: 5001234567"
-              class="w-full h-11 px-3 rounded-xl bg-slate-950 border border-slate-700 text-sm text-white font-mono tabular-nums focus:outline-none focus:border-blue-500"
-            />
-          </div>
-
-          <div class="grid grid-cols-2 gap-2">
-            <div>
-              <label class="text-xs font-medium text-slate-300 block mb-1">Localidade / Cidade</label>
-              <input
-                type="text"
-                name="locality"
-                value="${escapeHtml(company.cityCountry || company.address || '')}"
-                placeholder="Ex.: Bela Vista"
-                class="w-full h-11 px-3 rounded-xl bg-slate-950 border border-slate-700 text-sm text-white focus:outline-none focus:border-blue-500"
-              />
-            </div>
-            <div>
-              <label class="text-xs font-medium text-slate-300 block mb-1">Telefone</label>
-              <input
-                type="tel"
-                name="phone"
-                value="${escapeHtml(company.phone || '')}"
-                placeholder="Ex.: 923456789"
-                class="w-full h-11 px-3 rounded-xl bg-slate-950 border border-slate-700 text-sm text-white font-mono focus:outline-none focus:border-blue-500"
-              />
-            </div>
-          </div>
-
-          <div class="pt-2 flex gap-2">
-            <button
-              type="submit"
-              class="flex-1 h-12 rounded-xl bg-blue-600 hover:bg-blue-500 text-white font-bold text-sm shadow-md active:scale-[0.98]"
-            >
-              Guardar Configuração
-            </button>
-            <button
-              type="button"
-              data-action="mobile-close-modals"
-              class="h-12 px-4 rounded-xl bg-slate-800 text-slate-300 text-xs font-medium"
-            >
-              Cancelar
-            </button>
-          </div>
-        </form>
+        <div class="px-4 py-3 border-t border-slate-800 bg-slate-900/95 flex items-center gap-2 shrink-0">
+          <button
+            type="submit"
+            form="mobile-quick-company-form"
+            ${!canManageCompanySettings ? 'disabled' : ''}
+            class="flex-1 h-12 rounded-xl bg-blue-600 hover:bg-blue-500 disabled:opacity-40 text-white font-bold text-sm shadow-md active:scale-[0.98] flex items-center justify-center gap-2"
+          >
+            ${ICONS.check}
+            <span>${companyFormSavedNotice ? 'Guardado' : 'Guardar Ficha'}</span>
+          </button>
+          <button
+            type="button"
+            data-action="mobile-close-modals"
+            class="h-12 px-4 rounded-xl bg-slate-800 hover:bg-slate-700 text-slate-200 text-xs font-semibold"
+          >
+            Fechar
+          </button>
+        </div>
       </div>
     </div>
   `;

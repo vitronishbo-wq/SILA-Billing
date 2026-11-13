@@ -12,6 +12,17 @@ import {
   writeBatch,
 } from 'firebase/firestore';
 import {
+  AgtDocumentType,
+  AgtIvaExemptionCode,
+  AgtSeriesEnvironment,
+  AgtSeriesRecord,
+  AgtSeriesStatus,
+} from '../core/fiscalTypes';
+import { validateLogoDataUrl } from '../core/companyValidator';
+import {
+  AngolaLegalNature,
+  AngolaTaxRegime,
+  AngolaTaxTerritory,
   AppSettings,
   CalculatedLineItem,
   canCompanySyncCloudData,
@@ -19,11 +30,15 @@ import {
   CashMovementType,
   CashSession,
   CompanyMember,
+  CompanyProfile,
   CompanyRecord,
   Customer,
   DEFAULT_SETTINGS,
   DEFAULT_WAREHOUSE_ID,
   DirectPaymentMethod,
+  DocumentType,
+  EstablishmentRecord,
+  InvoiceIssuerSnapshot,
   InvoiceRecord,
   isJaimonaOwnerEmail,
   JAIMONA_COMPANY_ID,
@@ -32,6 +47,7 @@ import {
   PaymentSplit,
   Product,
   ProductPriceChange,
+  ProductType,
   PurchaseLineItem,
   PurchasePaymentMethod,
   PurchaseRecord,
@@ -39,13 +55,358 @@ import {
   StockMovementDirection,
   StockMovementType,
   Supplier,
+  TaxRate,
   validateCompanyNif,
   VITRONIS_INSTITUTIONAL,
+  WarehouseRecord,
 } from '../core/types';
 import { auth, db, handleFirestoreError, OperationType } from './firebaseClient';
 
 function sanitizeId(raw: string): string {
   return String(raw || '').replace(/[^a-zA-Z0-9_-]/g, '_').slice(0, 128) || 'item_default';
+}
+
+function normalizeTaxRate(raw: unknown): TaxRate {
+  const num = Number(raw);
+  if (num === 1 || num === 5 || num === 7 || num === 14) return num;
+  return 0;
+}
+
+const VALID_DOC_TYPES: ReadonlySet<DocumentType> = new Set([
+  'FR',
+  'FA',
+  'FP',
+  'NC',
+  'ND',
+  'RC',
+  'FT',
+  'CS',
+]);
+
+function normalizeDocType(raw: unknown): DocumentType {
+  const candidate = String(raw || '').trim().toUpperCase() as DocumentType;
+  return VALID_DOC_TYPES.has(candidate) ? candidate : 'FR';
+}
+
+function sanitizeEstablishmentsForCloud(raw?: EstablishmentRecord[]): EstablishmentRecord[] {
+  if (!Array.isArray(raw)) return [];
+  return raw
+    .filter((e) => e && e.id && e.code && e.name)
+    .slice(0, 20)
+    .map((e) => ({
+      id: sanitizeId(e.id),
+      code: String(e.code).trim().slice(0, 16),
+      name: String(e.name).trim().slice(0, 120),
+      isHeadquarters: Boolean(e.isHeadquarters),
+      address: String(e.address || '').trim().slice(0, 160),
+      ...(e.municipality ? { municipality: String(e.municipality).trim().slice(0, 80) } : {}),
+      ...(e.province ? { province: String(e.province).trim().slice(0, 80) } : {}),
+      ...(e.phone ? { phone: String(e.phone).trim().slice(0, 40) } : {}),
+      ...(e.email ? { email: String(e.email).trim().slice(0, 120) } : {}),
+      ...(e.defaultCashierCode
+        ? { defaultCashierCode: String(e.defaultCashierCode).trim().slice(0, 16) }
+        : {}),
+      ...(e.defaultWarehouseId
+        ? { defaultWarehouseId: sanitizeId(e.defaultWarehouseId).slice(0, 64) }
+        : {}),
+      active: e.active !== false,
+    }));
+}
+
+function sanitizeWarehousesForCloud(raw?: WarehouseRecord[]): WarehouseRecord[] {
+  if (!Array.isArray(raw)) return [];
+  return raw
+    .filter((w) => w && w.id && w.code && w.name)
+    .slice(0, 20)
+    .map((w) => ({
+      id: sanitizeId(w.id).slice(0, 64),
+      code: String(w.code).trim().slice(0, 16),
+      name: String(w.name).trim().slice(0, 120),
+      establishmentId: sanitizeId(w.establishmentId || 'est_matriz'),
+      ...(w.address ? { address: String(w.address).trim().slice(0, 160) } : {}),
+      active: w.active !== false,
+    }));
+}
+
+function buildMasterProfileMap(profile: CompanyProfile): Record<string, unknown> {
+  const mp: Record<string, unknown> = {};
+  if (profile.legalNature) mp.legalNature = String(profile.legalNature).slice(0, 16);
+  if (profile.cae) mp.cae = String(profile.cae).trim().slice(0, 32);
+  if (profile.commercialRegistry) {
+    mp.commercialRegistry = String(profile.commercialRegistry).trim().slice(0, 80);
+  }
+  if (profile.shareCapital) mp.shareCapital = String(profile.shareCapital).trim().slice(0, 40);
+
+  mp.taxRegime =
+    profile.taxRegime === 'SIMPLIFICADO' || profile.taxRegime === 'EXCLUSAO'
+      ? profile.taxRegime
+      : 'GERAL';
+  if (profile.taxOffice) mp.taxOffice = String(profile.taxOffice).trim().slice(0, 120);
+  if (profile.taxEntity) mp.taxEntity = String(profile.taxEntity).trim().slice(0, 120);
+  if (profile.defaultExemptionCode) {
+    mp.defaultExemptionCode = String(profile.defaultExemptionCode).trim().slice(0, 16);
+  }
+  if (typeof profile.isVatRetentionAgent === 'boolean') {
+    mp.isVatRetentionAgent = profile.isVatRetentionAgent;
+  }
+  if (
+    typeof profile.defaultWithholdingTax === 'number' &&
+    Number.isFinite(profile.defaultWithholdingTax)
+  ) {
+    mp.defaultWithholdingTax = Math.min(100, Math.max(0, profile.defaultWithholdingTax));
+  }
+  if (profile.specialTaxTerritory) {
+    mp.specialTaxTerritory = profile.specialTaxTerritory === 'AO-CAB' ? 'AO-CAB' : 'AO';
+  }
+  mp.agtEnvironment = profile.agtEnvironment === 'PRODUCAO' ? 'PRODUCAO' : 'SIMULACAO';
+  if (profile.activityStartDate) {
+    mp.activityStartDate = String(profile.activityStartDate).trim().slice(0, 20);
+  }
+
+  if (profile.municipality) mp.municipality = String(profile.municipality).trim().slice(0, 80);
+  if (profile.province) mp.province = String(profile.province).trim().slice(0, 80);
+  if (profile.postalCode) mp.postalCode = String(profile.postalCode).trim().slice(0, 32);
+  if (profile.country) mp.country = String(profile.country).trim().slice(0, 8);
+
+  if (profile.mobile) mp.mobile = String(profile.mobile).trim().slice(0, 40);
+  if (profile.whatsapp) mp.whatsapp = String(profile.whatsapp).trim().slice(0, 40);
+  if (profile.billingEmail) mp.billingEmail = String(profile.billingEmail).trim().slice(0, 120);
+  if (profile.website) mp.website = String(profile.website).trim().slice(0, 160);
+
+  if (profile.logoUrl && validateLogoDataUrl(profile.logoUrl).valid) {
+    mp.logoUrl = profile.logoUrl.trim().slice(0, 270000);
+  }
+  if (typeof profile.showLogoOnPos === 'boolean') mp.showLogoOnPos = profile.showLogoOnPos;
+  if (typeof profile.showLogoOnA4 === 'boolean') mp.showLogoOnA4 = profile.showLogoOnA4;
+
+  if (profile.bankName1) mp.bankName1 = String(profile.bankName1).trim().slice(0, 80);
+  if (profile.iban1) mp.iban1 = String(profile.iban1).trim().slice(0, 40);
+  if (profile.accountHolder1) mp.accountHolder1 = String(profile.accountHolder1).trim().slice(0, 120);
+  if (profile.swift1) mp.swift1 = String(profile.swift1).trim().slice(0, 24);
+  if (profile.bankName2) mp.bankName2 = String(profile.bankName2).trim().slice(0, 80);
+  if (profile.iban2) mp.iban2 = String(profile.iban2).trim().slice(0, 40);
+  if (profile.accountHolder2) mp.accountHolder2 = String(profile.accountHolder2).trim().slice(0, 120);
+  if (profile.swift2) mp.swift2 = String(profile.swift2).trim().slice(0, 24);
+  if (profile.multicaixaExpressPhone) {
+    mp.multicaixaExpressPhone = String(profile.multicaixaExpressPhone).trim().slice(0, 40);
+  }
+  if (
+    typeof profile.defaultPaymentTermsDays === 'number' &&
+    Number.isFinite(profile.defaultPaymentTermsDays)
+  ) {
+    mp.defaultPaymentTermsDays = Math.min(
+      3650,
+      Math.max(0, Math.floor(profile.defaultPaymentTermsDays))
+    );
+  }
+
+  if (profile.defaultEstablishmentId) {
+    mp.defaultEstablishmentId = sanitizeId(profile.defaultEstablishmentId);
+  }
+  const ests = sanitizeEstablishmentsForCloud(profile.establishments);
+  if (ests.length > 0) mp.establishments = ests;
+  const whs = sanitizeWarehousesForCloud(profile.warehouses);
+  if (whs.length > 0) mp.warehouses = whs;
+
+  if (profile.legalRepresentativeName) {
+    mp.legalRepresentativeName = String(profile.legalRepresentativeName).trim().slice(0, 120);
+  }
+  if (profile.legalRepresentativeRole) {
+    mp.legalRepresentativeRole = String(profile.legalRepresentativeRole).trim().slice(0, 64);
+  }
+  if (profile.legalRepresentativeNif) {
+    mp.legalRepresentativeNif = String(profile.legalRepresentativeNif).trim().slice(0, 32);
+  }
+  if (profile.legalRepresentativePhone) {
+    mp.legalRepresentativePhone = String(profile.legalRepresentativePhone).trim().slice(0, 40);
+  }
+  if (profile.accountantName) mp.accountantName = String(profile.accountantName).trim().slice(0, 120);
+  if (profile.accountantOcpcaNumber) {
+    mp.accountantOcpcaNumber = String(profile.accountantOcpcaNumber).trim().slice(0, 40);
+  }
+  if (profile.accountantEmail) {
+    mp.accountantEmail = String(profile.accountantEmail).trim().slice(0, 120);
+  }
+  if (profile.accountantPhone) {
+    mp.accountantPhone = String(profile.accountantPhone).trim().slice(0, 40);
+  }
+
+  return mp;
+}
+
+function hydrateProfileFromCloud(cd: Record<string, unknown>, fallbackId: string): CompanyProfile {
+  const mp =
+    cd.masterProfile && typeof cd.masterProfile === 'object'
+      ? (cd.masterProfile as Record<string, unknown>)
+      : {};
+
+  const taxRegimeRaw = String(mp.taxRegime || '');
+  const taxRegime: AngolaTaxRegime =
+    taxRegimeRaw === 'SIMPLIFICADO' || taxRegimeRaw === 'EXCLUSAO' ? taxRegimeRaw : 'GERAL';
+
+  const legalNatureRaw = String(mp.legalNature || '') as AngolaLegalNature;
+  const legalNature: AngolaLegalNature | undefined =
+    legalNatureRaw === 'LDA' ||
+    legalNatureRaw === 'SU_LDA' ||
+    legalNatureRaw === 'SA' ||
+    legalNatureRaw === 'ENI' ||
+    legalNatureRaw === 'COOP' ||
+    legalNatureRaw === 'OUTRA'
+      ? legalNatureRaw
+      : undefined;
+
+  const logoCandidate = typeof mp.logoUrl === 'string' ? mp.logoUrl : undefined;
+  const safeLogo = logoCandidate && validateLogoDataUrl(logoCandidate).valid ? logoCandidate : undefined;
+
+  return {
+    legalName: String(cd.legalName || cd.shortName || fallbackId),
+    shortName: String(cd.shortName || cd.legalName || fallbackId),
+    nif: String(cd.nif || ''),
+    address: String(cd.address || 'Angola'),
+    cityCountry: String(cd.cityCountry || 'Angola'),
+    phone: String(cd.phone || ''),
+    email: String(cd.email || ''),
+    tagline: String(cd.tagline || ''),
+    ...(legalNature ? { legalNature } : {}),
+    ...(mp.cae ? { cae: String(mp.cae) } : {}),
+    ...(mp.commercialRegistry ? { commercialRegistry: String(mp.commercialRegistry) } : {}),
+    ...(mp.shareCapital ? { shareCapital: String(mp.shareCapital) } : {}),
+    taxRegime,
+    ...(mp.taxOffice ? { taxOffice: String(mp.taxOffice) } : {}),
+    ...(mp.taxEntity ? { taxEntity: String(mp.taxEntity) } : {}),
+    ...(mp.defaultExemptionCode
+      ? { defaultExemptionCode: String(mp.defaultExemptionCode) as AgtIvaExemptionCode }
+      : {}),
+    ...(typeof mp.isVatRetentionAgent === 'boolean'
+      ? { isVatRetentionAgent: mp.isVatRetentionAgent }
+      : {}),
+    ...(typeof mp.defaultWithholdingTax === 'number'
+      ? { defaultWithholdingTax: mp.defaultWithholdingTax }
+      : {}),
+    ...(mp.specialTaxTerritory
+      ? {
+          specialTaxTerritory: (mp.specialTaxTerritory === 'AO-CAB'
+            ? 'AO-CAB'
+            : 'AO') as AngolaTaxTerritory,
+        }
+      : {}),
+    agtEnvironment: mp.agtEnvironment === 'PRODUCAO' ? 'PRODUCAO' : 'SIMULACAO',
+    ...(mp.activityStartDate ? { activityStartDate: String(mp.activityStartDate) } : {}),
+    ...(mp.municipality ? { municipality: String(mp.municipality) } : {}),
+    ...(mp.province ? { province: String(mp.province) } : {}),
+    ...(mp.postalCode ? { postalCode: String(mp.postalCode) } : {}),
+    country: mp.country ? String(mp.country) : 'AO',
+    ...(mp.mobile ? { mobile: String(mp.mobile) } : {}),
+    ...(mp.whatsapp ? { whatsapp: String(mp.whatsapp) } : {}),
+    ...(mp.billingEmail ? { billingEmail: String(mp.billingEmail) } : {}),
+    ...(mp.website ? { website: String(mp.website) } : {}),
+    ...(safeLogo ? { logoUrl: safeLogo } : {}),
+    ...(typeof mp.showLogoOnPos === 'boolean' ? { showLogoOnPos: mp.showLogoOnPos } : {}),
+    ...(typeof mp.showLogoOnA4 === 'boolean' ? { showLogoOnA4: mp.showLogoOnA4 } : {}),
+    ...(mp.bankName1 ? { bankName1: String(mp.bankName1) } : {}),
+    ...(mp.iban1 ? { iban1: String(mp.iban1) } : {}),
+    ...(mp.accountHolder1 ? { accountHolder1: String(mp.accountHolder1) } : {}),
+    ...(mp.swift1 ? { swift1: String(mp.swift1) } : {}),
+    ...(mp.bankName2 ? { bankName2: String(mp.bankName2) } : {}),
+    ...(mp.iban2 ? { iban2: String(mp.iban2) } : {}),
+    ...(mp.accountHolder2 ? { accountHolder2: String(mp.accountHolder2) } : {}),
+    ...(mp.swift2 ? { swift2: String(mp.swift2) } : {}),
+    ...(mp.multicaixaExpressPhone
+      ? { multicaixaExpressPhone: String(mp.multicaixaExpressPhone) }
+      : {}),
+    ...(typeof mp.defaultPaymentTermsDays === 'number'
+      ? { defaultPaymentTermsDays: mp.defaultPaymentTermsDays }
+      : {}),
+    ...(mp.defaultEstablishmentId
+      ? { defaultEstablishmentId: String(mp.defaultEstablishmentId) }
+      : {}),
+    ...(Array.isArray(mp.establishments)
+      ? { establishments: sanitizeEstablishmentsForCloud(mp.establishments as EstablishmentRecord[]) }
+      : {}),
+    ...(Array.isArray(mp.warehouses)
+      ? { warehouses: sanitizeWarehousesForCloud(mp.warehouses as WarehouseRecord[]) }
+      : {}),
+    ...(mp.legalRepresentativeName
+      ? { legalRepresentativeName: String(mp.legalRepresentativeName) }
+      : {}),
+    ...(mp.legalRepresentativeRole
+      ? { legalRepresentativeRole: String(mp.legalRepresentativeRole) }
+      : {}),
+    ...(mp.legalRepresentativeNif
+      ? { legalRepresentativeNif: String(mp.legalRepresentativeNif) }
+      : {}),
+    ...(mp.legalRepresentativePhone
+      ? { legalRepresentativePhone: String(mp.legalRepresentativePhone) }
+      : {}),
+    ...(mp.accountantName ? { accountantName: String(mp.accountantName) } : {}),
+    ...(mp.accountantOcpcaNumber
+      ? { accountantOcpcaNumber: String(mp.accountantOcpcaNumber) }
+      : {}),
+    ...(mp.accountantEmail ? { accountantEmail: String(mp.accountantEmail) } : {}),
+    ...(mp.accountantPhone ? { accountantPhone: String(mp.accountantPhone) } : {}),
+  };
+}
+
+function sanitizeIssuerSnapshotForCloud(
+  snap?: InvoiceIssuerSnapshot
+): Record<string, unknown> | undefined {
+  if (!snap || !snap.legalName || !snap.nif) return undefined;
+  const out: Record<string, unknown> = {
+    companyId: sanitizeId(snap.companyId || 'comp'),
+    legalName: String(snap.legalName).slice(0, 160),
+    shortName: String(snap.shortName || snap.legalName).slice(0, 64),
+    nif: String(snap.nif).slice(0, 32),
+    taxRegime:
+      snap.taxRegime === 'SIMPLIFICADO' || snap.taxRegime === 'EXCLUSAO'
+        ? snap.taxRegime
+        : 'GERAL',
+    address: String(snap.address || 'Angola').slice(0, 160),
+    cityCountry: String(snap.cityCountry || 'Angola').slice(0, 80),
+    phone: String(snap.phone || '').slice(0, 40),
+    email: String(snap.email || '').slice(0, 120),
+    tagline: String(snap.tagline || '').slice(0, 120),
+    capturedAtIso: String(snap.capturedAtIso || new Date().toISOString()).slice(0, 40),
+  };
+  if (snap.taxOffice) out.taxOffice = String(snap.taxOffice).slice(0, 120);
+  if (snap.commercialRegistry) out.commercialRegistry = String(snap.commercialRegistry).slice(0, 80);
+  if (snap.shareCapital) out.shareCapital = String(snap.shareCapital).slice(0, 40);
+  if (snap.cae) out.cae = String(snap.cae).slice(0, 32);
+  if (snap.municipality) out.municipality = String(snap.municipality).slice(0, 80);
+  if (snap.province) out.province = String(snap.province).slice(0, 80);
+  if (snap.postalCode) out.postalCode = String(snap.postalCode).slice(0, 32);
+  if (snap.mobile) out.mobile = String(snap.mobile).slice(0, 40);
+  if (snap.whatsapp) out.whatsapp = String(snap.whatsapp).slice(0, 40);
+  if (snap.billingEmail) out.billingEmail = String(snap.billingEmail).slice(0, 120);
+  if (snap.website) out.website = String(snap.website).slice(0, 160);
+  if (snap.logoUrl && validateLogoDataUrl(snap.logoUrl).valid) {
+    out.logoUrl = snap.logoUrl.slice(0, 270000);
+  }
+  if (typeof snap.showLogoOnPos === 'boolean') out.showLogoOnPos = snap.showLogoOnPos;
+  if (typeof snap.showLogoOnA4 === 'boolean') out.showLogoOnA4 = snap.showLogoOnA4;
+  if (snap.bankName1) out.bankName1 = String(snap.bankName1).slice(0, 80);
+  if (snap.iban1) out.iban1 = String(snap.iban1).slice(0, 40);
+  if (snap.accountHolder1) out.accountHolder1 = String(snap.accountHolder1).slice(0, 120);
+  if (snap.swift1) out.swift1 = String(snap.swift1).slice(0, 24);
+  if (snap.bankName2) out.bankName2 = String(snap.bankName2).slice(0, 80);
+  if (snap.iban2) out.iban2 = String(snap.iban2).slice(0, 40);
+  if (snap.accountHolder2) out.accountHolder2 = String(snap.accountHolder2).slice(0, 120);
+  if (snap.swift2) out.swift2 = String(snap.swift2).slice(0, 24);
+  if (snap.multicaixaExpressPhone) {
+    out.multicaixaExpressPhone = String(snap.multicaixaExpressPhone).slice(0, 40);
+  }
+  if (snap.establishmentId) out.establishmentId = sanitizeId(snap.establishmentId);
+  if (snap.establishmentCode) out.establishmentCode = String(snap.establishmentCode).slice(0, 16);
+  if (snap.establishmentName) out.establishmentName = String(snap.establishmentName).slice(0, 120);
+  if (snap.establishmentAddress) {
+    out.establishmentAddress = String(snap.establishmentAddress).slice(0, 160);
+  }
+  if (snap.legalRepresentativeName) {
+    out.legalRepresentativeName = String(snap.legalRepresentativeName).slice(0, 120);
+  }
+  if (snap.legalRepresentativeRole) {
+    out.legalRepresentativeRole = String(snap.legalRepresentativeRole).slice(0, 64);
+  }
+  return out;
 }
 
 const verifiedCloudCompaniesCache = new Set<string>();
@@ -109,6 +470,8 @@ export async function ensureCompanyRegisteredCloud(
       const isProtectedJaimona =
         companyId === JAIMONA_COMPANY_ID && isJaimonaOwnerEmail(user.email);
 
+      const masterProfilePayload = buildMasterProfileMap(company.profile);
+
       batch.set(companyRef, {
         id: companyId,
         normalizedNif,
@@ -122,6 +485,7 @@ export async function ensureCompanyRegisteredCloud(
         phone: (company.profile.phone || '').slice(0, 40),
         email: (company.profile.email || '').slice(0, 120),
         tagline: (company.profile.tagline || '').slice(0, 120),
+        masterProfile: masterProfilePayload,
         status: 'active',
         planTier: isProtectedJaimona ? 'PROFISSIONAL' : 'FREE',
         commercialActive: isProtectedJaimona,
@@ -174,6 +538,7 @@ export async function ensureCompanyRegisteredCloud(
         phone: (company.profile.phone || '').slice(0, 40),
         email: (company.profile.email || '').slice(0, 120),
         tagline: (company.profile.tagline || '').slice(0, 120),
+        masterProfile: buildMasterProfileMap(company.profile),
         allowManagerCancel: Boolean(company.allowManagerCancel),
         updatedAt: serverTimestamp(),
       });
@@ -290,6 +655,16 @@ export async function upsertProductCloud(
         : {};
     const historyField = cleanHistory.length > 0 ? { priceHistory: cleanHistory } : {};
 
+    const normalizedRate = normalizeTaxRate(product.ivaRate);
+    const extraProductFields = {
+      ...(product.productType === 'P' || product.productType === 'S' || product.productType === 'K'
+        ? { productType: product.productType }
+        : {}),
+      ...(product.exemptionCode
+        ? { exemptionCode: String(product.exemptionCode).trim().slice(0, 16) }
+        : {}),
+    };
+
     if (!snap.exists()) {
       await setDoc(compProdRef, {
         id: productId,
@@ -303,9 +678,10 @@ export async function upsertProductCloud(
         unit: (product.unit || 'un').slice(0, 16),
         costPrice: costPriceVal,
         price: Number(product.price) || 0,
-        ivaRate: product.ivaRate === 14 ? 14 : 0,
+        ivaRate: normalizedRate,
         exemptionReason: (product.exemptionReason || '').slice(0, 120),
         active: Boolean(product.active),
+        ...extraProductFields,
         ...stockFields,
         ...historyField,
         createdAt: serverTimestamp(),
@@ -321,9 +697,10 @@ export async function upsertProductCloud(
         unit: (product.unit || 'un').slice(0, 16),
         costPrice: costPriceVal,
         price: Number(product.price) || 0,
-        ivaRate: product.ivaRate === 14 ? 14 : 0,
+        ivaRate: normalizedRate,
         exemptionReason: (product.exemptionReason || '').slice(0, 120),
         active: Boolean(product.active),
+        ...extraProductFields,
         ...stockFields,
         ...historyField,
         updatedAt: serverTimestamp(),
@@ -345,9 +722,10 @@ export async function upsertProductCloud(
           unit: (product.unit || 'un').slice(0, 16),
           costPrice: costPriceVal,
           price: Number(product.price) || 0,
-          ivaRate: product.ivaRate === 14 ? 14 : 0,
+          ivaRate: normalizedRate,
           exemptionReason: (product.exemptionReason || '').slice(0, 120),
           active: Boolean(product.active),
+          ...extraProductFields,
           ...stockFields,
           ...historyField,
           createdAt: serverTimestamp(),
@@ -362,9 +740,10 @@ export async function upsertProductCloud(
           unit: (product.unit || 'un').slice(0, 16),
           costPrice: costPriceVal,
           price: Number(product.price) || 0,
-          ivaRate: product.ivaRate === 14 ? 14 : 0,
+          ivaRate: normalizedRate,
           exemptionReason: (product.exemptionReason || '').slice(0, 120),
           active: Boolean(product.active),
+          ...extraProductFields,
           ...stockFields,
           ...historyField,
           updatedAt: serverTimestamp(),
@@ -671,6 +1050,8 @@ export async function createInvoiceCloud(
           }))
       : [];
 
+    const sanitizedSnapshot = sanitizeIssuerSnapshotForCloud(invoice.issuerSnapshot);
+
     const batch = writeBatch(db);
     batch.set(invRef, {
       id: invoiceId,
@@ -678,7 +1059,7 @@ export async function createInvoiceCloud(
       companyOwnerUid: ownerUid,
       emittedByUid: user.uid,
       number: invoice.number.slice(0, 40),
-      docType: invoice.docType,
+      docType: normalizeDocType(invoice.docType),
       issuedAtIso: invoice.issuedAtIso.slice(0, 40),
       cashier: invoice.cashier.slice(0, 16),
       operator: invoice.operator.slice(0, 32),
@@ -693,11 +1074,39 @@ export async function createInvoiceCloud(
       ...(invoice.globalDiscountAmount ? { globalDiscountAmount: invoice.globalDiscountAmount } : {}),
       taxBase14: invoice.taxBase14,
       taxAmount14: invoice.taxAmount14,
+      ...(typeof invoice.taxBaseIntermediate === 'number'
+        ? { taxBaseIntermediate: invoice.taxBaseIntermediate }
+        : {}),
+      ...(typeof invoice.taxAmountIntermediate === 'number'
+        ? { taxAmountIntermediate: invoice.taxAmountIntermediate }
+        : {}),
+      ...(typeof invoice.taxBaseReduced === 'number'
+        ? { taxBaseReduced: invoice.taxBaseReduced }
+        : {}),
+      ...(typeof invoice.taxAmountReduced === 'number'
+        ? { taxAmountReduced: invoice.taxAmountReduced }
+        : {}),
       taxBase0: invoice.taxBase0,
       taxAmount0: 0,
       taxTotal: invoice.taxTotal,
       grandTotal: invoice.grandTotal,
       amountInWords: invoice.amountInWords.slice(0, 300),
+      ...(invoice.establishmentId ? { establishmentId: sanitizeId(invoice.establishmentId) } : {}),
+      ...(invoice.establishmentCode
+        ? { establishmentCode: invoice.establishmentCode.slice(0, 16) }
+        : {}),
+      ...(invoice.establishmentName
+        ? { establishmentName: invoice.establishmentName.slice(0, 120) }
+        : {}),
+      ...(invoice.seriesCode ? { seriesCode: invoice.seriesCode.slice(0, 16) } : {}),
+      ...(invoice.seriesEnvironment
+        ? { seriesEnvironment: invoice.seriesEnvironment }
+        : {}),
+      ...(invoice.agtAuthorizationCode
+        ? { agtAuthorizationCode: invoice.agtAuthorizationCode.slice(0, 64) }
+        : {}),
+      ...(invoice.saftHash4 ? { saftHash4: invoice.saftHash4.slice(0, 16) } : {}),
+      ...(sanitizedSnapshot ? { issuerSnapshot: sanitizedSnapshot } : {}),
       ...(invoice.sessionId ? { sessionId: sanitizeId(invoice.sessionId) } : {}),
       amountReceived: invoice.amountReceived,
       ...(typeof invoice.initialAmountReceived === 'number'
@@ -744,7 +1153,10 @@ export async function createInvoiceCloud(
         qty: line.qty,
         unitPrice: line.unitPrice,
         discountPct: line.discountPct,
-        ivaRate: line.ivaRate,
+        ivaRate: normalizeTaxRate(line.ivaRate),
+        ...(line.exemptionCode
+          ? { exemptionCode: String(line.exemptionCode).trim().slice(0, 16) }
+          : {}),
         lineGross: line.lineGross,
         lineNet: line.lineNet,
         lineBase: line.lineBase,
@@ -806,6 +1218,12 @@ export async function upsertSettingsCloud(
   }
   const settingsPath = `companies/${companyId}/settings/general`;
   const ref = doc(db, 'companies', companyId, 'settings', 'general');
+  const resolvedEstablishmentId =
+    settings.defaultEstablishmentId || settings.company.defaultEstablishmentId;
+  const resolvedAgtEnv =
+    settings.agtEnvironment === 'PRODUCAO' || settings.company.agtEnvironment === 'PRODUCAO'
+      ? 'PRODUCAO'
+      : 'SIMULACAO';
 
   const payload = {
     companyId,
@@ -822,11 +1240,16 @@ export async function upsertSettingsCloud(
     defaultCashier: (settings.defaultCashier || '01').slice(0, 16),
     defaultOperator: (settings.defaultOperator || '001').slice(0, 32),
     defaultFormat: settings.defaultFormat === 'A4' ? 'A4' : 'POS',
-    defaultDocType: settings.defaultDocType === 'FP' ? 'FP' : 'FR',
+    defaultDocType: normalizeDocType(settings.defaultDocType),
     defaultNotes: (settings.defaultNotes || '').slice(0, 300),
     autoPrintOnEmit: Boolean(settings.autoPrintOnEmit),
     hidePromotionalFooter: Boolean(settings.hidePromotionalFooter ?? true),
     allowCashierPriceEdit: Boolean(settings.allowCashierPriceEdit ?? false),
+    ...(resolvedEstablishmentId
+      ? { defaultEstablishmentId: sanitizeId(resolvedEstablishmentId) }
+      : {}),
+    agtEnvironment: resolvedAgtEnv,
+    masterProfile: buildMasterProfileMap(settings.company),
     updatedAt: serverTimestamp(),
   };
 
@@ -852,11 +1275,88 @@ export async function upsertSettingsCloud(
         autoPrintOnEmit: payload.autoPrintOnEmit,
         hidePromotionalFooter: payload.hidePromotionalFooter,
         allowCashierPriceEdit: payload.allowCashierPriceEdit,
+        ...(resolvedEstablishmentId
+          ? { defaultEstablishmentId: sanitizeId(resolvedEstablishmentId) }
+          : {}),
+        agtEnvironment: resolvedAgtEnv,
+        masterProfile: payload.masterProfile,
         updatedAt: serverTimestamp(),
       });
     }
   } catch (err) {
     handleFirestoreError(err, OperationType.WRITE, settingsPath);
+  }
+}
+
+export async function upsertFiscalSeriesCloud(
+  series: AgtSeriesRecord,
+  company?: CompanyRecord
+): Promise<void> {
+  const user = auth.currentUser;
+  if (!user || !user.emailVerified) return;
+  if (company && !canCompanySyncCloudData(company)) return;
+
+  const rawCompanyId = company?.id || series.companyId || '';
+  if (!rawCompanyId) return;
+  const companyId = sanitizeId(rawCompanyId);
+  const seriesId = sanitizeId(series.id);
+  const ownerUid = company?.ownerUid || user.uid;
+  if (companyId === JAIMONA_COMPANY_ID && !company?.ownerUid && !isJaimonaOwnerEmail(user.email)) {
+    return;
+  }
+
+  const seriesPath = `companies/${companyId}/fiscal_series/${seriesId}`;
+  const ref = doc(db, 'companies', companyId, 'fiscal_series', seriesId);
+  const env: AgtSeriesEnvironment = series.environment === 'PRODUCAO' ? 'PRODUCAO' : 'SIMULACAO';
+  const status: AgtSeriesStatus =
+    series.status === 'F' ? 'F' : series.status === 'U' ? 'U' : 'A';
+
+  try {
+    const snap = await getDoc(ref);
+    if (!snap.exists()) {
+      await setDoc(ref, {
+        id: seriesId,
+        companyId,
+        companyOwnerUid: ownerUid,
+        updatedByUid: user.uid,
+        seriesCode: String(series.seriesCode || '').slice(0, 16),
+        seriesYear: Math.max(2020, Math.min(2100, Math.floor(series.seriesYear || new Date().getFullYear()))),
+        documentType: String(series.documentType || 'FR').slice(0, 8),
+        firstDocumentNumber: Math.max(1, Math.floor(series.firstDocumentNumber || 1)),
+        lastDocumentNumber: Math.max(0, Math.floor(series.lastDocumentNumber || 0)),
+        status,
+        environment: env,
+        ...(series.establishmentId ? { establishmentId: sanitizeId(series.establishmentId) } : {}),
+        ...(series.establishmentCode
+          ? { establishmentCode: String(series.establishmentCode).slice(0, 16) }
+          : {}),
+        ...(series.agtAuthorizationCode
+          ? { agtAuthorizationCode: String(series.agtAuthorizationCode).slice(0, 64) }
+          : {}),
+        requestedAtIso: String(series.requestedAtIso || new Date().toISOString()).slice(0, 40),
+        ...(series.authorizedAtIso
+          ? { authorizedAtIso: String(series.authorizedAtIso).slice(0, 40) }
+          : {}),
+        ...(series.closedAtIso ? { closedAtIso: String(series.closedAtIso).slice(0, 40) } : {}),
+        ...(series.notes ? { notes: String(series.notes).slice(0, 300) } : {}),
+        createdAt: serverTimestamp(),
+        updatedAt: serverTimestamp(),
+      });
+    } else if (snap.data()?.status !== 'F') {
+      await updateDoc(ref, {
+        updatedByUid: user.uid,
+        lastDocumentNumber: Math.max(
+          Number(snap.data()?.lastDocumentNumber) || 0,
+          Math.max(0, Math.floor(series.lastDocumentNumber || 0))
+        ),
+        status,
+        ...(series.closedAtIso ? { closedAtIso: String(series.closedAtIso).slice(0, 40) } : {}),
+        ...(series.notes ? { notes: String(series.notes).slice(0, 300) } : {}),
+        updatedAt: serverTimestamp(),
+      });
+    }
+  } catch (err) {
+    handleFirestoreError(err, OperationType.WRITE, seriesPath);
   }
 }
 
@@ -1365,6 +1865,7 @@ export async function pullCompanyFromCloud(companyIdRaw: string): Promise<{
   stockMovements: StockMovement[];
   suppliers: Supplier[];
   purchases: PurchaseRecord[];
+  fiscalSeries?: AgtSeriesRecord[];
   settings: AppSettings | null;
 } | null> {
   const user = auth.currentUser;
@@ -1403,6 +1904,7 @@ export async function pullCompanyFromCloud(companyIdRaw: string): Promise<{
   const stockMovPath = `companies/${companyId}/stock_movements`;
   const supPath = `companies/${companyId}/suppliers`;
   const purPath = `companies/${companyId}/purchases`;
+  const seriesPath = `companies/${companyId}/fiscal_series`;
   const settingsRef = doc(db, 'companies', companyId, 'settings', 'general');
 
   try {
@@ -1415,6 +1917,7 @@ export async function pullCompanyFromCloud(companyIdRaw: string): Promise<{
       stockMovSnap,
       supSnap,
       purSnap,
+      seriesSnap,
       settingsSnap,
     ] = await Promise.all([
       getDocs(
@@ -1473,6 +1976,13 @@ export async function pullCompanyFromCloud(companyIdRaw: string): Promise<{
           where('companyOwnerUid', '==', user.uid)
         )
       ).catch(() => null),
+      getDocs(
+        query(
+          collection(db, seriesPath),
+          where('companyId', '==', companyId),
+          where('companyOwnerUid', '==', user.uid)
+        )
+      ).catch(() => null),
       getDoc(settingsRef).catch(() => null),
     ]);
 
@@ -1491,19 +2001,27 @@ export async function pullCompanyFromCloud(companyIdRaw: string): Promise<{
     const products: Product[] = prodSnap.docs.map((d) => {
       const data = d.data();
       const history = sanitizePriceHistory(data.priceHistory as ProductPriceChange[] | undefined);
+      const pt =
+        data.productType === 'P' || data.productType === 'S' || data.productType === 'K'
+          ? (data.productType as ProductType)
+          : undefined;
       return {
         id: data.id,
         companyId,
         code: data.code,
         ...(data.barcode ? { barcode: String(data.barcode) } : {}),
         name: data.name,
+        ...(pt ? { productType: pt } : {}),
         category: data.category || 'Geral',
         unit: data.unit,
         ...(typeof data.costPrice === 'number' && data.costPrice > 0
           ? { costPrice: Number(data.costPrice) }
           : {}),
         price: data.price,
-        ivaRate: data.ivaRate === 14 ? 14 : 0,
+        ivaRate: normalizeTaxRate(data.ivaRate),
+        ...(data.exemptionCode
+          ? { exemptionCode: String(data.exemptionCode) as AgtIvaExemptionCode }
+          : {}),
         exemptionReason: data.exemptionReason || '',
         active: Boolean(data.active),
         ...(typeof data.trackStock === 'boolean'
@@ -1578,7 +2096,10 @@ export async function pullCompanyFromCloud(companyIdRaw: string): Promise<{
             qty: it.qty,
             unitPrice: it.unitPrice,
             discountPct: it.discountPct,
-            ivaRate: it.ivaRate === 14 ? 14 : 0,
+            ivaRate: normalizeTaxRate(it.ivaRate),
+            ...(it.exemptionCode
+              ? { exemptionCode: String(it.exemptionCode) as AgtIvaExemptionCode }
+              : {}),
             lineGross: it.lineGross,
             lineDiscount: Math.max(0, it.lineGross - it.lineNet),
             lineNet: it.lineNet,
@@ -1592,7 +2113,7 @@ export async function pullCompanyFromCloud(companyIdRaw: string): Promise<{
           id: data.id,
           companyId,
           number: data.number,
-          docType: data.docType === 'FP' ? 'FP' : data.docType === 'NC' ? 'NC' : 'FR',
+          docType: normalizeDocType(data.docType),
           issuedAtIso: data.issuedAtIso,
           cashier: data.cashier,
           operator: data.operator,
@@ -1607,11 +2128,41 @@ export async function pullCompanyFromCloud(companyIdRaw: string): Promise<{
           globalDiscountAmount: typeof data.globalDiscountAmount === 'number' ? data.globalDiscountAmount : undefined,
           taxBase14: data.taxBase14,
           taxAmount14: data.taxAmount14,
+          ...(typeof data.taxBaseIntermediate === 'number'
+            ? { taxBaseIntermediate: data.taxBaseIntermediate }
+            : {}),
+          ...(typeof data.taxAmountIntermediate === 'number'
+            ? { taxAmountIntermediate: data.taxAmountIntermediate }
+            : {}),
+          ...(typeof data.taxBaseReduced === 'number'
+            ? { taxBaseReduced: data.taxBaseReduced }
+            : {}),
+          ...(typeof data.taxAmountReduced === 'number'
+            ? { taxAmountReduced: data.taxAmountReduced }
+            : {}),
           taxBase0: data.taxBase0,
           taxAmount0: 0,
           taxTotal: data.taxTotal,
           grandTotal: data.grandTotal,
           amountInWords: data.amountInWords,
+          ...(data.issuerSnapshot && typeof data.issuerSnapshot === 'object'
+            ? { issuerSnapshot: data.issuerSnapshot as InvoiceIssuerSnapshot }
+            : {}),
+          ...(data.establishmentId ? { establishmentId: String(data.establishmentId) } : {}),
+          ...(data.establishmentCode ? { establishmentCode: String(data.establishmentCode) } : {}),
+          ...(data.establishmentName ? { establishmentName: String(data.establishmentName) } : {}),
+          ...(data.seriesCode ? { seriesCode: String(data.seriesCode) } : {}),
+          ...(data.seriesEnvironment
+            ? {
+                seriesEnvironment: (data.seriesEnvironment === 'PRODUCAO'
+                  ? 'PRODUCAO'
+                  : 'SIMULACAO') as AgtSeriesEnvironment,
+              }
+            : {}),
+          ...(data.agtAuthorizationCode
+            ? { agtAuthorizationCode: String(data.agtAuthorizationCode) }
+            : {}),
+          ...(data.saftHash4 ? { saftHash4: String(data.saftHash4) } : {}),
           sessionId: data.sessionId ? String(data.sessionId) : undefined,
           amountReceived: data.amountReceived,
           initialAmountReceived:
@@ -1657,6 +2208,30 @@ export async function pullCompanyFromCloud(companyIdRaw: string): Promise<{
         };
       })
     );
+
+    const fiscalSeries: AgtSeriesRecord[] = (seriesSnap?.docs || []).map((d) => {
+      const sd = d.data();
+      return {
+        id: String(sd.id || d.id),
+        companyId,
+        seriesCode: String(sd.seriesCode || ''),
+        seriesYear: Number(sd.seriesYear) || new Date().getFullYear(),
+        documentType: String(sd.documentType || 'FR') as AgtDocumentType,
+        firstDocumentNumber: Number(sd.firstDocumentNumber) || 1,
+        lastDocumentNumber: Number(sd.lastDocumentNumber) || 0,
+        status: (sd.status === 'F' ? 'F' : sd.status === 'U' ? 'U' : 'A') as AgtSeriesStatus,
+        environment: (sd.environment === 'PRODUCAO' ? 'PRODUCAO' : 'SIMULACAO') as AgtSeriesEnvironment,
+        ...(sd.establishmentId ? { establishmentId: String(sd.establishmentId) } : {}),
+        ...(sd.establishmentCode ? { establishmentCode: String(sd.establishmentCode) } : {}),
+        ...(sd.agtAuthorizationCode
+          ? { agtAuthorizationCode: String(sd.agtAuthorizationCode) }
+          : {}),
+        requestedAtIso: String(sd.requestedAtIso || new Date().toISOString()),
+        ...(sd.authorizedAtIso ? { authorizedAtIso: String(sd.authorizedAtIso) } : {}),
+        ...(sd.closedAtIso ? { closedAtIso: String(sd.closedAtIso) } : {}),
+        ...(sd.notes ? { notes: String(sd.notes) } : {}),
+      };
+    });
 
     const cashSessions: CashSession[] = (sessSnap?.docs || []).map((d) => {
       const data = d.data();
@@ -1901,9 +2476,11 @@ export async function pullCompanyFromCloud(companyIdRaw: string): Promise<{
     let settings: AppSettings | null = null;
     if (settingsSnap && settingsSnap.exists()) {
       const sd = settingsSnap.data();
+      const hydratedCompany = hydrateProfileFromCloud(sd, companyId);
       settings = {
         companyId,
         company: {
+          ...hydratedCompany,
           legalName: sd.legalName || DEFAULT_SETTINGS.company.legalName,
           shortName: sd.shortName || DEFAULT_SETTINGS.company.shortName,
           nif: sd.nif || DEFAULT_SETTINGS.company.nif,
@@ -1916,9 +2493,18 @@ export async function pullCompanyFromCloud(companyIdRaw: string): Promise<{
         defaultCashier: sd.defaultCashier || '01',
         defaultOperator: sd.defaultOperator || '001',
         defaultFormat: sd.defaultFormat === 'A4' ? 'A4' : 'POS',
-        defaultDocType: sd.defaultDocType === 'FP' ? 'FP' : 'FR',
+        defaultDocType: normalizeDocType(sd.defaultDocType),
         defaultNotes: sd.defaultNotes || '',
         autoPrintOnEmit: Boolean(sd.autoPrintOnEmit),
+        ...(sd.defaultEstablishmentId
+          ? { defaultEstablishmentId: String(sd.defaultEstablishmentId) }
+          : hydratedCompany.defaultEstablishmentId
+            ? { defaultEstablishmentId: hydratedCompany.defaultEstablishmentId }
+            : {}),
+        agtEnvironment:
+          sd.agtEnvironment === 'PRODUCAO' || hydratedCompany.agtEnvironment === 'PRODUCAO'
+            ? 'PRODUCAO'
+            : 'SIMULACAO',
         hidePromotionalFooter:
           typeof sd.hidePromotionalFooter === 'boolean' ? sd.hidePromotionalFooter : true,
         allowCashierPriceEdit: Boolean(sd.allowCashierPriceEdit ?? false),
@@ -1937,6 +2523,7 @@ export async function pullCompanyFromCloud(companyIdRaw: string): Promise<{
       stockMovements,
       suppliers,
       purchases,
+      fiscalSeries,
       settings,
     };
   } catch (err) {
@@ -2163,16 +2750,7 @@ export async function pullOwnedCompaniesFromCloud(): Promise<CompanyRecord[]> {
         results.push({
           id: compId,
           normalizedNif: String(cd.normalizedNif || normalizeCompanyNif(String(cd.nif || ''))),
-          profile: {
-            legalName: String(cd.legalName || cd.shortName || compId),
-            shortName: String(cd.shortName || cd.legalName || compId),
-            nif: String(cd.nif || ''),
-            address: String(cd.address || 'Angola'),
-            cityCountry: String(cd.cityCountry || 'Angola'),
-            phone: String(cd.phone || ''),
-            email: String(cd.email || ''),
-            tagline: String(cd.tagline || ''),
-          },
+          profile: hydrateProfileFromCloud(cd, compId),
           status:
             cd.status === 'suspended'
               ? 'suspended'
@@ -2222,16 +2800,7 @@ export async function pullOwnedCompaniesFromCloud(): Promise<CompanyRecord[]> {
         results.push({
           id: JAIMONA_COMPANY_ID,
           normalizedNif: String(cd.normalizedNif || normalizeCompanyNif(String(cd.nif || ''))),
-          profile: {
-            legalName: String(cd.legalName || cd.shortName || JAIMONA_COMPANY_ID),
-            shortName: String(cd.shortName || cd.legalName || JAIMONA_COMPANY_ID),
-            nif: String(cd.nif || ''),
-            address: String(cd.address || 'Angola'),
-            cityCountry: String(cd.cityCountry || 'Angola'),
-            phone: String(cd.phone || ''),
-            email: String(cd.email || ''),
-            tagline: String(cd.tagline || ''),
-          },
+          profile: hydrateProfileFromCloud(cd, JAIMONA_COMPANY_ID),
           status:
             cd.status === 'suspended'
               ? 'suspended'
@@ -2259,8 +2828,8 @@ export async function pullOwnedCompaniesFromCloud(): Promise<CompanyRecord[]> {
     }
 
     return results;
-  } catch {
-    return [];
+  } catch (err) {
+    handleFirestoreError(err, OperationType.LIST, linksPath);
   }
 }
 

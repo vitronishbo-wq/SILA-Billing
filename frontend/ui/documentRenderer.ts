@@ -1,6 +1,8 @@
 import QRCode from 'qrcode';
-import { formatDateTimePt, formatKzNumber } from '../../src/core/billingEngine';
+import { formatDateTimePt, formatKzNumber, roundKz } from '../../src/core/billingEngine';
 import { generateAgtQrDataUrl } from '../../src/core/fiscalQrGenerator';
+import { AGT_IVA_EXEMPTION_CODES, type AgtIvaExemptionCode } from '../../src/core/fiscalTypes';
+import { computeDocumentSaftHash4 } from '../../src/core/saftGenerator';
 import {
   CashMovement,
   CashSession,
@@ -8,9 +10,11 @@ import {
   CompanyProfile,
   deriveCompanyInitials,
   DocumentFormat,
+  formatDocumentTypeLabelPt,
   InvoiceRecord,
   NEUTRAL_PLATFORM_PROFILE,
   normalizeCompanyNif,
+  resolveCompanyProfileFromSnapshot,
 } from '../../src/core/types';
 import {
   classifyInvoiceControlStatus,
@@ -26,15 +30,132 @@ function escapeHtml(raw: string): string {
     .replace(/'/g, '&#39;');
 }
 
+function formatTaxRegimeLabelPt(regime?: string): string {
+  switch (regime) {
+    case 'SIMPLIFICADO':
+      return 'Regime Simplificado de IVA';
+    case 'EXCLUSAO':
+      return 'Regime de Exclusão de IVA';
+    case 'GERAL':
+    default:
+      return 'Regime Geral de IVA';
+  }
+}
+
+interface RenderedTaxRow {
+  label: string;
+  rateLabel: string;
+  base: number;
+  amount: number;
+  exemptionNote?: string;
+}
+
+function buildDocumentTaxRows(invoice: InvoiceRecord, docCompany: CompanyProfile): RenderedTaxRow[] {
+  const rows: RenderedTaxRow[] = [];
+  const globalPct = Math.min(100, Math.max(0, Number(invoice.globalDiscountPct || 0)));
+  const factor = globalPct > 0 ? 1 - globalPct / 100 : 1;
+
+  if (Array.isArray(invoice.lines) && invoice.lines.length > 0) {
+    const rateConfigs: Array<{ rate: number; label: string; rateLabel: string }> = [
+      { rate: 14, label: 'IVA 14%', rateLabel: '14,00% (NOR)' },
+      { rate: 7, label: 'IVA 7%', rateLabel: '7,00% (INT)' },
+      { rate: 5, label: 'IVA 5%', rateLabel: '5,00% (RED)' },
+      { rate: 1, label: 'IVA 1% Cabinda', rateLabel: '1,00% (INT-CAB)' },
+      { rate: 0, label: 'IVA 0%', rateLabel: '0,00% (ISE)' },
+    ];
+
+    for (const cfg of rateConfigs) {
+      const matchingLines = invoice.lines.filter((l) => Number(l.ivaRate) === cfg.rate);
+      if (matchingLines.length === 0) continue;
+      const rawNet = roundKz(matchingLines.reduce((acc, l) => acc + (Number(l.lineNet) || 0), 0));
+      const net = globalPct > 0 ? roundKz(rawNet * factor) : rawNet;
+      if (net <= 0) continue;
+      const base = cfg.rate > 0 ? roundKz(net / (1 + cfg.rate / 100)) : net;
+      const amount = cfg.rate > 0 ? roundKz(base * (cfg.rate / 100)) : 0;
+      let exemptionNote: string | undefined;
+      if (cfg.rate === 0) {
+        const codes = Array.from(
+          new Set(
+            matchingLines
+              .map((l) => l.exemptionCode || docCompany.defaultExemptionCode)
+              .filter(Boolean) as string[]
+          )
+        );
+        if (codes.length > 0) {
+          exemptionNote = codes
+            .map((c) => {
+              const meta = AGT_IVA_EXEMPTION_CODES[c as AgtIvaExemptionCode];
+              return meta ? `${c}: ${meta.descriptionPt}` : c;
+            })
+            .join(' · ');
+        }
+      }
+      rows.push({
+        label: cfg.label,
+        rateLabel: cfg.rateLabel,
+        base,
+        amount,
+        exemptionNote,
+      });
+    }
+  }
+
+  if (rows.length === 0) {
+    if ((invoice.taxBase14 || 0) > 0 || (invoice.taxBase0 || 0) === 0) {
+      rows.push({
+        label: 'IVA 14%',
+        rateLabel: '14,00% (NOR)',
+        base: invoice.taxBase14 || 0,
+        amount: invoice.taxAmount14 || 0,
+      });
+    }
+    if ((invoice.taxBaseIntermediate || 0) > 0) {
+      rows.push({
+        label: 'IVA Interm.',
+        rateLabel: 'INT (1%/7%)',
+        base: invoice.taxBaseIntermediate || 0,
+        amount: invoice.taxAmountIntermediate || 0,
+      });
+    }
+    if ((invoice.taxBaseReduced || 0) > 0) {
+      rows.push({
+        label: 'IVA 5%',
+        rateLabel: '5,00% (RED)',
+        base: invoice.taxBaseReduced || 0,
+        amount: invoice.taxAmountReduced || 0,
+      });
+    }
+    rows.push({
+      label: 'IVA 0%',
+      rateLabel: '0,00% (ISE)',
+      base: invoice.taxBase0 || 0,
+      amount: 0,
+    });
+  }
+
+  return rows;
+}
+
 export async function generateInvoiceQrDataUrl(
   invoice: InvoiceRecord,
   company: CompanyProfile = NEUTRAL_PLATFORM_PROFILE
 ): Promise<string> {
   try {
+    const docCompany = resolveCompanyProfileFromSnapshot(invoice, company);
+    const sig4 = invoice.saftHash4 || computeDocumentSaftHash4(invoice).hash4;
+    const taxBaseIntRed = roundKz(
+      (invoice.taxBaseIntermediate || 0) + (invoice.taxBaseReduced || 0)
+    );
+    const taxAmountIntRed = roundKz(
+      (invoice.taxAmountIntermediate || 0) + (invoice.taxAmountReduced || 0)
+    );
+    const environment: 'PRODUCAO' | 'HOMOLOGACAO' =
+      invoice.seriesEnvironment === 'PRODUCAO' ? 'PRODUCAO' : 'HOMOLOGACAO';
+
     return await generateAgtQrDataUrl(
       {
-        companyNif: company.nif,
-        companyName: company.legalName,
+        companyNif: docCompany.nif,
+        companyName: docCompany.legalName,
         customerNif: invoice.customerNif,
         customerCountry: 'AO',
         documentType: invoice.docType,
@@ -45,11 +166,14 @@ export async function generateInvoiceQrDataUrl(
         totals: {
           taxBaseNor: invoice.taxBase14,
           taxAmountNor: invoice.taxAmount14,
+          taxBaseIntRed,
+          taxAmountIntRed,
           taxBaseIse: invoice.taxBase0,
           totalTax: invoice.taxTotal,
           grandTotal: invoice.grandTotal,
         },
-        signatureJwsPreview: invoice.id.slice(-4),
+        signatureJwsPreview: sig4,
+        environment,
       },
       {
         width: 350,
@@ -75,21 +199,31 @@ export function renderDocumentHtml(
     isReprint?: boolean;
   }
 ): string {
+  const docCompany = resolveCompanyProfileFromSnapshot(invoice, company);
   const dt = formatDateTimePt(invoice.issuedAtIso);
   const isCreditNote = invoice.docType === 'NC';
-  const titleLabel =
-    invoice.docType === 'FP'
-      ? 'FACTURA PROFORMA'
-      : isCreditNote
-        ? 'NOTA DE CRÉDITO'
-        : 'FACTURA / RECIBO';
+  const titleLabel = formatDocumentTypeLabelPt(invoice.docType).toUpperCase();
   const isSecondCopy = Boolean(options?.isReprint || (invoice.reprintCount || 0) > 0);
   const cancelledDt = invoice.cancelledAtIso ? formatDateTimePt(invoice.cancelledAtIso) : null;
   const showViralFooter = Boolean(options?.showViralFooter);
-  const custLoc = (invoice.customerLocality || company.cityCountry || 'Angola').trim();
+  const custLoc = (invoice.customerLocality || docCompany.cityCountry || 'Angola').trim();
   const custAddr = (options?.customerAddress || '').trim();
   const hasDistinctAddr = Boolean(custAddr && custAddr.toLowerCase() !== custLoc.toLowerCase());
   const custPhone = (options?.customerPhone || '').trim();
+  const isProductionDoc = invoice.seriesEnvironment === 'PRODUCAO';
+  const docHash4 = invoice.saftHash4 || computeDocumentSaftHash4(invoice).hash4;
+  const taxRows = buildDocumentTaxRows(invoice, docCompany);
+  const estCode = invoice.establishmentCode || invoice.issuerSnapshot?.establishmentCode || '';
+  const estName = invoice.establishmentName || invoice.issuerSnapshot?.establishmentName || '';
+  const estLabel = [estCode ? `Est. ${estCode}` : '', estName].filter(Boolean).join(' · ');
+  const estAddress =
+    invoice.issuerSnapshot?.establishmentAddress &&
+    invoice.issuerSnapshot.establishmentAddress.trim().toLowerCase() !==
+      docCompany.address.trim().toLowerCase()
+      ? invoice.issuerSnapshot.establishmentAddress.trim()
+      : '';
+  const showLogoPos = Boolean(docCompany.logoUrl) && docCompany.showLogoOnPos !== false;
+  const showLogoA4 = Boolean(docCompany.logoUrl) && docCompany.showLogoOnA4 !== false;
 
   if (format === 'POS') {
     const itemsHtml = invoice.lines
@@ -108,29 +242,44 @@ export function renderDocumentHtml(
       })
       .join('');
 
+    const posTaxRowsHtml = taxRows
+      .map(
+        (tr) =>
+          `<div class="tabular-nums">${escapeHtml(tr.label)} — Base: ${formatKzNumber(tr.base)} — IVA: ${formatKzNumber(tr.amount)}</div>${
+            tr.exemptionNote
+              ? `<div class="text-[9.5px] text-slate-600 pl-1.5">${escapeHtml(tr.exemptionNote)}</div>`
+              : ''
+          }`
+      )
+      .join('');
+
     return `
       <div class="print-target mx-auto w-full max-w-[330px] bg-white p-4 text-[12px] leading-snug text-black font-sans border border-slate-200">
         <div class="text-center space-y-0.5">
           ${
-            company.logoUrl
-              ? `<div class="mb-2 flex justify-center"><img src="${escapeHtml(company.logoUrl)}" class="max-h-12 max-w-[140px] object-contain" alt="Logótipo" /></div>`
+            showLogoPos && docCompany.logoUrl
+              ? `<div class="mb-2 flex justify-center"><img src="${escapeHtml(docCompany.logoUrl)}" class="max-h-12 max-w-[140px] object-contain" alt="Logótipo" /></div>`
               : ''
           }
-          <div class="font-bold text-[11px] tracking-tight">MODELO — SEM VALIDADE FISCAL</div>
-          <div class="font-bold text-[13px] leading-tight">${escapeHtml(company.legalName)}</div>
-          <div class="text-[11px]">${escapeHtml(company.address)}</div>
-          <div class="text-[11px]">Tel.: ${escapeHtml(company.phone)}${company.mobile ? ` / ${escapeHtml(company.mobile)}` : ''}</div>
-          ${company.email ? `<div class="text-[11px]">${escapeHtml(company.email)}</div>` : ''}
-          <div class="text-[11px]">Contribuinte: ${escapeHtml(company.nif)}</div>
           ${
-            company.taxRegime
-              ? `<div class="text-[10px] text-slate-700">${
-                  company.taxRegime === 'SIMPLIFICADO'
-                    ? 'Regime Simplificado (7%)'
-                    : company.taxRegime === 'EXCLUSAO'
-                      ? 'Regime de Exclusão'
-                      : 'Regime Geral (14%)'
-                }</div>`
+            isProductionDoc
+              ? `<div class="font-bold text-[10.5px] tracking-tight">DOCUMENTO FISCAL${invoice.seriesCode ? ` · SÉRIE ${escapeHtml(invoice.seriesCode)}` : ''}</div>`
+              : `<div class="font-bold text-[11px] tracking-tight">MODELO — SEM VALIDADE FISCAL</div>`
+          }
+          <div class="font-bold text-[13px] leading-tight">${escapeHtml(docCompany.legalName)}</div>
+          ${estLabel ? `<div class="text-[10px] font-semibold">${escapeHtml(estLabel)}</div>` : ''}
+          <div class="text-[11px]">${escapeHtml(estAddress || docCompany.address)}</div>
+          ${
+            docCompany.municipality || docCompany.province
+              ? `<div class="text-[10.5px]">${escapeHtml([docCompany.municipality, docCompany.province].filter(Boolean).join(', '))}</div>`
+              : ''
+          }
+          <div class="text-[11px]">Tel.: ${escapeHtml(docCompany.phone)}${docCompany.mobile ? ` / ${escapeHtml(docCompany.mobile)}` : ''}</div>
+          ${docCompany.email ? `<div class="text-[11px]">${escapeHtml(docCompany.email)}</div>` : ''}
+          <div class="text-[11px]">Contribuinte: ${escapeHtml(docCompany.nif)}</div>
+          ${
+            docCompany.taxRegime
+              ? `<div class="text-[10px] text-slate-700">${escapeHtml(formatTaxRegimeLabelPt(docCompany.taxRegime))}</div>`
               : ''
           }
         </div>
@@ -150,7 +299,9 @@ export function renderDocumentHtml(
               ? invoice.returnOriginNumber
                 ? `Retificação / Devolução ref. ${escapeHtml(invoice.returnOriginNumber)}`
                 : 'Devolução / Retificação Comercial'
-              : 'Venda Directa a Retalho'
+              : invoice.docType === 'FP'
+                ? 'Orçamento / Documento Provisório'
+                : 'Venda Directa a Retalho'
           }</div>
           ${
             isSecondCopy
@@ -201,8 +352,7 @@ export function renderDocumentHtml(
 
         <div class="py-2 border-b border-black text-[11px] space-y-1">
           <div class="font-bold text-[12px]">RESUMO DE IMPOSTOS</div>
-          <div class="tabular-nums">IVA 14% — Base: ${formatKzNumber(invoice.taxBase14)} — IVA: ${formatKzNumber(invoice.taxAmount14)}</div>
-          <div class="tabular-nums">IVA 0% — Base: ${formatKzNumber(invoice.taxBase0)} — IVA: 0,00</div>
+          ${posTaxRowsHtml}
           <div class="pt-1 space-y-0.5 tabular-nums">
             <div class="flex justify-between">
               <span>Total de mercadorias</span>
@@ -267,11 +417,16 @@ export function renderDocumentHtml(
 
         <div class="pt-2.5 text-center space-y-1">
           <div class="font-bold text-[11.5px]">OBRIGADO PELA SUA PREFERÊNCIA!</div>
-          <div class="text-[11px]">${escapeHtml(company.tagline)}</div>
+          <div class="text-[11px]">${escapeHtml(docCompany.tagline)}</div>
           <div class="border-t border-black mt-2 pt-1.5 text-[10px] space-y-0.5">
-            <div class="font-bold">Documento de demonstração</div>
-            <div class="tabular-nums">NIF: ${escapeHtml(company.nif)} | Caixa: ${escapeHtml(invoice.cashier)}</div>
-            <div>Não substitui factura fiscal</div>
+            ${
+              isProductionDoc
+                ? `<div class="font-bold tabular-nums">${escapeHtml(docHash4)}-Processado por programa validado SILA-Billing</div>
+                   <div class="tabular-nums">NIF: ${escapeHtml(docCompany.nif)} | Caixa: ${escapeHtml(invoice.cashier)}${invoice.agtAuthorizationCode ? ` | Aut.: ${escapeHtml(invoice.agtAuthorizationCode)}` : ''}</div>`
+                : `<div class="font-bold">Documento de demonstração · Hash: ${escapeHtml(docHash4)}</div>
+                   <div class="tabular-nums">NIF: ${escapeHtml(docCompany.nif)} | Caixa: ${escapeHtml(invoice.cashier)}</div>
+                   <div>Não substitui factura fiscal</div>`
+            }
             ${
               showViralFooter
                 ? `<div class="pt-1 mt-1 border-t border-dashed border-black/60 text-[9.5px] font-medium">Processado por SILA-Billing · VITRONIS (www.vitronis.co.ao)</div>`
@@ -300,41 +455,58 @@ export function renderDocumentHtml(
     )
     .join('');
 
+  const a4TaxRowsHtml = taxRows
+    .map(
+      (tr) => `
+              <tr>
+                <td class="py-1.5">
+                  <div>${escapeHtml(tr.rateLabel)}</div>
+                  ${tr.exemptionNote ? `<div class="text-[9.5px] text-slate-500">${escapeHtml(tr.exemptionNote)}</div>` : ''}
+                </td>
+                <td class="py-1.5 text-right">${formatKzNumber(tr.base)}</td>
+                <td class="py-1.5 text-right">${formatKzNumber(tr.amount)}</td>
+              </tr>`
+    )
+    .join('');
+
   return `
     <div class="print-target mx-auto w-full max-w-[794px] bg-white p-6 sm:p-8 text-slate-900 border border-slate-200 text-xs">
       <div class="flex flex-col sm:flex-row sm:items-start justify-between gap-4 pb-5 border-b border-slate-200">
         <div class="flex items-center gap-3.5">
           ${
-            company.logoUrl
-              ? `<img src="${escapeHtml(company.logoUrl)}" class="h-14 w-auto max-w-[130px] object-contain rounded" alt="Logótipo" />`
-              : `<div class="flex h-14 w-14 shrink-0 items-center justify-center rounded-full border-2 border-blue-600 bg-slate-900 text-white font-bold text-lg tracking-tight">${escapeHtml(deriveCompanyInitials(company))}</div>`
+            showLogoA4 && docCompany.logoUrl
+              ? `<img src="${escapeHtml(docCompany.logoUrl)}" class="h-14 w-auto max-w-[130px] object-contain rounded" alt="Logótipo" />`
+              : `<div class="flex h-14 w-14 shrink-0 items-center justify-center rounded-full border-2 border-blue-600 bg-slate-900 text-white font-bold text-lg tracking-tight">${escapeHtml(deriveCompanyInitials(docCompany))}</div>`
           }
           <div>
-            <div class="text-base font-bold tracking-tight text-slate-900">${escapeHtml(company.shortName)}</div>
-            <div class="text-[11px] font-medium text-slate-600">${escapeHtml(company.legalName)}</div>
+            <div class="text-base font-bold tracking-tight text-slate-900">${escapeHtml(docCompany.shortName)}</div>
+            <div class="text-[11px] font-medium text-slate-600">${escapeHtml(docCompany.legalName)}</div>
             <div class="text-[10px] text-blue-700 mt-0.5">${
-              normalizeCompanyNif(company.nif) === '5003069940'
+              normalizeCompanyNif(docCompany.nif) === '5003069940'
                 ? 'Qualidade · Confiança · Soluções'
-                : escapeHtml(company.tagline || company.cityCountry || 'Comércio & Serviços')
+                : escapeHtml(docCompany.tagline || docCompany.cityCountry || 'Comércio & Serviços')
             }</div>
             ${
-              company.taxRegime || company.commercialRegistry
+              docCompany.taxRegime || docCompany.commercialRegistry || docCompany.cae || docCompany.taxOffice
                 ? `<div class="text-[9.5px] text-slate-500 mt-0.5">
-                    ${company.taxRegime ? `Regime: ${company.taxRegime === 'SIMPLIFICADO' ? 'Simplificado' : company.taxRegime === 'EXCLUSAO' ? 'Exclusão' : 'Geral (IVA)'}` : ''}
-                    ${company.commercialRegistry ? ` · CRC: ${escapeHtml(company.commercialRegistry)}` : ''}
-                    ${company.shareCapital ? ` · Cap. Social: ${escapeHtml(company.shareCapital)}` : ''}
+                    ${docCompany.taxRegime ? escapeHtml(formatTaxRegimeLabelPt(docCompany.taxRegime)) : ''}
+                    ${docCompany.taxOffice ? ` · ${escapeHtml(docCompany.taxOffice)}` : ''}
+                    ${docCompany.cae ? ` · CAE: ${escapeHtml(docCompany.cae)}` : ''}
+                    ${docCompany.commercialRegistry ? ` · CRC: ${escapeHtml(docCompany.commercialRegistry)}` : ''}
+                    ${docCompany.shareCapital ? ` · Cap. Social: ${escapeHtml(docCompany.shareCapital)}` : ''}
                   </div>`
                 : ''
             }
           </div>
         </div>
         <div class="text-[11px] text-slate-600 space-y-0.5 sm:text-right tabular-nums">
-          <div>${escapeHtml(company.address)}${company.postalCode ? ` · CP ${escapeHtml(company.postalCode)}` : ''}</div>
-          <div>${escapeHtml(company.cityCountry || 'Angola')}</div>
-          <div>Tel.: ${escapeHtml(company.phone)}${company.mobile ? ` / ${escapeHtml(company.mobile)}` : ''}</div>
-          ${company.email ? `<div>${escapeHtml(company.email)}</div>` : ''}
-          ${company.website ? `<div>${escapeHtml(company.website)}</div>` : ''}
-          <div class="font-semibold text-slate-900">Contribuinte / NIF: ${escapeHtml(company.nif)}</div>
+          ${estLabel ? `<div class="font-semibold text-slate-800">${escapeHtml(estLabel)}</div>` : ''}
+          <div>${escapeHtml(estAddress || docCompany.address)}${docCompany.postalCode ? ` · CP ${escapeHtml(docCompany.postalCode)}` : ''}</div>
+          <div>${escapeHtml([docCompany.municipality, docCompany.province].filter(Boolean).join(', ') || docCompany.cityCountry || 'Angola')}</div>
+          <div>Tel.: ${escapeHtml(docCompany.phone)}${docCompany.mobile ? ` / ${escapeHtml(docCompany.mobile)}` : ''}</div>
+          ${docCompany.email ? `<div>${escapeHtml(docCompany.email)}</div>` : ''}
+          ${docCompany.website ? `<div>${escapeHtml(docCompany.website)}</div>` : ''}
+          <div class="font-semibold text-slate-900">Contribuinte / NIF: ${escapeHtml(docCompany.nif)}</div>
         </div>
       </div>
 
@@ -352,6 +524,13 @@ export function renderDocumentHtml(
               }
             </div>
             <div class="text-sm font-semibold text-slate-800 tabular-nums">N.º ${escapeHtml(invoice.number)}</div>
+            ${
+              invoice.seriesCode
+                ? `<div class="text-[10.5px] text-slate-500 tabular-nums">Série: ${escapeHtml(invoice.seriesCode)}${
+                    invoice.agtAuthorizationCode ? ` · Aut. AGT: ${escapeHtml(invoice.agtAuthorizationCode)}` : ''
+                  }</div>`
+                : ''
+            }
             ${
               isCreditNote && invoice.returnOriginNumber
                 ? `<div class="mt-0.5 text-[11px] font-medium text-slate-600 tabular-nums">Documento Origem Retificado: <span class="font-mono font-semibold text-slate-900">${escapeHtml(invoice.returnOriginNumber)}</span></div>`
@@ -443,16 +622,7 @@ export function renderDocumentHtml(
               </tr>
             </thead>
             <tbody class="divide-y divide-slate-200/70">
-              <tr>
-                <td class="py-1.5">14,00%</td>
-                <td class="py-1.5 text-right">${formatKzNumber(invoice.taxBase14)}</td>
-                <td class="py-1.5 text-right">${formatKzNumber(invoice.taxAmount14)}</td>
-              </tr>
-              <tr>
-                <td class="py-1.5">0,00%</td>
-                <td class="py-1.5 text-right">${formatKzNumber(invoice.taxBase0)}</td>
-                <td class="py-1.5 text-right">0,00</td>
-              </tr>
+              ${a4TaxRowsHtml}
             </tbody>
           </table>
         </div>
@@ -535,17 +705,30 @@ export function renderDocumentHtml(
         }
 
         ${
-          company.iban1
+          docCompany.iban1 || docCompany.multicaixaExpressPhone
             ? `<div class="p-2.5 rounded-lg bg-slate-50 border border-slate-200 text-[10.5px] text-slate-700 flex flex-col sm:flex-row sm:items-center justify-between gap-1.5 tabular-nums">
-                <div>
-                  <span class="font-semibold text-slate-900">Coordenadas Bancárias:</span>
-                  <span>${escapeHtml(company.bankName1 || 'Banco Principal')} · IBAN: <strong class="font-mono text-slate-900">${escapeHtml(company.iban1)}</strong></span>
-                </div>
                 ${
-                  company.iban2
+                  docCompany.iban1
                     ? `<div>
-                        <span>${escapeHtml(company.bankName2 || 'Banco Secundário')} · IBAN: <strong class="font-mono text-slate-900">${escapeHtml(company.iban2)}</strong></span>
+                        <span class="font-semibold text-slate-900">Coordenadas Bancárias:</span>
+                        <span>${escapeHtml(docCompany.bankName1 || 'Banco Principal')} · IBAN: <strong class="font-mono text-slate-900">${escapeHtml(docCompany.iban1)}</strong>${
+                          docCompany.accountHolder1 ? ` · Titular: ${escapeHtml(docCompany.accountHolder1)}` : ''
+                        }${docCompany.swift1 ? ` · SWIFT: ${escapeHtml(docCompany.swift1)}` : ''}</span>
                       </div>`
+                    : ''
+                }
+                ${
+                  docCompany.iban2
+                    ? `<div>
+                        <span>${escapeHtml(docCompany.bankName2 || 'Banco Secundário')} · IBAN: <strong class="font-mono text-slate-900">${escapeHtml(docCompany.iban2)}</strong>${
+                          docCompany.swift2 ? ` · SWIFT: ${escapeHtml(docCompany.swift2)}` : ''
+                        }</span>
+                      </div>`
+                    : ''
+                }
+                ${
+                  docCompany.multicaixaExpressPhone
+                    ? `<div>Multicaixa Express: <strong class="font-mono text-slate-900">${escapeHtml(docCompany.multicaixaExpressPhone)}</strong></div>`
                     : ''
                 }
               </div>`
@@ -562,11 +745,15 @@ export function renderDocumentHtml(
           }
           <div class="text-[10.5px] text-slate-600 space-y-0.5">
             <div class="font-bold text-slate-900">OBRIGADO PELA SUA PREFERÊNCIA!</div>
-            <div>${escapeHtml(company.legalName)}</div>
-            <div class="text-slate-500">Modelo — Sem validade fiscal · Não substitui factura fiscal</div>
+            <div>${escapeHtml(docCompany.legalName)}</div>
+            ${
+              isProductionDoc
+                ? `<div class="text-slate-700 font-medium tabular-nums">${escapeHtml(docHash4)}-Processado por programa validado SILA-Billing · Série ${escapeHtml(invoice.seriesCode || 'A')}</div>`
+                : `<div class="text-slate-500">Modelo — Sem validade fiscal · Não substitui factura fiscal · Hash: ${escapeHtml(docHash4)}</div>`
+            }
           </div>
         </div>
-        <div class="text-right text-xs font-semibold text-slate-700">${escapeHtml(company.tagline)}</div>
+        <div class="text-right text-xs font-semibold text-slate-700">${escapeHtml(docCompany.tagline)}</div>
       </div>
       ${
         showViralFooter
@@ -849,7 +1036,7 @@ export function renderHistoryControlReportHtml(
                         ? 'text-blue-700 font-semibold'
                         : 'text-emerald-700 font-medium'
                 }">${escapeHtml(cls.labelPt)}${inv.returnOriginNumber ? ` (${escapeHtml(inv.returnOriginNumber)})` : ''}</td>
-                <td class="py-1.5 px-2 text-right font-mono">${isCanc ? '0,00' : `${totalPrefix}${formatKzNumber(inv.taxAmount14)}`}</td>
+                <td class="py-1.5 px-2 text-right font-mono">${isCanc ? '0,00' : `${totalPrefix}${formatKzNumber(inv.taxTotal || inv.taxAmount14)}`}</td>
                 <td class="py-1.5 px-2 text-right font-mono font-semibold">${isCanc ? formatKzNumber(inv.grandTotal) : `${totalPrefix}${formatKzNumber(inv.grandTotal)}`}</td>
                 <td class="py-1.5 px-2 text-right font-mono">${formatKzNumber(cls.paidAmount)}</td>
                 <td class="py-1.5 px-2 text-right font-mono ${cls.dueAmount > 0 ? 'text-amber-700 font-semibold' : ''}">${formatKzNumber(cls.dueAmount)}</td>
@@ -881,9 +1068,9 @@ export function renderHistoryControlReportHtml(
 
       <div class="grid grid-cols-4 gap-3 py-4 tabular-nums">
         <div class="rounded-lg border border-slate-200 bg-slate-50 p-3">
-          <div class="text-[10px] text-slate-500">Faturação Líquida (FR - NC)</div>
+          <div class="text-[10px] text-slate-500">Faturação Líquida (Docs - NC)</div>
           <div class="text-sm font-bold font-mono text-slate-900 mt-0.5">${formatKzNumber(sum.netCommercialTotal)} Kz</div>
-          <div class="text-[10px] text-slate-500 mt-0.5">${sum.issuedFrCount} FR · ${sum.creditNoteCount} NC</div>
+          <div class="text-[10px] text-slate-500 mt-0.5">${sum.issuedFrCount} Docs · ${sum.creditNoteCount} NC</div>
         </div>
         <div class="rounded-lg border border-slate-200 bg-slate-50 p-3">
           <div class="text-[10px] text-slate-500">Total Recebido (Pagas + Parc.)</div>
@@ -911,7 +1098,7 @@ export function renderHistoryControlReportHtml(
               <th class="py-2 px-2 font-semibold">Cliente</th>
               <th class="py-2 px-2 font-semibold">Operador</th>
               <th class="py-2 px-2 font-semibold">Estado</th>
-              <th class="py-2 px-2 font-semibold text-right">IVA 14%</th>
+              <th class="py-2 px-2 font-semibold text-right">Impostos</th>
               <th class="py-2 px-2 font-semibold text-right">Total</th>
               <th class="py-2 px-2 font-semibold text-right">Pago</th>
               <th class="py-2 px-2 font-semibold text-right">Dívida</th>
@@ -920,8 +1107,12 @@ export function renderHistoryControlReportHtml(
           <tbody class="divide-y divide-slate-200 tabular-nums">${rowsHtml}</tbody>
           <tfoot>
             <tr class="bg-slate-100 font-bold text-slate-900 border-t border-slate-300 tabular-nums">
-              <td colspan="5" class="py-2 px-2">TOTAIS LÍQUIDOS VÁLIDOS (Base 14%: ${formatKzNumber(sum.taxBase14Total)} Kz · Isento 0%: ${formatKzNumber(sum.taxBase0Total)} Kz)</td>
-              <td class="py-2 px-2 text-right font-mono">${formatKzNumber(sum.taxAmount14Total)}</td>
+              <td colspan="5" class="py-2 px-2">TOTAIS LÍQUIDOS VÁLIDOS (Base 14%: ${formatKzNumber(sum.taxBase14Total)} Kz${
+                sum.taxBaseIntermediateTotal + sum.taxBaseReducedTotal > 0
+                  ? ` · Interm./Red.: ${formatKzNumber(roundKz(sum.taxBaseIntermediateTotal + sum.taxBaseReducedTotal))} Kz`
+                  : ''
+              } · Isento 0%: ${formatKzNumber(sum.taxBase0Total)} Kz)</td>
+              <td class="py-2 px-2 text-right font-mono">${formatKzNumber(sum.taxTotalAllRates)}</td>
               <td class="py-2 px-2 text-right font-mono">${formatKzNumber(sum.netCommercialTotal)}</td>
               <td class="py-2 px-2 text-right font-mono text-emerald-700">${formatKzNumber(sum.paidTotal)}</td>
               <td class="py-2 px-2 text-right font-mono text-amber-700">${formatKzNumber(sum.dueTotal)}</td>

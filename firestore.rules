@@ -115,6 +115,15 @@ service cloud.firestore {
 
     // ==================== LEGACY VALIDATION BLUEPRINTS (JAIMONA v1 CONTINUITY) ====================
 
+    function isValidVatRate(rate) {
+      return rate is number && (rate == 0 || rate == 1 || rate == 5 || rate == 7 || rate == 14);
+    }
+
+    function isValidBillingDocType(dt) {
+      return dt is string && dt.size() >= 2 && dt.size() <= 8
+        && (dt == 'FR' || dt == 'FA' || dt == 'FP' || dt == 'NC' || dt == 'ND' || dt == 'RC' || dt == 'FT' || dt == 'CS');
+    }
+
     function isValidPriceHistoryEntry(entry) {
       return entry is map
         && entry.keys().hasAll(['changedAtIso', 'previousPrice', 'newPrice', 'changedBy'])
@@ -135,8 +144,8 @@ service cloud.firestore {
           'ivaRate', 'exemptionReason', 'active', 'createdAt', 'updatedAt'
         ])
         && data.keys().hasOnly([
-          'id', 'ownerId', 'code', 'barcode', 'name', 'category', 'unit', 'costPrice', 'price',
-          'ivaRate', 'exemptionReason', 'active', 'trackStock', 'stockQty', 'minStockQty',
+          'id', 'ownerId', 'code', 'barcode', 'name', 'productType', 'category', 'unit', 'costPrice', 'price',
+          'ivaRate', 'exemptionCode', 'exemptionReason', 'active', 'trackStock', 'stockQty', 'minStockQty',
           'priceHistory', 'createdAt', 'updatedAt'
         ])
         && data.id is string && data.id == productId && isValidId(data.id)
@@ -144,11 +153,13 @@ service cloud.firestore {
         && data.code is string && data.code.size() >= 1 && data.code.size() <= 32
         && (!('barcode' in data) || (data.barcode is string && data.barcode.size() <= 48))
         && data.name is string && data.name.size() >= 1 && data.name.size() <= 160
+        && (!('productType' in data) || (data.productType is string && data.productType.size() <= 4 && (data.productType == 'P' || data.productType == 'S' || data.productType == 'K')))
         && (!('category' in data) || (data.category is string && data.category.size() >= 1 && data.category.size() <= 48))
         && data.unit is string && data.unit.size() >= 1 && data.unit.size() <= 16
         && (!('costPrice' in data) || (data.costPrice is number && data.costPrice >= 0 && data.costPrice <= 999999999))
         && data.price is number && data.price >= 0 && data.price <= 999999999
-        && data.ivaRate is number && (data.ivaRate == 0 || data.ivaRate == 14)
+        && isValidVatRate(data.ivaRate)
+        && (!('exemptionCode' in data) || (data.exemptionCode is string && data.exemptionCode.size() <= 16))
         && data.exemptionReason is string && data.exemptionReason.size() <= 120
         && data.active is bool
         && (!('trackStock' in data) || data.trackStock is bool)
@@ -199,6 +210,31 @@ service cloud.firestore {
         && (!('reference' in entry) || (entry.reference is string && entry.reference.size() <= 80));
     }
 
+    function isValidIssuerSnapshot(snap) {
+      return snap is map
+        && snap.keys().hasAll([
+          'companyId', 'legalName', 'shortName', 'nif', 'taxRegime', 'capturedAtIso'
+        ])
+        && snap.keys().hasOnly([
+          'companyId', 'legalName', 'shortName', 'nif', 'taxRegime', 'taxOffice',
+          'commercialRegistry', 'shareCapital', 'cae', 'address', 'municipality',
+          'province', 'postalCode', 'cityCountry', 'phone', 'mobile', 'whatsapp',
+          'email', 'billingEmail', 'website', 'tagline', 'logoUrl', 'showLogoOnPos',
+          'showLogoOnA4', 'bankName1', 'iban1', 'accountHolder1', 'swift1',
+          'bankName2', 'iban2', 'accountHolder2', 'swift2', 'multicaixaExpressPhone',
+          'establishmentId', 'establishmentCode', 'establishmentName', 'establishmentAddress',
+          'legalRepresentativeName', 'legalRepresentativeRole', 'capturedAtIso'
+        ])
+        && snap.companyId is string && isValidId(snap.companyId)
+        && snap.legalName is string && snap.legalName.size() >= 1 && snap.legalName.size() <= 160
+        && snap.nif is string && snap.nif.size() >= 1 && snap.nif.size() <= 32
+        && snap.taxRegime is string && snap.taxRegime.size() <= 24
+        && (snap.taxRegime == 'GERAL' || snap.taxRegime == 'SIMPLIFICADO' || snap.taxRegime == 'EXCLUSAO')
+        && (!('logoUrl' in snap) || (snap.logoUrl is string && snap.logoUrl.size() <= 270000))
+        && (!('establishmentId' in snap) || (snap.establishmentId is string && isValidId(snap.establishmentId)))
+        && snap.capturedAtIso is string && snap.capturedAtIso.size() >= 10 && snap.capturedAtIso.size() <= 40;
+    }
+
     function isValidInvoice(data, invoiceId) {
       return data.keys().hasAll([
           'id', 'ownerId', 'number', 'docType', 'issuedAtIso', 'cashier', 'operator',
@@ -211,16 +247,19 @@ service cloud.firestore {
           'id', 'ownerId', 'number', 'docType', 'issuedAtIso', 'cashier', 'operator',
           'paymentMethod', 'customerId', 'customerName', 'customerNif', 'customerLocality',
           'merchandiseTotal', 'discountTotal', 'globalDiscountPct', 'globalDiscountAmount',
-          'taxBase14', 'taxAmount14', 'taxBase0', 'taxAmount0', 'taxTotal', 'grandTotal',
-          'amountInWords', 'sessionId', 'amountReceived', 'initialAmountReceived', 'changeAmount',
+          'taxBase14', 'taxAmount14', 'taxBaseIntermediate', 'taxAmountIntermediate',
+          'taxBaseReduced', 'taxAmountReduced', 'taxBase0', 'taxAmount0', 'taxTotal', 'grandTotal',
+          'amountInWords', 'establishmentId', 'establishmentCode', 'establishmentName',
+          'seriesCode', 'seriesEnvironment', 'agtAuthorizationCode', 'saftHash4', 'issuerSnapshot',
+          'sessionId', 'amountReceived', 'initialAmountReceived', 'changeAmount',
           'initialChangeAmount', 'amountDue', 'transferReference', 'paymentSplits',
           'paymentSummary', 'returnOriginInvoiceId', 'returnOriginNumber', 'returnCreditApplied',
           'notes', 'itemCount', 'status', 'createdAt', 'updatedAt'
         ])
-        && data.id is string && data.id == invoiceId && isValidId(data.id)
-        && data.ownerId is string && data.ownerId == request.auth.uid && isValidId(data.ownerId)
+        && data.id == invoiceId
+        && data.ownerId == request.auth.uid && isValidId(data.ownerId)
         && data.number is string && data.number.size() >= 1 && data.number.size() <= 40
-        && data.docType is string && data.docType.size() <= 8 && (data.docType == 'FR' || data.docType == 'FP' || data.docType == 'NC')
+        && isValidBillingDocType(data.docType)
         && data.issuedAtIso is string && data.issuedAtIso.size() >= 10 && data.issuedAtIso.size() <= 40
         && data.cashier is string && data.cashier.size() >= 1 && data.cashier.size() <= 16
         && data.operator is string && data.operator.size() >= 1 && data.operator.size() <= 32
@@ -236,11 +275,23 @@ service cloud.firestore {
         && (!('globalDiscountAmount' in data) || (data.globalDiscountAmount is number && data.globalDiscountAmount >= 0))
         && data.taxBase14 is number && data.taxBase14 >= 0
         && data.taxAmount14 is number && data.taxAmount14 >= 0
+        && (!('taxBaseIntermediate' in data) || (data.taxBaseIntermediate is number && data.taxBaseIntermediate >= 0))
+        && (!('taxAmountIntermediate' in data) || (data.taxAmountIntermediate is number && data.taxAmountIntermediate >= 0))
+        && (!('taxBaseReduced' in data) || (data.taxBaseReduced is number && data.taxBaseReduced >= 0))
+        && (!('taxAmountReduced' in data) || (data.taxAmountReduced is number && data.taxAmountReduced >= 0))
         && data.taxBase0 is number && data.taxBase0 >= 0
         && data.taxAmount0 is number && data.taxAmount0 == 0
         && data.taxTotal is number && data.taxTotal >= 0
         && data.grandTotal is number && data.grandTotal >= 0
         && data.amountInWords is string && data.amountInWords.size() >= 1 && data.amountInWords.size() <= 300
+        && (!('establishmentId' in data) || (data.establishmentId is string && isValidId(data.establishmentId)))
+        && (!('establishmentCode' in data) || (data.establishmentCode is string && data.establishmentCode.size() <= 16))
+        && (!('establishmentName' in data) || (data.establishmentName is string && data.establishmentName.size() <= 120))
+        && (!('seriesCode' in data) || (data.seriesCode is string && data.seriesCode.size() <= 16))
+        && (!('seriesEnvironment' in data) || (data.seriesEnvironment is string && data.seriesEnvironment.size() <= 16 && (data.seriesEnvironment == 'SIMULACAO' || data.seriesEnvironment == 'PRODUCAO')))
+        && (!('agtAuthorizationCode' in data) || (data.agtAuthorizationCode is string && data.agtAuthorizationCode.size() <= 64))
+        && (!('saftHash4' in data) || (data.saftHash4 is string && data.saftHash4.size() <= 16))
+        && (!('issuerSnapshot' in data) || isValidIssuerSnapshot(data.issuerSnapshot))
         && (!('sessionId' in data) || (data.sessionId is string && data.sessionId.size() <= 128))
         && data.amountReceived is number && data.amountReceived >= 0
         && (!('initialAmountReceived' in data) || (data.initialAmountReceived is number && data.initialAmountReceived >= 0))
@@ -272,7 +323,7 @@ service cloud.firestore {
         ])
         && data.keys().hasOnly([
           'id', 'invoiceId', 'ownerId', 'code', 'description', 'unit', 'qty',
-          'unitPrice', 'discountPct', 'ivaRate', 'lineGross', 'lineNet',
+          'unitPrice', 'discountPct', 'ivaRate', 'exemptionCode', 'lineGross', 'lineNet',
           'lineBase', 'lineTax', 'lineTotal', 'createdAt'
         ])
         && data.id is string && data.id == itemId && isValidId(data.id)
@@ -284,7 +335,8 @@ service cloud.firestore {
         && data.qty is number && data.qty > 0 && data.qty <= 100000
         && data.unitPrice is number && data.unitPrice >= 0 && data.unitPrice <= 999999999
         && data.discountPct is number && data.discountPct >= 0 && data.discountPct <= 100
-        && data.ivaRate is number && (data.ivaRate == 0 || data.ivaRate == 14)
+        && isValidVatRate(data.ivaRate)
+        && (!('exemptionCode' in data) || (data.exemptionCode is string && data.exemptionCode.size() <= 16))
         && data.lineGross is number && data.lineGross >= 0
         && data.lineNet is number && data.lineNet >= 0
         && data.lineBase is number && data.lineBase >= 0
@@ -315,8 +367,8 @@ service cloud.firestore {
         && data.tagline is string && data.tagline.size() <= 120
         && data.defaultCashier is string && data.defaultCashier.size() >= 1 && data.defaultCashier.size() <= 16
         && data.defaultOperator is string && data.defaultOperator.size() >= 1 && data.defaultOperator.size() <= 32
-        && data.defaultFormat is string && (data.defaultFormat == 'POS' || data.defaultFormat == 'A4')
-        && data.defaultDocType is string && (data.defaultDocType == 'FR' || data.defaultDocType == 'FP')
+        && data.defaultFormat is string && data.defaultFormat.size() <= 8 && (data.defaultFormat == 'POS' || data.defaultFormat == 'A4')
+        && isValidBillingDocType(data.defaultDocType)
         && data.defaultNotes is string && data.defaultNotes.size() <= 300
         && data.autoPrintOnEmit is bool
         && data.updatedAt is timestamp;
@@ -356,6 +408,69 @@ service cloud.firestore {
         && data.updatedAt is timestamp;
     }
 
+    function isValidEstablishmentEntry(entry) {
+      return entry is map
+        && entry.keys().hasAll(['id', 'code', 'name', 'isHeadquarters', 'address', 'active'])
+        && entry.keys().hasOnly([
+          'id', 'code', 'name', 'isHeadquarters', 'address', 'municipality',
+          'province', 'phone', 'email', 'defaultCashierCode', 'defaultWarehouseId', 'active'
+        ])
+        && entry.id is string && isValidId(entry.id)
+        && entry.code is string && entry.code.size() >= 1 && entry.code.size() <= 16
+        && entry.name is string && entry.name.size() >= 1 && entry.name.size() <= 120
+        && entry.isHeadquarters is bool
+        && entry.address is string && entry.address.size() <= 160
+        && entry.active is bool;
+    }
+
+    function isValidWarehouseEntry(entry) {
+      return entry is map
+        && entry.keys().hasAll(['id', 'code', 'name', 'establishmentId', 'active'])
+        && entry.keys().hasOnly(['id', 'code', 'name', 'establishmentId', 'address', 'active'])
+        && entry.id is string && entry.id.size() >= 1 && entry.id.size() <= 64 && isValidId(entry.id)
+        && entry.code is string && entry.code.size() >= 1 && entry.code.size() <= 16
+        && entry.name is string && entry.name.size() >= 1 && entry.name.size() <= 120
+        && entry.establishmentId is string && isValidId(entry.establishmentId)
+        && entry.active is bool;
+    }
+
+    function isValidCompanyMasterProfile(mp) {
+      return mp is map
+        && mp.keys().hasOnly([
+          'legalNature', 'cae', 'commercialRegistry', 'shareCapital', 'taxRegime', 'taxOffice',
+          'taxEntity', 'defaultExemptionCode', 'isVatRetentionAgent', 'defaultWithholdingTax',
+          'specialTaxTerritory', 'agtEnvironment', 'activityStartDate', 'municipality', 'province',
+          'postalCode', 'country', 'mobile', 'whatsapp', 'billingEmail', 'website', 'logoUrl',
+          'showLogoOnPos', 'showLogoOnA4', 'bankName1', 'iban1', 'accountHolder1', 'swift1',
+          'bankName2', 'iban2', 'accountHolder2', 'swift2', 'multicaixaExpressPhone',
+          'defaultPaymentTermsDays', 'defaultEstablishmentId', 'establishments', 'warehouses',
+          'legalRepresentativeName', 'legalRepresentativeRole', 'legalRepresentativeNif',
+          'legalRepresentativePhone', 'accountantName', 'accountantOcpcaNumber',
+          'accountantEmail', 'accountantPhone'
+        ])
+        && (!('legalNature' in mp) || (mp.legalNature is string && mp.legalNature.size() <= 16 && (mp.legalNature == 'LDA' || mp.legalNature == 'SU_LDA' || mp.legalNature == 'SA' || mp.legalNature == 'ENI' || mp.legalNature == 'COOP' || mp.legalNature == 'OUTRA')))
+        && (!('taxRegime' in mp) || (mp.taxRegime is string && mp.taxRegime.size() <= 24 && (mp.taxRegime == 'GERAL' || mp.taxRegime == 'SIMPLIFICADO' || mp.taxRegime == 'EXCLUSAO')))
+        && (!('specialTaxTerritory' in mp) || (mp.specialTaxTerritory is string && mp.specialTaxTerritory.size() <= 12 && (mp.specialTaxTerritory == 'AO' || mp.specialTaxTerritory == 'AO-CAB')))
+        && (!('agtEnvironment' in mp) || (mp.agtEnvironment is string && mp.agtEnvironment.size() <= 16 && (mp.agtEnvironment == 'SIMULACAO' || mp.agtEnvironment == 'PRODUCAO')))
+        && (!('isVatRetentionAgent' in mp) || mp.isVatRetentionAgent is bool)
+        && (!('defaultWithholdingTax' in mp) || (mp.defaultWithholdingTax is number && mp.defaultWithholdingTax >= 0 && mp.defaultWithholdingTax <= 100))
+        && (!('defaultPaymentTermsDays' in mp) || (mp.defaultPaymentTermsDays is number && mp.defaultPaymentTermsDays >= 0 && mp.defaultPaymentTermsDays <= 3650))
+        && (!('logoUrl' in mp) || (mp.logoUrl is string && mp.logoUrl.size() <= 270000))
+        && (!('showLogoOnPos' in mp) || mp.showLogoOnPos is bool)
+        && (!('showLogoOnA4' in mp) || mp.showLogoOnA4 is bool)
+        && (!('defaultEstablishmentId' in mp) || (mp.defaultEstablishmentId is string && isValidId(mp.defaultEstablishmentId)))
+        && (!('establishments' in mp) || (
+          mp.establishments is list
+          && mp.establishments.size() <= 20
+          && (mp.establishments.size() == 0 || isValidEstablishmentEntry(mp.establishments[0]))
+        ))
+        && (!('warehouses' in mp) || (
+          mp.warehouses is list
+          && mp.warehouses.size() <= 20
+          && (mp.warehouses.size() == 0 || isValidWarehouseEntry(mp.warehouses[0]))
+        ));
+    }
+
     function isValidCompany(data, companyId) {
       return data.keys().hasAll([
           'id', 'normalizedNif', 'ownerUid', 'ownerEmail', 'legalName', 'shortName', 'nif',
@@ -364,7 +479,7 @@ service cloud.firestore {
         ])
         && data.keys().hasOnly([
           'id', 'normalizedNif', 'ownerUid', 'ownerEmail', 'legalName', 'shortName', 'nif',
-          'address', 'cityCountry', 'phone', 'email', 'tagline', 'status', 'planTier',
+          'address', 'cityCountry', 'phone', 'email', 'tagline', 'masterProfile', 'status', 'planTier',
           'commercialActive', 'baseSequence', 'allowManagerCancel',
           'termsAcceptedVersion', 'termsAcceptedAtIso', 'createdAt', 'updatedAt'
         ])
@@ -380,6 +495,7 @@ service cloud.firestore {
         && data.phone is string && data.phone.size() <= 40
         && data.email is string && data.email.size() <= 120
         && data.tagline is string && data.tagline.size() <= 120
+        && (!('masterProfile' in data) || isValidCompanyMasterProfile(data.masterProfile))
         && data.status is string && data.status.size() <= 16
         && (data.status == 'active' || data.status == 'suspended' || data.status == 'pending')
         && data.planTier is string && data.planTier.size() <= 24
@@ -423,8 +539,8 @@ service cloud.firestore {
           'category', 'unit', 'price', 'ivaRate', 'exemptionReason', 'active', 'createdAt', 'updatedAt'
         ])
         && data.keys().hasOnly([
-          'id', 'companyId', 'companyOwnerUid', 'updatedByUid', 'code', 'barcode', 'name',
-          'category', 'unit', 'costPrice', 'price', 'ivaRate', 'exemptionReason', 'active',
+          'id', 'companyId', 'companyOwnerUid', 'updatedByUid', 'code', 'barcode', 'name', 'productType',
+          'category', 'unit', 'costPrice', 'price', 'ivaRate', 'exemptionCode', 'exemptionReason', 'active',
           'trackStock', 'stockQty', 'minStockQty', 'priceHistory', 'createdAt', 'updatedAt'
         ])
         && data.id is string && data.id == productId && isValidId(data.id)
@@ -434,11 +550,13 @@ service cloud.firestore {
         && data.code is string && data.code.size() >= 1 && data.code.size() <= 32
         && (!('barcode' in data) || (data.barcode is string && data.barcode.size() <= 48))
         && data.name is string && data.name.size() >= 1 && data.name.size() <= 160
+        && (!('productType' in data) || (data.productType is string && data.productType.size() <= 4 && (data.productType == 'P' || data.productType == 'S' || data.productType == 'K')))
         && data.category is string && data.category.size() >= 1 && data.category.size() <= 48
         && data.unit is string && data.unit.size() >= 1 && data.unit.size() <= 16
         && (!('costPrice' in data) || (data.costPrice is number && data.costPrice >= 0 && data.costPrice <= 999999999))
         && data.price is number && data.price >= 0 && data.price <= 999999999
-        && data.ivaRate is number && (data.ivaRate == 0 || data.ivaRate == 14)
+        && isValidVatRate(data.ivaRate)
+        && (!('exemptionCode' in data) || (data.exemptionCode is string && data.exemptionCode.size() <= 16))
         && data.exemptionReason is string && data.exemptionReason.size() <= 120
         && data.active is bool
         && (!('trackStock' in data) || data.trackStock is bool)
@@ -495,19 +613,22 @@ service cloud.firestore {
           'id', 'companyId', 'companyOwnerUid', 'emittedByUid', 'number', 'docType', 'issuedAtIso',
           'cashier', 'operator', 'paymentMethod', 'customerId', 'customerName', 'customerNif',
           'customerLocality', 'merchandiseTotal', 'discountTotal', 'globalDiscountPct', 'globalDiscountAmount',
-          'taxBase14', 'taxAmount14', 'taxBase0', 'taxAmount0', 'taxTotal', 'grandTotal',
-          'amountInWords', 'sessionId', 'amountReceived', 'initialAmountReceived', 'changeAmount',
+          'taxBase14', 'taxAmount14', 'taxBaseIntermediate', 'taxAmountIntermediate',
+          'taxBaseReduced', 'taxAmountReduced', 'taxBase0', 'taxAmount0', 'taxTotal', 'grandTotal',
+          'amountInWords', 'establishmentId', 'establishmentCode', 'establishmentName',
+          'seriesCode', 'seriesEnvironment', 'agtAuthorizationCode', 'saftHash4', 'issuerSnapshot',
+          'sessionId', 'amountReceived', 'initialAmountReceived', 'changeAmount',
           'initialChangeAmount', 'amountDue', 'transferReference', 'paymentSplits',
           'paymentSummary', 'returnOriginInvoiceId', 'returnOriginNumber', 'returnCreditApplied',
           'notes', 'itemCount', 'status', 'cancelReason', 'cancelledBy', 'cancelledAtIso',
           'reprintCount', 'lastReprintedAtIso', 'lastReprintedBy', 'createdAt', 'updatedAt'
         ])
-        && data.id is string && data.id == invoiceId && isValidId(data.id)
-        && data.companyId is string && data.companyId == companyId && isValidId(data.companyId)
-        && data.companyOwnerUid is string && isValidId(data.companyOwnerUid)
-        && data.emittedByUid is string && isValidId(data.emittedByUid)
+        && data.id == invoiceId
+        && data.companyId == companyId
+        && isValidId(data.companyOwnerUid)
+        && isValidId(data.emittedByUid)
         && data.number is string && data.number.size() >= 1 && data.number.size() <= 40
-        && data.docType is string && data.docType.size() <= 8 && (data.docType == 'FR' || data.docType == 'FP' || data.docType == 'NC')
+        && isValidBillingDocType(data.docType)
         && data.issuedAtIso is string && data.issuedAtIso.size() >= 10 && data.issuedAtIso.size() <= 40
         && data.cashier is string && data.cashier.size() >= 1 && data.cashier.size() <= 16
         && data.operator is string && data.operator.size() >= 1 && data.operator.size() <= 32
@@ -523,11 +644,23 @@ service cloud.firestore {
         && (!('globalDiscountAmount' in data) || (data.globalDiscountAmount is number && data.globalDiscountAmount >= 0))
         && data.taxBase14 is number && data.taxBase14 >= 0
         && data.taxAmount14 is number && data.taxAmount14 >= 0
+        && (!('taxBaseIntermediate' in data) || (data.taxBaseIntermediate is number && data.taxBaseIntermediate >= 0))
+        && (!('taxAmountIntermediate' in data) || (data.taxAmountIntermediate is number && data.taxAmountIntermediate >= 0))
+        && (!('taxBaseReduced' in data) || (data.taxBaseReduced is number && data.taxBaseReduced >= 0))
+        && (!('taxAmountReduced' in data) || (data.taxAmountReduced is number && data.taxAmountReduced >= 0))
         && data.taxBase0 is number && data.taxBase0 >= 0
         && data.taxAmount0 is number && data.taxAmount0 == 0
         && data.taxTotal is number && data.taxTotal >= 0
         && data.grandTotal is number && data.grandTotal >= 0
         && data.amountInWords is string && data.amountInWords.size() >= 1 && data.amountInWords.size() <= 300
+        && (!('establishmentId' in data) || (data.establishmentId is string && isValidId(data.establishmentId)))
+        && (!('establishmentCode' in data) || (data.establishmentCode is string && data.establishmentCode.size() <= 16))
+        && (!('establishmentName' in data) || (data.establishmentName is string && data.establishmentName.size() <= 120))
+        && (!('seriesCode' in data) || (data.seriesCode is string && data.seriesCode.size() <= 16))
+        && (!('seriesEnvironment' in data) || (data.seriesEnvironment is string && data.seriesEnvironment.size() <= 16 && (data.seriesEnvironment == 'SIMULACAO' || data.seriesEnvironment == 'PRODUCAO')))
+        && (!('agtAuthorizationCode' in data) || (data.agtAuthorizationCode is string && data.agtAuthorizationCode.size() <= 64))
+        && (!('saftHash4' in data) || (data.saftHash4 is string && data.saftHash4.size() <= 16))
+        && (!('issuerSnapshot' in data) || isValidIssuerSnapshot(data.issuerSnapshot))
         && (!('sessionId' in data) || (data.sessionId is string && data.sessionId.size() <= 128))
         && data.amountReceived is number && data.amountReceived >= 0
         && (!('initialAmountReceived' in data) || (data.initialAmountReceived is number && data.initialAmountReceived >= 0))
@@ -565,7 +698,7 @@ service cloud.firestore {
         ])
         && data.keys().hasOnly([
           'id', 'invoiceId', 'companyId', 'companyOwnerUid', 'code', 'description', 'unit', 'qty',
-          'unitPrice', 'discountPct', 'ivaRate', 'lineGross', 'lineNet',
+          'unitPrice', 'discountPct', 'ivaRate', 'exemptionCode', 'lineGross', 'lineNet',
           'lineBase', 'lineTax', 'lineTotal', 'createdAt'
         ])
         && data.id is string && data.id == itemId && isValidId(data.id)
@@ -578,7 +711,8 @@ service cloud.firestore {
         && data.qty is number && data.qty > 0 && data.qty <= 100000
         && data.unitPrice is number && data.unitPrice >= 0 && data.unitPrice <= 999999999
         && data.discountPct is number && data.discountPct >= 0 && data.discountPct <= 100
-        && data.ivaRate is number && (data.ivaRate == 0 || data.ivaRate == 14)
+        && isValidVatRate(data.ivaRate)
+        && (!('exemptionCode' in data) || (data.exemptionCode is string && data.exemptionCode.size() <= 16))
         && data.lineGross is number && data.lineGross >= 0
         && data.lineNet is number && data.lineNet >= 0
         && data.lineBase is number && data.lineBase >= 0
@@ -597,7 +731,8 @@ service cloud.firestore {
           'companyId', 'companyOwnerUid', 'updatedByUid', 'legalName', 'shortName', 'nif',
           'address', 'cityCountry', 'phone', 'email', 'tagline', 'defaultCashier', 'defaultOperator',
           'defaultFormat', 'defaultDocType', 'defaultNotes', 'autoPrintOnEmit',
-          'hidePromotionalFooter', 'allowCashierPriceEdit', 'updatedAt'
+          'hidePromotionalFooter', 'allowCashierPriceEdit',
+          'defaultEstablishmentId', 'agtEnvironment', 'masterProfile', 'updatedAt'
         ])
         && data.companyId is string && data.companyId == companyId && isValidId(data.companyId)
         && data.companyOwnerUid is string && isValidId(data.companyOwnerUid)
@@ -612,12 +747,49 @@ service cloud.firestore {
         && data.tagline is string && data.tagline.size() <= 120
         && data.defaultCashier is string && data.defaultCashier.size() >= 1 && data.defaultCashier.size() <= 16
         && data.defaultOperator is string && data.defaultOperator.size() >= 1 && data.defaultOperator.size() <= 32
-        && data.defaultFormat is string && (data.defaultFormat == 'POS' || data.defaultFormat == 'A4')
-        && data.defaultDocType is string && (data.defaultDocType == 'FR' || data.defaultDocType == 'FP')
+        && data.defaultFormat is string && data.defaultFormat.size() <= 8 && (data.defaultFormat == 'POS' || data.defaultFormat == 'A4')
+        && isValidBillingDocType(data.defaultDocType)
         && data.defaultNotes is string && data.defaultNotes.size() <= 300
         && data.autoPrintOnEmit is bool
         && (!('hidePromotionalFooter' in data) || data.hidePromotionalFooter is bool)
         && (!('allowCashierPriceEdit' in data) || data.allowCashierPriceEdit is bool)
+        && (!('defaultEstablishmentId' in data) || (data.defaultEstablishmentId is string && isValidId(data.defaultEstablishmentId)))
+        && (!('agtEnvironment' in data) || (data.agtEnvironment is string && data.agtEnvironment.size() <= 16 && (data.agtEnvironment == 'SIMULACAO' || data.agtEnvironment == 'PRODUCAO')))
+        && (!('masterProfile' in data) || isValidCompanyMasterProfile(data.masterProfile))
+        && data.updatedAt is timestamp;
+    }
+
+    function isValidCompanyFiscalSeries(data, companyId, seriesId) {
+      return data.keys().hasAll([
+          'id', 'companyId', 'companyOwnerUid', 'updatedByUid', 'seriesCode', 'seriesYear',
+          'documentType', 'firstDocumentNumber', 'lastDocumentNumber', 'status',
+          'environment', 'requestedAtIso', 'createdAt', 'updatedAt'
+        ])
+        && data.keys().hasOnly([
+          'id', 'companyId', 'companyOwnerUid', 'updatedByUid', 'seriesCode', 'seriesYear',
+          'documentType', 'firstDocumentNumber', 'lastDocumentNumber', 'status', 'environment',
+          'establishmentId', 'establishmentCode', 'agtAuthorizationCode',
+          'requestedAtIso', 'authorizedAtIso', 'closedAtIso', 'notes', 'createdAt', 'updatedAt'
+        ])
+        && data.id is string && data.id == seriesId && isValidId(data.id)
+        && data.companyId is string && data.companyId == companyId && isValidId(data.companyId)
+        && data.companyOwnerUid is string && isValidId(data.companyOwnerUid)
+        && data.updatedByUid is string && data.updatedByUid == request.auth.uid && isValidId(data.updatedByUid)
+        && data.seriesCode is string && data.seriesCode.size() >= 1 && data.seriesCode.size() <= 16
+        && data.seriesYear is number && data.seriesYear >= 2020 && data.seriesYear <= 2100
+        && (data.documentType == 'GT' || isValidBillingDocType(data.documentType))
+        && data.firstDocumentNumber is number && data.firstDocumentNumber >= 1 && data.firstDocumentNumber <= 999999999
+        && data.lastDocumentNumber is number && data.lastDocumentNumber >= 0 && data.lastDocumentNumber <= 999999999
+        && data.status is string && data.status.size() <= 4 && (data.status == 'A' || data.status == 'U' || data.status == 'F')
+        && data.environment is string && data.environment.size() <= 16 && (data.environment == 'SIMULACAO' || data.environment == 'PRODUCAO')
+        && (!('establishmentId' in data) || (data.establishmentId is string && isValidId(data.establishmentId)))
+        && (!('establishmentCode' in data) || (data.establishmentCode is string && data.establishmentCode.size() <= 16))
+        && (!('agtAuthorizationCode' in data) || (data.agtAuthorizationCode is string && data.agtAuthorizationCode.size() <= 64))
+        && data.requestedAtIso is string && data.requestedAtIso.size() >= 10 && data.requestedAtIso.size() <= 40
+        && (!('authorizedAtIso' in data) || (data.authorizedAtIso is string && data.authorizedAtIso.size() >= 10 && data.authorizedAtIso.size() <= 40))
+        && (!('closedAtIso' in data) || (data.closedAtIso is string && data.closedAtIso.size() >= 10 && data.closedAtIso.size() <= 40))
+        && (!('notes' in data) || (data.notes is string && data.notes.size() <= 300))
+        && data.createdAt is timestamp
         && data.updatedAt is timestamp;
     }
 
@@ -899,8 +1071,8 @@ service cloud.firestore {
         && incoming().updatedAt == request.time
         && (
           incoming().diff(existing()).affectedKeys().hasOnly([
-            'code', 'barcode', 'name', 'category', 'unit', 'costPrice', 'price',
-            'ivaRate', 'exemptionReason', 'active', 'trackStock', 'stockQty', 'minStockQty',
+            'code', 'barcode', 'name', 'productType', 'category', 'unit', 'costPrice', 'price',
+            'ivaRate', 'exemptionCode', 'exemptionReason', 'active', 'trackStock', 'stockQty', 'minStockQty',
             'priceHistory', 'updatedAt'
           ])
         );
@@ -1218,7 +1390,7 @@ service cloud.firestore {
             && incoming().commercialActive == existing().commercialActive
             && incoming().diff(existing()).affectedKeys().hasOnly([
               'legalName', 'shortName', 'address', 'cityCountry',
-              'phone', 'email', 'tagline', 'allowManagerCancel',
+              'phone', 'email', 'tagline', 'masterProfile', 'allowManagerCancel',
               'termsAcceptedVersion', 'termsAcceptedAtIso', 'updatedAt'
             ])
           )
@@ -1335,8 +1507,8 @@ service cloud.firestore {
               canSyncCompanyCloudData(companyId)
               && isCompanyOwnerOrManager(companyId)
               && incoming().diff(existing()).affectedKeys().hasOnly([
-                'updatedByUid', 'code', 'barcode', 'name', 'category', 'unit', 'costPrice', 'price',
-                'ivaRate', 'exemptionReason', 'active', 'trackStock', 'stockQty', 'minStockQty',
+                'updatedByUid', 'code', 'barcode', 'name', 'productType', 'category', 'unit', 'costPrice', 'price',
+                'ivaRate', 'exemptionCode', 'exemptionReason', 'active', 'trackStock', 'stockQty', 'minStockQty',
                 'priceHistory', 'updatedAt'
               ])
             )
@@ -1487,27 +1659,31 @@ service cloud.firestore {
           && existing().status != 'cancelled'
           && incoming().updatedAt == request.time
           && (
-            (
-              canCancelCompanyInvoice(companyId)
-              && incoming().status == 'cancelled'
-              && ('cancelReason' in incoming())
-              && incoming().cancelReason is string
-              && incoming().cancelReason.size() >= 4
-              && incoming().diff(existing()).affectedKeys().hasOnly([
-                'status', 'cancelReason', 'cancelledBy', 'cancelledAtIso', 'updatedAt'
-              ])
-            )
+            isPlatformAdmin()
             || (
               canSyncCompanyCloudData(companyId)
-              && isCompanyAnyActiveRole(companyId)
-              && incoming().status == 'issued'
-              && incoming().diff(existing()).affectedKeys().hasOnly([
-                'amountReceived', 'initialAmountReceived', 'amountDue', 'changeAmount',
-                'initialChangeAmount', 'paymentSummary', 'transferReference', 'notes',
-                'reprintCount', 'lastReprintedAtIso', 'lastReprintedBy', 'updatedAt'
-              ])
+              && (
+                (
+                  canCancelCompanyInvoice(companyId)
+                  && incoming().status == 'cancelled'
+                  && ('cancelReason' in incoming())
+                  && incoming().cancelReason is string
+                  && incoming().cancelReason.size() >= 4
+                  && incoming().diff(existing()).affectedKeys().hasOnly([
+                    'status', 'cancelReason', 'cancelledBy', 'cancelledAtIso', 'updatedAt'
+                  ])
+                )
+                || (
+                  isCompanyAnyActiveRole(companyId)
+                  && incoming().status == 'issued'
+                  && incoming().diff(existing()).affectedKeys().hasOnly([
+                    'amountReceived', 'initialAmountReceived', 'amountDue', 'changeAmount',
+                    'initialChangeAmount', 'paymentSummary', 'transferReference', 'notes',
+                    'reprintCount', 'lastReprintedAtIso', 'lastReprintedBy', 'updatedAt'
+                  ])
+                )
+              )
             )
-            || isPlatformAdmin()
           );
 
         allow delete: if false;
@@ -1569,7 +1745,8 @@ service cloud.firestore {
                 'updatedByUid', 'legalName', 'shortName', 'address', 'cityCountry',
                 'phone', 'email', 'tagline', 'defaultCashier', 'defaultOperator',
                 'defaultFormat', 'defaultDocType', 'defaultNotes', 'autoPrintOnEmit',
-                'hidePromotionalFooter', 'allowCashierPriceEdit', 'updatedAt'
+                'hidePromotionalFooter', 'allowCashierPriceEdit',
+                'defaultEstablishmentId', 'agtEnvironment', 'masterProfile', 'updatedAt'
               ])
             )
             || isPlatformAdmin()
@@ -1870,6 +2047,59 @@ service cloud.firestore {
 
           allow update, delete: if false;
         }
+      }
+
+      // Subcollection: /companies/{companyId}/fiscal_series/{seriesId}
+      match /fiscal_series/{seriesId} {
+        allow get: if isVerifiedUser()
+          && isValidId(companyId)
+          && isValidId(seriesId)
+          && (isCompanyAnyActiveRole(companyId) || isPlatformAdmin());
+
+        allow list: if isVerifiedUser()
+          && existing().companyId == companyId
+          && existing().companyOwnerUid == request.auth.uid;
+
+        allow create: if isVerifiedUser()
+          && isValidId(companyId)
+          && isValidId(seriesId)
+          && isValidCompanyFiscalSeries(incoming(), companyId, seriesId)
+          && incoming().createdAt == request.time
+          && incoming().updatedAt == request.time
+          && canSyncCompanyCloudData(companyId)
+          && isCompanyAnyActiveRole(companyId)
+          && incoming().companyOwnerUid == companyDocData(companyId).ownerUid;
+
+        // Terminal State Locking: séries encerradas ('F') são imutáveis e numeração é estritamente monotónica
+        allow update: if isVerifiedUser()
+          && isValidId(companyId)
+          && isValidId(seriesId)
+          && isValidCompanyFiscalSeries(incoming(), companyId, seriesId)
+          && incoming().id == existing().id
+          && incoming().companyId == existing().companyId
+          && incoming().companyOwnerUid == existing().companyOwnerUid
+          && incoming().seriesCode == existing().seriesCode
+          && incoming().seriesYear == existing().seriesYear
+          && incoming().documentType == existing().documentType
+          && incoming().firstDocumentNumber == existing().firstDocumentNumber
+          && incoming().environment == existing().environment
+          && incoming().requestedAtIso == existing().requestedAtIso
+          && incoming().createdAt == existing().createdAt
+          && incoming().updatedAt == request.time
+          && (
+            (
+              existing().status != 'F'
+              && canSyncCompanyCloudData(companyId)
+              && isCompanyAnyActiveRole(companyId)
+              && incoming().lastDocumentNumber >= existing().lastDocumentNumber
+              && incoming().diff(existing()).affectedKeys().hasOnly([
+                'updatedByUid', 'lastDocumentNumber', 'status', 'closedAtIso', 'notes', 'updatedAt'
+              ])
+            )
+            || isPlatformAdmin()
+          );
+
+        allow delete: if false;
       }
     }
   }

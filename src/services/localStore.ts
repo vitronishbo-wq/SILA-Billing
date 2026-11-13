@@ -9,6 +9,16 @@ import {
   UNASSIGNED_TENANT_RECORD,
 } from '../core/seedData';
 import {
+  evaluateCompanyMasterCompleteness,
+  validateAngolaIban,
+  validateLogoDataUrl,
+} from '../core/companyValidator';
+import { seriesStorage } from '../core/seriesManager';
+import {
+  AgtOperationEnvironment,
+  AngolaLegalNature,
+  AngolaTaxRegime,
+  AngolaTaxTerritory,
   AppSettings,
   CartDraftItem,
   CashMovement,
@@ -16,10 +26,13 @@ import {
   CompanyMember,
   CompanyProfile,
   CompanyRecord,
+  createDefaultEstablishmentForCompany,
   Customer,
   DEFAULT_SETTINGS,
+  DEFAULT_WAREHOUSE_ID,
   DocumentFormat,
   DocumentType,
+  EstablishmentRecord,
   getDirectCustomerIdForCompany,
   InvoiceRecord,
   isJaimonaOwnerEmail,
@@ -38,6 +51,7 @@ import {
   SyncQueueEntry,
   validateCompanyNif,
   VITRONIS_INSTITUTIONAL,
+  WarehouseRecord,
 } from '../core/types';
 
 export interface PosWorkspaceDraft {
@@ -107,15 +121,80 @@ export interface RegisterCompanyInput {
   shortName: string;
   nif: string;
   address?: string;
+  municipality?: string;
+  province?: string;
   cityCountry?: string;
+  postalCode?: string;
   phone?: string;
+  mobile?: string;
+  whatsapp?: string;
   email?: string;
+  billingEmail?: string;
+  website?: string;
   tagline?: string;
+  legalNature?: AngolaLegalNature;
+  cae?: string;
+  commercialRegistry?: string;
+  shareCapital?: string;
+  taxRegime?: AngolaTaxRegime;
+  taxOffice?: string;
+  taxEntity?: string;
+  specialTaxTerritory?: AngolaTaxTerritory;
+  agtEnvironment?: AgtOperationEnvironment;
+  logoUrl?: string;
+  bankName1?: string;
+  iban1?: string;
+  legalRepresentativeName?: string;
+  accountantName?: string;
+  establishments?: EstablishmentRecord[];
+  warehouses?: WarehouseRecord[];
   ownerUid?: string;
   ownerEmail?: string;
   ownerDisplayName?: string;
   copyStarterCatalog?: boolean;
   termsAccepted?: boolean;
+}
+
+export function normalizeCompanyMasterProfile(profile: CompanyProfile): CompanyProfile {
+  const existingEstablishments = Array.isArray(profile.establishments)
+    ? profile.establishments.filter((e) => e && e.id && e.code && e.name)
+    : [];
+  const defaultEst = createDefaultEstablishmentForCompany(profile);
+  const establishments =
+    existingEstablishments.length > 0 ? existingEstablishments : [defaultEst];
+
+  const defaultEstablishmentId =
+    establishments.find((e) => e.id === profile.defaultEstablishmentId)?.id ||
+    establishments.find((e) => e.isHeadquarters && e.active)?.id ||
+    establishments.find((e) => e.active)?.id ||
+    establishments[0]!.id;
+
+  const existingWarehouses = Array.isArray(profile.warehouses)
+    ? profile.warehouses.filter((w) => w && w.id && w.code && w.name)
+    : [];
+  const warehouses: WarehouseRecord[] =
+    existingWarehouses.length > 0
+      ? existingWarehouses
+      : [
+          {
+            id: DEFAULT_WAREHOUSE_ID,
+            code: 'ARM-01',
+            name: 'Armazém Principal',
+            establishmentId: defaultEstablishmentId,
+            address: profile.address || 'Angola',
+            active: true,
+          },
+        ];
+
+  return {
+    ...profile,
+    taxRegime: profile.taxRegime || 'GERAL',
+    agtEnvironment: profile.agtEnvironment || 'SIMULACAO',
+    country: profile.country || 'AO',
+    establishments,
+    warehouses,
+    defaultEstablishmentId,
+  };
 }
 
 const DB_NAME = 'sila_billing_idb_v1';
@@ -1137,16 +1216,26 @@ export async function loadCompanyWorkspace(
   suppliers.sort((a, b) => a.name.localeCompare(b.name, 'pt'));
   purchases.sort((a, b) => b.issuedAtIso.localeCompare(a.issuedAtIso));
 
-  const fallbackSettings = createDefaultSettingsForCompany(activeCompany);
+  const activeCompanyNormalized: CompanyRecord = {
+    ...activeCompany,
+    profile: normalizeCompanyMasterProfile(activeCompany.profile),
+  };
+
+  const fallbackSettings = createDefaultSettingsForCompany(activeCompanyNormalized);
   const validLegacySettings =
     legacySettingsMeta?.value && legacySettingsMeta.value.company?.nif !== '---'
       ? legacySettingsMeta.value
       : undefined;
-  const resolvedSettings: AppSettings = scopedSettingsMeta?.value
-    ? { ...scopedSettingsMeta.value, companyId: activeCompany.id, company: activeCompany.profile }
-    : validLegacySettings
-      ? { ...validLegacySettings, companyId: activeCompany.id, company: activeCompany.profile }
-      : fallbackSettings;
+  const baseSettings = scopedSettingsMeta?.value || validLegacySettings || fallbackSettings;
+  const resolvedSettings: AppSettings = {
+    ...baseSettings,
+    companyId: activeCompanyNormalized.id,
+    company: activeCompanyNormalized.profile,
+    defaultEstablishmentId:
+      baseSettings.defaultEstablishmentId || activeCompanyNormalized.profile.defaultEstablishmentId,
+    agtEnvironment:
+      baseSettings.agtEnvironment || activeCompanyNormalized.profile.agtEnvironment || 'SIMULACAO',
+  };
 
   return {
     activeCompany,
@@ -1216,24 +1305,70 @@ export async function registerNewCompanyLocal(
     throw new Error('A designação social da empresa é obrigatória.');
   }
 
+  const logoCheck = validateLogoDataUrl(input.logoUrl);
+  if (!logoCheck.valid) {
+    throw new Error(logoCheck.error || 'Logótipo da empresa inválido.');
+  }
+  const iban1Check = validateAngolaIban(input.iban1);
+  if (!iban1Check.valid) {
+    throw new Error(iban1Check.error || 'IBAN principal inválido.');
+  }
+
   const now = new Date().toISOString();
   const slug = Math.random().toString(36).slice(2, 7);
   const companyId = `comp_${Date.now()}_${slug}`;
   const cityCountry = (input.cityCountry || 'Angola').trim() || 'Angola';
 
+  const normalizedProfile = normalizeCompanyMasterProfile({
+    legalName: legalName.slice(0, 160),
+    shortName,
+    legalNature: input.legalNature,
+    cae: input.cae?.trim().slice(0, 32),
+    commercialRegistry: input.commercialRegistry?.trim().slice(0, 80),
+    shareCapital: input.shareCapital?.trim().slice(0, 40),
+    nif: input.nif.trim().slice(0, 32),
+    taxRegime: input.taxRegime || 'GERAL',
+    taxOffice: input.taxOffice?.trim().slice(0, 120),
+    taxEntity: input.taxEntity?.trim().slice(0, 120),
+    specialTaxTerritory: input.specialTaxTerritory,
+    agtEnvironment: input.agtEnvironment === 'PRODUCAO' ? 'PRODUCAO' : 'SIMULACAO',
+    address: (input.address || cityCountry).trim().slice(0, 160),
+    municipality: input.municipality?.trim().slice(0, 80),
+    province: input.province?.trim().slice(0, 80),
+    cityCountry: cityCountry.slice(0, 80),
+    postalCode: input.postalCode?.trim().slice(0, 32),
+    country: 'AO',
+    phone: (input.phone || '').trim().slice(0, 40),
+    mobile: input.mobile?.trim().slice(0, 40),
+    whatsapp: input.whatsapp?.trim().slice(0, 40),
+    email: (input.email || input.ownerEmail || '').trim().slice(0, 120),
+    billingEmail: input.billingEmail?.trim().slice(0, 120),
+    website: input.website?.trim().slice(0, 160),
+    tagline: (input.tagline || 'Obrigado pela preferência').trim().slice(0, 120),
+    logoUrl: input.logoUrl?.trim() || undefined,
+    showLogoOnPos: Boolean(input.logoUrl),
+    showLogoOnA4: Boolean(input.logoUrl),
+    bankName1: input.bankName1?.trim().slice(0, 80),
+    iban1: iban1Check.normalized || undefined,
+    legalRepresentativeName: input.legalRepresentativeName?.trim().slice(0, 120),
+    accountantName: input.accountantName?.trim().slice(0, 120),
+    establishments: input.establishments,
+    warehouses: input.warehouses,
+  });
+
+  if (normalizedProfile.agtEnvironment === 'PRODUCAO') {
+    const prodCheck = evaluateCompanyMasterCompleteness(normalizedProfile);
+    if (!prodCheck.readyForProductionEmission) {
+      throw new Error(
+        `Para iniciar directamente em Produção complete a Ficha Mestre: ${prodCheck.blockingIssues.map((i) => i.message).join(' ')}`
+      );
+    }
+  }
+
   const newCompany: CompanyRecord = {
     id: companyId,
     normalizedNif: nifCheck.normalized,
-    profile: {
-      legalName: legalName.slice(0, 160),
-      shortName,
-      nif: input.nif.trim().slice(0, 32),
-      address: (input.address || cityCountry).trim().slice(0, 160),
-      cityCountry: cityCountry.slice(0, 80),
-      phone: (input.phone || '').trim().slice(0, 40),
-      email: (input.email || input.ownerEmail || '').trim().slice(0, 120),
-      tagline: (input.tagline || 'Obrigado pela preferência').trim().slice(0, 120),
-    },
+    profile: normalizedProfile,
     status: 'active',
     plan: {
       planTier: 'FREE',
@@ -1261,6 +1396,8 @@ export async function registerNewCompanyLocal(
   await putInStore('customers', directCustomer);
 
   const defaultSettings = createDefaultSettingsForCompany(newCompany);
+  defaultSettings.defaultEstablishmentId = normalizedProfile.defaultEstablishmentId;
+  defaultSettings.agtEnvironment = normalizedProfile.agtEnvironment;
   await putInStore('meta', { key: `app_settings:${companyId}`, value: defaultSettings });
 
   if (input.ownerUid) {
@@ -1290,7 +1427,11 @@ export async function registerNewCompanyLocal(
 }
 
 /**
- * Atualiza configurações e perfil da empresa ativa garantindo que o NIF não colide com outra empresa.
+ * Atualiza configurações e Ficha Mestre da empresa ativa:
+ * - Garante unicidade de NIF (1 NIF = 1 Empresa)
+ * - Valida segurança do logótipo (bloqueia SVG/XSS/excesso de tamanho) e formato IBAN AO06
+ * - Permite gravação parcial em modo Simulação
+ * - Exige completude total + série de Produção antes de activar modo Produção
  */
 export async function saveCompanySettingsScoped(
   companyId: string,
@@ -1312,9 +1453,66 @@ export async function saveCompanySettingsScoped(
     );
   }
 
+  const logoCheck = validateLogoDataUrl(settings.company.logoUrl);
+  if (!logoCheck.valid) {
+    throw new Error(logoCheck.error || 'Logótipo inválido.');
+  }
+
+  const iban1Check = validateAngolaIban(settings.company.iban1);
+  if (!iban1Check.valid) {
+    throw new Error(iban1Check.error || 'IBAN principal inválido.');
+  }
+  const iban2Check = validateAngolaIban(settings.company.iban2);
+  if (!iban2Check.valid) {
+    throw new Error(iban2Check.error || 'IBAN secundário inválido.');
+  }
+
   const existingCompany = await getFromStore<CompanyRecord>('companies', companyId);
   if (!existingCompany) {
     throw new Error('Registo da empresa não encontrado na base local.');
+  }
+
+  const targetEnvironment: AgtOperationEnvironment =
+    settings.agtEnvironment === 'PRODUCAO' || settings.company.agtEnvironment === 'PRODUCAO'
+      ? 'PRODUCAO'
+      : 'SIMULACAO';
+
+  const normalizedProfile = normalizeCompanyMasterProfile({
+    ...existingCompany.profile,
+    ...settings.company,
+    iban1: iban1Check.normalized || undefined,
+    iban2: iban2Check.normalized || undefined,
+    agtEnvironment: targetEnvironment,
+    defaultEstablishmentId:
+      settings.defaultEstablishmentId ||
+      settings.company.defaultEstablishmentId ||
+      existingCompany.profile.defaultEstablishmentId,
+  });
+
+  if (targetEnvironment === 'PRODUCAO') {
+    const companySeries = seriesStorage.loadSeries(companyId);
+    const completeness = evaluateCompanyMasterCompleteness(normalizedProfile, {
+      series: companySeries,
+      requireProductionSeriesCheck: true,
+    });
+    if (!completeness.readyForProductionEmission) {
+      const reasons = [
+        ...completeness.blockingIssues.map((b) => b.message),
+        ...(completeness.fieldStatus.taxOffice !== 'ok'
+          ? ['Informe a Repartição Fiscal de domicílio antes de activar o modo Produção.']
+          : []),
+      ];
+      throw new Error(
+        `Não é possível activar a emissão fiscal em Produção enquanto faltarem requisitos: ${reasons.join(' ')}`
+      );
+    }
+  } else {
+    const simCheck = evaluateCompanyMasterCompleteness(normalizedProfile);
+    if (!simCheck.readyForSimulation) {
+      throw new Error(
+        'Preencha pelo menos a Denominação Social, Nome Comercial e um NIF válido para guardar a empresa.'
+      );
+    }
   }
 
   const now = new Date().toISOString();
@@ -1322,7 +1520,7 @@ export async function saveCompanySettingsScoped(
     ...existingCompany,
     id: companyId,
     normalizedNif: nifCheck.normalized,
-    profile: { ...settings.company },
+    profile: normalizedProfile,
     syncState: settings.synced ? 'synced' : 'pending',
     synced: Boolean(settings.synced),
     updatedAtIso: now,
@@ -1333,6 +1531,9 @@ export async function saveCompanySettingsScoped(
   const scopedSettings: AppSettings = {
     ...settings,
     companyId,
+    company: normalizedProfile,
+    defaultEstablishmentId: normalizedProfile.defaultEstablishmentId,
+    agtEnvironment: targetEnvironment,
     updatedAtIso: settings.updatedAtIso || now,
   };
   await putInStore('meta', { key: `app_settings:${companyId}`, value: scopedSettings });
