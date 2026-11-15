@@ -662,15 +662,54 @@ export interface Product {
   updatedAtIso: string;
 }
 
+export type CustomerType = 'CONSUMIDOR_FINAL' | 'PARTICULAR' | 'EMPRESA' | 'ESTRANGEIRO';
+
+export type CustomerPaymentTerms =
+  | 'IMEDIATO'
+  | '15_DIAS'
+  | '30_DIAS'
+  | '45_DIAS'
+  | '60_DIAS'
+  | 'PERSONALIZADO';
+
+export interface CustomerChangeLogEntry {
+  changedAtIso: string;
+  changedBy: string;
+  summary: string;
+}
+
 export interface Customer {
   id: string;
   companyId?: string;
+  internalCode?: string; // Código interno único gerado automaticamente por empresa (ex: CLI-0001)
+  customerType?: CustomerType;
+  active?: boolean;
+  // Dados fiscais
   name: string;
   nif: string;
+  normalizedNif?: string;
+  countryCode?: string; // ISO-3166-1 alpha-2 ('AO' padrão ou código estrangeiro)
+  foreignTaxId?: string; // Identificação fiscal estrangeira (quando customerType === 'ESTRANGEIRO')
+  province?: string;
+  municipality?: string;
   locality: string;
-  phone: string;
   address: string;
+  // Contactos & dados comerciais (separados da identificação fiscal documental)
+  phone: string;
+  email?: string;
   creditLimit?: number;
+  paymentTerms?: CustomerPaymentTerms;
+  hasCreditAccount?: boolean;
+  notes?: string;
+  // Campos avançados (recolhíveis na UI)
+  bankName?: string;
+  bankIban?: string;
+  documentRef?: string;
+  representativeName?: string;
+  representativePhone?: string;
+  specialCreditNotes?: string;
+  // Histórico de alterações (não altera documentos emitidos)
+  changeHistory?: CustomerChangeLogEntry[];
   syncState?: SyncState;
   syncError?: string;
   synced?: boolean;

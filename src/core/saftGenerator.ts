@@ -462,7 +462,7 @@ export function generateSaftAoXml(params: GenerateSaftParams): SaftExportResult 
   const validation = validateSaftDataset(company, invoices, startDate, endDate, periodMonth, fiscalYear);
 
   // 4. Mapeamento de Clientes (<Customer>)
-  const customersMap = new Map<string, { id: string; name: string; nif: string; address: string; city: string; postalCode: string }>();
+  const customersMap = new Map<string, { id: string; name: string; nif: string; address: string; city: string; postalCode: string; country: string }>();
 
   // Consumidor final padrão obrigatório no SAF-T
   customersMap.set('999999999', {
@@ -472,18 +472,24 @@ export function generateSaftAoXml(params: GenerateSaftParams): SaftExportResult 
     address: 'Desconhecido',
     city: 'Desconhecido',
     postalCode: 'Desconhecido',
+    country: 'AO',
   });
 
   for (const c of customers) {
-    const safeTaxId = normalizeTaxIdForSaft(c.nif);
+    const isForeign = c.customerType === 'ESTRANGEIRO' || (c.countryCode && c.countryCode.toUpperCase() !== 'AO');
+    const safeTaxId = isForeign
+      ? String(c.foreignTaxId || c.nif || 'Desconhecido').trim() || 'Desconhecido'
+      : normalizeTaxIdForSaft(c.nif);
     const cid = c.id || safeTaxId;
+    const country = isForeign && c.countryCode ? c.countryCode.toUpperCase().slice(0, 2) : 'AO';
     customersMap.set(cid, {
       id: cid,
       name: c.name || 'Cliente Sem Nome',
       nif: safeTaxId,
-      address: c.address || 'Angola',
-      city: c.locality || 'Luanda',
+      address: c.address || (isForeign ? country : 'Angola'),
+      city: c.municipality || c.province || c.locality || 'Luanda',
       postalCode: 'Desconhecido',
+      country,
     });
   }
 
@@ -498,6 +504,7 @@ export function generateSaftAoXml(params: GenerateSaftParams): SaftExportResult 
         address: 'Angola',
         city: inv.customerLocality || 'Luanda',
         postalCode: 'Desconhecido',
+        country: 'AO',
       });
     }
   }
@@ -817,7 +824,7 @@ export function generateSaftAoXml(params: GenerateSaftParams): SaftExportResult 
         <AddressDetail>${escapeXml(c.address)}</AddressDetail>
         <City>${escapeXml(c.city)}</City>
         <PostalCode>${escapeXml(c.postalCode)}</PostalCode>
-        <Country>AO</Country>
+        <Country>${escapeXml(c.country || 'AO')}</Country>
       </BillingAddress>
       <SelfBillingIndicator>0</SelfBillingIndicator>
     </Customer>

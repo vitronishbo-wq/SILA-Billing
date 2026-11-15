@@ -329,7 +329,9 @@ export function filterCustomersSmart(customers: Customer[], rawQuery: string): C
 
     if (
       matchesFormattedIdentifier(c.nif, trimmed) ||
-      matchesFormattedIdentifier(c.phone || '', trimmed)
+      matchesFormattedIdentifier(c.phone || '', trimmed) ||
+      matchesFormattedIdentifier(c.internalCode || '', trimmed) ||
+      matchesFormattedIdentifier(c.foreignTaxId || '', trimmed)
     ) {
       scored.push({ customer: c, score: 900 });
       continue;
@@ -340,7 +342,10 @@ export function filterCustomersSmart(customers: Customer[], rawQuery: string): C
     const normName = normalizeSearchText(c.name);
     const normLoc = normalizeSearchText(c.locality || '');
     const normAddr = normalizeSearchText(c.address || '');
-    const fullNorm = `${normName} ${normAddr} ${normLoc}`.trim();
+    const normProv = normalizeSearchText(c.province || '');
+    const normMunic = normalizeSearchText(c.municipality || '');
+    const normEmail = normalizeSearchText(c.email || '');
+    const fullNorm = `${normName} ${normAddr} ${normLoc} ${normProv} ${normMunic} ${normEmail}`.trim();
 
     if (normName.startsWith(qNorm)) {
       scored.push({ customer: c, score: 750 });

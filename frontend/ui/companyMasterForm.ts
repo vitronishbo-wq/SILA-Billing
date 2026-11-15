@@ -114,24 +114,41 @@ function escapeHtml(raw: string | undefined | null): string {
     .replace(/'/g, '&#39;');
 }
 
-function formatRequirementLabel(req: FieldRequirementLevel): string {
-  if (req === 'REQUIRED') return 'Obrigatório';
-  if (req === 'CONDITIONAL') return 'Condicional';
-  return 'Opcional';
+function formatRequirementSymbol(req: FieldRequirementLevel): string {
+  if (req === 'REQUIRED') return '*';
+  if (req === 'CONDITIONAL') return 'ⓘ';
+  return '';
 }
 
 function getRequirementTextClass(req: FieldRequirementLevel, isMobile: boolean): string {
   if (req === 'REQUIRED') {
-    return isMobile ? 'text-amber-300 font-semibold' : 'text-slate-700 font-semibold';
+    return isMobile ? 'text-amber-400 font-bold' : 'text-amber-600 font-bold';
   }
   if (req === 'CONDITIONAL') {
-    return isMobile ? 'text-blue-300' : 'text-blue-700';
+    return isMobile ? 'text-blue-400 font-semibold' : 'text-blue-600 font-semibold';
   }
-  return isMobile ? 'text-slate-400' : 'text-slate-500';
+  return isMobile ? 'text-slate-500' : 'text-slate-400';
 }
 
 function getFieldDescriptor(key: keyof CompanyProfile | 'series' | 'establishments') {
   return COMPANY_MASTER_FIELD_REGISTRY.find((d) => d.key === key);
+}
+
+function formatCompactIssueChipLabel(
+  issue: { field: string; message: string },
+): string {
+  const desc = getFieldDescriptor(issue.field as keyof CompanyProfile | 'series' | 'establishments');
+  if (desc?.label) {
+    return desc.label
+      .replace(/\s*\([^)]*\)/g, '')
+      .replace(' Completo', '')
+      .replace(' Principal', '')
+      .replace(' Institucional / Fiscal', '')
+      .replace(' / Marca', '')
+      .replace(' / Firma', '')
+      .trim();
+  }
+  return issue.message.replace(/^O\s+|^A\s+/i, '').split(/\s+é\s+|\s+para\s+/i)[0]?.trim() || issue.field;
 }
 
 /**
@@ -527,14 +544,23 @@ export function renderCompanyMasterSection(options: CompanyMasterRenderOptions):
   const renderFieldLabel = (
     text: string,
     key?: keyof CompanyProfile | 'series' | 'establishments',
-    explicitReq?: FieldRequirementLevel
+    explicitReq?: FieldRequirementLevel,
+    customTitle?: string
   ) => {
     const desc = key ? getFieldDescriptor(key) : undefined;
     const req = explicitReq || desc?.requirement || 'OPTIONAL';
+    const symbol = formatRequirementSymbol(req);
+    const titleAttr = customTitle || desc?.legalNote || '';
     return `
-      <label class="${labelCls}">
-        <span>${escapeHtml(text)}</span>
-        <span class="text-[10px] ${getRequirementTextClass(req, isMobile)} shrink-0">${formatRequirementLabel(req)}</span>
+      <label class="${labelCls}" ${titleAttr ? `title="${escapeHtml(titleAttr)}"` : ''}>
+        <span class="inline-flex items-center gap-1">
+          <span>${escapeHtml(text)}</span>
+          ${
+            symbol
+              ? `<span class="text-[11px] leading-none ${getRequirementTextClass(req, isMobile)}" aria-hidden="true">${symbol}</span>`
+              : ''
+          }
+        </span>
       </label>
     `;
   };
@@ -546,77 +572,76 @@ export function renderCompanyMasterSection(options: CompanyMasterRenderOptions):
     const prodReady = completeness.readyForProductionEmission;
     const simReady = completeness.readyForSimulation;
     const isProdEnv = c.agtEnvironment === 'PRODUCAO';
+    const pendingCount = completeness.blockingIssues.length;
 
     return `
       <div class="${
         isMobile
-          ? 'bg-slate-900 border border-slate-800 rounded-2xl p-3.5 space-y-2.5'
-          : 'bg-slate-50 border border-slate-200 rounded-lg p-4 space-y-3'
+          ? 'bg-slate-900 border border-slate-800 rounded-2xl px-3.5 py-2.5 space-y-2'
+          : 'bg-slate-50 border border-slate-200 rounded-lg px-3.5 py-2.5 space-y-2'
       }">
-        <div class="flex flex-col sm:flex-row sm:items-center justify-between gap-2">
-          <div>
-            <div class="flex items-center gap-2 flex-wrap">
-              <span class="text-xs font-bold ${isMobile ? 'text-white' : 'text-slate-900'}">
-                Completude da Ficha Mestre
-              </span>
-              <span class="text-xs font-mono font-bold tabular-nums ${
-                completeness.completionPct >= 85
-                  ? isMobile
-                    ? 'text-emerald-400'
-                    : 'text-emerald-700'
-                  : isMobile
-                    ? 'text-amber-300'
-                    : 'text-amber-700'
-              }">${completeness.completionPct}% preenchido</span>
+        <div class="flex flex-wrap items-center justify-between gap-2 text-[11px]">
+          <div class="flex flex-wrap items-center gap-2.5">
+            <span class="font-bold font-mono tabular-nums ${
+              completeness.completionPct >= 85
+                ? isMobile
+                  ? 'text-emerald-400'
+                  : 'text-emerald-700'
+                : isMobile
+                  ? 'text-amber-300'
+                  : 'text-amber-700'
+            }">${completeness.completionPct}%</span>
+            <div class="w-20 sm:w-28 h-1.5 rounded-full overflow-hidden ${isMobile ? 'bg-slate-800' : 'bg-slate-200'}">
+              <div
+                class="h-full transition-all ${
+                  prodReady ? 'bg-emerald-500' : simReady ? 'bg-blue-500' : 'bg-amber-500'
+                }"
+                style="width: ${completeness.completionPct}%"
+              ></div>
             </div>
-            <p class="text-[11px] ${isMobile ? 'text-slate-400' : 'text-slate-600'} mt-0.5 tabular-nums">
-              Simulação: <strong class="${simReady ? (isMobile ? 'text-emerald-400' : 'text-emerald-700') : isMobile ? 'text-red-400' : 'text-red-700'}">${simReady ? 'Disponível (gravação parcial permitida)' : 'Faltam dados mínimos'}</strong>
-              <span aria-hidden="true"> · </span>
-              Produção AGT: <strong class="${prodReady ? (isMobile ? 'text-emerald-400' : 'text-emerald-700') : isMobile ? 'text-amber-300' : 'text-amber-700'}">${prodReady ? 'Pronta para emissão real' : `${completeness.blockingIssues.length} requisito(s) em falta`}</strong>
-            </p>
+            <span
+              class="font-medium ${simReady ? (isMobile ? 'text-emerald-400' : 'text-emerald-700') : isMobile ? 'text-red-400' : 'text-red-700'}"
+              title="Gravação parcial permitida em ambiente de Simulação"
+            >Simulação: ${simReady ? 'OK' : 'Incompleta'}</span>
+            <span class="${isMobile ? 'text-slate-600' : 'text-slate-300'}" aria-hidden="true">·</span>
+            <span
+              class="font-medium ${prodReady ? (isMobile ? 'text-emerald-400' : 'text-emerald-700') : isMobile ? 'text-amber-300' : 'text-amber-700'}"
+              title="${prodReady ? 'Todos os requisitos fiscais AGT preenchidos' : `${pendingCount} requisito(s) em falta para emissão fiscal em Produção`}"
+            >Produção AGT: ${prodReady ? 'Pronta' : `${pendingCount} pendente(s)`}</span>
           </div>
-          <div class="text-[11px] font-mono tabular-nums ${isMobile ? 'text-slate-300' : 'text-slate-700'}">
-            Ambiente: <strong>${isProdEnv ? 'PRODUÇÃO FISCAL' : 'SIMULAÇÃO'}</strong>
+          <div class="font-mono tabular-nums ${isMobile ? 'text-slate-300' : 'text-slate-700'}">
+            <strong>${isProdEnv ? 'PRODUÇÃO' : 'SIMULAÇÃO'}</strong>
             <span aria-hidden="true"> · </span>
-            Estab.: <strong>${escapeHtml(activeEst.code)}</strong>
+            <span>Estab. ${escapeHtml(activeEst.code)}</span>
           </div>
-        </div>
-
-        <div class="w-full h-1.5 rounded-full overflow-hidden ${isMobile ? 'bg-slate-800' : 'bg-slate-200'}">
-          <div
-            class="h-full transition-all ${
-              prodReady ? 'bg-emerald-500' : simReady ? 'bg-blue-500' : 'bg-amber-500'
-            }"
-            style="width: ${completeness.completionPct}%"
-          ></div>
         </div>
 
         ${
-          completeness.blockingIssues.length > 0
-            ? `<div class="pt-1 space-y-1">
-                <div class="text-[11px] font-semibold ${isMobile ? 'text-amber-300' : 'text-amber-800'}">
-                  Requisitos pendentes para emissão fiscal em Produção:
-                </div>
-                <ul class="space-y-1 text-[11px] ${isMobile ? 'text-slate-300' : 'text-slate-700'}">
-                  ${completeness.blockingIssues
-                    .slice(0, 6)
-                    .map(
-                      (issue) => `
-                        <li class="flex items-center justify-between gap-2">
-                          <span>• ${escapeHtml(issue.message)}</span>
-                          <button
-                            type="button"
-                            data-action="master-select-section"
-                            data-section="${issue.section}"
-                            class="shrink-0 text-[10px] font-semibold underline ${
-                              isMobile ? 'text-blue-400' : 'text-blue-700'
-                            }"
-                          >Abrir secção</button>
-                        </li>
-                      `
-                    )
-                    .join('')}
-                </ul>
+          pendingCount > 0
+            ? `<div class="flex flex-wrap items-center gap-1.5 pt-0.5">
+                ${completeness.blockingIssues
+                  .slice(0, 6)
+                  .map(
+                    (issue) => `
+                      <button
+                        type="button"
+                        data-action="master-select-section"
+                        data-section="${issue.section}"
+                        title="${escapeHtml(issue.message)}"
+                        class="px-2 py-0.5 rounded border text-[10px] font-medium transition-colors ${
+                          isMobile
+                            ? 'border-amber-700/60 bg-amber-950/50 text-amber-300 hover:bg-amber-900/60'
+                            : 'border-amber-200 bg-amber-50 text-amber-800 hover:bg-amber-100'
+                        }"
+                      >Falta: ${escapeHtml(formatCompactIssueChipLabel(issue))}</button>
+                    `
+                  )
+                  .join('')}
+                ${
+                  pendingCount > 6
+                    ? `<span class="text-[10px] font-mono ${isMobile ? 'text-slate-400' : 'text-slate-500'}">+${pendingCount - 6}</span>`
+                    : ''
+                }
               </div>`
             : ''
         }
@@ -653,7 +678,7 @@ export function renderCompanyMasterSection(options: CompanyMasterRenderOptions):
 
     return `
       <div class="flex items-center gap-1.5 overflow-x-auto pb-1">
-        ${tabBtn('ALL', 'Todas (9 Secções)')}
+        ${tabBtn('ALL', 'Todas (9)')}
         ${MASTER_SECTION_ORDER.map((secId) =>
           tabBtn(secId, MASTER_SECTION_SHORT_LABELS[secId], completeness.sectionStatus[secId]?.ready)
         ).join('')}
@@ -681,12 +706,14 @@ export function renderCompanyMasterSection(options: CompanyMasterRenderOptions):
         <div class="flex-1 space-y-2">
           <input type="hidden" name="logoUrl" value="${escapeHtml(c.logoUrl || '')}" />
           <div class="flex flex-wrap items-center gap-2">
-            <label class="${
-              isMobile
-                ? 'h-11 px-4 rounded-xl bg-blue-600 hover:bg-blue-500 text-white text-xs font-semibold inline-flex items-center gap-2 cursor-pointer'
-                : 'h-9 px-3 rounded-md bg-slate-900 hover:bg-slate-800 text-white text-xs font-semibold inline-flex items-center gap-1.5 cursor-pointer'
-            } ${!canManage ? 'opacity-50 pointer-events-none' : ''}">
-              <span>${hasLogo ? 'Substituir Logótipo' : 'Carregar Logótipo (PNG/JPG/WebP)'}</span>
+            <label
+              title="PNG, JPG ou WebP · máx. 200 KB (SVG bloqueado por segurança)"
+              class="${
+                isMobile
+                  ? 'h-11 px-4 rounded-xl bg-blue-600 hover:bg-blue-500 text-white text-xs font-semibold inline-flex items-center gap-2 cursor-pointer'
+                  : 'h-9 px-3 rounded-md bg-slate-900 hover:bg-slate-800 text-white text-xs font-semibold inline-flex items-center gap-1.5 cursor-pointer'
+              } ${!canManage ? 'opacity-50 pointer-events-none' : ''}">
+              <span>${hasLogo ? 'Substituir Logótipo' : 'Carregar Logótipo'}</span>
               <input
                 type="file"
                 accept="image/png,image/jpeg,image/webp"
@@ -708,20 +735,18 @@ export function renderCompanyMasterSection(options: CompanyMasterRenderOptions):
                   >Remover</button>`
                 : ''
             }
+            <span class="text-[11px] font-mono ${isMobile ? 'text-slate-400' : 'text-slate-500'}">PNG/JPG/WebP ≤ 200 KB</span>
           </div>
-          <p class="text-[11px] ${isMobile ? 'text-slate-400' : 'text-slate-500'}">
-            Máximo 200 KB (PNG, JPG ou WebP — SVG bloqueado por segurança). Optimização automática ao carregar.
-          </p>
           <div class="flex flex-wrap gap-4 pt-1">
             <input type="hidden" name="showLogoOnA4Present" value="1" />
             <label class="flex items-center gap-2 text-xs ${isMobile ? 'text-slate-200' : 'text-slate-700'} cursor-pointer select-none min-h-[36px]">
               <input type="checkbox" name="showLogoOnA4" ${!canManage ? 'disabled' : ''} ${c.showLogoOnA4 !== false ? 'checked' : ''} class="h-4 w-4 rounded border-slate-400 text-blue-600" />
-              <span>Imprimir logótipo na Factura A4</span>
+              <span>Logótipo na Factura A4</span>
             </label>
             <input type="hidden" name="showLogoOnPosPresent" value="1" />
             <label class="flex items-center gap-2 text-xs ${isMobile ? 'text-slate-200' : 'text-slate-700'} cursor-pointer select-none min-h-[36px]">
               <input type="checkbox" name="showLogoOnPos" ${!canManage ? 'disabled' : ''} ${c.showLogoOnPos !== false ? 'checked' : ''} class="h-4 w-4 rounded border-slate-400 text-blue-600" />
-              <span>Imprimir logótipo no Talão POS 80mm</span>
+              <span>Logótipo no Talão POS</span>
             </label>
           </div>
         </div>
@@ -737,8 +762,8 @@ export function renderCompanyMasterSection(options: CompanyMasterRenderOptions):
 
     const seriesCardsOrTable = isMobile
       ? series.length === 0
-        ? `<div class="p-4 text-center text-xs text-slate-400 bg-slate-950/60 rounded-xl border border-slate-800">
-            Nenhuma série AGT registada. Toque em "Solicitar Série à AGT" para adicionar.
+        ? `<div class="p-3.5 text-center text-xs text-slate-400 bg-slate-950/60 rounded-xl border border-slate-800">
+            Sem séries AGT registadas.
           </div>`
         : `<div class="space-y-2">
             ${series
@@ -805,7 +830,7 @@ export function renderCompanyMasterSection(options: CompanyMasterRenderOptions):
             <tbody class="divide-y divide-slate-100 font-mono tabular-nums">
               ${
                 series.length === 0
-                  ? `<tr><td colspan="8" class="py-4 px-3 text-xs text-slate-500 text-center font-sans">Nenhuma série registada para esta empresa. Clique em "Solicitar Série à AGT" para provisionar.</td></tr>`
+                  ? `<tr><td colspan="8" class="py-3.5 px-3 text-xs text-slate-500 text-center font-sans">Sem séries registadas para esta empresa.</td></tr>`
                   : series
                       .map((sr) => {
                         const docMeta = AGT_DOCUMENT_TYPES[sr.documentType];
@@ -864,11 +889,9 @@ export function renderCompanyMasterSection(options: CompanyMasterRenderOptions):
     return `
       <section data-master-section="series" class="${cardCls} ${isSeriesHidden}">
         <div class="flex flex-col sm:flex-row sm:items-center justify-between gap-2 pb-2 border-b ${isMobile ? 'border-slate-800' : 'border-slate-200'}">
-          <div>
-            <h2 class="${secTitleCls}">6. Séries e Configuração Documental AGT (Dec. Exec. 683/25)</h2>
-            <p class="text-[11px] ${isMobile ? 'text-slate-400' : 'text-slate-500'} mt-0.5">
-              Separação estrita entre séries de Simulação e Produção. Séries fictícias são bloqueadas em modo Produção.
-            </p>
+          <div class="flex items-center gap-2">
+            <h2 class="${secTitleCls}" title="Dec. Exec. 683/25 · Separação estrita entre séries de Simulação e Produção. Séries fictícias são bloqueadas em modo Produção.">6. Séries Documentais AGT</h2>
+            <span class="text-[11px] ${isMobile ? 'text-slate-400' : 'text-slate-400'}" title="Dec. Exec. 683/25 · Separação estrita entre séries de Simulação e Produção">ⓘ</span>
           </div>
           ${
             canManage
@@ -967,8 +990,8 @@ export function renderCompanyMasterSection(options: CompanyMasterRenderOptions):
                     </select>
                   </div>
                   <div class="sm:col-span-6">
-                    <label class="${labelCls}"><span>Observação / Código Autorização</span></label>
-                    <input name="notes" type="text" maxlength="120" placeholder="Opcional" class="${inputCls}" />
+                    <label class="${labelCls}" title="Código de autorização AGT ou nota interna"><span>Observação / Cód. Autorização</span></label>
+                    <input name="notes" type="text" maxlength="120" placeholder="Ex: AGT-2026-001" class="${inputCls}" />
                   </div>
                 </div>
                 <div class="flex items-center justify-end gap-2 pt-1">
@@ -990,11 +1013,12 @@ export function renderCompanyMasterSection(options: CompanyMasterRenderOptions):
     return `
       <section data-master-section="estabelecimentos" class="${cardCls} ${isEstHidden}">
         <div class="flex flex-col sm:flex-row sm:items-center justify-between gap-2 pb-2 border-b ${isMobile ? 'border-slate-800' : 'border-slate-200'}">
-          <div>
+          <div class="flex items-center gap-2 flex-wrap">
             <h2 class="${secTitleCls}">8. Estabelecimentos, Caixas e Armazéns</h2>
-            <p class="text-[11px] ${isMobile ? 'text-slate-400' : 'text-slate-500'} mt-0.5">
-              Estabelecimento padrão activo: <strong>${escapeHtml(activeEst.code)} · ${escapeHtml(activeEst.name)}</strong>. Cada documento emitido grava o snapshot do estabelecimento.
-            </p>
+            <span
+              class="text-[11px] font-mono ${isMobile ? 'text-slate-400' : 'text-slate-500'}"
+              title="Cada documento emitido guarda o snapshot do estabelecimento padrão activo."
+            >Padrão: ${escapeHtml(activeEst.code)} · ${escapeHtml(activeEst.name)}</span>
           </div>
           ${
             canManage
@@ -1057,23 +1081,23 @@ export function renderCompanyMasterSection(options: CompanyMasterRenderOptions):
                   </div>
                   <div class="sm:col-span-6">
                     <label class="${labelCls}"><span>Endereço *</span></label>
-                    <input name="address" type="text" required maxlength="160" value="${escapeHtml(editingEstablishment?.address || c.address || '')}" class="${inputCls}" />
+                    <input name="address" type="text" required maxlength="160" value="${escapeHtml(editingEstablishment?.address || c.address || '')}" placeholder="Ex: Rua Principal, N.º 12" class="${inputCls}" />
                   </div>
                   <div class="sm:col-span-3">
                     <label class="${labelCls}"><span>Município</span></label>
-                    <input name="municipality" type="text" maxlength="80" value="${escapeHtml(editingEstablishment?.municipality || c.municipality || '')}" class="${inputCls}" />
+                    <input name="municipality" type="text" maxlength="80" value="${escapeHtml(editingEstablishment?.municipality || c.municipality || '')}" placeholder="Ex: Talatona" class="${inputCls}" />
                   </div>
                   <div class="sm:col-span-3">
                     <label class="${labelCls}"><span>Província</span></label>
-                    <input name="province" type="text" list="sila-ao-provinces" maxlength="80" value="${escapeHtml(editingEstablishment?.province || c.province || '')}" class="${inputCls}" />
+                    <input name="province" type="text" list="sila-ao-provinces" maxlength="80" value="${escapeHtml(editingEstablishment?.province || c.province || '')}" placeholder="Ex: Luanda" class="${inputCls}" />
                   </div>
                   <div class="sm:col-span-4">
                     <label class="${labelCls}"><span>Telefone</span></label>
-                    <input name="phone" type="text" maxlength="40" value="${escapeHtml(editingEstablishment?.phone || c.phone || '')}" class="${inputCls} font-mono" />
+                    <input name="phone" type="text" maxlength="40" value="${escapeHtml(editingEstablishment?.phone || c.phone || '')}" placeholder="(+244) 9..." class="${inputCls} font-mono" />
                   </div>
                   <div class="sm:col-span-4">
                     <label class="${labelCls}"><span>Email</span></label>
-                    <input name="email" type="email" maxlength="120" value="${escapeHtml(editingEstablishment?.email || c.email || '')}" class="${inputCls}" />
+                    <input name="email" type="email" maxlength="120" value="${escapeHtml(editingEstablishment?.email || c.email || '')}" placeholder="filial@empresa.ao" class="${inputCls}" />
                   </div>
                   <div class="sm:col-span-4 flex items-center gap-4 pt-2">
                     <label class="flex items-center gap-2 text-xs ${isMobile ? 'text-slate-200' : 'text-slate-700'} cursor-pointer">
@@ -1269,11 +1293,11 @@ export function renderCompanyMasterSection(options: CompanyMasterRenderOptions):
           </div>
           <div class="grid grid-cols-1 sm:grid-cols-12 gap-3">
             <div class="sm:col-span-8">
-              ${renderFieldLabel('Denominação Social / Firma', 'legalName')}
+              ${renderFieldLabel('Firma / Denominação Social', 'legalName')}
               <input name="legalName" type="text" required maxlength="160" ${!canManage ? 'disabled' : ''} value="${escapeHtml(c.legalName)}" placeholder="Ex: JAIMONA - COMÉRCIO E SERVIÇOS, (SU) LDA" class="${inputCls}" />
             </div>
             <div class="sm:col-span-4">
-              ${renderFieldLabel('Nome Comercial / Marca', 'shortName')}
+              ${renderFieldLabel('Nome Comercial', 'shortName')}
               <input name="shortName" type="text" required maxlength="64" ${!canManage ? 'disabled' : ''} value="${escapeHtml(c.shortName)}" placeholder="Ex: JAIMONA" class="${inputCls}" />
             </div>
             <div class="sm:col-span-4">
@@ -1289,11 +1313,11 @@ export function renderCompanyMasterSection(options: CompanyMasterRenderOptions):
               </select>
             </div>
             <div class="sm:col-span-4">
-              ${renderFieldLabel('CAE (Actividade Económica)', 'cae')}
+              ${renderFieldLabel('CAE', 'cae')}
               <input name="cae" type="text" maxlength="32" ${!canManage ? 'disabled' : ''} value="${escapeHtml(c.cae)}" placeholder="Ex: 47110" class="${inputCls} font-mono" />
             </div>
             <div class="sm:col-span-4">
-              ${renderFieldLabel('Registo Comercial / Matrícula', 'commercialRegistry')}
+              ${renderFieldLabel('Registo Comercial', 'commercialRegistry')}
               <input name="commercialRegistry" type="text" maxlength="80" ${!canManage ? 'disabled' : ''} value="${escapeHtml(c.commercialRegistry)}" placeholder="Ex: CRC Luanda n.º 1234/2024" class="${inputCls}" />
             </div>
             <div class="sm:col-span-4">
@@ -1301,7 +1325,7 @@ export function renderCompanyMasterSection(options: CompanyMasterRenderOptions):
               <input name="shareCapital" type="text" maxlength="40" ${!canManage ? 'disabled' : ''} value="${escapeHtml(c.shareCapital)}" placeholder="Ex: 1.000.000,00 Kz" class="${inputCls} font-mono tabular-nums" />
             </div>
             <div class="sm:col-span-8">
-              ${renderFieldLabel('Slogan / Assinatura de Rodapé', 'tagline')}
+              ${renderFieldLabel('Slogan de Rodapé', 'tagline')}
               <input name="tagline" type="text" maxlength="120" ${!canManage ? 'disabled' : ''} value="${escapeHtml(c.tagline)}" placeholder="Ex: Servimos com Qualidade" class="${inputCls}" />
             </div>
           </div>
@@ -1314,11 +1338,11 @@ export function renderCompanyMasterSection(options: CompanyMasterRenderOptions):
           </div>
           <div class="grid grid-cols-1 sm:grid-cols-12 gap-3">
             <div class="sm:col-span-4">
-              ${renderFieldLabel('NIF (Contribuinte Único)', 'nif')}
-              <input name="nif" type="text" required maxlength="32" ${!canManage ? 'disabled' : ''} value="${escapeHtml(c.nif)}" class="${inputCls} font-mono tabular-nums" />
+              ${renderFieldLabel('NIF', 'nif')}
+              <input name="nif" type="text" required maxlength="32" ${!canManage ? 'disabled' : ''} value="${escapeHtml(c.nif)}" placeholder="Ex: 5000123456" class="${inputCls} font-mono tabular-nums" />
             </div>
             <div class="sm:col-span-4">
-              ${renderFieldLabel('Regime de IVA (CIVA)', 'taxRegime')}
+              ${renderFieldLabel('Regime de IVA', 'taxRegime')}
               <select name="taxRegime" ${!canManage ? 'disabled' : ''} class="${selectCls}">
                 <option value="GERAL" ${(c.taxRegime || 'GERAL') === 'GERAL' ? 'selected' : ''}>Regime Geral de IVA (14%)</option>
                 <option value="SIMPLIFICADO" ${c.taxRegime === 'SIMPLIFICADO' ? 'selected' : ''}>Regime Simplificado (M81)</option>
@@ -1326,18 +1350,18 @@ export function renderCompanyMasterSection(options: CompanyMasterRenderOptions):
               </select>
             </div>
             <div class="sm:col-span-4">
-              ${renderFieldLabel('Ambiente Operacional AGT', 'agtEnvironment')}
+              ${renderFieldLabel('Ambiente AGT', 'agtEnvironment')}
               <select name="agtEnvironment" ${!canManage ? 'disabled' : ''} class="${selectCls}">
                 <option value="SIMULACAO" ${(c.agtEnvironment || 'SIMULACAO') === 'SIMULACAO' ? 'selected' : ''}>Simulação / Homologação</option>
                 <option value="PRODUCAO" ${c.agtEnvironment === 'PRODUCAO' ? 'selected' : ''}>Produção Fiscal Real (AGT)</option>
               </select>
             </div>
             <div class="sm:col-span-6">
-              ${renderFieldLabel('Repartição Fiscal de Domicílio', 'taxOffice')}
+              ${renderFieldLabel('Repartição Fiscal', 'taxOffice')}
               <input name="taxOffice" type="text" maxlength="80" ${!canManage ? 'disabled' : ''} value="${escapeHtml(c.taxOffice)}" placeholder="Ex: 1.ª Repartição Fiscal de Luanda" class="${inputCls}" />
             </div>
             <div class="sm:col-span-6">
-              ${renderFieldLabel('Código de Isenção Padrão (CIVA)', 'defaultExemptionCode')}
+              ${renderFieldLabel('Isenção Padrão (CIVA)', 'defaultExemptionCode')}
               <select name="defaultExemptionCode" ${!canManage ? 'disabled' : ''} class="${selectCls}">
                 <option value="" ${!c.defaultExemptionCode ? 'selected' : ''}>Automático consoante o regime</option>
                 ${Object.values(AGT_IVA_EXEMPTION_CODES)
@@ -1349,29 +1373,31 @@ export function renderCompanyMasterSection(options: CompanyMasterRenderOptions):
               </select>
             </div>
             <div class="sm:col-span-4">
-              ${renderFieldLabel('Território Fiscal Especial', 'specialTaxTerritory')}
+              ${renderFieldLabel('Território Fiscal', 'specialTaxTerritory')}
               <select name="specialTaxTerritory" ${!canManage ? 'disabled' : ''} class="${selectCls}">
                 <option value="AO" ${(c.specialTaxTerritory || 'AO') === 'AO' ? 'selected' : ''}>AO — Regime Nacional Geral</option>
                 <option value="AO-CAB" ${c.specialTaxTerritory === 'AO-CAB' ? 'selected' : ''}>AO-CAB — Cabinda (1% Lei n.º 14/23)</option>
               </select>
             </div>
             <div class="sm:col-span-4">
-              ${renderFieldLabel('Retenção na Fonte Padrão (%)', 'defaultWithholdingTax')}
+              ${renderFieldLabel('Retenção Padrão (%)', 'defaultWithholdingTax')}
               <input name="defaultWithholdingTax" type="number" step="0.1" min="0" max="35" ${!canManage ? 'disabled' : ''} value="${c.defaultWithholdingTax ?? ''}" placeholder="Ex: 6.5" class="${inputCls} font-mono tabular-nums" />
             </div>
             <div class="sm:col-span-4">
-              ${renderFieldLabel('Início de Actividade', undefined, 'OPTIONAL')}
+              ${renderFieldLabel('Início de Actividade', undefined, 'OPTIONAL', 'Data de início de actividade fiscal na AGT')}
               <input name="activityStartDate" type="date" ${!canManage ? 'disabled' : ''} value="${escapeHtml(c.activityStartDate)}" class="${inputCls} font-mono" />
             </div>
             <div class="sm:col-span-6">
-              ${renderFieldLabel('Entidade Tributária / SAF-T (<TaxEntity>)', undefined, 'OPTIONAL')}
+              ${renderFieldLabel('Entidade SAF-T', undefined, 'OPTIONAL', 'Campo <TaxEntity> exportado no cabeçalho SAF-T (AO)')}
               <input name="taxEntity" type="text" maxlength="80" ${!canManage ? 'disabled' : ''} value="${escapeHtml(c.taxEntity)}" placeholder="Ex: Sede" class="${inputCls}" />
             </div>
             <div class="sm:col-span-6 flex items-end pb-1">
               <input type="hidden" name="isVatRetentionAgentPresent" value="1" />
-              <label class="flex items-center gap-2 text-xs ${isMobile ? 'text-slate-200' : 'text-slate-700'} cursor-pointer select-none min-h-[36px]">
+              <label
+                title="Marcar se a empresa actua como agente de retenção / cativo de IVA nos termos do CIVA"
+                class="flex items-center gap-2 text-xs ${isMobile ? 'text-slate-200' : 'text-slate-700'} cursor-pointer select-none min-h-[36px]">
                 <input type="checkbox" name="isVatRetentionAgent" ${!canManage ? 'disabled' : ''} ${c.isVatRetentionAgent ? 'checked' : ''} class="h-4 w-4 rounded border-slate-400 text-blue-600" />
-                <span>Empresa sujeita a cativo / agente de retenção de IVA</span>
+                <span>Agente de retenção / cativo de IVA</span>
               </label>
             </div>
           </div>
@@ -1384,24 +1410,24 @@ export function renderCompanyMasterSection(options: CompanyMasterRenderOptions):
           </div>
           <div class="grid grid-cols-1 sm:grid-cols-12 gap-3">
             <div class="sm:col-span-12">
-              ${renderFieldLabel('Endereço Fiscal Completo (Rua, Bairro, N.º)', 'address')}
+              ${renderFieldLabel('Endereço Fiscal', 'address')}
               <input name="address" type="text" required maxlength="160" ${!canManage ? 'disabled' : ''} value="${escapeHtml(c.address)}" placeholder="Ex: Rua Fapla, Bairro Verde A" class="${inputCls}" />
             </div>
             <div class="sm:col-span-4">
               ${renderFieldLabel('Município', 'municipality')}
-              <input name="municipality" type="text" maxlength="80" ${!canManage ? 'disabled' : ''} value="${escapeHtml(c.municipality)}" placeholder="Ex: Saurimo / Belas / Ingombota" class="${inputCls}" />
+              <input name="municipality" type="text" maxlength="80" ${!canManage ? 'disabled' : ''} value="${escapeHtml(c.municipality)}" placeholder="Ex: Belas / Ingombota" class="${inputCls}" />
             </div>
             <div class="sm:col-span-4">
               ${renderFieldLabel('Província', 'province')}
               <input name="province" type="text" list="sila-ao-provinces" maxlength="80" ${!canManage ? 'disabled' : ''} value="${escapeHtml(c.province)}" placeholder="Ex: Luanda / Lunda Sul" class="${inputCls}" />
             </div>
             <div class="sm:col-span-4">
-              ${renderFieldLabel('Caixa / Código Postal', 'postalCode')}
+              ${renderFieldLabel('Código Postal', 'postalCode')}
               <input name="postalCode" type="text" maxlength="24" ${!canManage ? 'disabled' : ''} value="${escapeHtml(c.postalCode)}" placeholder="Ex: CX 1024" class="${inputCls} font-mono" />
             </div>
             <div class="sm:col-span-12">
-              ${renderFieldLabel('Cidade / País de Referência', 'cityCountry')}
-              <input name="cityCountry" type="text" required maxlength="80" ${!canManage ? 'disabled' : ''} value="${escapeHtml(c.cityCountry || 'Luanda - Angola')}" class="${inputCls}" />
+              ${renderFieldLabel('Cidade / País', 'cityCountry')}
+              <input name="cityCountry" type="text" required maxlength="80" ${!canManage ? 'disabled' : ''} value="${escapeHtml(c.cityCountry || 'Luanda - Angola')}" placeholder="Ex: Luanda - Angola" class="${inputCls}" />
             </div>
           </div>
         </section>
@@ -1413,27 +1439,27 @@ export function renderCompanyMasterSection(options: CompanyMasterRenderOptions):
           </div>
           <div class="grid grid-cols-1 sm:grid-cols-12 gap-3">
             <div class="sm:col-span-4">
-              ${renderFieldLabel('Telefone Principal', 'phone')}
+              ${renderFieldLabel('Telefone', 'phone')}
               <input name="phone" type="tel" maxlength="40" ${!canManage ? 'disabled' : ''} value="${escapeHtml(c.phone)}" placeholder="(+244) 9..." class="${inputCls} font-mono tabular-nums" />
             </div>
             <div class="sm:col-span-4">
-              ${renderFieldLabel('Telemóvel Alternativo', 'mobile')}
+              ${renderFieldLabel('Telemóvel', 'mobile')}
               <input name="mobile" type="tel" maxlength="40" ${!canManage ? 'disabled' : ''} value="${escapeHtml(c.mobile)}" placeholder="(+244) 9..." class="${inputCls} font-mono tabular-nums" />
             </div>
             <div class="sm:col-span-4">
-              ${renderFieldLabel('WhatsApp Comercial', 'whatsapp')}
+              ${renderFieldLabel('WhatsApp', 'whatsapp')}
               <input name="whatsapp" type="tel" maxlength="40" ${!canManage ? 'disabled' : ''} value="${escapeHtml(c.whatsapp)}" placeholder="(+244) 9..." class="${inputCls} font-mono tabular-nums" />
             </div>
             <div class="sm:col-span-4">
-              ${renderFieldLabel('Email Institucional / Fiscal', 'email')}
+              ${renderFieldLabel('Email Fiscal', 'email')}
               <input name="email" type="email" maxlength="120" ${!canManage ? 'disabled' : ''} value="${escapeHtml(c.email)}" placeholder="geral@empresa.ao" class="${inputCls}" />
             </div>
             <div class="sm:col-span-4">
-              ${renderFieldLabel('Email Exclusivo de Facturação', 'billingEmail')}
+              ${renderFieldLabel('Email de Facturação', 'billingEmail')}
               <input name="billingEmail" type="email" maxlength="120" ${!canManage ? 'disabled' : ''} value="${escapeHtml(c.billingEmail)}" placeholder="faturacao@empresa.ao" class="${inputCls}" />
             </div>
             <div class="sm:col-span-4">
-              ${renderFieldLabel('Website Institucional', 'website')}
+              ${renderFieldLabel('Website', 'website')}
               <input name="website" type="text" maxlength="120" ${!canManage ? 'disabled' : ''} value="${escapeHtml(c.website)}" placeholder="www.empresa.ao" class="${inputCls}" />
             </div>
           </div>
@@ -1458,39 +1484,39 @@ export function renderCompanyMasterSection(options: CompanyMasterRenderOptions):
               <input name="bankName1" type="text" maxlength="60" ${!canManage ? 'disabled' : ''} value="${escapeHtml(c.bankName1)}" placeholder="Ex: BAI / BFA / BIC / Atlântico" class="${inputCls}" />
             </div>
             <div class="sm:col-span-8">
-              ${renderFieldLabel('IBAN Principal (AO06...)', 'iban1')}
-              <input name="iban1" type="text" maxlength="40" ${!canManage ? 'disabled' : ''} value="${escapeHtml(c.iban1)}" placeholder="AO06004000000000000000000" class="${inputCls} font-mono tabular-nums uppercase" />
+              ${renderFieldLabel('IBAN Principal', 'iban1')}
+              <input name="iban1" type="text" maxlength="40" ${!canManage ? 'disabled' : ''} value="${escapeHtml(c.iban1)}" placeholder="Ex: AO06004000000000000000000" class="${inputCls} font-mono tabular-nums uppercase" />
             </div>
             <div class="sm:col-span-6">
-              ${renderFieldLabel('Titular da Conta Principal', undefined, 'OPTIONAL')}
-              <input name="accountHolder1" type="text" maxlength="120" ${!canManage ? 'disabled' : ''} value="${escapeHtml(c.accountHolder1)}" class="${inputCls}" />
+              ${renderFieldLabel('Titular (Banco 1)', undefined, 'OPTIONAL', 'Titular da conta bancária principal')}
+              <input name="accountHolder1" type="text" maxlength="120" ${!canManage ? 'disabled' : ''} value="${escapeHtml(c.accountHolder1)}" placeholder="Ex: Empresa Lda" class="${inputCls}" />
             </div>
             <div class="sm:col-span-6">
-              ${renderFieldLabel('Código SWIFT / BIC (Banco 1)', undefined, 'OPTIONAL')}
+              ${renderFieldLabel('SWIFT / BIC 1', undefined, 'OPTIONAL', 'Código SWIFT/BIC do banco principal')}
               <input name="swift1" type="text" maxlength="20" ${!canManage ? 'disabled' : ''} value="${escapeHtml(c.swift1)}" placeholder="Ex: BAIPAOLU" class="${inputCls} font-mono uppercase" />
             </div>
             <div class="sm:col-span-4">
               ${renderFieldLabel('Banco Secundário', 'bankName2')}
-              <input name="bankName2" type="text" maxlength="60" ${!canManage ? 'disabled' : ''} value="${escapeHtml(c.bankName2)}" class="${inputCls}" />
+              <input name="bankName2" type="text" maxlength="60" ${!canManage ? 'disabled' : ''} value="${escapeHtml(c.bankName2)}" placeholder="Ex: BFA / Sol" class="${inputCls}" />
             </div>
             <div class="sm:col-span-8">
               ${renderFieldLabel('IBAN Secundário', 'iban2')}
-              <input name="iban2" type="text" maxlength="40" ${!canManage ? 'disabled' : ''} value="${escapeHtml(c.iban2)}" placeholder="AO06..." class="${inputCls} font-mono tabular-nums uppercase" />
+              <input name="iban2" type="text" maxlength="40" ${!canManage ? 'disabled' : ''} value="${escapeHtml(c.iban2)}" placeholder="Ex: AO06..." class="${inputCls} font-mono tabular-nums uppercase" />
             </div>
             <div class="sm:col-span-4">
-              ${renderFieldLabel('Titular da Conta Secundária', undefined, 'OPTIONAL')}
-              <input name="accountHolder2" type="text" maxlength="120" ${!canManage ? 'disabled' : ''} value="${escapeHtml(c.accountHolder2)}" class="${inputCls}" />
+              ${renderFieldLabel('Titular (Banco 2)', undefined, 'OPTIONAL', 'Titular da conta bancária secundária')}
+              <input name="accountHolder2" type="text" maxlength="120" ${!canManage ? 'disabled' : ''} value="${escapeHtml(c.accountHolder2)}" placeholder="Ex: Empresa Lda" class="${inputCls}" />
             </div>
             <div class="sm:col-span-2">
-              ${renderFieldLabel('SWIFT (Banco 2)', undefined, 'OPTIONAL')}
-              <input name="swift2" type="text" maxlength="20" ${!canManage ? 'disabled' : ''} value="${escapeHtml(c.swift2)}" class="${inputCls} font-mono uppercase" />
+              ${renderFieldLabel('SWIFT 2', undefined, 'OPTIONAL', 'Código SWIFT/BIC do banco secundário')}
+              <input name="swift2" type="text" maxlength="20" ${!canManage ? 'disabled' : ''} value="${escapeHtml(c.swift2)}" placeholder="Ex: BFAAOLU" class="${inputCls} font-mono uppercase" />
             </div>
             <div class="sm:col-span-3">
-              ${renderFieldLabel('Multicaixa Express (Tel.)', undefined, 'OPTIONAL')}
-              <input name="multicaixaExpressPhone" type="tel" maxlength="32" ${!canManage ? 'disabled' : ''} value="${escapeHtml(c.multicaixaExpressPhone)}" placeholder="9..." class="${inputCls} font-mono tabular-nums" />
+              ${renderFieldLabel('Multicaixa Express', undefined, 'OPTIONAL', 'Número associado ao Multicaixa Express')}
+              <input name="multicaixaExpressPhone" type="tel" maxlength="32" ${!canManage ? 'disabled' : ''} value="${escapeHtml(c.multicaixaExpressPhone)}" placeholder="(+244) 9..." class="${inputCls} font-mono tabular-nums" />
             </div>
             <div class="sm:col-span-3">
-              ${renderFieldLabel('Prazo Vencimento FA (dias)', undefined, 'OPTIONAL')}
+              ${renderFieldLabel('Prazo FA (dias)', undefined, 'OPTIONAL', 'Prazo de vencimento padrão para Facturas a Prazo (FA)')}
               <input name="defaultPaymentTermsDays" type="number" min="0" max="365" ${!canManage ? 'disabled' : ''} value="${c.defaultPaymentTermsDays ?? ''}" placeholder="Ex: 15" class="${inputCls} font-mono tabular-nums" />
             </div>
           </div>
@@ -1503,50 +1529,50 @@ export function renderCompanyMasterSection(options: CompanyMasterRenderOptions):
           </div>
           <div class="grid grid-cols-1 sm:grid-cols-12 gap-3">
             <div class="sm:col-span-5">
-              ${renderFieldLabel('Representante Legal / Gerente', 'legalRepresentativeName')}
-              <input name="legalRepresentativeName" type="text" maxlength="120" ${!canManage ? 'disabled' : ''} value="${escapeHtml(c.legalRepresentativeName)}" class="${inputCls}" />
+              ${renderFieldLabel('Representante Legal', 'legalRepresentativeName')}
+              <input name="legalRepresentativeName" type="text" maxlength="120" ${!canManage ? 'disabled' : ''} value="${escapeHtml(c.legalRepresentativeName)}" placeholder="Ex: João Manuel" class="${inputCls}" />
             </div>
             <div class="sm:col-span-3">
-              ${renderFieldLabel('Cargo / Função', undefined, 'OPTIONAL')}
+              ${renderFieldLabel('Cargo', undefined, 'OPTIONAL')}
               <input name="legalRepresentativeRole" type="text" maxlength="60" ${!canManage ? 'disabled' : ''} value="${escapeHtml(c.legalRepresentativeRole)}" placeholder="Ex: Sócio-Gerente" class="${inputCls}" />
             </div>
             <div class="sm:col-span-2">
-              ${renderFieldLabel('NIF do Representante', undefined, 'OPTIONAL')}
-              <input name="legalRepresentativeNif" type="text" maxlength="24" ${!canManage ? 'disabled' : ''} value="${escapeHtml(c.legalRepresentativeNif)}" class="${inputCls} font-mono" />
+              ${renderFieldLabel('NIF Representante', undefined, 'OPTIONAL')}
+              <input name="legalRepresentativeNif" type="text" maxlength="24" ${!canManage ? 'disabled' : ''} value="${escapeHtml(c.legalRepresentativeNif)}" placeholder="Ex: 000123456LA012" class="${inputCls} font-mono" />
             </div>
             <div class="sm:col-span-2">
               ${renderFieldLabel('Tel. Representante', undefined, 'OPTIONAL')}
-              <input name="legalRepresentativePhone" type="tel" maxlength="32" ${!canManage ? 'disabled' : ''} value="${escapeHtml(c.legalRepresentativePhone)}" class="${inputCls} font-mono" />
+              <input name="legalRepresentativePhone" type="tel" maxlength="32" ${!canManage ? 'disabled' : ''} value="${escapeHtml(c.legalRepresentativePhone)}" placeholder="(+244) 9..." class="${inputCls} font-mono" />
             </div>
 
             <div class="sm:col-span-4">
-              ${renderFieldLabel('Contabilista Responsável', 'accountantName')}
-              <input name="accountantName" type="text" maxlength="120" ${!canManage ? 'disabled' : ''} value="${escapeHtml(c.accountantName)}" class="${inputCls}" />
+              ${renderFieldLabel('Contabilista', 'accountantName')}
+              <input name="accountantName" type="text" maxlength="120" ${!canManage ? 'disabled' : ''} value="${escapeHtml(c.accountantName)}" placeholder="Ex: Maria Antónia" class="${inputCls}" />
             </div>
             <div class="sm:col-span-2">
               ${renderFieldLabel('Cédula OCPCA', 'accountantOcpcaNumber')}
-              <input name="accountantOcpcaNumber" type="text" maxlength="40" ${!canManage ? 'disabled' : ''} value="${escapeHtml(c.accountantOcpcaNumber)}" class="${inputCls} font-mono" />
+              <input name="accountantOcpcaNumber" type="text" maxlength="40" ${!canManage ? 'disabled' : ''} value="${escapeHtml(c.accountantOcpcaNumber)}" placeholder="Ex: OCPCA-1234" class="${inputCls} font-mono" />
             </div>
             <div class="sm:col-span-3">
               ${renderFieldLabel('Email Contabilista', undefined, 'OPTIONAL')}
-              <input name="accountantEmail" type="email" maxlength="120" ${!canManage ? 'disabled' : ''} value="${escapeHtml(c.accountantEmail)}" class="${inputCls}" />
+              <input name="accountantEmail" type="email" maxlength="120" ${!canManage ? 'disabled' : ''} value="${escapeHtml(c.accountantEmail)}" placeholder="contabilidade@empresa.ao" class="${inputCls}" />
             </div>
             <div class="sm:col-span-3">
               ${renderFieldLabel('Tel. Contabilista', undefined, 'OPTIONAL')}
-              <input name="accountantPhone" type="tel" maxlength="32" ${!canManage ? 'disabled' : ''} value="${escapeHtml(c.accountantPhone)}" class="${inputCls} font-mono" />
+              <input name="accountantPhone" type="tel" maxlength="32" ${!canManage ? 'disabled' : ''} value="${escapeHtml(c.accountantPhone)}" placeholder="(+244) 9..." class="${inputCls} font-mono" />
             </div>
           </div>
 
           <div class="pt-3 border-t ${isMobile ? 'border-slate-800' : 'border-slate-200'} space-y-3">
-            <h3 class="text-xs font-semibold ${isMobile ? 'text-slate-200' : 'text-slate-800'}">Caixa e Predefinições de Emissão (POS / A4)</h3>
+            <h3 class="text-xs font-semibold ${isMobile ? 'text-slate-200' : 'text-slate-800'}">Caixa e Emissão (POS / A4)</h3>
             <div class="grid grid-cols-2 sm:grid-cols-12 gap-3">
               <div class="col-span-1 sm:col-span-3">
                 <label class="${labelCls}"><span>Caixa Padrão</span></label>
-                <input name="defaultCashier" type="text" required maxlength="16" ${!canManage ? 'disabled' : ''} value="${escapeHtml(s.defaultCashier)}" class="${inputCls} font-mono" />
+                <input name="defaultCashier" type="text" required maxlength="16" ${!canManage ? 'disabled' : ''} value="${escapeHtml(s.defaultCashier)}" placeholder="Ex: 01" class="${inputCls} font-mono" />
               </div>
               <div class="col-span-1 sm:col-span-3">
                 <label class="${labelCls}"><span>Operador(a) Padrão</span></label>
-                <input name="defaultOperator" type="text" required maxlength="32" ${!canManage ? 'disabled' : ''} value="${escapeHtml(s.defaultOperator)}" class="${inputCls} font-mono" />
+                <input name="defaultOperator" type="text" required maxlength="32" ${!canManage ? 'disabled' : ''} value="${escapeHtml(s.defaultOperator)}" placeholder="Ex: 001" class="${inputCls} font-mono" />
               </div>
               <div class="col-span-1 sm:col-span-3">
                 <label class="${labelCls}"><span>Documento Padrão</span></label>
@@ -1564,8 +1590,8 @@ export function renderCompanyMasterSection(options: CompanyMasterRenderOptions):
                 </select>
               </div>
               <div class="col-span-2 sm:col-span-8">
-                <label class="${labelCls}"><span>Observação Padrão nos Documentos</span></label>
-                <input name="defaultNotes" type="text" maxlength="300" ${!canManage ? 'disabled' : ''} value="${escapeHtml(s.defaultNotes)}" class="${inputCls}" />
+                <label class="${labelCls}"><span>Observação Padrão</span></label>
+                <input name="defaultNotes" type="text" maxlength="300" ${!canManage ? 'disabled' : ''} value="${escapeHtml(s.defaultNotes)}" placeholder="Ex: Obrigado pela preferência" class="${inputCls}" />
               </div>
               <div class="col-span-2 sm:col-span-4 flex items-end pb-1">
                 <input type="hidden" name="autoPrintOnEmitPresent" value="1" />
@@ -1576,7 +1602,7 @@ export function renderCompanyMasterSection(options: CompanyMasterRenderOptions):
               </div>
               <div class="col-span-1 sm:col-span-6">
                 <label class="${labelCls}"><span>Desconto Máx. Caixa (%)</span></label>
-                <input name="maxCashierDiscountPct" type="number" min="0" max="100" step="0.5" ${!canManage ? 'disabled' : ''} value="${s.maxCashierDiscountPct ?? 5}" class="${inputCls} font-mono tabular-nums" />
+                <input name="maxCashierDiscountPct" type="number" min="0" max="100" step="0.5" ${!canManage ? 'disabled' : ''} value="${s.maxCashierDiscountPct ?? 5}" placeholder="Ex: 5" class="${inputCls} font-mono tabular-nums" />
               </div>
               <div class="col-span-1 sm:col-span-6">
                 <label class="${labelCls}"><span>PIN do Supervisor</span></label>
@@ -1586,12 +1612,12 @@ export function renderCompanyMasterSection(options: CompanyMasterRenderOptions):
                 <input type="hidden" name="allowCashierPriceEditPresent" value="1" />
                 <label class="flex items-center gap-2 text-xs ${isMobile ? 'text-slate-200' : 'text-slate-700'} cursor-pointer select-none">
                   <input name="allowCashierPriceEdit" type="checkbox" ${!canManage ? 'disabled' : ''} ${s.allowCashierPriceEdit ? 'checked' : ''} class="h-4 w-4 rounded border-slate-400 text-blue-600" />
-                  <span>Autorizar Operadores de Caixa a alterar o preço unitário no POS</span>
+                  <span>Permitir alteração de preço unitário no POS</span>
                 </label>
                 <input type="hidden" name="hidePromotionalFooterPresent" value="1" />
                 <label class="flex items-center gap-2 text-xs ${isMobile ? 'text-slate-200' : 'text-slate-700'} cursor-pointer select-none">
                   <input name="hidePromotionalFooter" type="checkbox" data-field="toggle-clean-footer" ${!canManage || !canCompanyHideViralFooter(company) ? 'disabled' : ''} ${!shouldShowViralDocumentFooter(company, s) ? 'checked' : ''} class="h-4 w-4 rounded border-slate-400 text-blue-600" />
-                  <span>Emitir talões POS 80mm e facturas A4 sem linha promocional de rodapé</span>
+                  <span>Ocultar linha promocional no rodapé (POS / A4)</span>
                 </label>
               </div>
             </div>

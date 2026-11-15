@@ -31,6 +31,15 @@ import {
   validateEstablishmentRecord,
 } from '../src/core/companyValidator';
 import {
+  CUSTOMER_PAYMENT_TERMS_LABELS,
+  CUSTOMER_TYPE_LABELS,
+  FOREIGN_COUNTRY_OPTIONS,
+  generateNextCustomerInternalCode,
+  inferCustomerType,
+  validateAndBuildCustomer,
+  validateCustomerForInvoiceEmission,
+} from '../src/core/customerValidator';
+import {
   AppSettings,
   buildInvoiceIssuerSnapshot,
   canCompanyHideViralFooter,
@@ -50,6 +59,8 @@ import {
   CompanyRecord,
   CompanyRole,
   Customer,
+  CustomerPaymentTerms,
+  CustomerType,
   DEFAULT_EXPENSE_CATEGORIES,
   DEFAULT_EXTRA_REVENUE_CATEGORIES,
   DEFAULT_IVA_EXEMPTION_REASONS,
@@ -188,6 +199,10 @@ import {
   renderCompanyMasterSection,
   resizeImageFileToLogoDataUrl,
 } from './ui/companyMasterForm';
+import {
+  extractCustomerDraftFromFormData,
+  renderCustomerMasterForm,
+} from './ui/customerForm';
 import {
   formatPlanLabelPt,
   formatRoleLabelPt,
@@ -422,9 +437,29 @@ export class SilaBillingApp {
   private editingCustomer: Customer | null = null;
   private editingCustomerCreditLimitInput = '';
   private isNewCustomer = false;
+  private showCustomerAdvancedFields = false;
+  private mobileCustomerModalMode: 'QUICK' | 'FULL' = 'QUICK';
   private customerFormError: string | null = null;
   private customerSavedNotice: string | null = null;
-  private quickCustomerDraft = { name: '', nif: '', phone: '', address: '', locality: '' };
+  private quickCustomerDraft: {
+    name: string;
+    nif: string;
+    phone: string;
+    address: string;
+    locality: string;
+    customerType?: CustomerType;
+    countryCode?: string;
+    foreignTaxId?: string;
+  } = {
+    name: '',
+    nif: '',
+    phone: '',
+    address: '',
+    locality: '',
+    customerType: 'PARTICULAR',
+    countryCode: 'AO',
+    foreignTaxId: '',
+  };
   private quickCustomerError: string | null = null;
   private dbBootError: string | null = null;
 
@@ -3392,7 +3427,82 @@ export class SilaBillingApp {
         break;
       }
       case 'mobile-open-quick-customer': {
+        this.quickCustomerError = null;
+        this.showCustomerAdvancedFields = false;
+        this.editingCustomer = null;
+        this.editingCustomerCreditLimitInput = '';
+        this.mobileCustomerModalMode = value === 'FULL' ? 'FULL' : 'QUICK';
+        this.quickCustomerDraft = {
+          name: '',
+          nif: '',
+          phone: '',
+          address: '',
+          locality: this.activeCompany.profile.cityCountry || 'Angola',
+          customerType: 'PARTICULAR',
+          countryCode: 'AO',
+          foreignTaxId: '',
+        };
         this.showQuickCustomerForm = true;
+        this.render();
+        break;
+      }
+      case 'mobile-edit-customer': {
+        if (!this.canEditExistingCustomers()) return;
+        const custId = target.dataset.customerId;
+        const directCustId = getDirectCustomerIdForCompany(this.activeCompany.id);
+        const cust = this.customers.find((c) => c.id === custId);
+        if (cust && cust.id !== directCustId) {
+          this.quickCustomerError = null;
+          this.showCustomerAdvancedFields = false;
+          this.mobileCustomerModalMode = 'FULL';
+          this.editingCustomer = {
+            ...cust,
+            customerType: cust.customerType || inferCustomerType(cust, directCustId),
+          };
+          this.editingCustomerCreditLimitInput =
+            cust.creditLimit && cust.creditLimit > 0 ? String(cust.creditLimit) : '';
+          this.showQuickCustomerForm = true;
+          this.render();
+        }
+        break;
+      }
+      case 'mobile-toggle-customer-full-form': {
+        this.mobileCustomerModalMode = this.mobileCustomerModalMode === 'FULL' ? 'QUICK' : 'FULL';
+        this.quickCustomerError = null;
+        this.render();
+        break;
+      }
+      case 'mobile-set-quick-customer-type': {
+        const nextType = value as CustomerType;
+        if (
+          nextType === 'PARTICULAR' ||
+          nextType === 'EMPRESA' ||
+          nextType === 'ESTRANGEIRO' ||
+          nextType === 'CONSUMIDOR_FINAL'
+        ) {
+          this.quickCustomerDraft.customerType = nextType;
+          this.quickCustomerDraft.countryCode = nextType === 'ESTRANGEIRO' ? 'PT' : 'AO';
+          this.quickCustomerError = null;
+          this.render();
+        }
+        break;
+      }
+      case 'pos-set-quick-customer-type': {
+        const nextType = value as CustomerType;
+        if (
+          nextType === 'PARTICULAR' ||
+          nextType === 'EMPRESA' ||
+          nextType === 'ESTRANGEIRO'
+        ) {
+          this.quickCustomerDraft.customerType = nextType;
+          this.quickCustomerDraft.countryCode = nextType === 'ESTRANGEIRO' ? 'PT' : 'AO';
+          this.quickCustomerError = null;
+          this.render();
+        }
+        break;
+      }
+      case 'toggle-customer-advanced': {
+        this.showCustomerAdvancedFields = !this.showCustomerAdvancedFields;
         this.render();
         break;
       }
@@ -4319,6 +4429,9 @@ export class SilaBillingApp {
             phone: '',
             address: '',
             locality: this.activeCompany.profile.cityCountry || 'Angola',
+            customerType: 'PARTICULAR',
+            countryCode: 'AO',
+            foreignTaxId: '',
           };
         }
         this.render();
@@ -4960,15 +5073,24 @@ export class SilaBillingApp {
         this.isNewCustomer = true;
         this.customerFormError = null;
         this.customerSavedNotice = null;
+        this.showCustomerAdvancedFields = false;
         this.editingCustomerCreditLimitInput = '';
         this.editingCustomer = {
           id: `cust_${Date.now()}_${rand}`,
           companyId: this.activeCompany.id,
+          internalCode: generateNextCustomerInternalCode(this.customers, this.activeCompany.id),
+          customerType: 'PARTICULAR',
+          active: true,
           name: '',
           nif: '',
+          countryCode: 'AO',
           locality: this.activeCompany.profile.cityCountry || 'Angola',
           phone: '',
+          email: '',
+          province: this.activeCompany.profile.province || '',
+          municipality: this.activeCompany.profile.municipality || '',
           address: '',
+          paymentTerms: 'IMEDIATO',
           syncState: 'pending',
           synced: false,
           createdAtIso: now,
@@ -4981,12 +5103,20 @@ export class SilaBillingApp {
       }
       case 'edit-customer': {
         if (!this.canEditExistingCustomers()) return;
+        const directCustId = getDirectCustomerIdForCompany(this.activeCompany.id);
         const cust = this.customers.find((c) => c.id === id);
         if (cust) {
           this.isNewCustomer = false;
           this.customerFormError = null;
           this.customerSavedNotice = null;
-          this.editingCustomer = { ...cust };
+          this.showCustomerAdvancedFields = false;
+          this.editingCustomer = {
+            ...cust,
+            customerType: cust.customerType || inferCustomerType(cust, directCustId),
+            active: cust.active !== false,
+            countryCode: cust.countryCode || 'AO',
+            paymentTerms: cust.paymentTerms || 'IMEDIATO',
+          };
           this.editingCustomerCreditLimitInput =
             cust.creditLimit && cust.creditLimit > 0 ? String(cust.creditLimit) : '';
           this.selectedCustomerDetailId = cust.id;
@@ -5000,6 +5130,7 @@ export class SilaBillingApp {
         this.editingCustomer = null;
         this.editingCustomerCreditLimitInput = '';
         this.isNewCustomer = false;
+        this.showCustomerAdvancedFields = false;
         this.customerFormError = null;
         this.render();
         break;
@@ -6889,6 +7020,42 @@ export class SilaBillingApp {
       return;
     }
 
+    const mobileCustForm = el.closest<HTMLFormElement>('#mobile-quick-customer-form');
+    if (mobileCustForm) {
+      const inputName = el.name;
+      if (this.editingCustomer) {
+        if (inputName === 'name') this.editingCustomer.name = el.value;
+        else if (inputName === 'nif') this.editingCustomer.nif = el.value;
+        else if (inputName === 'foreignTaxId') this.editingCustomer.foreignTaxId = el.value;
+        else if (inputName === 'phone') this.editingCustomer.phone = el.value;
+        else if (inputName === 'email') this.editingCustomer.email = el.value;
+        else if (inputName === 'province') this.editingCustomer.province = el.value;
+        else if (inputName === 'municipality') this.editingCustomer.municipality = el.value;
+        else if (inputName === 'address') this.editingCustomer.address = el.value;
+        else if (inputName === 'locality') this.editingCustomer.locality = el.value;
+        else if (inputName === 'notes') this.editingCustomer.notes = el.value;
+        else if (inputName === 'bankName') this.editingCustomer.bankName = el.value;
+        else if (inputName === 'bankIban') this.editingCustomer.bankIban = el.value;
+        else if (inputName === 'documentRef') this.editingCustomer.documentRef = el.value;
+        else if (inputName === 'representativeName') this.editingCustomer.representativeName = el.value;
+        else if (inputName === 'representativePhone') this.editingCustomer.representativePhone = el.value;
+        else if (inputName === 'specialCreditNotes') this.editingCustomer.specialCreditNotes = el.value;
+        else if (inputName === 'creditLimit') {
+          this.editingCustomerCreditLimitInput = el.value;
+          const lim = parseDecimalInput(el.value);
+          this.editingCustomer.creditLimit = !Number.isNaN(lim) && lim > 0 ? lim : undefined;
+        }
+      } else {
+        if (inputName === 'name') this.quickCustomerDraft.name = el.value;
+        else if (inputName === 'nif') this.quickCustomerDraft.nif = el.value;
+        else if (inputName === 'foreignTaxId') this.quickCustomerDraft.foreignTaxId = el.value;
+        else if (inputName === 'phone') this.quickCustomerDraft.phone = el.value;
+        else if (inputName === 'address') this.quickCustomerDraft.address = el.value;
+        else if (inputName === 'locality') this.quickCustomerDraft.locality = el.value;
+      }
+      return;
+    }
+
     // Preserva em memória os campos em edição (sem re-renderizar o DOM a cada tecla)
     // para que eventos assíncronos de rede/auth nunca limpem o formulário do utilizador.
     const parentForm = el.closest<HTMLFormElement>('form[data-form]');
@@ -6969,9 +7136,20 @@ export class SilaBillingApp {
       } else if (fName === 'customer-form' && this.editingCustomer) {
         if (inputName === 'name') this.editingCustomer.name = el.value;
         else if (inputName === 'nif') this.editingCustomer.nif = el.value;
+        else if (inputName === 'foreignTaxId') this.editingCustomer.foreignTaxId = el.value;
         else if (inputName === 'phone') this.editingCustomer.phone = el.value;
+        else if (inputName === 'email') this.editingCustomer.email = el.value;
+        else if (inputName === 'province') this.editingCustomer.province = el.value;
+        else if (inputName === 'municipality') this.editingCustomer.municipality = el.value;
         else if (inputName === 'address') this.editingCustomer.address = el.value;
         else if (inputName === 'locality') this.editingCustomer.locality = el.value;
+        else if (inputName === 'notes') this.editingCustomer.notes = el.value;
+        else if (inputName === 'bankName') this.editingCustomer.bankName = el.value;
+        else if (inputName === 'bankIban') this.editingCustomer.bankIban = el.value;
+        else if (inputName === 'documentRef') this.editingCustomer.documentRef = el.value;
+        else if (inputName === 'representativeName') this.editingCustomer.representativeName = el.value;
+        else if (inputName === 'representativePhone') this.editingCustomer.representativePhone = el.value;
+        else if (inputName === 'specialCreditNotes') this.editingCustomer.specialCreditNotes = el.value;
         else if (inputName === 'creditLimit') {
           this.editingCustomerCreditLimitInput = el.value;
           const lim = parseDecimalInput(el.value);
@@ -6980,6 +7158,7 @@ export class SilaBillingApp {
       } else if (fName === 'pos-quick-customer-form') {
         if (inputName === 'name') this.quickCustomerDraft.name = el.value;
         else if (inputName === 'nif') this.quickCustomerDraft.nif = el.value;
+        else if (inputName === 'foreignTaxId') this.quickCustomerDraft.foreignTaxId = el.value;
         else if (inputName === 'phone') this.quickCustomerDraft.phone = el.value;
         else if (inputName === 'address') this.quickCustomerDraft.address = el.value;
         else if (inputName === 'locality') this.quickCustomerDraft.locality = el.value;
@@ -7463,6 +7642,44 @@ export class SilaBillingApp {
         return;
       }
     }
+    if (el && (el.closest('form[data-form="customer-form"]') || el.closest('#mobile-quick-customer-form'))) {
+      if (this.editingCustomer) {
+        if (el.name === 'customerType') {
+          const nextType = el.value as CustomerType;
+          this.editingCustomer.customerType = nextType;
+          if (nextType === 'ESTRANGEIRO' && (!this.editingCustomer.countryCode || this.editingCustomer.countryCode === 'AO')) {
+            this.editingCustomer.countryCode = 'PT';
+          } else if (nextType !== 'ESTRANGEIRO') {
+            this.editingCustomer.countryCode = 'AO';
+          }
+          this.render();
+          return;
+        } else if (el.name === 'active') {
+          this.editingCustomer.active = el.value !== 'false';
+          return;
+        } else if (el.name === 'countryCode') {
+          this.editingCustomer.countryCode = el.value;
+          return;
+        } else if (el.name === 'paymentTerms') {
+          this.editingCustomer.paymentTerms = el.value as CustomerPaymentTerms;
+          return;
+        }
+      } else if (el.closest('#mobile-quick-customer-form')) {
+        if (el.name === 'customerType') {
+          this.quickCustomerDraft.customerType = el.value as CustomerType;
+          this.quickCustomerDraft.countryCode = el.value === 'ESTRANGEIRO' ? 'PT' : 'AO';
+          this.render();
+          return;
+        } else if (el.name === 'countryCode') {
+          this.quickCustomerDraft.countryCode = el.value;
+          return;
+        }
+      }
+    }
+    if (el && el.closest('form[data-form="pos-quick-customer-form"]') && el.name === 'countryCode') {
+      this.quickCustomerDraft.countryCode = el.value;
+      return;
+    }
     const field = el.dataset.field;
     const id = el.dataset.id || '';
     if (!field) return;
@@ -7680,8 +7897,18 @@ export class SilaBillingApp {
       const rawPrice = String(fd.get('price') || '').trim();
       const price = parseFloat(rawPrice.replace(/\s/g, '').replace(',', '.')) || 0;
 
-      const ivaRate = (parseInt(String(fd.get('ivaRate') || '14'), 10) || 14) as TaxRate;
+      const parsedIva = parseInt(String(fd.get('ivaRate') ?? '14'), 10);
+      const ivaRate = (parsedIva === 0 || parsedIva === 1 || parsedIva === 5 || parsedIva === 7 || parsedIva === 14
+        ? parsedIva
+        : 14) as TaxRate;
       const exemptionReason = ivaRate === 0 ? String(fd.get('exemptionReason') || DEFAULT_IVA_EXEMPTION_REASONS[0]).trim() : '';
+      const exemptionCode = ivaRate === 0 ? 'M10' : undefined;
+      const productType =
+        category === 'Serviços'
+          ? 'S'
+          : category === 'Kit / Produto Composto'
+            ? 'K'
+            : 'P';
       const active = fd.get('active') !== 'false';
       const trackStock = fd.get('trackStock') === 'on' || fd.get('trackStock') === 'true';
       const rawStockQty = String(fd.get('stockQty') || '').trim();
@@ -7690,10 +7917,12 @@ export class SilaBillingApp {
       const minStockQty = trackStock ? (parseFloat(rawMinStock.replace(',', '.')) || 5) : undefined;
 
       if (!name || price <= 0) {
-        alert('Por favor informe o nome e um preço de venda válido para o artigo.');
+        this.quickProductError = 'Por favor informe o nome e um preço de venda válido para o artigo.';
+        this.render();
         return;
       }
 
+      this.quickProductError = null;
       const now = new Date().toISOString();
 
       if (productId) {
@@ -7705,11 +7934,13 @@ export class SilaBillingApp {
             name,
             code,
             barcode: barcode || undefined,
+            productType,
             category,
             unit,
             costPrice,
             price,
             ivaRate,
+            exemptionCode,
             exemptionReason,
             active,
             trackStock,
@@ -7744,11 +7975,13 @@ export class SilaBillingApp {
         code,
         barcode: barcode || undefined,
         name,
+        productType,
         category,
         unit,
         costPrice,
         price,
         ivaRate,
+        exemptionCode,
         exemptionReason,
         active,
         trackStock,
@@ -7780,40 +8013,91 @@ export class SilaBillingApp {
     }
 
     if (form.id === 'mobile-quick-customer-form') {
-      const name = String(fd.get('name') || '').trim();
-      const nif = String(fd.get('nif') || '999999999').trim();
-      const phone = String(fd.get('phone') || '').trim();
-      const locality = String(fd.get('locality') || 'Luanda').trim();
-
-      if (!name) {
-        alert('Por favor informe o nome do cliente.');
+      if (this.isCompanySuspended()) {
+        this.quickCustomerError = 'A empresa encontra-se suspensa.';
+        this.render();
+        return;
+      }
+      const directCustId = getDirectCustomerIdForCompany(this.activeCompany.id);
+      const existingMatch = this.editingCustomer
+        ? this.customers.find((c) => c.id === this.editingCustomer!.id) || null
+        : null;
+      const isEditingExisting = Boolean(existingMatch);
+      if (isEditingExisting && !this.canEditExistingCustomers()) {
+        this.quickCustomerError = 'O seu perfil actual não permite editar clientes existentes.';
+        this.render();
         return;
       }
 
-      const now = new Date().toISOString();
-      const newCust: Customer = {
-        id: `cust_${Date.now()}_${Math.random().toString(36).substring(2, 7)}`,
-        companyId: this.activeCompany.id,
-        name,
-        nif,
-        phone,
-        address: locality || 'Luanda',
-        locality,
-        synced: false,
-        syncState: 'pending',
-        createdAtIso: now,
-        updatedAtIso: now,
-      };
+      const defaultLoc =
+        this.settings.company.cityCountry || this.activeCompany.profile.cityCountry || 'Angola';
+      const isDirectCust = Boolean(this.editingCustomer && this.editingCustomer.id === directCustId);
+      const { draft, rawCreditLimitInvalid } = extractCustomerDraftFromFormData(
+        fd,
+        this.editingCustomer,
+        {
+          companyId: this.activeCompany.id,
+          isDirectCustomer: isDirectCust,
+          defaultLocality: defaultLoc,
+        }
+      );
 
-      await localDb.saveCustomer(newCust, this.activeCompany.id);
-      this.customers = [newCust, ...this.customers];
-      this.selectedCustomerId = newCust.id;
+      if (rawCreditLimitInvalid) {
+        this.quickCustomerError = 'Indique um limite de crédito válido em Kwanzas.';
+        this.render();
+        return;
+      }
+
+      const validation = validateAndBuildCustomer(draft, {
+        companyId: this.activeCompany.id,
+        existingCustomers: this.customers,
+        previousCustomer: existingMatch,
+        defaultLocality: defaultLoc,
+        actorLabel: this.operator || this.user?.email || 'Mobile',
+        isQuickPosMode: this.mobileCustomerModalMode === 'QUICK',
+      });
+
+      if (!validation.ok || !validation.customer) {
+        this.quickCustomerError = validation.error || 'Verifique os dados do cliente.';
+        this.render();
+        return;
+      }
+
+      const savedCust = validation.customer;
+      this.quickCustomerError = null;
+      await localDb.saveCustomer(savedCust, this.activeCompany.id);
+      this.customers = [savedCust, ...this.customers.filter((c) => c.id !== savedCust.id)].sort(
+        (a, b) =>
+          a.id === directCustId ? -1 : b.id === directCustId ? 1 : a.name.localeCompare(b.name, 'pt')
+      );
+      if (!isEditingExisting) {
+        this.selectedCustomerId = savedCust.id;
+      }
+      this.selectedCustomerDetailId = savedCust.id;
+      this.editingCustomer = null;
+      this.editingCustomerCreditLimitInput = '';
+      this.showCustomerAdvancedFields = false;
       this.showQuickCustomerForm = false;
+      this.quickCustomerDraft = {
+        name: '',
+        nif: '',
+        phone: '',
+        address: '',
+        locality: defaultLoc,
+        customerType: 'PARTICULAR',
+        countryCode: 'AO',
+        foreignTaxId: '',
+      };
       this.render();
 
       if (this.user && this.isOnline && canCompanySyncCloudData(this.activeCompany)) {
         try {
-          await upsertCustomerCloud(newCust, this.activeCompany);
+          await ensureCompanyRegisteredCloud(this.activeCompany);
+          await upsertCustomerCloud(savedCust, this.activeCompany);
+          const syncedCust: Customer = { ...savedCust, synced: true, syncState: 'synced' };
+          await localDb.saveCustomer(syncedCust, this.activeCompany.id);
+          this.customers = this.customers.map((c) => (c.id === syncedCust.id ? syncedCust : c));
+          this.render();
         } catch {
           // Mantém pendente local
         }
@@ -9039,8 +9323,11 @@ export class SilaBillingApp {
     }
 
     if (formName === 'customer-form' && this.editingCustomer) {
-      const isEditingExisting =
-        !this.isNewCustomer && this.customers.some((c) => c.id === this.editingCustomer!.id);
+      const existingMatch =
+        !this.isNewCustomer
+          ? this.customers.find((c) => c.id === this.editingCustomer!.id) || null
+          : null;
+      const isEditingExisting = Boolean(existingMatch);
       if (isEditingExisting && !this.canEditExistingCustomers()) {
         this.customerFormError =
           'O seu perfil atual não tem permissão para editar clientes existentes.';
@@ -9056,50 +9343,40 @@ export class SilaBillingApp {
 
       const directCustId = getDirectCustomerIdForCompany(this.activeCompany.id);
       const isDirectCust = this.editingCustomer.id === directCustId;
-      const name = String(fd.get('name') || this.editingCustomer.name || '').trim();
-      const nif = isDirectCust
-        ? 'Consumidor Final'
-        : String(fd.get('nif') || this.editingCustomer.nif || '').trim() || 'Consumidor Final';
-      const phone = String(fd.get('phone') || this.editingCustomer.phone || '').trim();
       const defaultLoc = this.activeCompany.profile.cityCountry || 'Angola';
-      const locality =
-        String(fd.get('locality') || this.editingCustomer.locality || '').trim() || defaultLoc;
-      const address =
-        String(fd.get('address') || this.editingCustomer.address || '').trim() || locality;
-      const rawLimit = String(
-        fd.get('creditLimit') ?? this.editingCustomerCreditLimitInput ?? ''
-      ).trim();
-      const parsedLimit = rawLimit ? parseDecimalInput(rawLimit) : 0;
 
-      if (!name) {
-        this.customerFormError = 'Indique o nome completo ou entidade do cliente.';
-        this.render();
-        return;
-      }
+      const { draft, rawCreditLimitInvalid } = extractCustomerDraftFromFormData(
+        fd,
+        this.editingCustomer,
+        {
+          companyId: this.activeCompany.id,
+          isDirectCustomer: isDirectCust,
+          defaultLocality: defaultLoc,
+        }
+      );
 
-      if (!isDirectCust && rawLimit && (Number.isNaN(parsedLimit) || parsedLimit < 0)) {
+      if (rawCreditLimitInvalid) {
         this.customerFormError = 'Indique um limite de crédito válido em Kwanzas (ou deixe em branco).';
         this.render();
         return;
       }
 
-      const creditLimit = !isDirectCust && parsedLimit > 0 ? roundKz(parsedLimit) : undefined;
-      const { creditLimit: _prevLimit, ...restCustomer } = this.editingCustomer;
-      void _prevLimit;
-
-      const updated: Customer = {
-        ...restCustomer,
+      const validation = validateAndBuildCustomer(draft, {
         companyId: this.activeCompany.id,
-        name,
-        nif,
-        phone,
-        locality,
-        address,
-        ...(creditLimit ? { creditLimit } : {}),
-        syncState: 'pending',
-        synced: false,
-        updatedAtIso: new Date().toISOString(),
-      };
+        existingCustomers: this.customers,
+        previousCustomer: existingMatch,
+        defaultLocality: defaultLoc,
+        actorLabel: this.operator || this.user?.email || 'Operador',
+        isQuickPosMode: false,
+      });
+
+      if (!validation.ok || !validation.customer) {
+        this.customerFormError = validation.error || 'Verifique os campos obrigatórios do cliente.';
+        this.render();
+        return;
+      }
+
+      const updated = validation.customer;
 
       try {
         await localDb.saveCustomer(updated, this.activeCompany.id);
@@ -9119,6 +9396,7 @@ export class SilaBillingApp {
       this.editingCustomer = null;
       this.editingCustomerCreditLimitInput = '';
       this.isNewCustomer = false;
+      this.showCustomerAdvancedFields = false;
       this.customerFormError = null;
       this.customerSavedNotice = `Cliente "${updated.name}" guardado com sucesso.`;
       this.render();
@@ -9613,24 +9891,32 @@ export class SilaBillingApp {
 
     const previewDraft = this.buildLivePreviewInvoice();
     const directCustId = getDirectCustomerIdForCompany(this.activeCompany.id);
-    if (
-      this.docType === 'FR' &&
-      (previewDraft.amountDue || 0) > 0 &&
-      this.selectedCustomerId === directCustId
-    ) {
-      this.showCustomerPicker = true;
+    const newDue = this.docType === 'FR' ? roundKz(previewDraft.amountDue || 0) : 0;
+    const selectedCustObj = this.customers.find((c) => c.id === this.selectedCustomerId);
+
+    const custCheck = validateCustomerForInvoiceEmission(selectedCustObj, {
+      companyId: this.activeCompany.id,
+      docType: this.docType,
+      paymentMethod: this.paymentMethod,
+      amountDue: newDue,
+    });
+    if (!custCheck.allowed) {
+      if (this.selectedCustomerId === directCustId) {
+        this.showCustomerPicker = true;
+      }
       this.mobilePane = 'CART';
       this.showScannerFeedback(
-        'Identifique ou cadastre o cliente para registar venda a crédito ou com pagamento parcial.',
+        custCheck.reason || 'Verifique a conformidade cadastral do cliente antes de emitir.',
         true
       );
       this.render();
-      const searchInput = document.getElementById('pos-customer-search-input') as HTMLInputElement | null;
-      searchInput?.focus();
+      if (this.selectedCustomerId === directCustId) {
+        const searchInput = document.getElementById('pos-customer-search-input') as HTMLInputElement | null;
+        searchInput?.focus();
+      }
       return;
     }
 
-    const newDue = this.docType === 'FR' ? roundKz(previewDraft.amountDue || 0) : 0;
     if (newDue > 0 && this.selectedCustomerId !== directCustId) {
       const custObj = this.customers.find((c) => c.id === this.selectedCustomerId);
       const limit =
@@ -10440,6 +10726,14 @@ export class SilaBillingApp {
                 showQuickCompanyModal: this.showMobileQuickCompanyModal,
                 showCustomerPickerModal: this.showMobileCustomerPicker,
                 editingMobileProduct: this.editingMobileProduct,
+                editingCustomer: this.editingCustomer,
+                editingCustomerCreditLimitInput: this.editingCustomerCreditLimitInput,
+                showCustomerAdvancedFields: this.showCustomerAdvancedFields,
+                mobileCustomerModalMode: this.mobileCustomerModalMode,
+                canEditExistingCustomers: this.canEditExistingCustomers(),
+                quickCustomerDraft: this.quickCustomerDraft,
+                quickProductError: this.quickProductError,
+                quickCustomerError: this.quickCustomerError,
                 operator: this.operator,
               })}
             </div>`
@@ -11560,6 +11854,8 @@ export class SilaBillingApp {
                           : matchingCustomers
                               .map((c) => {
                                 const isSel = c.id === this.selectedCustomerId;
+                                const isInactive = c.active === false;
+                                const cType = inferCustomerType(c, directCustId);
                                 const custDebt =
                                   c.id !== directCustId ? this.getCustomerOpenDebt(c.id) : 0;
                                 return `
@@ -11567,16 +11863,24 @@ export class SilaBillingApp {
                                     type="button"
                                     data-action="select-pos-customer"
                                     data-id="${escapeHtml(c.id)}"
-                                    class="w-full px-2.5 py-2 text-left flex items-center justify-between gap-2 text-xs transition-colors ${
+                                    ${isInactive ? 'disabled' : ''}
+                                    class="w-full px-2.5 py-2 text-left flex items-center justify-between gap-2 text-xs transition-colors disabled:opacity-45 ${
                                       isSel ? 'bg-blue-50/80 text-blue-900 font-semibold' : 'hover:bg-slate-50 text-slate-800'
                                     }"
                                   >
                                     <div class="min-w-0">
-                                      <div class="truncate">${escapeHtml(c.name)}</div>
+                                      <div class="truncate">
+                                        ${c.internalCode ? `<span class="text-[10px] font-mono text-slate-400 mr-1">${escapeHtml(c.internalCode)}</span>` : ''}${escapeHtml(c.name)}
+                                      </div>
                                       ${
-                                        c.phone || (c.address && c.address !== c.locality)
+                                        c.phone || (c.address && c.address !== c.locality) || isInactive
                                           ? `<div class="text-[10px] text-slate-400 truncate">${escapeHtml(
-                                              [c.phone, c.address && c.address !== c.locality ? c.address : '']
+                                              [
+                                                CUSTOMER_TYPE_LABELS[cType],
+                                                c.phone,
+                                                c.address && c.address !== c.locality ? c.address : '',
+                                                isInactive ? 'Inactivo' : '',
+                                              ]
                                                 .filter(Boolean)
                                                 .join(' · ')
                                             )}</div>`
@@ -11604,19 +11908,38 @@ export class SilaBillingApp {
               <!-- Cadastro Rápido de Cliente Sem Sair da Fatura -->
               ${
                 this.showQuickCustomerForm
-                  ? `
+                  ? (() => {
+                      const qType: CustomerType = this.quickCustomerDraft.customerType || 'PARTICULAR';
+                      const qForeign = qType === 'ESTRANGEIRO';
+                      const qCompany = qType === 'EMPRESA';
+                      return `
                   <form
                     data-form="pos-quick-customer-form"
                     class="border border-slate-200 rounded-lg bg-slate-50 p-2.5 space-y-2"
                   >
                     <div class="flex items-center justify-between">
-                      <span class="text-[11px] font-semibold text-slate-800">Novo cliente na fatura</span>
+                      <span class="text-[11px] font-semibold text-slate-800">Cadastro rápido no POS</span>
                       <button
                         type="button"
                         data-action="toggle-quick-customer"
                         class="h-6 w-6 flex items-center justify-center rounded text-slate-400 hover:text-slate-700"
                       >${ICONS.close}</button>
                     </div>
+                    <div class="grid grid-cols-3 gap-1 bg-white p-0.5 border border-slate-200 rounded-md">
+                      ${(['PARTICULAR', 'EMPRESA', 'ESTRANGEIRO'] as CustomerType[])
+                        .map(
+                          (t) => `<button
+                            type="button"
+                            data-action="pos-set-quick-customer-type"
+                            data-value="${t}"
+                            class="h-7 rounded text-[11px] font-medium transition-colors ${
+                              qType === t ? 'bg-slate-900 text-white font-semibold' : 'text-slate-600 hover:text-slate-900'
+                            }"
+                          >${escapeHtml(CUSTOMER_TYPE_LABELS[t])}</button>`
+                        )
+                        .join('')}
+                    </div>
+                    <input type="hidden" name="customerType" value="${qType}" />
                     ${
                       this.quickCustomerError
                         ? `<div class="p-2 rounded bg-red-50 border border-red-200 text-[11px] text-red-700">${escapeHtml(
@@ -11633,37 +11956,72 @@ export class SilaBillingApp {
                           required
                           maxlength="160"
                           value="${escapeHtml(this.quickCustomerDraft.name)}"
-                          placeholder="Nome completo ou empresa *"
+                          placeholder="${qCompany ? 'Denominação social *' : 'Nome completo *'}"
                           class="w-full h-8 px-2.5 text-xs bg-white border border-slate-200 rounded-md focus:outline-none focus:border-blue-600"
                         />
                       </div>
-                      <div>
-                        <input
-                          name="nif"
-                          type="text"
-                          maxlength="32"
-                          value="${escapeHtml(this.quickCustomerDraft.nif)}"
-                          placeholder="NIF (ou Consumidor Final)"
-                          class="w-full h-8 px-2.5 text-xs font-mono bg-white border border-slate-200 rounded-md focus:outline-none focus:border-blue-600"
-                        />
-                      </div>
-                      <div>
-                        <input
-                          name="phone"
-                          type="text"
-                          maxlength="40"
-                          value="${escapeHtml(this.quickCustomerDraft.phone)}"
-                          placeholder="Telefone (+244...)"
-                          class="w-full h-8 px-2.5 text-xs font-mono bg-white border border-slate-200 rounded-md focus:outline-none focus:border-blue-600"
-                        />
-                      </div>
+                      ${
+                        qForeign
+                          ? `<div>
+                              <select name="countryCode" class="w-full h-8 px-2 text-xs bg-white border border-slate-200 rounded-md focus:outline-none focus:border-blue-600">
+                                ${FOREIGN_COUNTRY_OPTIONS.map(
+                                  (opt) =>
+                                    `<option value="${opt.code}" ${(this.quickCustomerDraft.countryCode || 'PT') === opt.code ? 'selected' : ''}>${escapeHtml(opt.name)}</option>`
+                                ).join('')}
+                              </select>
+                            </div>
+                            <div>
+                              <input
+                                name="foreignTaxId"
+                                type="text"
+                                maxlength="40"
+                                value="${escapeHtml(this.quickCustomerDraft.foreignTaxId || '')}"
+                                placeholder="ID fiscal estrangeiro *"
+                                class="w-full h-8 px-2.5 text-xs font-mono bg-white border border-slate-200 rounded-md focus:outline-none focus:border-blue-600"
+                              />
+                            </div>`
+                          : `<div>
+                              <input
+                                name="nif"
+                                type="text"
+                                maxlength="32"
+                                value="${escapeHtml(this.quickCustomerDraft.nif)}"
+                                placeholder="${qCompany ? 'NIF (obrigatório) *' : 'NIF (opcional)'}"
+                                class="w-full h-8 px-2.5 text-xs font-mono bg-white border border-slate-200 rounded-md focus:outline-none focus:border-blue-600"
+                              />
+                            </div>
+                            <div>
+                              <input
+                                name="phone"
+                                type="text"
+                                maxlength="40"
+                                value="${escapeHtml(this.quickCustomerDraft.phone)}"
+                                placeholder="+244 ..."
+                                class="w-full h-8 px-2.5 text-xs font-mono bg-white border border-slate-200 rounded-md focus:outline-none focus:border-blue-600"
+                              />
+                            </div>`
+                      }
+                      ${
+                        qForeign
+                          ? `<div class="col-span-2">
+                              <input
+                                name="phone"
+                                type="text"
+                                maxlength="40"
+                                value="${escapeHtml(this.quickCustomerDraft.phone)}"
+                                placeholder="Telefone (+...) "
+                                class="w-full h-8 px-2.5 text-xs font-mono bg-white border border-slate-200 rounded-md focus:outline-none focus:border-blue-600"
+                              />
+                            </div>`
+                          : ''
+                      }
                       <div class="col-span-2">
                         <input
                           name="address"
                           type="text"
                           maxlength="200"
                           value="${escapeHtml(this.quickCustomerDraft.address)}"
-                          placeholder="Endereço (rua, bairro, n.º — opcional)"
+                          placeholder="${qCompany ? 'Morada fiscal *' : 'Morada (rua, bairro, edifício...)'}"
                           class="w-full h-8 px-2.5 text-xs bg-white border border-slate-200 rounded-md focus:outline-none focus:border-blue-600"
                         />
                       </div>
@@ -11673,7 +12031,7 @@ export class SilaBillingApp {
                           type="text"
                           maxlength="160"
                           value="${escapeHtml(this.quickCustomerDraft.locality || defaultLocality)}"
-                          placeholder="Localidade / Município"
+                          placeholder="Município / Cidade"
                           class="flex-1 h-8 px-2.5 text-xs bg-white border border-slate-200 rounded-md focus:outline-none focus:border-blue-600"
                         />
                         <button
@@ -11683,7 +12041,8 @@ export class SilaBillingApp {
                       </div>
                     </div>
                   </form>
-                `
+                `;
+                    })()
                   : ''
               }
 
@@ -12511,102 +12870,18 @@ export class SilaBillingApp {
 
         ${
           this.editingCustomer
-            ? `
-            <form
-              data-form="customer-form"
-              class="p-3.5 border-b border-slate-200 bg-slate-50 grid grid-cols-1 sm:grid-cols-12 gap-2.5 items-end shrink-0"
-            >
-              ${
-                this.customerFormError
-                  ? `<div class="sm:col-span-12 p-2 rounded-md bg-red-50 border border-red-200 text-xs text-red-700">${escapeHtml(
-                      this.customerFormError
-                    )}</div>`
-                  : ''
-              }
-              <div class="sm:col-span-4">
-                <label class="block text-[10px] font-medium text-slate-600 mb-1">Nome / Identificação Fiscal *</label>
-                <input
-                  id="customer-form-name-input"
-                  name="name"
-                  type="text"
-                  required
-                  maxlength="160"
-                  value="${escapeHtml(this.editingCustomer.name)}"
-                  placeholder="Nome completo ou designação social"
-                  class="w-full h-9 px-2.5 text-xs bg-white border border-slate-200 rounded-md focus:outline-none focus:border-blue-600"
-                />
-              </div>
-              <div class="sm:col-span-3">
-                <label class="block text-[10px] font-medium text-slate-600 mb-1">NIF / Contribuinte</label>
-                <input
-                  name="nif"
-                  type="text"
-                  maxlength="32"
-                  ${isEditingDirect ? 'readonly' : ''}
-                  value="${escapeHtml(this.editingCustomer.nif)}"
-                  placeholder="Ex: 5001234567 ou Consumidor Final"
-                  class="w-full h-9 px-2.5 text-xs font-mono ${isEditingDirect ? 'bg-slate-100 text-slate-500' : 'bg-white'} border border-slate-200 rounded-md focus:outline-none focus:border-blue-600"
-                />
-              </div>
-              <div class="sm:col-span-2">
-                <label class="block text-[10px] font-medium text-slate-600 mb-1">Contacto Telefónico</label>
-                <input
-                  name="phone"
-                  type="text"
-                  maxlength="40"
-                  value="${escapeHtml(this.editingCustomer.phone)}"
-                  placeholder="(+244) 9..."
-                  class="w-full h-9 px-2.5 text-xs font-mono bg-white border border-slate-200 rounded-md focus:outline-none focus:border-blue-600"
-                />
-              </div>
-              <div class="sm:col-span-3">
-                <label class="block text-[10px] font-medium text-slate-600 mb-1">Limite de Crédito (Kz, opcional)</label>
-                <input
-                  name="creditLimit"
-                  type="text"
-                  inputmode="decimal"
-                  autocomplete="off"
-                  ${isEditingDirect ? 'disabled' : ''}
-                  value="${escapeHtml(isEditingDirect ? '' : this.editingCustomerCreditLimitInput)}"
-                  placeholder="${isEditingDirect ? 'Não aplicável' : 'Sem limite fixo'}"
-                  class="w-full h-9 px-2.5 text-xs font-mono tabular-nums ${isEditingDirect ? 'bg-slate-100 text-slate-400' : 'bg-white'} border border-slate-200 rounded-md focus:outline-none focus:border-blue-600"
-                />
-              </div>
-              <div class="sm:col-span-6">
-                <label class="block text-[10px] font-medium text-slate-600 mb-1">Endereço (Rua, Bairro, Edifício)</label>
-                <input
-                  name="address"
-                  type="text"
-                  maxlength="200"
-                  value="${escapeHtml(this.editingCustomer.address)}"
-                  placeholder="Ex: Rua Rainha Ginga, Bairro Cidade-Alta"
-                  class="w-full h-9 px-2.5 text-xs bg-white border border-slate-200 rounded-md focus:outline-none focus:border-blue-600"
-                />
-              </div>
-              <div class="sm:col-span-4">
-                <label class="block text-[10px] font-medium text-slate-600 mb-1">Localidade / Município</label>
-                <input
-                  name="locality"
-                  type="text"
-                  maxlength="160"
-                  value="${escapeHtml(this.editingCustomer.locality)}"
-                  placeholder="Ex: Huambo - Angola"
-                  class="w-full h-9 px-2.5 text-xs bg-white border border-slate-200 rounded-md focus:outline-none focus:border-blue-600"
-                />
-              </div>
-              <div class="sm:col-span-2 flex items-center gap-1.5">
-                <button
-                  type="submit"
-                  class="flex-1 h-9 px-3 rounded-md bg-blue-600 text-white text-xs font-semibold hover:bg-blue-700 whitespace-nowrap"
-                >Guardar</button>
-                <button
-                  type="button"
-                  data-action="cancel-edit-customer"
-                  class="h-9 w-9 flex items-center justify-center rounded-md border border-slate-200 bg-white text-slate-600 hover:bg-slate-100 shrink-0"
-                >${ICONS.close}</button>
-              </div>
-            </form>
-          `
+            ? renderCustomerMasterForm({
+                mode: 'DESKTOP',
+                companyId: this.activeCompany.id,
+                customer: this.editingCustomer,
+                creditLimitInput: this.editingCustomerCreditLimitInput,
+                formId: 'customer-form',
+                isDirectCustomer: isEditingDirect,
+                showAdvanced: this.showCustomerAdvancedFields,
+                errorMessage: this.customerFormError,
+                canManage: this.isNewCustomer || canEditCust,
+                defaultLocality: this.activeCompany.profile.cityCountry || 'Angola',
+              })
             : ''
         }
 
@@ -12631,6 +12906,8 @@ export class SilaBillingApp {
                       : filtered
                           .map((c) => {
                             const isDirect = c.id === directCustId;
+                            const cType = inferCustomerType(c, directCustId);
+                            const isInactive = c.active === false;
                             const st = statsByCustomer.get(c.id);
                             const openDebt = !isDirect ? st?.openDebt || 0 : 0;
                             const limit = !isDirect && c.creditLimit && c.creditLimit > 0 ? c.creditLimit : 0;
@@ -12640,7 +12917,7 @@ export class SilaBillingApp {
                               c.address && c.address.toLowerCase() !== (c.locality || '').toLowerCase()
                                 ? c.address
                                 : '',
-                              c.locality || '',
+                              c.municipality || c.province || c.locality || '',
                             ]
                               .filter(Boolean)
                               .join(' · ');
@@ -12649,17 +12926,25 @@ export class SilaBillingApp {
                             <tr
                               data-action="select-customer-detail"
                               data-id="${escapeHtml(c.id)}"
-                              class="cursor-pointer transition-colors ${
+                              class="cursor-pointer transition-colors ${isInactive ? 'opacity-65' : ''} ${
                                 isSelected ? 'bg-blue-50/60' : 'hover:bg-slate-50/80'
                               }"
                             >
                               <td class="py-2.5 px-3">
-                                <div class="font-medium text-slate-900">${escapeHtml(c.name)}</div>
-                                <div class="text-[11px] text-slate-500 truncate max-w-[230px]">${escapeHtml(addrLine || '—')}</div>
+                                <div class="font-medium text-slate-900 flex items-center gap-1.5">
+                                  ${c.internalCode ? `<span class="text-[10px] font-mono text-slate-400 shrink-0">${escapeHtml(c.internalCode)}</span>` : ''}
+                                  <span class="truncate">${escapeHtml(c.name)}</span>
+                                  ${isInactive ? `<span class="text-[10px] font-medium text-red-600 shrink-0">(Inactivo)</span>` : ''}
+                                </div>
+                                <div class="text-[11px] text-slate-500 truncate max-w-[230px]">${escapeHtml(CUSTOMER_TYPE_LABELS[cType])}${addrLine ? ` · ${escapeHtml(addrLine)}` : ''}</div>
                               </td>
                               <td class="py-2.5 px-3 font-mono tabular-nums">
-                                <div class="text-slate-700">${escapeHtml(c.nif || 'Consumidor Final')}</div>
-                                <div class="text-[11px] text-slate-400">${escapeHtml(c.phone || 'Sem telefone')}</div>
+                                <div class="text-slate-700">${
+                                  cType === 'ESTRANGEIRO'
+                                    ? `${escapeHtml(c.countryCode || 'OUT')} · ${escapeHtml(c.foreignTaxId || c.nif)}`
+                                    : escapeHtml(c.nif || 'Consumidor Final')
+                                }</div>
+                                <div class="text-[11px] text-slate-400">${escapeHtml(c.phone || c.email || 'Sem contacto')}</div>
                               </td>
                               <td class="py-2.5 px-3 text-right font-mono tabular-nums hidden sm:table-cell">
                                 ${
@@ -12724,6 +13009,10 @@ export class SilaBillingApp {
               activeDetailCust && activeDetailStats
                 ? (() => {
                     const isDirect = activeDetailCust.id === directCustId;
+                    const detailType = inferCustomerType(activeDetailCust, directCustId);
+                    const detailPaymentTerm = activeDetailCust.paymentTerms
+                      ? CUSTOMER_PAYMENT_TERMS_LABELS[activeDetailCust.paymentTerms]
+                      : 'Imediato';
                     const limit =
                       !isDirect && activeDetailCust.creditLimit && activeDetailCust.creditLimit > 0
                         ? roundKz(activeDetailCust.creditLimit)
@@ -12739,21 +13028,58 @@ export class SilaBillingApp {
                       <div class="p-3.5 bg-white border-b border-slate-200 space-y-2 shrink-0">
                         <div class="flex items-start justify-between gap-2">
                           <div class="min-w-0">
-                            <div class="text-sm font-bold text-slate-900 truncate">${escapeHtml(activeDetailCust.name)}</div>
+                            <div class="flex items-center gap-1.5 min-w-0">
+                              ${
+                                activeDetailCust.internalCode
+                                  ? `<span class="text-[11px] font-mono text-slate-400 shrink-0">${escapeHtml(activeDetailCust.internalCode)}</span>`
+                                  : ''
+                              }
+                              <span class="text-sm font-bold text-slate-900 truncate">${escapeHtml(activeDetailCust.name)}</span>
+                              ${
+                                activeDetailCust.active === false
+                                  ? `<span class="text-[10.5px] font-semibold text-red-600 shrink-0">Inactivo</span>`
+                                  : ''
+                              }
+                            </div>
                             <div class="text-[11px] text-slate-600 font-mono tabular-nums mt-0.5">
-                              NIF: ${escapeHtml(activeDetailCust.nif || 'Consumidor Final')}${
-                                activeDetailCust.phone ? ` · Tel: ${escapeHtml(activeDetailCust.phone)}` : ''
+                              ${escapeHtml(CUSTOMER_TYPE_LABELS[detailType])} · ${
+                                detailType === 'ESTRANGEIRO'
+                                  ? `${escapeHtml(activeDetailCust.countryCode || 'OUT')} ${escapeHtml(activeDetailCust.foreignTaxId || activeDetailCust.nif)}`
+                                  : `NIF: ${escapeHtml(activeDetailCust.nif || 'Consumidor Final')}`
+                              }${activeDetailCust.phone ? ` · Tel: ${escapeHtml(activeDetailCust.phone)}` : ''}${
+                                activeDetailCust.email ? ` · ${escapeHtml(activeDetailCust.email)}` : ''
                               }
                             </div>
                             <div class="text-[11px] text-slate-500 mt-0.5">
-                              ${
-                                activeDetailCust.address &&
-                                activeDetailCust.address.toLowerCase() !==
-                                  (activeDetailCust.locality || '').toLowerCase()
-                                  ? `${escapeHtml(activeDetailCust.address)} · `
-                                  : ''
-                              }${escapeHtml(activeDetailCust.locality || 'Angola')}
+                              ${escapeHtml(
+                                [
+                                  activeDetailCust.address &&
+                                  activeDetailCust.address.toLowerCase() !==
+                                    (activeDetailCust.locality || '').toLowerCase()
+                                    ? activeDetailCust.address
+                                    : '',
+                                  activeDetailCust.municipality,
+                                  activeDetailCust.province,
+                                  !activeDetailCust.municipality && !activeDetailCust.province
+                                    ? activeDetailCust.locality || 'Angola'
+                                    : '',
+                                ]
+                                  .filter(Boolean)
+                                  .join(' · ')
+                              )} · Prazo: ${escapeHtml(detailPaymentTerm)}
                             </div>
+                            ${
+                              activeDetailCust.notes
+                                ? `<div class="text-[11px] text-slate-500 italic mt-1 truncate" title="${escapeHtml(activeDetailCust.notes)}">Obs.: ${escapeHtml(activeDetailCust.notes)}</div>`
+                                : ''
+                            }
+                            ${
+                              activeDetailCust.changeHistory && activeDetailCust.changeHistory.length > 0
+                                ? `<div class="text-[10px] text-slate-400 font-mono mt-1">
+                                    Última alteração: ${escapeHtml(activeDetailCust.changeHistory[0]!.summary)} (${formatDateTimePt(activeDetailCust.changeHistory[0]!.changedAtIso).slashDate} · ${escapeHtml(activeDetailCust.changeHistory[0]!.changedBy)})
+                                  </div>`
+                                : ''
+                            }
                           </div>
 
                           <div class="flex items-center gap-1.5 shrink-0">
@@ -12772,7 +13098,8 @@ export class SilaBillingApp {
                               type="button"
                               data-action="use-customer-in-pos"
                               data-id="${escapeHtml(activeDetailCust.id)}"
-                              class="h-8 px-2.5 rounded-lg bg-slate-900 text-white text-xs font-semibold hover:bg-slate-800 whitespace-nowrap"
+                              ${activeDetailCust.active === false ? 'disabled' : ''}
+                              class="h-8 px-2.5 rounded-lg bg-slate-900 text-white text-xs font-semibold hover:bg-slate-800 disabled:opacity-40 whitespace-nowrap"
                             >Nova Venda</button>
                           </div>
                         </div>
@@ -16521,8 +16848,11 @@ export class SilaBillingApp {
           <div class="flex flex-col sm:flex-row sm:items-center justify-between gap-3 pb-3 border-b border-slate-200">
             <div>
               <h1 class="text-sm font-bold text-slate-900">Ficha Mestre da Empresa</h1>
-              <p class="text-xs text-slate-500">
-                Identificação jurídica, enquadramento fiscal AGT, endereço, contactos, logótipo, séries, dados bancários, estabelecimentos e responsáveis.
+              <p
+                class="text-xs text-slate-500"
+                title="Identificação jurídica, enquadramento fiscal AGT, endereço, contactos, logótipo, séries, dados bancários, estabelecimentos e responsáveis."
+              >
+                Dados fiscais, séries e estabelecimentos
               </p>
             </div>
             <div class="flex items-center gap-2 shrink-0">

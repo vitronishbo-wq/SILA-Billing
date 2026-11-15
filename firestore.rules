@@ -174,29 +174,77 @@ service cloud.firestore {
         && data.updatedAt is timestamp;
     }
 
+    function isValidCustomerHistoryEntry(entry) {
+      return entry is map
+        && entry.keys().hasAll(['changedAtIso', 'changedBy', 'summary'])
+        && entry.keys().hasOnly(['changedAtIso', 'changedBy', 'summary'])
+        && entry.changedAtIso is string && entry.changedAtIso.size() >= 10 && entry.changedAtIso.size() <= 40
+        && entry.changedBy is string && entry.changedBy.size() >= 1 && entry.changedBy.size() <= 80
+        && entry.summary is string && entry.summary.size() >= 1 && entry.summary.size() <= 240;
+    }
+
+    function isValidCustomerType(ct) {
+      return ct is string && ct.size() <= 24
+        && (ct == 'CONSUMIDOR_FINAL' || ct == 'PARTICULAR' || ct == 'EMPRESA' || ct == 'ESTRANGEIRO');
+    }
+
+    function isValidCustomerPaymentTerms(pt) {
+      return pt is string && pt.size() <= 24
+        && (pt == 'IMEDIATO' || pt == '15_DIAS' || pt == '30_DIAS' || pt == '45_DIAS' || pt == '60_DIAS' || pt == 'PERSONALIZADO');
+    }
+
     function isValidCustomer(data, customerId) {
       return data.keys().hasAll([
           'id', 'ownerId', 'name', 'nif', 'locality', 'createdAt', 'updatedAt'
         ])
         && data.keys().hasOnly([
-          'id', 'ownerId', 'name', 'nif', 'locality', 'creditLimit', 'createdAt', 'updatedAt'
+          'id', 'ownerId', 'internalCode', 'customerType', 'active', 'name', 'nif', 'normalizedNif',
+          'countryCode', 'foreignTaxId', 'province', 'municipality', 'locality', 'creditLimit',
+          'paymentTerms', 'hasCreditAccount', 'notes', 'documentRef', 'specialCreditNotes',
+          'changeHistory', 'createdAt', 'updatedAt'
         ])
         && data.id is string && data.id == customerId && isValidId(data.id)
         && data.ownerId is string && data.ownerId == request.auth.uid && isValidId(data.ownerId)
+        && (!('internalCode' in data) || (data.internalCode is string && data.internalCode.size() <= 24))
+        && (!('customerType' in data) || isValidCustomerType(data.customerType))
+        && (!('active' in data) || data.active is bool)
         && data.name is string && data.name.size() >= 1 && data.name.size() <= 160
         && data.nif is string && data.nif.size() <= 32
+        && (!('normalizedNif' in data) || (data.normalizedNif is string && data.normalizedNif.size() <= 48))
+        && (!('countryCode' in data) || (data.countryCode is string && data.countryCode.size() <= 8))
+        && (!('foreignTaxId' in data) || (data.foreignTaxId is string && data.foreignTaxId.size() <= 40))
+        && (!('province' in data) || (data.province is string && data.province.size() <= 80))
+        && (!('municipality' in data) || (data.municipality is string && data.municipality.size() <= 80))
         && data.locality is string && data.locality.size() <= 160
         && (!('creditLimit' in data) || (data.creditLimit is number && data.creditLimit >= 0 && data.creditLimit <= 999999999))
+        && (!('paymentTerms' in data) || isValidCustomerPaymentTerms(data.paymentTerms))
+        && (!('hasCreditAccount' in data) || data.hasCreditAccount is bool)
+        && (!('notes' in data) || (data.notes is string && data.notes.size() <= 500))
+        && (!('documentRef' in data) || (data.documentRef is string && data.documentRef.size() <= 80))
+        && (!('specialCreditNotes' in data) || (data.specialCreditNotes is string && data.specialCreditNotes.size() <= 300))
+        && (!('changeHistory' in data) || (
+          data.changeHistory is list
+          && data.changeHistory.size() <= 20
+          && (data.changeHistory.size() == 0 || isValidCustomerHistoryEntry(data.changeHistory[0]))
+        ))
         && data.createdAt is timestamp
         && data.updatedAt is timestamp;
     }
 
     function isValidCustomerPrivate(data) {
       return data.keys().hasAll(['ownerId', 'phone', 'address', 'updatedAt'])
-        && data.keys().hasOnly(['ownerId', 'phone', 'address', 'updatedAt'])
+        && data.keys().hasOnly([
+          'ownerId', 'phone', 'email', 'address', 'bankName', 'bankIban',
+          'representativeName', 'representativePhone', 'updatedAt'
+        ])
         && data.ownerId is string && data.ownerId == request.auth.uid && isValidId(data.ownerId)
         && data.phone is string && data.phone.size() <= 40
+        && (!('email' in data) || (data.email is string && data.email.size() <= 120))
         && data.address is string && data.address.size() <= 200
+        && (!('bankName' in data) || (data.bankName is string && data.bankName.size() <= 80))
+        && (!('bankIban' in data) || (data.bankIban is string && data.bankIban.size() <= 48))
+        && (!('representativeName' in data) || (data.representativeName is string && data.representativeName.size() <= 120))
+        && (!('representativePhone' in data) || (data.representativePhone is string && data.representativePhone.size() <= 40))
         && data.updatedAt is timestamp;
     }
 
@@ -576,28 +624,57 @@ service cloud.firestore {
           'id', 'companyId', 'companyOwnerUid', 'updatedByUid', 'name', 'nif', 'locality', 'createdAt', 'updatedAt'
         ])
         && data.keys().hasOnly([
-          'id', 'companyId', 'companyOwnerUid', 'updatedByUid', 'name', 'nif', 'locality', 'creditLimit', 'createdAt', 'updatedAt'
+          'id', 'companyId', 'companyOwnerUid', 'updatedByUid', 'internalCode', 'customerType',
+          'active', 'name', 'nif', 'normalizedNif', 'countryCode', 'foreignTaxId',
+          'province', 'municipality', 'locality', 'creditLimit', 'paymentTerms', 'hasCreditAccount',
+          'notes', 'documentRef', 'specialCreditNotes', 'changeHistory', 'createdAt', 'updatedAt'
         ])
         && data.id is string && data.id == customerId && isValidId(data.id)
         && data.companyId is string && data.companyId == companyId && isValidId(data.companyId)
         && data.companyOwnerUid is string && isValidId(data.companyOwnerUid)
         && data.updatedByUid is string && data.updatedByUid == request.auth.uid && isValidId(data.updatedByUid)
+        && (!('internalCode' in data) || (data.internalCode is string && data.internalCode.size() <= 24))
+        && (!('customerType' in data) || isValidCustomerType(data.customerType))
+        && (!('active' in data) || data.active is bool)
         && data.name is string && data.name.size() >= 1 && data.name.size() <= 160
         && data.nif is string && data.nif.size() <= 32
+        && (!('normalizedNif' in data) || (data.normalizedNif is string && data.normalizedNif.size() <= 48))
+        && (!('countryCode' in data) || (data.countryCode is string && data.countryCode.size() <= 8))
+        && (!('foreignTaxId' in data) || (data.foreignTaxId is string && data.foreignTaxId.size() <= 40))
+        && (!('province' in data) || (data.province is string && data.province.size() <= 80))
+        && (!('municipality' in data) || (data.municipality is string && data.municipality.size() <= 80))
         && data.locality is string && data.locality.size() <= 160
         && (!('creditLimit' in data) || (data.creditLimit is number && data.creditLimit >= 0 && data.creditLimit <= 999999999))
+        && (!('paymentTerms' in data) || isValidCustomerPaymentTerms(data.paymentTerms))
+        && (!('hasCreditAccount' in data) || data.hasCreditAccount is bool)
+        && (!('notes' in data) || (data.notes is string && data.notes.size() <= 500))
+        && (!('documentRef' in data) || (data.documentRef is string && data.documentRef.size() <= 80))
+        && (!('specialCreditNotes' in data) || (data.specialCreditNotes is string && data.specialCreditNotes.size() <= 300))
+        && (!('changeHistory' in data) || (
+          data.changeHistory is list
+          && data.changeHistory.size() <= 20
+          && (data.changeHistory.size() == 0 || isValidCustomerHistoryEntry(data.changeHistory[0]))
+        ))
         && data.createdAt is timestamp
         && data.updatedAt is timestamp;
     }
 
     function isValidCompanyCustomerPrivate(data, companyId) {
       return data.keys().hasAll(['companyId', 'companyOwnerUid', 'updatedByUid', 'phone', 'address', 'updatedAt'])
-        && data.keys().hasOnly(['companyId', 'companyOwnerUid', 'updatedByUid', 'phone', 'address', 'updatedAt'])
+        && data.keys().hasOnly([
+          'companyId', 'companyOwnerUid', 'updatedByUid', 'phone', 'email', 'address',
+          'bankName', 'bankIban', 'representativeName', 'representativePhone', 'updatedAt'
+        ])
         && data.companyId is string && data.companyId == companyId && isValidId(data.companyId)
         && data.companyOwnerUid is string && isValidId(data.companyOwnerUid)
         && data.updatedByUid is string && data.updatedByUid == request.auth.uid && isValidId(data.updatedByUid)
         && data.phone is string && data.phone.size() <= 40
+        && (!('email' in data) || (data.email is string && data.email.size() <= 120))
         && data.address is string && data.address.size() <= 200
+        && (!('bankName' in data) || (data.bankName is string && data.bankName.size() <= 80))
+        && (!('bankIban' in data) || (data.bankIban is string && data.bankIban.size() <= 48))
+        && (!('representativeName' in data) || (data.representativeName is string && data.representativeName.size() <= 120))
+        && (!('representativePhone' in data) || (data.representativePhone is string && data.representativePhone.size() <= 40))
         && data.updatedAt is timestamp;
     }
 
@@ -1110,7 +1187,10 @@ service cloud.firestore {
         && incoming().updatedAt == request.time
         && (
           incoming().diff(existing()).affectedKeys().hasOnly([
-            'name', 'nif', 'locality', 'creditLimit', 'updatedAt'
+            'internalCode', 'customerType', 'active', 'name', 'nif', 'normalizedNif',
+            'countryCode', 'foreignTaxId', 'province', 'municipality', 'locality',
+            'creditLimit', 'paymentTerms', 'hasCreditAccount', 'notes', 'documentRef',
+            'specialCreditNotes', 'changeHistory', 'updatedAt'
           ])
         );
 
@@ -1145,7 +1225,10 @@ service cloud.firestore {
           && incoming().ownerId == existing().ownerId
           && incoming().updatedAt == request.time
           && (
-            incoming().diff(existing()).affectedKeys().hasOnly(['phone', 'address', 'updatedAt'])
+            incoming().diff(existing()).affectedKeys().hasOnly([
+              'phone', 'email', 'address', 'bankName', 'bankIban',
+              'representativeName', 'representativePhone', 'updatedAt'
+            ])
           )
           && get(/databases/$(database)/documents/users/$(userId)/customers/$(customerId)).data.ownerId == request.auth.uid;
 
@@ -1564,7 +1647,10 @@ service cloud.firestore {
               canSyncCompanyCloudData(companyId)
               && isCompanyOwnerOrManager(companyId)
               && incoming().diff(existing()).affectedKeys().hasOnly([
-                'updatedByUid', 'name', 'nif', 'locality', 'creditLimit', 'updatedAt'
+                'updatedByUid', 'internalCode', 'customerType', 'active', 'name', 'nif',
+                'normalizedNif', 'countryCode', 'foreignTaxId', 'province', 'municipality',
+                'locality', 'creditLimit', 'paymentTerms', 'hasCreditAccount', 'notes',
+                'documentRef', 'specialCreditNotes', 'changeHistory', 'updatedAt'
               ])
             )
             || isPlatformAdmin()
@@ -1608,7 +1694,8 @@ service cloud.firestore {
                 canSyncCompanyCloudData(companyId)
                 && isCompanyOwnerOrManager(companyId)
                 && incoming().diff(existing()).affectedKeys().hasOnly([
-                  'updatedByUid', 'phone', 'address', 'updatedAt'
+                  'updatedByUid', 'phone', 'email', 'address', 'bankName', 'bankIban',
+                  'representativeName', 'representativePhone', 'updatedAt'
                 ])
               )
               || isPlatformAdmin()

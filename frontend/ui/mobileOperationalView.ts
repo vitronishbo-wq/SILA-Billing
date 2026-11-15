@@ -9,16 +9,23 @@ import {
 } from '../../src/core/companyValidator';
 import type { AgtSeriesRecord } from '../../src/core/fiscalTypes';
 import {
+  CUSTOMER_TYPE_LABELS,
+  FOREIGN_COUNTRY_OPTIONS,
+  inferCustomerType,
+} from '../../src/core/customerValidator';
+import {
   AppSettings,
   CartDraftItem,
   CompanyProfile,
   CompanyRecord,
   Customer,
+  CustomerType,
   DEFAULT_IVA_EXEMPTION_REASONS,
   DEFAULT_PRODUCT_CATEGORIES,
   DEFAULT_PRODUCT_UNITS,
   DocumentType,
   EstablishmentRecord,
+  getDirectCustomerIdForCompany,
   InvoiceRecord,
   PaymentMethod,
   Product,
@@ -29,6 +36,7 @@ import {
   CompanyMasterSectionTab,
   renderCompanyMasterSection,
 } from './companyMasterForm';
+import { renderCustomerMasterForm } from './customerForm';
 import { ICONS } from './icons';
 
 export type MobileTab = 'HOME' | 'SALE' | 'DOCS' | 'CUSTOMERS' | 'MORE' | 'PRODUCTS';
@@ -74,6 +82,23 @@ export interface MobileOperationalProps {
   showQuickCompanyModal: boolean;
   showCustomerPickerModal: boolean;
   editingMobileProduct: Product | null;
+  editingCustomer: Customer | null;
+  editingCustomerCreditLimitInput: string;
+  showCustomerAdvancedFields: boolean;
+  mobileCustomerModalMode: 'QUICK' | 'FULL';
+  canEditExistingCustomers: boolean;
+  quickCustomerDraft: {
+    name: string;
+    nif: string;
+    phone: string;
+    address: string;
+    locality: string;
+    customerType?: CustomerType;
+    countryCode?: string;
+    foreignTaxId?: string;
+  };
+  quickProductError?: string | null;
+  quickCustomerError?: string | null;
   operator: string;
 }
 
@@ -128,10 +153,10 @@ export function renderMobileOperationalView(props: MobileOperationalProps): stri
       <!-- Modais Operacionais Mobile -->
       ${
         props.showQuickProductModal
-          ? renderMobileProductModal(props.editingMobileProduct, nextSku)
+          ? renderMobileProductModal(props.editingMobileProduct, nextSku, props.quickProductError)
           : ''
       }
-      ${props.showQuickCustomerModal ? renderMobileQuickCustomerModal() : ''}
+      ${props.showQuickCustomerModal ? renderMobileQuickCustomerModal(props) : ''}
       ${props.showQuickCompanyModal ? renderMobileQuickCompanyModal(props) : ''}
       ${props.showCustomerPickerModal ? renderMobileCustomerPickerModal(props) : ''}
     </div>
@@ -1238,16 +1263,21 @@ function renderMobileDocs(props: MobileOperationalProps): string {
 
 // ==================== 7. ECRÃ DE CLIENTES ====================
 function renderMobileCustomers(props: MobileOperationalProps): string {
-  const { customers } = props;
+  const { activeCompany, customers, canEditExistingCustomers } = props;
+  const directCustId = getDirectCustomerIdForCompany(activeCompany.id);
 
   return `
     <div class="p-3.5 flex flex-col gap-3 max-w-lg mx-auto">
-      <div class="flex items-center justify-between pb-1 border-b border-slate-800">
-        <h2 class="text-base font-bold text-white">Clientes Cadastrados</h2>
+      <div class="flex items-center justify-between pb-2 border-b border-slate-800">
+        <div>
+          <h2 class="text-base font-bold text-white">Clientes Cadastrados</h2>
+          <p class="text-[11px] text-slate-400 tabular-nums">${customers.length} registo(s)</p>
+        </div>
         <button
           type="button"
           data-action="mobile-open-quick-customer"
-          class="h-8 px-3 rounded-lg bg-blue-600 hover:bg-blue-500 text-white text-xs font-semibold flex items-center gap-1 active:scale-95"
+          data-value="FULL"
+          class="h-10 px-3 rounded-lg bg-blue-600 hover:bg-blue-500 text-white text-xs font-semibold flex items-center gap-1 active:scale-95"
         >
           ${ICONS.plus}
           <span>Novo Cliente</span>
@@ -1255,25 +1285,56 @@ function renderMobileCustomers(props: MobileOperationalProps): string {
       </div>
 
       <div class="flex flex-col gap-2">
-        ${customers.map(
-          (c) => `
-          <div class="bg-slate-900 border border-slate-800 rounded-xl p-3 flex items-center justify-between gap-2 shadow-sm">
+        ${customers
+          .map((c) => {
+            const isDirect = c.id === directCustId;
+            const cType = inferCustomerType(c, directCustId);
+            const isInactive = c.active === false;
+            return `
+          <div class="bg-slate-900 border ${isInactive ? 'border-slate-800/60 opacity-75' : 'border-slate-800'} rounded-xl p-3 flex items-center justify-between gap-2 shadow-sm">
             <div class="min-w-0 flex-1">
-              <p class="text-sm font-semibold text-white truncate">${escapeHtml(c.name)}</p>
-              <p class="text-xs text-slate-400 font-mono tabular-nums">NIF: ${escapeHtml(c.nif || 'Consumidor Final')}</p>
-              ${c.phone ? `<p class="text-xs text-slate-500">Tel: ${escapeHtml(c.phone)}</p>` : ''}
+              <div class="flex items-center gap-1.5 min-w-0">
+                ${
+                  c.internalCode
+                    ? `<span class="text-[10px] font-mono text-slate-400 shrink-0">${escapeHtml(c.internalCode)}</span>`
+                    : ''
+                }
+                <p class="text-sm font-semibold text-white truncate">${escapeHtml(c.name)}</p>
+              </div>
+              <p class="text-[11px] text-slate-400 font-mono tabular-nums mt-0.5 truncate">
+                ${escapeHtml(CUSTOMER_TYPE_LABELS[cType])} · ${
+                  cType === 'ESTRANGEIRO'
+                    ? `${escapeHtml(c.countryCode || 'OUT')} ${escapeHtml(c.foreignTaxId || c.nif)}`
+                    : `NIF: ${escapeHtml(c.nif || 'Consumidor Final')}`
+                }${isInactive ? ' · Inactivo' : ''}
+              </p>
+              ${c.phone ? `<p class="text-[11px] text-slate-500 font-mono">${escapeHtml(c.phone)}</p>` : ''}
             </div>
-            <button
-              type="button"
-              data-action="mobile-select-customer-and-sale"
-              data-customer-id="${escapeHtml(c.id)}"
-              class="h-8 px-2.5 rounded-lg bg-slate-800 hover:bg-blue-600 text-slate-300 hover:text-white text-xs font-medium active:scale-95 transition-colors shrink-0"
-            >
-              Vender
-            </button>
+            <div class="flex items-center gap-1.5 shrink-0">
+              ${
+                canEditExistingCustomers && !isDirect
+                  ? `<button
+                      type="button"
+                      data-action="mobile-edit-customer"
+                      data-customer-id="${escapeHtml(c.id)}"
+                      class="h-10 px-2.5 rounded-lg bg-slate-800 hover:bg-slate-700 text-slate-200 text-xs font-medium active:scale-95"
+                    >Editar</button>`
+                  : ''
+              }
+              <button
+                type="button"
+                data-action="mobile-select-customer-and-sale"
+                data-customer-id="${escapeHtml(c.id)}"
+                ${isInactive ? 'disabled' : ''}
+                class="h-10 px-3 rounded-lg bg-blue-600/20 hover:bg-blue-600 text-blue-300 hover:text-white disabled:opacity-35 text-xs font-semibold active:scale-95 transition-colors shrink-0"
+              >
+                Vender
+              </button>
+            </div>
           </div>
-        `
-        ).join('')}
+        `;
+          })
+          .join('')}
       </div>
     </div>
   `;
@@ -1466,7 +1527,11 @@ function renderMobileBottomNav(activeTab: MobileTab, cartItemCount: number): str
 }
 
 // ==================== 10. MODAL COMPLETO DE CADASTRAMENTO E EDIÇÃO DE PRODUTOS ====================
-function renderMobileProductModal(editingProduct: Product | null, nextSku: string): string {
+function renderMobileProductModal(
+  editingProduct: Product | null,
+  nextSku: string,
+  errorMsg?: string | null
+): string {
   const isEditing = Boolean(editingProduct);
   const p = editingProduct;
 
@@ -1505,7 +1570,7 @@ function renderMobileProductModal(editingProduct: Product | null, nextSku: strin
               <h3 class="text-sm font-bold text-white leading-tight">
                 ${isEditing ? `Editar Artigo: ${escapeHtml(currentCode)}` : 'Cadastrar Novo Artigo'}
               </h3>
-              <p class="text-[11px] text-slate-400">Ficha operacional completa (9 requisitos fiscais)</p>
+              <p class="text-[11px] text-slate-400">Dados comerciais e IVA</p>
             </div>
           </div>
           <button
@@ -1520,6 +1585,11 @@ function renderMobileProductModal(editingProduct: Product | null, nextSku: strin
         <!-- Formulário Scrollável com as 9 Áreas -->
         <form id="mobile-quick-product-form" class="flex-1 overflow-y-auto p-5 flex flex-col gap-4 text-xs">
           ${isEditing ? `<input type="hidden" name="productId" value="${escapeHtml(p!.id)}" />` : ''}
+          ${
+            errorMsg
+              ? `<div class="p-3 rounded-xl bg-red-950/70 border border-red-800/80 text-red-200 text-xs font-medium">${escapeHtml(errorMsg)}</div>`
+              : ''
+          }
 
           <!-- SEÇÃO 1: Identificação (Nome, SKU, Código de Barras, Tipo/Categoria) -->
           <div class="flex flex-col gap-2.5">
@@ -1658,7 +1728,7 @@ function renderMobileProductModal(editingProduct: Product | null, nextSku: strin
                   ${
                     numCost > 0
                       ? `${profit >= 0 ? '+' : ''}${formatKzNumber(profit)} Kz`
-                      : 'Indique custo para calcular lucro'
+                      : 'Sem custo definido'
                   }
                 </span>
               </div>
@@ -1793,14 +1863,92 @@ function renderMobileProductModal(editingProduct: Product | null, nextSku: strin
 
 // ==================== 11. MODAIS AUXILIARES (CLIENTE, EMPRESA, SELETOR) ====================
 
-function renderMobileQuickCustomerModal(): string {
+function renderMobileQuickCustomerModal(props: MobileOperationalProps): string {
+  const {
+    activeCompany,
+    mobileCustomerModalMode,
+    editingCustomer,
+    editingCustomerCreditLimitInput,
+    showCustomerAdvancedFields,
+    quickCustomerDraft,
+    quickCustomerError,
+    canEditExistingCustomers,
+    settings,
+  } = props;
+  const directCustId = getDirectCustomerIdForCompany(activeCompany.id);
+  const isEditingExisting = Boolean(
+    editingCustomer && props.customers.some((c) => c.id === editingCustomer.id)
+  );
+  const defaultLoc = settings.company.cityCountry || activeCompany.profile.cityCountry || 'Angola';
+
+  if (mobileCustomerModalMode === 'FULL') {
+    const customerToRender: Customer = editingCustomer || {
+      id: '',
+      companyId: activeCompany.id,
+      customerType: quickCustomerDraft.customerType || 'PARTICULAR',
+      active: true,
+      name: quickCustomerDraft.name || '',
+      nif: quickCustomerDraft.nif || '',
+      countryCode: quickCustomerDraft.countryCode || 'AO',
+      foreignTaxId: quickCustomerDraft.foreignTaxId || '',
+      phone: quickCustomerDraft.phone || '',
+      address: quickCustomerDraft.address || '',
+      locality: quickCustomerDraft.locality || defaultLoc,
+      paymentTerms: 'IMEDIATO',
+      syncState: 'pending',
+      synced: false,
+      createdAtIso: new Date().toISOString(),
+      updatedAtIso: new Date().toISOString(),
+    };
+
+    return `
+      <div class="fixed inset-0 z-50 bg-black/80 backdrop-blur-sm flex items-end sm:items-center justify-center p-0 sm:p-4 animate-in fade-in">
+        <div class="bg-slate-950 border border-slate-800 w-full max-w-lg rounded-t-3xl sm:rounded-2xl p-4 flex flex-col gap-3 max-h-[92dvh] overflow-y-auto">
+          <div class="flex items-center justify-between pb-2 border-b border-slate-800 shrink-0">
+            <h3 class="text-base font-bold text-white flex items-center gap-2">
+              ${ICONS.users}
+              <span>${isEditingExisting ? 'Editar Cliente' : 'Cadastro de Cliente'}</span>
+            </h3>
+            <div class="flex items-center gap-1.5">
+              ${
+                !isEditingExisting
+                  ? `<button type="button" data-action="mobile-toggle-customer-full-form" class="h-8 px-2.5 rounded-lg bg-slate-800 text-slate-300 text-[11px] font-medium">Modo Rápido POS</button>`
+                  : ''
+              }
+              <button type="button" data-action="mobile-close-modals" class="text-slate-400 hover:text-white p-1.5">
+                ${ICONS.close}
+              </button>
+            </div>
+          </div>
+
+          ${renderCustomerMasterForm({
+            mode: 'MOBILE',
+            companyId: activeCompany.id,
+            customer: customerToRender,
+            creditLimitInput: editingCustomerCreditLimitInput,
+            formId: 'mobile-quick-customer-form',
+            isDirectCustomer: customerToRender.id === directCustId,
+            showAdvanced: showCustomerAdvancedFields,
+            errorMessage: quickCustomerError || null,
+            canManage: isEditingExisting ? canEditExistingCustomers : true,
+            defaultLocality: defaultLoc,
+          })}
+        </div>
+      </div>
+    `;
+  }
+
+  const qType: CustomerType = quickCustomerDraft.customerType || 'PARTICULAR';
+  const isForeign = qType === 'ESTRANGEIRO';
+  const isEmpresa = qType === 'EMPRESA';
+
   return `
     <div class="fixed inset-0 z-50 bg-black/80 backdrop-blur-sm flex items-end sm:items-center justify-center p-0 sm:p-4 animate-in fade-in">
-      <div class="bg-slate-900 border border-slate-800 w-full max-w-md rounded-t-3xl sm:rounded-2xl p-5 flex flex-col gap-4 max-h-[90dvh] overflow-y-auto">
+      <div class="bg-slate-900 border border-slate-800 w-full max-w-md rounded-t-3xl sm:rounded-2xl p-5 flex flex-col gap-3.5 max-h-[90dvh] overflow-y-auto">
         <div class="flex items-center justify-between pb-2 border-b border-slate-800">
           <h3 class="text-base font-bold text-white flex items-center gap-2">
             ${ICONS.users}
-            <span>Novo Cliente</span>
+            <span>Cadastro Rápido POS</span>
           </h3>
           <button type="button" data-action="mobile-close-modals" class="text-slate-400 hover:text-white p-1">
             ${ICONS.close}
@@ -1808,26 +1956,74 @@ function renderMobileQuickCustomerModal(): string {
         </div>
 
         <form id="mobile-quick-customer-form" class="flex flex-col gap-3">
+          ${
+            quickCustomerError
+              ? `<div class="p-3 rounded-xl bg-red-950/70 border border-red-800/80 text-red-200 text-xs font-medium">${escapeHtml(quickCustomerError)}</div>`
+              : ''
+          }
+
+          <div class="grid grid-cols-3 gap-1.5 bg-slate-950 p-1 rounded-xl border border-slate-800">
+            ${(['PARTICULAR', 'EMPRESA', 'ESTRANGEIRO'] as CustomerType[])
+              .map(
+                (t) => `<button
+                  type="button"
+                  data-action="mobile-set-quick-customer-type"
+                  data-value="${t}"
+                  class="h-9 rounded-lg text-xs font-semibold transition-colors ${
+                    qType === t ? 'bg-blue-600 text-white' : 'text-slate-400 hover:text-white'
+                  }"
+                >${escapeHtml(CUSTOMER_TYPE_LABELS[t])}</button>`
+              )
+              .join('')}
+          </div>
+          <input type="hidden" name="customerType" value="${qType}" />
+
           <div>
-            <label class="text-xs font-medium text-slate-300 block mb-1">Nome do Cliente *</label>
+            <label class="text-xs font-medium text-slate-300 block mb-1">${isEmpresa ? 'Denominação social *' : 'Nome completo *'}</label>
             <input
               type="text"
               name="name"
               required
-              placeholder="Ex.: António Manuel ou Empresa XYZ"
+              value="${escapeHtml(quickCustomerDraft.name || '')}"
+              placeholder="${isEmpresa ? 'Nome da empresa' : 'Nome do cliente'}"
               class="w-full h-11 px-3 rounded-xl bg-slate-950 border border-slate-700 text-sm text-white focus:outline-none focus:border-blue-500"
             />
           </div>
 
-          <div>
-            <label class="text-xs font-medium text-slate-300 block mb-1">NIF (ou 999999999 para Consumidor Final)</label>
-            <input
-              type="text"
-              name="nif"
-              placeholder="Ex.: 5001234567"
-              class="w-full h-11 px-3 rounded-xl bg-slate-950 border border-slate-700 text-sm text-white font-mono tabular-nums focus:outline-none focus:border-blue-500"
-            />
-          </div>
+          ${
+            isForeign
+              ? `<div class="grid grid-cols-2 gap-2">
+                  <div>
+                    <label class="text-xs font-medium text-slate-300 block mb-1">País *</label>
+                    <select name="countryCode" class="w-full h-11 px-2.5 rounded-xl bg-slate-950 border border-slate-700 text-sm text-white focus:outline-none focus:border-blue-500">
+                      ${FOREIGN_COUNTRY_OPTIONS.map(
+                        (opt) =>
+                          `<option value="${opt.code}" ${(quickCustomerDraft.countryCode || 'PT') === opt.code ? 'selected' : ''}>${escapeHtml(opt.name)}</option>`
+                      ).join('')}
+                    </select>
+                  </div>
+                  <div>
+                    <label class="text-xs font-medium text-slate-300 block mb-1">ID Fiscal *</label>
+                    <input
+                      type="text"
+                      name="foreignTaxId"
+                      value="${escapeHtml(quickCustomerDraft.foreignTaxId || '')}"
+                      placeholder="NIF / VAT"
+                      class="w-full h-11 px-3 rounded-xl bg-slate-950 border border-slate-700 text-sm text-white font-mono tabular-nums focus:outline-none focus:border-blue-500"
+                    />
+                  </div>
+                </div>`
+              : `<div>
+                  <label class="text-xs font-medium text-slate-300 block mb-1">NIF${isEmpresa ? ' *' : ''}</label>
+                  <input
+                    type="text"
+                    name="nif"
+                    value="${escapeHtml(quickCustomerDraft.nif || '')}"
+                    placeholder="${isEmpresa ? '5001234567' : 'NIF (opcional para venda directa)'}"
+                    class="w-full h-11 px-3 rounded-xl bg-slate-950 border border-slate-700 text-sm text-white font-mono tabular-nums focus:outline-none focus:border-blue-500"
+                  />
+                </div>`
+          }
 
           <div class="grid grid-cols-2 gap-2">
             <div>
@@ -1835,22 +2031,43 @@ function renderMobileQuickCustomerModal(): string {
               <input
                 type="tel"
                 name="phone"
-                placeholder="Ex.: 923456789"
+                value="${escapeHtml(quickCustomerDraft.phone || '')}"
+                placeholder="+244 ..."
                 class="w-full h-11 px-3 rounded-xl bg-slate-950 border border-slate-700 text-sm text-white font-mono focus:outline-none focus:border-blue-500"
               />
             </div>
             <div>
-              <label class="text-xs font-medium text-slate-300 block mb-1">Localidade</label>
+              <label class="text-xs font-medium text-slate-300 block mb-1">Município / Cidade</label>
               <input
                 type="text"
                 name="locality"
-                placeholder="Ex.: Luanda"
+                value="${escapeHtml(quickCustomerDraft.locality || defaultLoc)}"
+                placeholder="Luanda"
                 class="w-full h-11 px-3 rounded-xl bg-slate-950 border border-slate-700 text-sm text-white focus:outline-none focus:border-blue-500"
               />
             </div>
           </div>
 
-          <div class="pt-2 flex gap-2">
+          <div>
+            <label class="text-xs font-medium text-slate-300 block mb-1">Morada${isEmpresa ? ' *' : ''}</label>
+            <input
+              type="text"
+              name="address"
+              value="${escapeHtml(quickCustomerDraft.address || '')}"
+              placeholder="Rua, bairro, edifício..."
+              class="w-full h-11 px-3 rounded-xl bg-slate-950 border border-slate-700 text-sm text-white focus:outline-none focus:border-blue-500"
+            />
+          </div>
+
+          <button
+            type="button"
+            data-action="mobile-toggle-customer-full-form"
+            class="h-9 rounded-lg border border-slate-700 text-slate-300 hover:text-white text-xs font-medium"
+          >
+            Abrir ficha completa (5 secções)
+          </button>
+
+          <div class="pt-1 flex gap-2">
             <button
               type="submit"
               class="flex-1 h-12 rounded-xl bg-blue-600 hover:bg-blue-500 text-white font-bold text-sm shadow-md active:scale-[0.98]"
@@ -1905,7 +2122,7 @@ function renderMobileQuickCompanyModal(props: MobileOperationalProps): string {
             </div>
             <div class="min-w-0">
               <h3 class="text-sm font-bold text-white truncate">Ficha Mestre da Empresa</h3>
-              <p class="text-[11px] text-slate-400 truncate">9 secções fiscais e operacionais · Paridade total</p>
+              <p class="text-[11px] text-slate-400 truncate">Dados fiscais e séries AGT</p>
             </div>
           </div>
           <button
@@ -1985,22 +2202,29 @@ function renderMobileCustomerPickerModal(props: MobileOperationalProps): string 
 
         <div class="overflow-y-auto divide-y divide-slate-800/80 pr-1 max-h-[60dvh]">
           ${customers
-            .map(
-              (c) => `
+            .map((c) => {
+              const isInactive = c.active === false;
+              const cType = inferCustomerType(c, getDirectCustomerIdForCompany(props.activeCompany.id));
+              return `
             <button
               type="button"
               data-action="mobile-choose-customer"
               data-customer-id="${escapeHtml(c.id)}"
-              class="w-full p-3 text-left hover:bg-slate-800/60 flex items-center justify-between transition-colors"
+              ${isInactive ? 'disabled' : ''}
+              class="w-full p-3 text-left hover:bg-slate-800/60 disabled:opacity-45 flex items-center justify-between transition-colors"
             >
-              <div>
-                <p class="text-sm font-semibold text-white">${escapeHtml(c.name)}</p>
-                <p class="text-xs text-slate-400 font-mono tabular-nums">NIF: ${escapeHtml(c.nif || 'Consumidor Final')}</p>
+              <div class="min-w-0">
+                <p class="text-sm font-semibold text-white truncate">
+                  ${c.internalCode ? `<span class="text-[11px] font-mono text-slate-400 mr-1">${escapeHtml(c.internalCode)}</span>` : ''}${escapeHtml(c.name)}
+                </p>
+                <p class="text-xs text-slate-400 font-mono tabular-nums truncate">
+                  ${escapeHtml(CUSTOMER_TYPE_LABELS[cType])} · ${escapeHtml(c.nif || 'Consumidor Final')}${isInactive ? ' · Inactivo' : ''}
+                </p>
               </div>
-              <span class="text-slate-500">${ICONS.chevronRight}</span>
+              <span class="text-slate-500 shrink-0">${ICONS.chevronRight}</span>
             </button>
-          `
-            )
+          `;
+            })
             .join('')}
         </div>
 
@@ -2008,6 +2232,7 @@ function renderMobileCustomerPickerModal(props: MobileOperationalProps): string 
           <button
             type="button"
             data-action="mobile-open-quick-customer"
+            data-value="QUICK"
             class="w-full h-11 rounded-xl bg-emerald-700 hover:bg-emerald-600 text-white font-bold text-xs flex items-center justify-center gap-1.5"
           >
             ${ICONS.plus}

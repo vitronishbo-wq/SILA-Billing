@@ -324,19 +324,35 @@ companiesRouter.get(
       const customers = await Promise.all(
         custSnap.docs.map(async (d) => {
           let phone = '';
+          let email = '';
           let address = '';
+          let bankName = '';
+          let bankIban = '';
+          let representativeName = '';
+          let representativePhone = '';
           if (includePrivatePii) {
             const priv = await d.ref.collection('private').doc('contact').get();
             if (priv.exists) {
-              phone = String(priv.data()?.phone || '');
-              address = String(priv.data()?.address || '');
+              const pData = priv.data();
+              phone = String(pData?.phone || '');
+              email = String(pData?.email || '');
+              address = String(pData?.address || '');
+              bankName = String(pData?.bankName || '');
+              bankIban = String(pData?.bankIban || '');
+              representativeName = String(pData?.representativeName || '');
+              representativePhone = String(pData?.representativePhone || '');
             }
           }
           return {
             id: d.id,
             ...d.data(),
             phone,
+            email,
             address,
+            ...(bankName ? { bankName } : {}),
+            ...(bankIban ? { bankIban } : {}),
+            ...(representativeName ? { representativeName } : {}),
+            ...(representativePhone ? { representativePhone } : {}),
           };
         })
       );

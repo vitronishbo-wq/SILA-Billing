@@ -155,7 +155,9 @@ export function calculateInvoiceTotals(
     }
   }
 
-  const merchandiseTotal = Math.max(0, roundKz(grossItemsTotal - discountTotal));
+  const merchandiseTotal = roundKz(
+    taxBase14 + taxBaseIntermediate + taxBaseReduced + taxBase0
+  );
   const taxTotal = roundKz(taxAmount14 + taxAmountIntermediate + taxAmountReduced);
   const grandTotal = roundKz(merchandiseTotal + taxTotal);
 

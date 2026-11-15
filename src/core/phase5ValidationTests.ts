@@ -1,0 +1,1371 @@
+/**
+ * SILA-Billing — Suíte de Testes e Validação Integral (Fase 5)
+ *
+ * Cobre os 5 pilares exigidos na Fase 5:
+ * 1. Fiscalidade & Cálculos Tributários (multi-taxa 0%, 1% Cabinda, 5%, 7%, 14%, retenções, descontos, NC/ND)
+ * 2. Isolamento Multiempresa & Snapshots Históricos Imutáveis
+ * 3. Funcionamento Offline & Persistência Determinística
+ * 4. Sincronização Cloud & Conformidade estrita com allowlists de `firestore.rules`
+ * 5. Regressão (Paridade Desktop/Mobile + Bugfix IVA 0%) e Validação Estrita XSD SAF-T (AO) v1.01_01
+ */
+
+import {
+  buildMasterProfileMap,
+  hydrateProfileFromCloud,
+  sanitizeEstablishmentsForCloud,
+  sanitizeIssuerSnapshotForCloud,
+  sanitizeWarehousesForCloud,
+} from './cloudMasterMapper.ts';
+import {
+  calculateInvoiceTotals,
+} from './billingEngine.ts';
+import {
+  evaluateCompanyMasterCompleteness,
+  validateLogoDataUrl,
+} from './companyValidator.ts';
+import {
+  generateSaftAoXml,
+} from './saftGenerator.ts';
+import {
+  validateSaftAoXsdStrict,
+} from './saftXsdValidator.ts';
+import {
+  listarSeries,
+  mergeSeriesFromCloud,
+  obterSerieAtiva,
+  reservarProximoNumeroFiscal,
+  seriesStorage,
+  solicitarSerie,
+  validarPermissaoEmissaoFiscal,
+} from './seriesManager.ts';
+import {
+  calculateAgtDocumentTotals,
+  calculateAgtLineItem,
+  convertCartItemsToAgtLines,
+  validateAgtTaxCompliance,
+} from './taxEngine.ts';
+import {
+  buildInvoiceIssuerSnapshot,
+  createDefaultEstablishmentForCompany,
+  JAIMONA_COMPANY,
+  JAIMONA_COMPANY_ID,
+  resolveCompanyProfileFromSnapshot,
+  VITRONIS_INSTITUTIONAL,
+  type CompanyProfile,
+  type Customer,
+  type InvoiceRecord,
+  type Product,
+  type Supplier,
+  type TaxRate,
+} from './types.ts';
+import { normalizeCompanyMasterProfile } from '../services/localStore.ts';
+import {
+  generateNextCustomerInternalCode,
+  validateAndBuildCustomer,
+  validateCustomerForInvoiceEmission,
+} from './customerValidator.ts';
+import { renderCustomerMasterForm } from '../../frontend/ui/customerForm.ts';
+import { renderDocumentHtml } from '../../frontend/ui/documentRenderer.ts';
+import { renderMobileOperationalView } from '../../frontend/ui/mobileOperationalView.ts';
+
+function assert(condition: boolean, message: string): void {
+  if (!condition) {
+    throw new Error(`[FASE 5 FALHA]: ${message}`);
+  }
+}
+
+// Allowlists espelhadas exactamente de `firestore.rules`
+const FIRESTORE_MASTER_PROFILE_KEYS = new Set([
+  'legalNature', 'cae', 'commercialRegistry', 'shareCapital', 'taxRegime', 'taxOffice',
+  'taxEntity', 'defaultExemptionCode', 'isVatRetentionAgent', 'defaultWithholdingTax',
+  'specialTaxTerritory', 'agtEnvironment', 'activityStartDate', 'municipality', 'province',
+  'postalCode', 'country', 'mobile', 'whatsapp', 'billingEmail', 'website', 'logoUrl',
+  'showLogoOnPos', 'showLogoOnA4', 'bankName1', 'iban1', 'accountHolder1', 'swift1',
+  'bankName2', 'iban2', 'accountHolder2', 'swift2', 'multicaixaExpressPhone',
+  'defaultPaymentTermsDays', 'defaultEstablishmentId', 'establishments', 'warehouses',
+  'legalRepresentativeName', 'legalRepresentativeRole', 'legalRepresentativeNif',
+  'legalRepresentativePhone', 'accountantName', 'accountantOcpcaNumber',
+  'accountantEmail', 'accountantPhone',
+]);
+
+const FIRESTORE_ESTABLISHMENT_KEYS = new Set([
+  'id', 'code', 'name', 'isHeadquarters', 'address', 'municipality',
+  'province', 'phone', 'email', 'defaultCashierCode', 'defaultWarehouseId', 'active',
+]);
+
+const FIRESTORE_WAREHOUSE_KEYS = new Set([
+  'id', 'code', 'name', 'establishmentId', 'address', 'active',
+]);
+
+const FIRESTORE_SNAPSHOT_KEYS = new Set([
+  'companyId', 'legalName', 'shortName', 'nif', 'taxRegime', 'taxOffice',
+  'commercialRegistry', 'shareCapital', 'cae', 'address', 'municipality',
+  'province', 'postalCode', 'cityCountry', 'phone', 'mobile', 'whatsapp',
+  'email', 'billingEmail', 'website', 'tagline', 'logoUrl', 'showLogoOnPos',
+  'showLogoOnA4', 'bankName1', 'iban1', 'accountHolder1', 'swift1',
+  'bankName2', 'iban2', 'accountHolder2', 'swift2', 'multicaixaExpressPhone',
+  'establishmentId', 'establishmentCode', 'establishmentName', 'establishmentAddress',
+  'legalRepresentativeName', 'legalRepresentativeRole', 'capturedAtIso',
+]);
+
+export async function runPhase5ValidationTests(): Promise<{ passed: number; total: number }> {
+  let passed = 0;
+  let total = 0;
+
+  async function test(name: string, fn: () => Promise<void> | void): Promise<void> {
+    total++;
+    try {
+      await fn();
+      passed++;
+      console.log(`✓ [PASS] ${name}`);
+    } catch (err) {
+      console.error(`✗ [FAIL] ${name}:`, err);
+      throw err;
+    }
+  }
+
+  console.log('\n=== FASE 5: TESTES INTEGRAIS DE VALIDAÇÃO, OFFLINE, SYNC, REGRESSÃO & XSD ===');
+
+  // -------------------------------------------------------------------------
+  // 1. FISCALIDADE & REGRESSÃO DO MOTOR TRIBUTÁRIO
+  // -------------------------------------------------------------------------
+  await test('5.1 Fiscalidade: conversão multi-taxa, retenções múltiplas (II + IVA_RET) e isenção obrigatória', () => {
+    const line14 = calculateAgtLineItem({
+      lineNumber: 1,
+      productCode: 'SERV-01',
+      productDescription: 'Consultoria & Auditoria',
+      quantity: 2,
+      unitPrice: 50000,
+      unitPriceIncludesTax: false,
+      taxCode: 'NOR',
+      taxPercentage: 14,
+    });
+    const lineCabinda = calculateAgtLineItem({
+      lineNumber: 2,
+      productCode: 'CAB-01',
+      productDescription: 'Mercadoria Cabinda 1%',
+      quantity: 1,
+      unitPrice: 10100,
+      unitPriceIncludesTax: true,
+      taxCode: 'INT',
+      taxPercentage: 1,
+    });
+    const lineIsento = calculateAgtLineItem({
+      lineNumber: 3,
+      productCode: 'ARR-01',
+      productDescription: 'Arroz Cesta Básica',
+      quantity: 3,
+      unitPrice: 4000,
+      unitPriceIncludesTax: true,
+      taxCode: 'ISE',
+      taxPercentage: 0,
+      exemptionCode: 'M10',
+    });
+
+    const compliance = validateAgtTaxCompliance([line14, lineCabinda, lineIsento]);
+    assert(compliance.valid, `Conformidade devia ser válida: ${compliance.errors.join('; ')}`);
+
+    const consolidated = calculateAgtDocumentTotals([line14, lineCabinda, lineIsento], {
+      withholdingTaxes: [
+        { type: 'II', ratePct: 6.5, baseAmount: 100000, reason: 'Retenção Serviços' },
+        { type: 'IVA_RET', ratePct: 50 },
+      ],
+    });
+
+    assert(consolidated.totals.totalTaxBaseNOR === 100000, 'Base NOR esperada 100000');
+    assert(consolidated.totals.totalTaxAmountNOR === 14000, 'IVA NOR esperado 14000');
+    assert(consolidated.totals.totalTaxBaseINT === 10000, 'Base Cabinda INT esperada 10000');
+    assert(consolidated.totals.totalTaxAmountINT === 100, 'IVA Cabinda 1% esperado 100');
+    assert(consolidated.totals.totalTaxBaseISE === 12000, 'Base isenta esperada 12000');
+    // II = 6500; IVA_RET = 50% de 14100 = 7050 => total retenção = 13550
+    assert(consolidated.totals.totalWithholdingTax === 13550, `Retenção esperada 13550, obtida ${consolidated.totals.totalWithholdingTax}`);
+    assert(consolidated.totals.grossTotal === 136100, `GrossTotal esperado 136100, obtido ${consolidated.totals.grossTotal}`);
+    assert(consolidated.totals.netPayableTotal === 122550, `NetPayable esperado 122550, obtido ${consolidated.totals.netPayableTotal}`);
+
+    // Regressão 0% IVA vs 14%: convertCartItemsToAgtLines preserva 0% com M16 sem cair em 14%
+    const zeroCart = convertCartItemsToAgtLines(
+      [{ productId: 'z1', code: 'Z1', description: 'Medicamento Isento', unit: 'cx', qty: 1, unitPrice: 2500, discountPct: 0, ivaRate: 0, exemptionCode: 'M16' }],
+      'M80'
+    );
+    assert(zeroCart[0]!.taxPercentage === 0 && zeroCart[0]!.taxCode === 'ISE', '0% deve manter taxPercentage=0 e taxCode=ISE');
+    assert(zeroCart[0]!.exemptionCode === 'M16', 'Código de isenção M16 explícito deve ser preservado');
+
+    // Reconciliação SAF-T de calculateInvoiceTotals (PVP inclui IVA -> NetTotal + TaxTotal == GrandTotal)
+    const posMulti = calculateInvoiceTotals(
+      [
+        { productId: 'p14', code: 'P14', description: 'Normal 14%', unit: 'un', qty: 1, unitPrice: 11400, discountPct: 0, ivaRate: 14 },
+        { productId: 'p1', code: 'P1', description: 'Cabinda 1%', unit: 'un', qty: 1, unitPrice: 2020, discountPct: 0, ivaRate: 1 },
+        { productId: 'p5', code: 'P5', description: 'Reduzida 5%', unit: 'un', qty: 1, unitPrice: 1050, discountPct: 0, ivaRate: 5 },
+        { productId: 'p0', code: 'P0', description: 'Isento 0%', unit: 'un', qty: 1, unitPrice: 3000, discountPct: 0, ivaRate: 0, exemptionCode: 'M10' },
+      ],
+      10
+    );
+    const sumBases =
+      posMulti.taxBase14 +
+      (posMulti.taxBaseIntermediate || 0) +
+      (posMulti.taxBaseReduced || 0) +
+      posMulti.taxBase0;
+    assert(Math.abs(sumBases - posMulti.merchandiseTotal) < 0.01, 'merchandiseTotal deve igualar soma das bases tributáveis líquidas');
+    assert(Math.abs(sumBases + posMulti.taxTotal - posMulti.grandTotal) < 0.01, 'NetTotal + TaxPayable deve igualar GrandTotal sem dupla tributação');
+  });
+
+  // -------------------------------------------------------------------------
+  // 2. ISOLAMENTO MULTIEMPRESA & SNAPSHOTS HISTÓRICOS
+  // -------------------------------------------------------------------------
+  await test('5.2 Isolamento Multiempresa: perfis, estabelecimentos, séries e snapshots sem fugas VITRONIS', () => {
+    seriesStorage.clearMemoryCache();
+    const companyAId = `comp_alfa_${Date.now()}`;
+    const companyBId = `comp_beta_${Date.now()}`;
+    const year = new Date().getFullYear();
+
+    const profileA: CompanyProfile = {
+      legalName: 'Alfa Distribuição Benguela, Lda',
+      shortName: 'ALFA BENGUELA',
+      legalNature: 'LDA',
+      cae: '46900',
+      commercialRegistry: 'CRC Benguela 102/2026',
+      shareCapital: '2.000.000,00 Kz',
+      nif: '5001234567',
+      taxRegime: 'GERAL',
+      taxOffice: 'Repartição Fiscal de Benguela',
+      agtEnvironment: 'PRODUCAO',
+      address: 'Rua 10 de Fevereiro, N.º 88',
+      municipality: 'Benguela',
+      province: 'Benguela',
+      cityCountry: 'Benguela - Angola',
+      postalCode: 'BG-01',
+      phone: '+244 923 100 200',
+      email: 'fiscal@alfabenguela.ao',
+      tagline: 'Qualidade no Lobito e Benguela',
+      bankName1: 'Banco BAI',
+      iban1: 'AO06004000001111222233344',
+      logoUrl: 'data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAAEAAAAB',
+      showLogoOnA4: true,
+      showLogoOnPos: false,
+      establishments: [
+        {
+          id: 'est_alfa_001',
+          code: '001',
+          name: 'Sede Benguela',
+          isHeadquarters: true,
+          address: 'Rua 10 de Fevereiro, N.º 88',
+          municipality: 'Benguela',
+          province: 'Benguela',
+          active: true,
+        },
+        {
+          id: 'est_alfa_002',
+          code: '002',
+          name: 'Sucursal Lobito',
+          isHeadquarters: false,
+          address: 'Av. da Restinga, N.º 14',
+          municipality: 'Lobito',
+          province: 'Benguela',
+          active: true,
+        },
+      ],
+    };
+
+    const profileB: CompanyProfile = {
+      legalName: 'Beta Consultoria Lubango, S.A.',
+      shortName: 'BETA LUBANGO',
+      nif: '5007654321',
+      taxRegime: 'EXCLUSAO',
+      defaultExemptionCode: 'M80',
+      agtEnvironment: 'SIMULACAO',
+      address: 'Av. Agostinho Neto, N.º 5',
+      municipality: 'Lubango',
+      province: 'Huíla',
+      cityCountry: 'Lubango - Angola',
+      phone: '+244 912 999 888',
+      email: 'geral@betalubango.ao',
+      tagline: 'Consultoria Huíla',
+    };
+
+    // Solicitar séries independentes por empresa e estabelecimento
+    solicitarSerie({
+      companyId: companyAId,
+      seriesCode: 'P02',
+      seriesYear: year,
+      documentType: 'FA',
+      environment: 'PRODUCAO',
+      establishmentId: 'est_alfa_002',
+      establishmentCode: '002',
+      companyProfile: profileA,
+      operator: 'AdminAlfa',
+    });
+
+    solicitarSerie({
+      companyId: companyBId,
+      seriesCode: 'S01',
+      seriesYear: year,
+      documentType: 'FA',
+      environment: 'SIMULACAO',
+      operator: 'AdminBeta',
+    });
+
+    // Empresa B não pode enxergar séries da Empresa A nem emitir em PRODUCAO sem série PRODUCAO
+    const listB = listarSeries({ companyId: companyBId });
+    assert(listB.length === 1 && listB[0]!.seriesCode === 'S01', 'Empresa B só deve listar a própria série');
+    const prodCheckB = validarPermissaoEmissaoFiscal(companyBId, 'FA', year, { environment: 'PRODUCAO' });
+    assert(!prodCheckB.allowed, 'Empresa B sem série PRODUCAO não pode emitir em PRODUCAO');
+
+    // Empresa A emite FA na Sucursal Lobito (est_alfa_002)
+    const numRes = reservarProximoNumeroFiscal(companyAId, 'FA', year, undefined, {
+      environment: 'PRODUCAO',
+      establishmentId: 'est_alfa_002',
+    });
+    assert(numRes.documentNo === `FA P02/000001`, `Esperado FA P02/000001, obtido ${numRes.documentNo}`);
+
+    const estLobito = profileA.establishments![1]!;
+    const snapshotA = buildInvoiceIssuerSnapshot(profileA, {
+      companyId: companyAId,
+      establishment: estLobito,
+    });
+    const totals = calculateInvoiceTotals([
+      { productId: 'p1', code: 'P1', description: 'Serviço Técnico', unit: 'hr', qty: 2, unitPrice: 11400, discountPct: 0, ivaRate: 14 },
+    ]);
+
+    const invA: InvoiceRecord = {
+      id: 'inv_alfa_lobito_1',
+      companyId: companyAId,
+      number: numRes.documentNo,
+      docType: 'FA',
+      issuedAtIso: '2026-05-10T10:00:00.000Z',
+      createdAtIso: '2026-05-10T10:00:00.000Z',
+      updatedAtIso: '2026-05-10T10:00:00.000Z',
+      cashier: '01',
+      operator: 'AdminAlfa',
+      paymentMethod: 'Transferência',
+      customerId: 'c1',
+      customerName: 'Cliente Lobito',
+      customerNif: '5004445556',
+      customerLocality: 'Lobito',
+      merchandiseTotal: totals.merchandiseTotal,
+      discountTotal: 0,
+      taxBase14: totals.taxBase14,
+      taxAmount14: totals.taxAmount14,
+      taxBase0: 0,
+      taxAmount0: 0,
+      taxTotal: totals.taxTotal,
+      grandTotal: totals.grandTotal,
+      amountInWords: totals.amountInWords,
+      amountReceived: 0,
+      changeAmount: 0,
+      notes: '',
+      status: 'issued',
+      lines: totals.lines,
+      establishmentId: estLobito.id,
+      establishmentCode: estLobito.code,
+      establishmentName: estLobito.name,
+      seriesCode: numRes.seriesCode,
+      seriesEnvironment: numRes.environment,
+      issuerSnapshot: snapshotA,
+    };
+
+    // Renderiza com perfil errado (Beta) ou perfil mutado e verifica integridade absoluta do snapshot
+    const resolvedFromSnapshot = resolveCompanyProfileFromSnapshot(invA, profileB);
+    assert(resolvedFromSnapshot.nif === '5001234567', 'Snapshot deve impedir contaminação pelo NIF da Empresa B');
+    assert(resolvedFromSnapshot.nif !== VITRONIS_INSTITUTIONAL.nif, 'Snapshot nunca pode vazar NIF da VITRONIS');
+
+    const a4Html = renderDocumentHtml(invA, 'A4', profileB, '');
+    assert(a4Html.includes('Alfa Distribuição Benguela, Lda'), 'A4 deve preservar denominação histórica da Empresa A');
+    assert(a4Html.includes('Est. 002 · Sucursal Lobito'), 'A4 deve exibir estabelecimento 002');
+    assert(a4Html.includes('Av. da Restinga, N.º 14'), 'A4 deve exibir endereço específico do estabelecimento 002');
+    assert(!a4Html.includes('Beta Consultoria'), 'A4 não pode vazar dados da Empresa B');
+    assert(!a4Html.includes(VITRONIS_INSTITUTIONAL.nif), 'A4 não pode vazar NIF da VITRONIS como emitente');
+
+    // Garante também preservação do NIF âncora JAIMONA
+    assert(JAIMONA_COMPANY_ID === 'comp_jaimona' && JAIMONA_COMPANY.nif === '5003069940', 'Empresa âncora comp_jaimona intacta');
+  });
+
+  // -------------------------------------------------------------------------
+  // 3. FUNCIONAMENTO OFFLINE & REINICIALIZAÇÃO A FRIO
+  // -------------------------------------------------------------------------
+  await test('5.3 Offline: persistência localStorage de séries sobrevive a cold-start e normalização offline', () => {
+    const store = new Map<string, string>();
+    const prevWindow = (globalThis as any).window;
+    (globalThis as any).window = {
+      localStorage: {
+        getItem: (k: string) => (store.has(k) ? store.get(k)! : null),
+        setItem: (k: string, v: string) => {
+          store.set(k, v);
+        },
+        removeItem: (k: string) => {
+          store.delete(k);
+        },
+      },
+    };
+
+    try {
+      seriesStorage.clearMemoryCache();
+      const offComp = `comp_offline_${Date.now()}`;
+      const year = new Date().getFullYear();
+
+      solicitarSerie({
+        companyId: offComp,
+        seriesCode: 'OFF26',
+        seriesYear: year,
+        documentType: 'FR',
+        environment: 'SIMULACAO',
+        operator: 'OfflineOp',
+      });
+      const r1 = reservarProximoNumeroFiscal(offComp, 'FR', year);
+      const r2 = reservarProximoNumeroFiscal(offComp, 'FR', year);
+      assert(r1.sequenceNumber === 1 && r2.sequenceNumber === 2, 'Offline deve avançar sequência 1 -> 2');
+
+      // Simular reboot do navegador limpando cache em memória
+      seriesStorage.clearMemoryCache();
+      const reloaded = obterSerieAtiva(offComp, 'FR', year);
+      assert(reloaded !== null && reloaded.lastDocumentNumber === 2 && reloaded.status === 'U', 'Após cold-start offline deve recuperar lastDocumentNumber=2 e status=U');
+
+      const r3 = reservarProximoNumeroFiscal(offComp, 'FR', year);
+      assert(r3.sequenceNumber === 3 && r3.documentNo === `FR OFF26/000003`, 'Após cold-start deve continuar em 3 sem duplicação');
+
+      // Normalização offline de perfil legado sem estabelecimentos/armazéns
+      const legacyMinimal: CompanyProfile = {
+        legalName: 'Padaria Offline, Lda',
+        shortName: 'PADARIA OFFLINE',
+        nif: '5009998887',
+        address: 'Rua Direita, N.º 3',
+        cityCountry: 'Malanje - Angola',
+        phone: '923000999',
+        email: 'padaria@offline.ao',
+        tagline: 'Pão Quente',
+      };
+      const normalized = normalizeCompanyMasterProfile(legacyMinimal);
+      assert(normalized.establishments?.length === 1 && normalized.establishments[0]!.code === '001', 'Perfil legado offline deve auto-gerar estabelecimento matriz 001');
+      assert(normalized.warehouses?.length === 1 && normalized.warehouses[0]!.code === 'ARM-01', 'Perfil legado offline deve auto-gerar armazém principal ARM-01');
+      assert(normalized.agtEnvironment === 'SIMULACAO' && normalized.taxRegime === 'GERAL', 'Defaults fiscais offline devem permanecer íntegros');
+    } finally {
+      seriesStorage.clearMemoryCache();
+      if (prevWindow === undefined) {
+        delete (globalThis as any).window;
+      } else {
+        (globalThis as any).window = prevWindow;
+      }
+    }
+  });
+
+  // -------------------------------------------------------------------------
+  // 4. SINCRONIZAÇÃO CLOUD & CONFORMIDADE FIRESTORE RULES
+  // -------------------------------------------------------------------------
+  await test('5.4 Cloud Sync: round-trip dos 9 blocos, bloqueio XSS e conformidade estrita com allowlists firestore.rules', () => {
+    const fullProfile: CompanyProfile = {
+      legalName: 'Kwanza Global Serviços, S.A.',
+      shortName: 'KWANZA GLOBAL',
+      legalNature: 'SA',
+      cae: '62020',
+      commercialRegistry: 'CRC Luanda 2026/77',
+      shareCapital: '15.000.000,00 Kz',
+      tagline: 'Soluções Empresariais',
+      nif: '5004443332',
+      taxRegime: 'GERAL',
+      taxOffice: 'Repartição Fiscal dos Grandes Contribuintes',
+      taxEntity: 'Sede Luanda',
+      defaultExemptionCode: 'M10',
+      isVatRetentionAgent: true,
+      defaultWithholdingTax: 6.5,
+      specialTaxTerritory: 'AO-CAB',
+      agtEnvironment: 'PRODUCAO',
+      activityStartDate: '2020-03-15',
+      address: 'Av. Comandante Gika, Ed. Garden Towers',
+      municipality: 'Luanda',
+      province: 'Luanda',
+      cityCountry: 'Luanda - Angola',
+      postalCode: '1234',
+      country: 'AO',
+      phone: '+244 923 555 111',
+      mobile: '+244 912 555 222',
+      whatsapp: '+244 923 555 111',
+      email: 'geral@kwanzaglobal.ao',
+      billingEmail: 'facturacao@kwanzaglobal.ao',
+      website: 'https://www.kwanzaglobal.ao',
+      logoUrl: 'data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAAEAAAAB',
+      showLogoOnPos: true,
+      showLogoOnA4: true,
+      bankName1: 'Banco BAI',
+      iban1: 'AO06004000001219563410150',
+      accountHolder1: 'Kwanza Global Serviços, S.A.',
+      swift1: 'BAIPAOLU',
+      bankName2: 'Banco BFA',
+      iban2: 'AO06000600002222333344455',
+      accountHolder2: 'Kwanza Global Serviços, S.A.',
+      swift2: 'BFXAAOLU',
+      multicaixaExpressPhone: '923555111',
+      defaultPaymentTermsDays: 30,
+      defaultEstablishmentId: 'est_001',
+      establishments: [
+        {
+          id: 'est_001',
+          code: '001',
+          name: 'Sede Luanda',
+          isHeadquarters: true,
+          address: 'Av. Comandante Gika',
+          municipality: 'Luanda',
+          province: 'Luanda',
+          phone: '923555111',
+          email: 'sede@kwanzaglobal.ao',
+          defaultCashierCode: '01',
+          defaultWarehouseId: 'wh_001',
+          active: true,
+        },
+        {
+          id: 'est_002',
+          code: '002',
+          name: 'Loja Cabinda',
+          isHeadquarters: false,
+          address: 'Rua do Porto, Cabinda',
+          municipality: 'Cabinda',
+          province: 'Cabinda',
+          active: true,
+        },
+      ],
+      warehouses: [
+        { id: 'wh_001', code: 'ARM-01', name: 'Armazém Central', establishmentId: 'est_001', address: 'Viana KM 12', active: true },
+        { id: 'wh_002', code: 'ARM-02', name: 'Armazém Cabinda', establishmentId: 'est_002', active: true },
+      ],
+      legalRepresentativeName: 'Domingos António',
+      legalRepresentativeRole: 'PCA',
+      legalRepresentativeNif: '000111222LA033',
+      legalRepresentativePhone: '923000001',
+      accountantName: 'Carla Mendes',
+      accountantOcpcaNumber: 'OCPCA-8821',
+      accountantEmail: 'carla.mendes@ocpca.ao',
+      accountantPhone: '923000002',
+    };
+
+    const mp = buildMasterProfileMap(fullProfile);
+    for (const k of Object.keys(mp)) {
+      assert(FIRESTORE_MASTER_PROFILE_KEYS.has(k), `Chave '${k}' em masterProfile não está na allowlist de firestore.rules`);
+    }
+
+    const estList = sanitizeEstablishmentsForCloud(fullProfile.establishments);
+    assert(estList.length === 2, 'Deve serializar 2 estabelecimentos');
+    for (const est of estList) {
+      for (const k of Object.keys(est)) {
+        assert(FIRESTORE_ESTABLISHMENT_KEYS.has(k), `Chave '${k}' em Establishment não está na allowlist de firestore.rules`);
+      }
+    }
+
+    const whList = sanitizeWarehousesForCloud(fullProfile.warehouses);
+    assert(whList.length === 2, 'Deve serializar 2 armazéns');
+    for (const wh of whList) {
+      for (const k of Object.keys(wh)) {
+        assert(FIRESTORE_WAREHOUSE_KEYS.has(k), `Chave '${k}' em Warehouse não está na allowlist de firestore.rules`);
+      }
+    }
+
+    const hydrated = hydrateProfileFromCloud(
+      {
+        legalName: fullProfile.legalName,
+        shortName: fullProfile.shortName,
+        nif: fullProfile.nif,
+        address: fullProfile.address,
+        cityCountry: fullProfile.cityCountry,
+        phone: fullProfile.phone,
+        email: fullProfile.email,
+        tagline: fullProfile.tagline,
+        masterProfile: mp,
+      },
+      'comp_kwanza'
+    );
+
+    assert(hydrated.legalName === fullProfile.legalName, 'Round-trip legalName');
+    assert(hydrated.taxOffice === fullProfile.taxOffice, 'Round-trip taxOffice');
+    assert(hydrated.specialTaxTerritory === 'AO-CAB', 'Round-trip specialTaxTerritory');
+    assert(hydrated.isVatRetentionAgent === true, 'Round-trip isVatRetentionAgent');
+    assert(hydrated.iban2 === fullProfile.iban2, 'Round-trip iban2');
+    assert(hydrated.multicaixaExpressPhone === '923555111', 'Round-trip multicaixaExpressPhone');
+    assert(hydrated.establishments?.length === 2 && hydrated.warehouses?.length === 2, 'Round-trip estabelecimentos e armazéns');
+    assert(hydrated.accountantOcpcaNumber === 'OCPCA-8821', 'Round-trip cédula OCPCA');
+
+    // Sanitização de IssuerSnapshot + bloqueio XSS SVG
+    const rawSnap = buildInvoiceIssuerSnapshot(
+      { ...fullProfile, logoUrl: 'data:image/svg+xml;base64,PHN2Zz48c2NyaXB0Lz48L3N2Zz4=' },
+      { companyId: 'comp_kwanza', establishment: fullProfile.establishments![1]! }
+    );
+    const cloudSnap = sanitizeIssuerSnapshotForCloud(rawSnap);
+    assert(Boolean(cloudSnap), 'Snapshot válido deve ser serializado');
+    assert(!('logoUrl' in cloudSnap!), 'Logo SVG XSS deve ser removido na serialização Cloud');
+    for (const k of Object.keys(cloudSnap!)) {
+      assert(FIRESTORE_SNAPSHOT_KEYS.has(k), `Chave '${k}' em IssuerSnapshot não está na allowlist de firestore.rules`);
+    }
+
+    // Reconciliação offline/cloud de séries com preservação de maior número e estado
+    const syncComp = `comp_sync_series_${Date.now()}`;
+    const year = new Date().getFullYear();
+    const sLocal = solicitarSerie({
+      companyId: syncComp,
+      seriesCode: 'SN26',
+      seriesYear: year,
+      documentType: 'FR',
+      environment: 'PRODUCAO',
+      companyProfile: fullProfile,
+      operator: 'Op1',
+    });
+    reservarProximoNumeroFiscal(syncComp, 'FR', year, undefined, { environment: 'PRODUCAO' });
+    reservarProximoNumeroFiscal(syncComp, 'FR', year, undefined, { environment: 'PRODUCAO' });
+
+    const reconciled = mergeSeriesFromCloud(syncComp, [
+      { ...sLocal, status: 'A', lastDocumentNumber: 1 }, // Cloud desactualizada
+    ]);
+    const recFr = reconciled.find((s) => s.id === sLocal.id);
+    assert(recFr?.lastDocumentNumber === 2 && recFr.status === 'U', 'Cloud Sync nunca pode regredir numeração local mais alta');
+  });
+
+  // -------------------------------------------------------------------------
+  // 5. REGRESSÃO MOBILE (9 REQUISITOS DE PRODUTO + ZERO ALERTS)
+  // -------------------------------------------------------------------------
+  await test('5.5 Regressão Mobile: modal de produto inclui os 9 campos operacionais e banner de erro inline', () => {
+    const companyRecord = {
+      id: 'comp_mob_1',
+      normalizedNif: '5001234567',
+      profile: JAIMONA_COMPANY,
+      status: 'active' as const,
+      plan: {
+        planTier: 'PROFISSIONAL' as const,
+        commercialActive: true,
+        maxUsers: null,
+        maxInvoicesPerMonth: null,
+        updatedAtIso: new Date().toISOString(),
+      },
+      baseSequence: 0,
+      allowManagerCancel: false,
+      createdAtIso: new Date().toISOString(),
+      updatedAtIso: new Date().toISOString(),
+    };
+    const html = renderMobileOperationalView({
+      activeCompany: companyRecord,
+      settings: {
+        companyId: 'comp_mob_1',
+        company: JAIMONA_COMPANY,
+        defaultCashier: '01',
+        defaultOperator: '001',
+        defaultFormat: 'POS',
+        defaultDocType: 'FR',
+        defaultNotes: '',
+        autoPrintOnEmit: false,
+        hidePromotionalFooter: false,
+        allowCashierPriceEdit: false,
+        updatedAtIso: new Date().toISOString(),
+      },
+      companyMasterDraftProfile: null,
+      companyMasterDraftSettings: null,
+      companyMasterSection: 'ALL',
+      companySeries: [],
+      canManageCompanySettings: true,
+      companyFormError: null,
+      companyFormSavedNotice: false,
+      showRequestAgtSeriesForm: false,
+      confirmFinalizeSeriesId: null,
+      agtSeriesErrorMessage: null,
+      agtSeriesSuccessMessage: null,
+      showEstablishmentForm: false,
+      editingEstablishment: null,
+      establishmentError: null,
+      showWarehouseForm: false,
+      editingWarehouse: null,
+      warehouseError: null,
+      isOnline: true,
+      user: { email: 'admin@empresa.ao' },
+      mobileTab: 'PRODUCTS',
+      mobileCheckoutStep: 'CART',
+      cart: [],
+      products: [],
+      customers: [],
+      invoices: [],
+      selectedCustomerId: '999999999',
+      docType: 'FR',
+      paymentMethod: 'Dinheiro',
+      amountReceivedInput: '',
+      mobileSearchQuery: '',
+      mobileProductSearchInput: '',
+      lastEmittedInvoice: null,
+      showQuickProductModal: true,
+      showQuickCustomerModal: false,
+      showQuickCompanyModal: false,
+      showCustomerPickerModal: false,
+      editingMobileProduct: null,
+      editingCustomer: null,
+      editingCustomerCreditLimitInput: '',
+      showCustomerAdvancedFields: false,
+      mobileCustomerModalMode: 'QUICK',
+      canEditExistingCustomers: true,
+      quickCustomerDraft: {
+        name: '',
+        nif: '',
+        phone: '',
+        address: '',
+        locality: 'Luanda',
+        customerType: 'PARTICULAR',
+        countryCode: 'AO',
+        foreignTaxId: '',
+      },
+      quickProductError: 'Erro de validação inline no modal móvel',
+      quickCustomerError: null,
+      operator: '001',
+    });
+
+    for (const marker of [
+      'name="code"',
+      'name="barcode"',
+      'name="category"',
+      'name="unit"',
+      'name="costPrice"',
+      'name="price"',
+      'name="ivaRate"',
+      'value="0"',
+      'name="active"',
+      'name="exemptionReason"',
+      'Erro de validação inline no modal móvel',
+    ]) {
+      assert(html.includes(marker), `Modal mobile de artigo deve conter '${marker}'`);
+    }
+  });
+
+  // -------------------------------------------------------------------------
+  // 6. VALIDAÇÃO ESTRITA XSD SAF-T (AO) v1.01_01 (POSITIVO + NEGATIVO)
+  // -------------------------------------------------------------------------
+  await test('5.6 SAF-T XSD Positivo: valida XML completo com &, multi-taxa, NC, anulada, Fornecedores e WorkingDocuments', () => {
+    const company: CompanyProfile = {
+      ...JAIMONA_COMPANY,
+      legalName: 'A & B Comércio <Geral>, Lda',
+      shortName: 'A & B COMÉRCIO',
+      nif: '5003069940',
+      address: 'Rua da Missão & Kizomba, N.º 12',
+      municipality: 'Luanda',
+      province: 'Luanda',
+      postalCode: '1000',
+      taxEntity: 'Sede Luanda',
+      phone: '+244 923 111 222',
+      email: 'fiscal@aebcomercio.ao',
+    };
+
+    const suppliers: Supplier[] = [
+      {
+        id: 'sup_xml_1',
+        companyId: 'comp_jaimona',
+        name: 'Fornecedor Alpha & Filhos, Lda',
+        nif: '5005554443',
+        phone: '923000111',
+        email: 'fornecedor@alpha.ao',
+        address: 'Viana, Luanda',
+        locality: 'Luanda',
+      },
+    ];
+
+    const customers: Customer[] = [
+      {
+        id: 'cli_xml_1',
+        name: 'Cliente Silva & Irmãos, S.A.',
+        nif: '5008889991',
+        phone: '924000111',
+        address: 'Talatona, Luanda',
+        locality: 'Luanda',
+        createdAtIso: '2026-06-01T09:00:00.000Z',
+        updatedAtIso: '2026-06-01T09:00:00.000Z',
+      },
+    ];
+
+    const products: Product[] = [
+      {
+        id: 'p_nor',
+        code: 'P-NOR',
+        name: 'Equipamento & Rede',
+        productType: 'P',
+        category: 'Tecnologia',
+        unit: 'UN',
+        price: 11400,
+        ivaRate: 14,
+        exemptionReason: '',
+        active: true,
+        createdAtIso: '2026-06-01T09:00:00.000Z',
+        updatedAtIso: '2026-06-01T09:00:00.000Z',
+      },
+      {
+        id: 'p_cab',
+        code: 'P-CAB',
+        name: 'Serviço Cabinda',
+        productType: 'S',
+        category: 'Serviços',
+        unit: 'HR',
+        price: 2020,
+        ivaRate: 1,
+        exemptionReason: '',
+        active: true,
+        createdAtIso: '2026-06-01T09:00:00.000Z',
+        updatedAtIso: '2026-06-01T09:00:00.000Z',
+      },
+      {
+        id: 'p_ise',
+        code: 'P-ISE',
+        name: 'Arroz Cesta Básica',
+        productType: 'P',
+        category: 'Alimentação',
+        unit: 'KG',
+        price: 3000,
+        ivaRate: 0,
+        exemptionCode: 'M10',
+        exemptionReason: 'Cesta Básica',
+        active: true,
+        createdAtIso: '2026-06-01T09:00:00.000Z',
+        updatedAtIso: '2026-06-01T09:00:00.000Z',
+      },
+    ];
+
+    const t1 = calculateInvoiceTotals([
+      { productId: 'p_nor', code: 'P-NOR', description: 'Equipamento & Rede', unit: 'UN', qty: 1, unitPrice: 11400, discountPct: 0, ivaRate: 14 },
+      { productId: 'p_cab', code: 'P-CAB', description: 'Serviço Cabinda', unit: 'HR', qty: 1, unitPrice: 2020, discountPct: 0, ivaRate: 1 },
+      { productId: 'p_ise', code: 'P-ISE', description: 'Arroz Cesta Básica', unit: 'KG', qty: 1, unitPrice: 3000, discountPct: 0, ivaRate: 0, exemptionCode: 'M10' },
+    ]);
+
+    const tNc = calculateInvoiceTotals([
+      { productId: 'p_nor', code: 'P-NOR', description: 'Devolução Equipamento', unit: 'UN', qty: 1, unitPrice: 11400, discountPct: 0, ivaRate: 14 },
+    ]);
+
+    const invoices: InvoiceRecord[] = [
+      {
+        id: 'inv_xsd_1',
+        number: 'FR A2026/000001',
+        docType: 'FR',
+        issuedAtIso: '2026-06-05T10:00:00.000Z',
+        createdAtIso: '2026-06-05T10:00:00.000Z',
+        updatedAtIso: '2026-06-05T10:00:00.000Z',
+        cashier: '01',
+        operator: 'Op1',
+        paymentMethod: 'Multicaixa',
+        customerId: 'cli_xml_1',
+        customerName: 'Cliente Silva & Irmãos, S.A.',
+        customerNif: '5008889991',
+        customerLocality: 'Luanda',
+        merchandiseTotal: t1.merchandiseTotal,
+        discountTotal: 0,
+        taxBase14: t1.taxBase14,
+        taxAmount14: t1.taxAmount14,
+        taxBaseIntermediate: t1.taxBaseIntermediate,
+        taxAmountIntermediate: t1.taxAmountIntermediate,
+        taxBaseReduced: 0,
+        taxAmountReduced: 0,
+        taxBase0: t1.taxBase0,
+        taxAmount0: 0,
+        taxTotal: t1.taxTotal,
+        grandTotal: t1.grandTotal,
+        amountInWords: t1.amountInWords,
+        amountReceived: t1.grandTotal,
+        changeAmount: 0,
+        notes: '',
+        status: 'issued',
+        lines: t1.lines,
+      },
+      {
+        id: 'inv_xsd_nc',
+        number: 'NC A2026/000001',
+        docType: 'NC',
+        issuedAtIso: '2026-06-06T12:00:00.000Z',
+        createdAtIso: '2026-06-06T12:00:00.000Z',
+        updatedAtIso: '2026-06-06T12:00:00.000Z',
+        cashier: '01',
+        operator: 'Op1',
+        paymentMethod: 'Transferência',
+        customerId: 'cli_xml_1',
+        customerName: 'Cliente Silva & Irmãos, S.A.',
+        customerNif: '5008889991',
+        customerLocality: 'Luanda',
+        returnOriginInvoiceId: 'inv_xsd_1',
+        returnOriginNumber: 'FR A2026/000001',
+        cancelReason: 'Devolução parcial',
+        merchandiseTotal: tNc.merchandiseTotal,
+        discountTotal: 0,
+        taxBase14: tNc.taxBase14,
+        taxAmount14: tNc.taxAmount14,
+        taxBase0: 0,
+        taxAmount0: 0,
+        taxTotal: tNc.taxTotal,
+        grandTotal: tNc.grandTotal,
+        amountInWords: tNc.amountInWords,
+        amountReceived: 0,
+        changeAmount: 0,
+        notes: '',
+        status: 'issued',
+        lines: tNc.lines,
+      },
+      {
+        id: 'inv_xsd_canc',
+        number: 'FA A2026/000001',
+        docType: 'FA',
+        issuedAtIso: '2026-06-07T14:00:00.000Z',
+        createdAtIso: '2026-06-07T14:00:00.000Z',
+        updatedAtIso: '2026-06-07T14:30:00.000Z',
+        cancelledAtIso: '2026-06-07T14:30:00.000Z',
+        cashier: '01',
+        operator: 'Op1',
+        paymentMethod: 'Crédito',
+        customerId: 'cli_xml_1',
+        customerName: 'Cliente Silva & Irmãos, S.A.',
+        customerNif: '5008889991',
+        customerLocality: 'Luanda',
+        merchandiseTotal: tNc.merchandiseTotal,
+        discountTotal: 0,
+        taxBase14: tNc.taxBase14,
+        taxAmount14: tNc.taxAmount14,
+        taxBase0: 0,
+        taxAmount0: 0,
+        taxTotal: tNc.taxTotal,
+        grandTotal: tNc.grandTotal,
+        amountInWords: tNc.amountInWords,
+        amountReceived: 0,
+        changeAmount: 0,
+        notes: '',
+        cancelReason: 'Anulada por erro de cliente',
+        status: 'cancelled',
+        lines: tNc.lines,
+      },
+      {
+        id: 'inv_xsd_fp',
+        number: 'FP A2026/000001',
+        docType: 'FP',
+        issuedAtIso: '2026-06-08T09:00:00.000Z',
+        createdAtIso: '2026-06-08T09:00:00.000Z',
+        updatedAtIso: '2026-06-08T09:00:00.000Z',
+        cashier: '01',
+        operator: 'Op1',
+        paymentMethod: 'Transferência',
+        customerId: 'cli_xml_1',
+        customerName: 'Cliente Silva & Irmãos, S.A.',
+        customerNif: '5008889991',
+        customerLocality: 'Luanda',
+        merchandiseTotal: tNc.merchandiseTotal,
+        discountTotal: 0,
+        taxBase14: tNc.taxBase14,
+        taxAmount14: tNc.taxAmount14,
+        taxBase0: 0,
+        taxAmount0: 0,
+        taxTotal: tNc.taxTotal,
+        grandTotal: tNc.grandTotal,
+        amountInWords: tNc.amountInWords,
+        amountReceived: 0,
+        changeAmount: 0,
+        notes: '',
+        status: 'issued',
+        lines: tNc.lines,
+      },
+    ];
+
+    const saft = generateSaftAoXml({
+      company,
+      invoices,
+      products,
+      customers,
+      suppliers,
+      options: { fiscalYear: 2026, periodMonth: 6, startDate: '2026-06-01', endDate: '2026-06-30' },
+    });
+
+    const xsdReport = validateSaftAoXsdStrict(saft.xml);
+    assert(
+      xsdReport.valid && xsdReport.errors.length === 0,
+      `SAF-T gerado deve passar 100% na validação XSD estrita. Erros: ${xsdReport.errors.map((e) => `${e.path}: ${e.message}`).join(' | ')}`
+    );
+    assert(xsdReport.stats.salesInvoices === 3, `Esperadas 3 facturas em SalesInvoices, obtidas ${xsdReport.stats.salesInvoices}`);
+    assert(xsdReport.stats.workingDocuments === 1, `Esperado 1 documento em WorkingDocuments, obtido ${xsdReport.stats.workingDocuments}`);
+    assert(xsdReport.stats.suppliers === 1, 'Deve contabilizar 1 fornecedor');
+  });
+
+  await test('5.7 SAF-T XSD Negativo: validador detecta sequência XSD inválida, & não escapado, References fora de Line e divergência numérica', () => {
+    const t = calculateInvoiceTotals([
+      { productId: 'p1', code: 'P1', description: 'Produto Teste', unit: 'UN', qty: 1, unitPrice: 11400, discountPct: 0, ivaRate: 14 },
+    ]);
+    const validSaft = generateSaftAoXml({
+      company: JAIMONA_COMPANY,
+      invoices: [
+        {
+          id: 'inv_neg_1',
+          number: 'FR A2026/000001',
+          docType: 'FR',
+          issuedAtIso: '2026-06-01T10:00:00.000Z',
+          createdAtIso: '2026-06-01T10:00:00.000Z',
+          updatedAtIso: '2026-06-01T10:00:00.000Z',
+          cashier: '01',
+          operator: 'Op1',
+          paymentMethod: 'Dinheiro',
+          customerId: '999999999',
+          customerName: 'Consumidor Final',
+          customerNif: '999999999',
+          customerLocality: 'Luanda',
+          merchandiseTotal: t.merchandiseTotal,
+          discountTotal: 0,
+          taxBase14: t.taxBase14,
+          taxAmount14: t.taxAmount14,
+          taxBase0: 0,
+          taxAmount0: 0,
+          taxTotal: t.taxTotal,
+          grandTotal: t.grandTotal,
+          amountInWords: t.amountInWords,
+          amountReceived: t.grandTotal,
+          changeAmount: 0,
+          notes: '',
+          status: 'issued',
+          lines: t.lines,
+        },
+      ],
+    });
+
+    // (a) Ordem xs:sequence quebrada em Header
+    const badSeq = validSaft.xml.replace(
+      /<CompanyName>([\s\S]*?)<\/CompanyName>\s*<BusinessName>([\s\S]*?)<\/BusinessName>/,
+      '<BusinessName>$2</BusinessName>\n    <CompanyName>$1</CompanyName>'
+    );
+    const rSeq = validateSaftAoXsdStrict(badSeq);
+    assert(!rSeq.valid && rSeq.errors.some((e) => e.code === 'XSD_SEQUENCE'), 'Deve detectar violação <xs:sequence> em Header');
+
+    // (b) <References> colocado fora de <Line>
+    const badRef = validSaft.xml.replace(
+      '<CustomerID>',
+      '<References><Reference>FR 2026/0</Reference></References>\n        <CustomerID>'
+    );
+    const rRef = validateSaftAoXsdStrict(badRef);
+    assert(!rRef.valid && rRef.errors.some((e) => e.code === 'XSD_SEQUENCE'), 'Deve rejeitar <References> fora de <Line>');
+
+    // (c) '&' não escapado
+    const badAmp = validSaft.xml.replace('Consumidor Final', 'Comercio & Servicos');
+    const rAmp = validateSaftAoXsdStrict(badAmp);
+    assert(!rAmp.valid && rAmp.errors.some((e) => e.code === 'XML_SYNTAX'), 'Deve detectar "&" não escapado');
+
+    // (d) Divergência em TotalCredit e NumberOfEntries
+    const badTotals = validSaft.xml
+      .replace('<NumberOfEntries>1</NumberOfEntries>', '<NumberOfEntries>9</NumberOfEntries>')
+      .replace(/<TotalCredit>[\d.]+<\/TotalCredit>/, '<TotalCredit>999999.00</TotalCredit>');
+    const rTot = validateSaftAoXsdStrict(badTotals);
+    assert(
+      !rTot.valid && rTot.errors.filter((e) => e.code === 'XSD_RECONCILIATION').length >= 2,
+      'Deve detectar divergência de NumberOfEntries e TotalCredit'
+    );
+
+    // (e) Data inválida fora do padrão YYYY-MM-DD
+    const badDate = validSaft.xml.replace(/<InvoiceDate>\d{4}-\d{2}-\d{2}<\/InvoiceDate>/, '<InvoiceDate>01/06/2026</InvoiceDate>');
+    const rDate = validateSaftAoXsdStrict(badDate);
+    assert(!rDate.valid && rDate.errors.some((e) => e.code === 'XSD_DATATYPE'), 'Deve detectar InvoiceDate inválido');
+  });
+
+  // -------------------------------------------------------------------------
+  // 7. CADASTRO DE CLIENTES (TIPOS, CRÉDITO, CÓDIGO, HISTÓRICO, ESTRANGEIRO SAF-T & PARIDADE 5 SECÇÕES)
+  // -------------------------------------------------------------------------
+  await test('5.7 Cadastro de Cliente: Particular, Empresa, Estrangeiro, Crédito, NIF único por empresa e Imutabilidade histórica', () => {
+    const compA = 'comp_cli_a';
+    const compB = 'comp_cli_b';
+
+    // (a) Código interno sequencial por empresa
+    const code1 = generateNextCustomerInternalCode([], compA);
+    assert(code1 === 'CLI-0001', `Esperado CLI-0001, obtido ${code1}`);
+
+    // (b) Empresa exige NIF AO válido + domicílio fiscal completo
+    const badEmp = validateAndBuildCustomer(
+      {
+        companyId: compA,
+        customerType: 'EMPRESA',
+        active: true,
+        name: 'Alfa Tech, Lda',
+        nif: '999999999',
+        phone: '923100200',
+        address: '',
+      },
+      { companyId: compA, existingCustomers: [] }
+    );
+    assert(!badEmp.ok, 'Empresa não pode ser registada com NIF Consumidor Final');
+
+    const okEmp = validateAndBuildCustomer(
+      {
+        companyId: compA,
+        customerType: 'EMPRESA',
+        active: true,
+        name: 'Alfa Tech, Lda',
+        nif: '5001234567',
+        phone: '923100200',
+        email: 'contabilidade@alfatech.ao',
+        province: 'Luanda',
+        municipality: 'Belas',
+        address: 'Via Expressa, Edifício Alfa',
+      },
+      { companyId: compA, existingCustomers: [] }
+    );
+    assert(okEmp.ok && okEmp.customer?.internalCode === 'CLI-0001', 'Empresa válida deve receber CLI-0001');
+
+    // (c) Bloqueio de duplicação na mesma empresa, mas permitido noutra empresa
+    const dupEmp = validateAndBuildCustomer(
+      {
+        companyId: compA,
+        customerType: 'EMPRESA',
+        active: true,
+        name: 'Duplicada Lda',
+        nif: '500 123 4567',
+        phone: '923999888',
+        province: 'Luanda',
+        municipality: 'Luanda',
+        address: 'Maianga',
+      },
+      { companyId: compA, existingCustomers: [okEmp.customer!] }
+    );
+    assert(!dupEmp.ok, 'NIF duplicado dentro da mesma empresa deve ser bloqueado');
+
+    const otherCompEmp = validateAndBuildCustomer(
+      {
+        companyId: compB,
+        customerType: 'EMPRESA',
+        active: true,
+        name: 'Alfa Tech Filial B',
+        nif: '5001234567',
+        phone: '923100200',
+        province: 'Benguela',
+        municipality: 'Benguela',
+        address: 'Centro',
+      },
+      { companyId: compB, existingCustomers: [okEmp.customer!] }
+    );
+    assert(otherCompEmp.ok && otherCompEmp.customer?.internalCode === 'CLI-0001', 'Outra empresa pode cadastrar mesmo NIF com CLI-0001 isolado');
+
+    // (d) Particular com crédito exige NIF e contacto
+    const badPartCredit = validateAndBuildCustomer(
+      {
+        companyId: compA,
+        customerType: 'PARTICULAR',
+        active: true,
+        name: 'João Baptista',
+        nif: '',
+        phone: '924000111',
+        address: 'Rocha Pinto',
+        creditLimit: 50000,
+        paymentTerms: '30_DIAS',
+      },
+      { companyId: compA, existingCustomers: [okEmp.customer!] }
+    );
+    assert(!badPartCredit.ok, 'Particular com crédito exige NIF');
+
+    // (e) Cliente Estrangeiro com país PT e NIF estrangeiro sem forçar NIF AO -> Exportação SAF-T AO + XSD
+    const foreignRes = validateAndBuildCustomer(
+      {
+        companyId: compA,
+        customerType: 'ESTRANGEIRO',
+        active: true,
+        name: 'Lusitania Exports, S.A.',
+        nif: '',
+        countryCode: 'PT',
+        foreignTaxId: 'PT508991234',
+        phone: '+351 210 000 000',
+        address: 'Av. da Liberdade 100, Lisboa',
+      },
+      { companyId: compA, existingCustomers: [okEmp.customer!] }
+    );
+    assert(
+      foreignRes.ok &&
+        foreignRes.customer?.countryCode === 'PT' &&
+        foreignRes.customer?.foreignTaxId === 'PT508991234' &&
+        foreignRes.customer?.internalCode === 'CLI-0002',
+      'Cliente estrangeiro deve aceitar identificação fiscal estrangeira e país PT'
+    );
+
+    // (f) Consumidor final liberado para venda directa e bloqueado para crédito/inactivo
+    const directCheckOk = validateCustomerForInvoiceEmission(null, {
+      companyId: compA,
+      docType: 'FR',
+      paymentMethod: 'Dinheiro',
+      amountDue: 0,
+    });
+    assert(directCheckOk.allowed, 'Consumidor Final deve emitir FR à vista sem cadastro');
+    const directCreditFail = validateCustomerForInvoiceEmission(null, {
+      companyId: compA,
+      docType: 'FR',
+      paymentMethod: 'Crédito',
+      amountDue: 1000,
+    });
+    assert(!directCreditFail.allowed, 'Consumidor Final não pode comprar a crédito');
+
+    // (g) Histórico de alterações sem modificar facturas históricas
+    const oldInvoiceSnapshot: Pick<InvoiceRecord, 'customerId' | 'customerName' | 'customerNif'> = {
+      customerId: okEmp.customer!.id,
+      customerName: okEmp.customer!.name,
+      customerNif: okEmp.customer!.nif,
+    };
+    const editedEmp = validateAndBuildCustomer(
+      {
+        id: okEmp.customer!.id,
+        companyId: compA,
+        customerType: 'EMPRESA',
+        active: true,
+        internalCode: okEmp.customer!.internalCode,
+        name: 'Alfa Tech Angola, S.A.',
+        nif: '5001234567',
+        phone: '923100201',
+        province: 'Luanda',
+        municipality: 'Belas',
+        address: 'Nova Sede, Belas',
+      },
+      {
+        companyId: compA,
+        existingCustomers: [okEmp.customer!],
+        previousCustomer: okEmp.customer!,
+        actorLabel: 'Gestor',
+      }
+    );
+    assert(
+      editedEmp.ok &&
+        (editedEmp.customer?.changeHistory?.length || 0) === 1 &&
+        oldInvoiceSnapshot.customerName === 'Alfa Tech, Lda',
+      'Alteração do cliente deve registar changeHistory sem alterar facturas já emitidas'
+    );
+
+    // (h) SAF-T XML para cliente estrangeiro mantém <Country>PT</Country> válido no XSD
+    const foreignProd: Product = {
+      id: 'p1',
+      code: 'P001',
+      name: 'Serviço Exportação',
+      category: 'Serviços',
+      unit: 'un',
+      price: 10000,
+      ivaRate: 14,
+      exemptionReason: '',
+      active: true,
+      createdAtIso: '2026-06-01T09:00:00.000Z',
+      updatedAtIso: '2026-06-01T09:00:00.000Z',
+    };
+    const tot = calculateInvoiceTotals([
+      {
+        productId: foreignProd.id,
+        code: foreignProd.code,
+        description: foreignProd.name,
+        unit: foreignProd.unit,
+        qty: 1,
+        unitPrice: foreignProd.price,
+        discountPct: 0,
+        ivaRate: 14,
+      },
+    ]);
+    const foreignSaft = generateSaftAoXml({
+      company: {
+        ...JAIMONA_COMPANY,
+        nif: '5003069940',
+        province: 'Luanda',
+        municipality: 'Luanda',
+        address: 'Centro',
+      },
+      customers: [foreignRes.customer!],
+      products: [foreignProd],
+      invoices: [
+        {
+          id: 'inv_for_1',
+          companyId: compA,
+          number: 'FR S12026/000001',
+          seriesCode: 'S1',
+          docType: 'FR',
+          paymentMethod: 'Transferência',
+          cashier: '01',
+          operator: 'Op',
+          issuedAtIso: '2026-06-05T10:00:00.000Z',
+          createdAtIso: '2026-06-05T10:00:00.000Z',
+          updatedAtIso: '2026-06-05T10:00:00.000Z',
+          customerId: foreignRes.customer!.id,
+          customerName: foreignRes.customer!.name,
+          customerNif: foreignRes.customer!.nif,
+          customerLocality: foreignRes.customer!.locality,
+          merchandiseTotal: tot.merchandiseTotal,
+          discountTotal: 0,
+          taxBase14: tot.taxBase14,
+          taxAmount14: tot.taxAmount14,
+          taxBase0: 0,
+          taxAmount0: 0,
+          taxTotal: tot.taxTotal,
+          grandTotal: tot.grandTotal,
+          amountInWords: tot.amountInWords,
+          amountReceived: tot.grandTotal,
+          changeAmount: 0,
+          notes: '',
+          status: 'issued',
+          lines: tot.lines,
+        },
+      ],
+    });
+    assert(
+      foreignSaft.xml.includes('<Country>PT</Country>') &&
+        foreignSaft.xml.includes('<CustomerTaxID>PT508991234</CustomerTaxID>') &&
+        validateSaftAoXsdStrict(foreignSaft.xml).valid,
+      'SAF-T deve exportar cliente estrangeiro com Country=PT e passar validação XSD'
+    );
+  });
+
+  await test('5.8 Paridade 5 Secções Desktop e Mobile no Formulário de Cliente + Campos Avançados', () => {
+    const sampleCust: Customer = {
+      id: 'cust_parity_1',
+      companyId: 'comp_1',
+      internalCode: 'CLI-0007',
+      customerType: 'EMPRESA',
+      active: true,
+      name: 'Kwanza Distribuição, Lda',
+      nif: '5001234567',
+      countryCode: 'AO',
+      province: 'Luanda',
+      municipality: 'Viana',
+      address: 'ZEE Luanda-Bengo',
+      locality: 'Viana · Luanda',
+      phone: '+244 923 000 111',
+      email: 'geral@kwanza.ao',
+      creditLimit: 250000,
+      paymentTerms: '30_DIAS',
+      notes: 'Cliente prioritário',
+      createdAtIso: '2026-06-01T09:00:00.000Z',
+      updatedAtIso: '2026-06-01T09:00:00.000Z',
+    };
+
+    for (const viewMode of ['DESKTOP', 'MOBILE'] as const) {
+      const html = renderCustomerMasterForm({
+        mode: viewMode,
+        companyId: 'comp_1',
+        customer: sampleCust,
+        creditLimitInput: '250000',
+        formId: viewMode === 'DESKTOP' ? 'customer-form' : 'mobile-quick-customer-form',
+        isDirectCustomer: false,
+        showAdvanced: true,
+        errorMessage: null,
+        canManage: true,
+        defaultLocality: 'Luanda',
+      });
+      for (const marker of [
+        '01 — Identificação',
+        '02 — Contactos',
+        '03 — Endereço',
+        '04 — Dados Comerciais',
+        '05 — Observações',
+        'name="customerType"',
+        'name="active"',
+        'name="name"',
+        'name="nif"',
+        'name="phone"',
+        'name="email"',
+        'name="province"',
+        'name="municipality"',
+        'name="address"',
+        'name="creditLimit"',
+        'name="paymentTerms"',
+        'name="notes"',
+        'name="bankName"',
+        'name="bankIban"',
+        'name="documentRef"',
+        'name="representativeName"',
+        'name="representativePhone"',
+        'name="specialCreditNotes"',
+      ]) {
+        assert(html.includes(marker), `Modo ${viewMode} do formulário de cliente deve conter '${marker}'`);
+      }
+    }
+  });
+
+  console.log(`\n=== FASE 5 CONCLUÍDA: ${passed}/${total} TESTES PASSARAM COM SUCESSO ===\n`);
+  return { passed, total };
+}
+
+if (typeof process !== 'undefined' && process.argv && process.argv[1]?.includes('phase5ValidationTests')) {
+  runPhase5ValidationTests()
+    .then(() => process.exit(0))
+    .catch((err) => {
+      console.error('Falha nos testes da Fase 5:', err);
+      process.exit(1);
+    });
+}
