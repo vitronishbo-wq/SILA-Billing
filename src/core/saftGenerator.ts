@@ -627,8 +627,16 @@ export function generateSaftAoXml(params: GenerateSaftParams): SaftExportResult 
       const taxCode = isZeroRate ? 'ISE' : rateNum === 5 ? 'RED' : (rateNum === 1 || rateNum === 7) ? 'INT' : 'NOR';
       const taxCountryRegion = rateNum === 1 ? 'AO-CAB' : 'AO';
       const taxPercentage = rateNum.toFixed(2);
-      const exemptionCode = (l as any).exemptionCode || company.defaultExemptionCode || 'M10';
-      const exemptionReason = getIvaExemptionReason(exemptionCode);
+      const exemptionCode =
+        (l as any).exemptionCode ||
+        company.defaultExemptionCode ||
+        (company.taxRegime === 'EXCLUSAO'
+          ? 'M80'
+          : company.taxRegime === 'SIMPLIFICADO'
+            ? 'M81'
+            : 'M10');
+      const customExReason = String((l as any).exemptionReason || '').trim();
+      const exemptionReason = customExReason || getIvaExemptionReason(exemptionCode);
 
       // Débito para Notas de Crédito, Crédito para Faturas/Recibo, Faturas e Notas de Débito
       const amountTag = invoiceType === 'NC'
@@ -681,7 +689,7 @@ export function generateSaftAoXml(params: GenerateSaftParams): SaftExportResult 
     invoicesXmlChunks.push(`
       <Invoice>
         <InvoiceNo>${escapeXml(inv.number)}</InvoiceNo>
-        <ATCUD>0</ATCUD>
+        <ATCUD>${escapeXml(inv.atcud || '0')}</ATCUD>
         <DocumentStatus>
           <InvoiceStatus>${invoiceStatus}</InvoiceStatus>
           <InvoiceStatusDate>${invoiceStatusDate}</InvoiceStatusDate>

@@ -13,6 +13,11 @@ import {
   validateAngolaIban,
   validateLogoDataUrl,
 } from '../core/companyValidator';
+import {
+  buildDefaultCompanyRoles,
+  normalizeLegacyMember,
+  resolveMemberStatus,
+} from '../core/rbac';
 import { seriesStorage } from '../core/seriesManager';
 import {
   AgtOperationEnvironment,
@@ -26,6 +31,7 @@ import {
   CompanyMember,
   CompanyProfile,
   CompanyRecord,
+  CompanyRoleDefinition,
   createDefaultEstablishmentForCompany,
   Customer,
   DEFAULT_SETTINGS,
@@ -45,6 +51,8 @@ import {
   PaymentSplit,
   Product,
   PurchaseRecord,
+  resolveEstablishmentLocality,
+  SecurityAuditEntry,
   StockMovement,
   Supplier,
   SuspendedSale,
@@ -102,6 +110,8 @@ export interface CompanyWorkspaceBundle {
   activeCompany: CompanyRecord;
   companies: CompanyRecord[];
   members: CompanyMember[];
+  roles: CompanyRoleDefinition[];
+  securityAuditLogs: SecurityAuditEntry[];
   products: Product[];
   customers: Customer[];
   invoices: InvoiceRecord[];
@@ -268,6 +278,16 @@ const REQUIRED_SCHEMA: StoreSchemaSpec[] = [
     keyPath: 'id',
     indexes: [{ name: 'by_company', keyPath: 'companyId', unique: false }],
   },
+  {
+    name: 'company_roles',
+    keyPath: 'id',
+    indexes: [{ name: 'by_company', keyPath: 'companyId', unique: false }],
+  },
+  {
+    name: 'security_audit_logs',
+    keyPath: 'id',
+    indexes: [{ name: 'by_company', keyPath: 'companyId', unique: false }],
+  },
 ];
 
 let activeDb: IDBDatabase | null = null;
@@ -409,6 +429,8 @@ async function flushFallbackStoresIfReady(db: IDBDatabase): Promise<void> {
   const fallbackStoreNames = [
     'companies',
     'company_members',
+    'company_roles',
+    'security_audit_logs',
     'sync_queue',
     'cash_sessions',
     'cash_movements',
@@ -785,11 +807,11 @@ function canViewerAccessTenant(
     return true;
   }
 
-  // Membro explícito ativo (owner / manager / cashier)
+  // Membro explícito ativo (qualquer função autorizada)
   const hasMembership = allMembers.some(
     (m) =>
       m.companyId === company.id &&
-      m.active &&
+      resolveMemberStatus(m) === 'active' &&
       ((uid && m.uid === uid) || (emailLower && m.email.trim().toLowerCase() === emailLower))
   );
   if (hasMembership) {
@@ -1118,6 +1140,8 @@ export async function loadCompanyWorkspace(
       activeCompany: UNASSIGNED_TENANT_RECORD,
       companies: [],
       members: [],
+      roles: [],
+      securityAuditLogs: [],
       products: [],
       customers: [],
       invoices: [],
@@ -1154,7 +1178,9 @@ export async function loadCompanyWorkspace(
     stockMovements,
     suppliers,
     purchases,
-    members,
+    rawMembers,
+    storedRoles,
+    rawAuditLogs,
     scopedSettingsMeta,
     legacySettingsMeta,
     draftMeta,
@@ -1168,6 +1194,8 @@ export async function loadCompanyWorkspace(
     getAllByCompanyIndex<Supplier>('suppliers', activeCompany.id),
     getAllByCompanyIndex<PurchaseRecord>('purchases', activeCompany.id),
     getAllByCompanyIndex<CompanyMember>('company_members', activeCompany.id),
+    getAllByCompanyIndex<CompanyRoleDefinition>('company_roles', activeCompany.id),
+    getAllByCompanyIndex<SecurityAuditEntry>('security_audit_logs', activeCompany.id),
     getFromStore<{ key: string; value: AppSettings }>(
       'meta',
       `app_settings:${activeCompany.id}`
@@ -1181,12 +1209,113 @@ export async function loadCompanyWorkspace(
     ),
   ]);
 
-  // Garante cliente Consumidor Final próprio da empresa
+  // Garante as 7 funções base do RBAC + preserva funções personalizadas da empresa
+  const systemRoles = buildDefaultCompanyRoles(activeCompany.id);
+  const rolesMap = new Map<string, CompanyRoleDefinition>();
+  for (const sr of systemRoles) {
+    rolesMap.set(sr.id, sr);
+  }
+  for (const r of storedRoles) {
+    if (r && r.id) {
+      rolesMap.set(r.id, r);
+    }
+  }
+  const roles = Array.from(rolesMap.values());
+  for (const sr of systemRoles) {
+    if (!storedRoles.some((r) => r.id === sr.id)) {
+      await putInStore('company_roles', sr);
+    }
+  }
+
+  // Migração compatível de membros legados e bootstrap seguro do Proprietário local quando ausente
+  const members: CompanyMember[] = [];
+  for (const m of rawMembers) {
+    const normalizedMember = normalizeLegacyMember(m, activeCompany.allowManagerCancel);
+    members.push(normalizedMember);
+    if (
+      normalizedMember.roleId !== m.roleId ||
+      normalizedMember.status !== m.status ||
+      !Array.isArray(m.establishmentIds)
+    ) {
+      await putInStore('company_members', normalizedMember);
+    }
+  }
+  if (!members.some((m) => m.role === 'owner')) {
+    const nowIso = new Date().toISOString();
+    const ownerUid =
+      activeCompany.ownerUid ||
+      viewer?.uid ||
+      `owner_local_${activeCompany.id}`;
+    const ownerEmail =
+      activeCompany.ownerEmail ||
+      (activeCompany.id === JAIMONA_COMPANY_ID ? JAIMONA_OWNER_EMAIL : viewer?.email || '') ||
+      'proprietario@empresa.ao';
+    const ownerBootstrap = normalizeLegacyMember(
+      {
+        id: `${activeCompany.id}_${ownerUid}`,
+        companyId: activeCompany.id,
+        uid: ownerUid,
+        email: ownerEmail,
+        emailLower: ownerEmail.trim().toLowerCase(),
+        displayName:
+          viewer?.uid && viewer.uid === ownerUid && viewer.email
+            ? viewer.email.split('@')[0] || 'Proprietário'
+            : 'Proprietário',
+        role: 'owner',
+        roleId: 'role_owner',
+        status: 'active',
+        allowInvoiceCancel: true,
+        active: true,
+        createdAtIso: activeCompany.createdAtIso || nowIso,
+        updatedAtIso: nowIso,
+      },
+      activeCompany.allowManagerCancel
+    );
+    await putInStore('company_members', ownerBootstrap);
+    members.unshift(ownerBootstrap);
+  }
+
+  const securityAuditLogs = [...rawAuditLogs].sort((a, b) =>
+    b.createdAtIso.localeCompare(a.createdAtIso)
+  );
+
+  // Garante cliente Consumidor Final próprio da empresa e mantém localidade alinhada com o estabelecimento activo
   const directCustId = getDirectCustomerIdForCompany(activeCompany.id);
-  if (!customers.some((c) => c.id === directCustId)) {
+  const activeEst =
+    activeCompany.profile.establishments?.find(
+      (e) => e.id === activeCompany.profile.defaultEstablishmentId && e.active
+    ) ||
+    activeCompany.profile.establishments?.find((e) => e.isHeadquarters && e.active) ||
+    activeCompany.profile.establishments?.find((e) => e.active);
+  const expectedDirectLocality = resolveEstablishmentLocality(activeCompany.profile, activeEst);
+  const existingDirect = customers.find((c) => c.id === directCustId);
+  if (!existingDirect) {
     const directCustomer = createDirectCustomerForCompany(activeCompany);
     await putInStore('customers', directCustomer);
     customers.unshift(directCustomer);
+  } else if (
+    expectedDirectLocality &&
+    expectedDirectLocality !== 'Angola' &&
+    existingDirect.locality === 'Luanda - Angola' &&
+    expectedDirectLocality !== 'Luanda - Angola'
+  ) {
+    const refreshedDirect: Customer = {
+      ...existingDirect,
+      customerType: 'CONSUMIDOR_FINAL',
+      countryCode: activeCompany.profile.country || 'AO',
+      ...(activeEst?.province || activeCompany.profile.province
+        ? { province: activeEst?.province || activeCompany.profile.province }
+        : {}),
+      ...(activeEst?.municipality || activeCompany.profile.municipality
+        ? { municipality: activeEst?.municipality || activeCompany.profile.municipality }
+        : {}),
+      locality: expectedDirectLocality,
+      address: `Venda a Balcão — ${expectedDirectLocality}`,
+      updatedAtIso: new Date().toISOString(),
+    };
+    await putInStore('customers', refreshedDirect);
+    const idx = customers.findIndex((c) => c.id === directCustId);
+    if (idx >= 0) customers[idx] = refreshedDirect;
   }
 
   // Normaliza categorias caso algum artigo antigo não tenha
@@ -1241,6 +1370,8 @@ export async function loadCompanyWorkspace(
     activeCompany,
     companies: sortedForSwitcher,
     members,
+    roles,
+    securityAuditLogs,
     products,
     customers,
     invoices,
@@ -1541,6 +1672,35 @@ export async function saveCompanySettingsScoped(
     await putInStore('meta', { key: 'app_settings', value: scopedSettings });
   }
 
+  // Atualiza também a localidade do cliente Consumidor Final local quando a sede/estabelecimento muda
+  const directCustId = getDirectCustomerIdForCompany(companyId);
+  const existingDirect = await getFromStore<Customer>('customers', directCustId);
+  if (existingDirect) {
+    const est =
+      normalizedProfile.establishments?.find(
+        (e) => e.id === normalizedProfile.defaultEstablishmentId && e.active
+      ) ||
+      normalizedProfile.establishments?.find((e) => e.isHeadquarters && e.active) ||
+      normalizedProfile.establishments?.find((e) => e.active);
+    const nextDirectLocality = resolveEstablishmentLocality(normalizedProfile, est);
+    if (nextDirectLocality && nextDirectLocality !== existingDirect.locality) {
+      await putInStore('customers', {
+        ...existingDirect,
+        customerType: 'CONSUMIDOR_FINAL',
+        countryCode: normalizedProfile.country || 'AO',
+        ...(est?.province || normalizedProfile.province
+          ? { province: est?.province || normalizedProfile.province }
+          : {}),
+        ...(est?.municipality || normalizedProfile.municipality
+          ? { municipality: est?.municipality || normalizedProfile.municipality }
+          : {}),
+        locality: nextDirectLocality,
+        address: `Venda a Balcão — ${nextDirectLocality}`,
+        updatedAtIso: now,
+      });
+    }
+  }
+
   return updatedCompany;
 }
 
@@ -1618,8 +1778,15 @@ export const localDb = {
     await deleteFromStore('meta', `app_settings:${companyId}`);
   },
   getAllCompanies: () => getAllFromStore<CompanyRecord>('companies'),
-  saveMember: (member: CompanyMember) => putInStore('company_members', member),
+  saveMember: (member: CompanyMember) =>
+    putInStore('company_members', normalizeLegacyMember(member)),
   deleteMember: (id: string) => deleteFromStore('company_members', id),
+  saveRole: (role: CompanyRoleDefinition) => putInStore('company_roles', role),
+  deleteRole: (id: string) => deleteFromStore('company_roles', id),
+  appendSecurityAudit: (entry: SecurityAuditEntry) =>
+    putInStore('security_audit_logs', entry),
+  getSecurityAuditsByCompany: (companyId: string) =>
+    getAllByCompanyIndex<SecurityAuditEntry>('security_audit_logs', companyId),
   enqueueSync: (entry: SyncQueueEntry) => putInStore('sync_queue', entry),
   deleteSyncEntry: (id: string) => deleteFromStore('sync_queue', id),
   saveProduct: (p: Product, companyId: string) => {

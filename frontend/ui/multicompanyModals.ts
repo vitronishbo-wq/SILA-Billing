@@ -1,4 +1,5 @@
 import { formatDateTimePt } from '../../src/core/billingEngine';
+import { formatRoleLabelPt } from '../../src/core/rbac';
 import {
   CompanyOperationalStatus,
   CompanyRecord,
@@ -20,11 +21,7 @@ function escapeHtml(raw: string): string {
     .replace(/'/g, '&#39;');
 }
 
-export function formatRoleLabelPt(role: CompanyRole): string {
-  if (role === 'owner') return 'Proprietário';
-  if (role === 'manager') return 'Gerente';
-  return 'Operador de Caixa';
-}
+export { formatRoleLabelPt };
 
 export function formatPlanLabelPt(plan: PlanTier): string {
   switch (plan) {
@@ -410,8 +407,11 @@ export function renderTenantOnboardingView(params: {
           }
         </div>
 
-        <div class="pt-3 border-t border-slate-100 text-[11px] text-slate-400 leading-relaxed">
-          SILA-Billing · Dependência institucional de <span class="text-slate-600 font-medium">${escapeHtml(VITRONIS_INSTITUTIONAL.legalName)}</span> · Cidade-Alta, ${escapeHtml(VITRONIS_INSTITUTIONAL.city)} · ${escapeHtml(VITRONIS_INSTITUTIONAL.website)}
+        <div class="pt-3 border-t border-slate-100 text-[11px] text-slate-400 leading-relaxed flex flex-wrap items-center justify-between gap-2">
+          <span>
+            SILA-Billing · Dependência institucional de <span class="text-slate-600 font-medium">${escapeHtml(VITRONIS_INSTITUTIONAL.legalName)}</span> · Cidade-Alta, ${escapeHtml(VITRONIS_INSTITUTIONAL.city)} · ${escapeHtml(VITRONIS_INSTITUTIONAL.website)}
+          </span>
+          <button type="button" data-action="open-privacy-policy" class="text-blue-600 hover:underline font-medium">Política de Privacidade</button>
         </div>
       </div>
     </div>
@@ -463,10 +463,10 @@ export function renderFriendlyGrowthModal(params: {
     lead =
       'A ocultação da assinatura institucional no rodapé dos talões POS 80mm e faturas A4 fica disponível automaticamente a partir do Plano Essencial (1.000 Kz/mês).';
   } else if (reason === 'team_access') {
-    kicker = 'Operação Multi-Operador';
-    headline = 'Equipa sincronizada com Gerentes e Operadores de Caixa';
+    kicker = 'Sincronização Multi-Dispositivo na Nuvem';
+    headline = 'Convites Cloud e gestão centralizada entre terminais';
     lead =
-      'A adição de múltiplos colaboradores autenticados e sincronização entre terminais faz parte do Plano Cloud Profissional.';
+      'A gestão local de utilizadores, funções, PINs e auditoria está incluída em todos os planos. Para convidar colaboradores em múltiplos dispositivos com sincronização Cloud em tempo real, ative o Plano Cloud Profissional.';
   }
 
   const waText = encodeURIComponent(
@@ -547,12 +547,12 @@ export function renderFriendlyGrowthModal(params: {
                   <span class="text-xs font-semibold text-blue-700">Sob consulta corporativa</span>
                 </div>
                 <p class="text-[11px] text-slate-600 leading-relaxed">
-                  Para empresas que exigem salvaguarda automática na nuvem e equipa multi-operador.
+                  Para empresas com múltiplos dispositivos, convites Cloud e sincronização centralizada em tempo real.
                 </p>
                 <ul class="space-y-1 text-[11px] text-slate-700 pt-1">
                   <li class="flex items-center gap-1.5"><span class="text-blue-600">${ICONS.check}</span><span>Tudo do Plano Essencial incluído</span></li>
                   <li class="flex items-center gap-1.5"><span class="text-blue-600">${ICONS.check}</span><span>Sincronização e Backup Cloud automático</span></li>
-                  <li class="flex items-center gap-1.5"><span class="text-blue-600">${ICONS.check}</span><span>Equipa com Gerentes e Operadores de Caixa</span></li>
+                  <li class="flex items-center gap-1.5"><span class="text-blue-600">${ICONS.check}</span><span>Convites Cloud e gestão multi-dispositivo</span></li>
                 </ul>
               </div>
             </div>

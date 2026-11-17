@@ -93,6 +93,7 @@ import {
   PurchaseLineItem,
   PurchasePaymentMethod,
   PurchaseRecord,
+  resolveEstablishmentLocality,
   shouldShowViralDocumentFooter,
   StockMovement,
   StockMovementDirection,
@@ -180,9 +181,14 @@ import {
   summarizeDocumentControlList,
   triggerBrowserDownload,
 } from '../src/core/documentExport';
-import { computeDocumentSaftHash4, generateSaftAoXml } from '../src/core/saftGenerator';
+import {
+  computeDocumentSaftHash4,
+  generateChainedDocumentHash,
+  generateSaftAoXml,
+} from '../src/core/saftGenerator';
 import {
   generateInvoiceQrDataUrl,
+  getInvoiceQrCacheKey,
   renderCashClosureReportHtml,
   renderDocumentHtml,
   renderHistoryControlReportHtml,
@@ -1195,18 +1201,31 @@ export class SilaBillingApp {
     showViralFooter: boolean;
     customerAddress?: string;
     customerPhone?: string;
+    customerEmail?: string;
+    customerType?: CustomerType;
+    customerCountryCode?: string;
     isReprint?: boolean;
   } {
     const directCustId = getDirectCustomerIdForCompany(this.activeCompany.id);
-    if (!invoice.customerId || invoice.customerId === directCustId) {
-      return { showViralFooter, ...(isReprint ? { isReprint: true } : {}) };
-    }
-    const cust = this.customers.find((c) => c.id === invoice.customerId);
-    if (!cust) return { showViralFooter, ...(isReprint ? { isReprint: true } : {}) };
+    const cust =
+      invoice.customerId && invoice.customerId !== directCustId
+        ? this.customers.find((c) => c.id === invoice.customerId)
+        : undefined;
+    const customerAddress = invoice.customerAddress || cust?.address || undefined;
+    const customerPhone = invoice.customerPhone || cust?.phone || undefined;
+    const customerEmail = invoice.customerEmail || cust?.email || undefined;
+    const customerType =
+      invoice.customerType ||
+      (cust ? inferCustomerType(cust, directCustId) : undefined);
+    const customerCountryCode = invoice.customerCountryCode || cust?.countryCode || undefined;
+
     return {
       showViralFooter,
-      customerAddress: cust.address || undefined,
-      customerPhone: cust.phone || undefined,
+      ...(customerAddress ? { customerAddress } : {}),
+      ...(customerPhone ? { customerPhone } : {}),
+      ...(customerEmail ? { customerEmail } : {}),
+      ...(customerType ? { customerType } : {}),
+      ...(customerCountryCode ? { customerCountryCode } : {}),
       ...(isReprint ? { isReprint: true } : {}),
     };
   }
@@ -3148,6 +3167,7 @@ export class SilaBillingApp {
         discountPct: 0,
         ivaRate: prod.ivaRate,
         ...(prod.exemptionCode ? { exemptionCode: prod.exemptionCode } : {}),
+        ...(prod.exemptionReason ? { exemptionReason: prod.exemptionReason } : {}),
       });
     }
     if (prod.trackStock) {
@@ -3176,8 +3196,7 @@ export class SilaBillingApp {
   }
 
   private getInvoiceQrCacheKey(inv: InvoiceRecord): string {
-    const issuerNif = inv.issuerSnapshot?.nif || this.settings.company.nif;
-    return `${inv.number}|${inv.grandTotal.toFixed(2)}|${issuerNif}|${inv.saftHash4 || ''}`;
+    return getInvoiceQrCacheKey(inv, this.settings.company);
   }
 
   private async ensureQrForInvoice(inv: InvoiceRecord): Promise<string> {
@@ -3227,14 +3246,41 @@ export class SilaBillingApp {
           this.activeCompany.baseSequence
         );
     const directCustId = getDirectCustomerIdForCompany(this.activeCompany.id);
+    const dynamicEstLocality = resolveEstablishmentLocality(this.settings.company, activeEst);
     const customer =
       this.customers.find((c) => c.id === this.selectedCustomerId) ||
       this.customers[0] || {
         id: directCustId,
         name: 'Cliente de Venda Directa',
         nif: 'Consumidor Final',
-        locality: this.activeCompany.profile.cityCountry || 'Angola',
+        customerType: 'CONSUMIDOR_FINAL' as CustomerType,
+        countryCode: this.settings.company.country || 'AO',
+        locality: dynamicEstLocality,
       };
+    const resolvedCustomerType = inferCustomerType(customer, directCustId);
+    const resolvedCustomerCountry = (
+      customer.countryCode ||
+      this.settings.company.country ||
+      'AO'
+    )
+      .trim()
+      .toUpperCase();
+    const rawCustomerLoc = (customer.locality || '').trim();
+    const resolvedCustomerLocality =
+      resolvedCustomerType === 'CONSUMIDOR_FINAL'
+        ? !rawCustomerLoc ||
+          rawCustomerLoc === 'Angola' ||
+          (rawCustomerLoc === 'Luanda - Angola' && dynamicEstLocality !== 'Luanda - Angola')
+          ? dynamicEstLocality
+          : rawCustomerLoc
+        : rawCustomerLoc ||
+          [customer.municipality, customer.province].filter(Boolean).join(', ') ||
+          dynamicEstLocality;
+    const previewSeqNum = activeAgtSeries ? (activeAgtSeries.lastDocumentNumber || 0) + 1 : 0;
+    const previewAtcud =
+      activeAgtSeries?.environment === 'PRODUCAO' && activeAgtSeries.agtAuthorizationCode
+        ? `${activeAgtSeries.agtAuthorizationCode.trim()}-${previewSeqNum}`
+        : undefined;
 
     const returnCreditApplied = this.returnOriginInvoice
       ? Math.min(totals.grandTotal, roundKz(this.returnOriginInvoice.creditAmount))
@@ -3298,7 +3344,12 @@ export class SilaBillingApp {
       customerId: customer.id,
       customerName: customer.name,
       customerNif: customer.nif,
-      customerLocality: customer.locality,
+      customerType: resolvedCustomerType,
+      customerCountryCode: resolvedCustomerCountry,
+      customerLocality: resolvedCustomerLocality,
+      ...(customer.address ? { customerAddress: customer.address } : {}),
+      ...(customer.phone ? { customerPhone: customer.phone } : {}),
+      ...(customer.email ? { customerEmail: customer.email } : {}),
       merchandiseTotal: totals.merchandiseTotal,
       discountTotal: totals.discountTotal,
       ...(totals.globalDiscountPct > 0
@@ -3337,8 +3388,9 @@ export class SilaBillingApp {
             ...(activeAgtSeries.agtAuthorizationCode
               ? { agtAuthorizationCode: activeAgtSeries.agtAuthorizationCode }
               : {}),
+            ...(previewAtcud ? { atcud: previewAtcud } : {}),
           }
-        : {}),
+        : { seriesEnvironment: activeEnv }),
       amountReceived: numericReceived,
       changeAmount,
       ...(amountDue > 0 ? { amountDue } : {}),
@@ -9838,6 +9890,29 @@ export class SilaBillingApp {
         agtEnvironment: updatedCompany.profile.agtEnvironment,
       };
       this.settings = savedSettings;
+      const savedEst = resolveActiveEstablishment(
+        updatedCompany.profile,
+        updatedCompany.profile.defaultEstablishmentId
+      );
+      const nextDirectLocality = resolveEstablishmentLocality(updatedCompany.profile, savedEst);
+      const directCustId = getDirectCustomerIdForCompany(updatedCompany.id);
+      this.customers = this.customers.map((c) =>
+        c.id === directCustId
+          ? {
+              ...c,
+              customerType: 'CONSUMIDOR_FINAL',
+              countryCode: updatedCompany.profile.country || 'AO',
+              ...(savedEst.province || updatedCompany.profile.province
+                ? { province: savedEst.province || updatedCompany.profile.province }
+                : {}),
+              ...(savedEst.municipality || updatedCompany.profile.municipality
+                ? { municipality: savedEst.municipality || updatedCompany.profile.municipality }
+                : {}),
+              locality: nextDirectLocality,
+              address: `Venda a Balcão — ${nextDirectLocality}`,
+            }
+          : c
+      );
       this.companyMasterDraftProfile = null;
       this.companyMasterDraftSettings = null;
       this.cashier = savedSettings.defaultCashier;
@@ -10002,11 +10077,29 @@ export class SilaBillingApp {
         establishment: activeEst,
         capturedAtIso: now,
       });
-      const saftHash4 = computeDocumentSaftHash4({
-        issuedAtIso: now,
-        number: officialNumber,
-        grandTotal: draft.grandTotal,
-      }).hash4;
+      const targetSeriesCode = reservedSeriesMeta?.seriesCode || draft.seriesCode;
+      const prevSeriesInv = this.invoices.find(
+        (i) =>
+          i.companyId === this.activeCompany.id &&
+          (!targetSeriesCode || i.seriesCode === targetSeriesCode) &&
+          (i.seriesEnvironment || 'SIMULACAO') === activeEnv
+      );
+      const previousInvoiceHash = prevSeriesInv
+        ? prevSeriesInv.saftHashFull ||
+          generateChainedDocumentHash(prevSeriesInv, prevSeriesInv.previousInvoiceHash || '')
+        : '';
+      const hashResult = computeDocumentSaftHash4(
+        {
+          issuedAtIso: now,
+          number: officialNumber,
+          grandTotal: draft.grandTotal,
+        },
+        previousInvoiceHash
+      );
+      const officialAtcud =
+        reservedSeriesMeta?.environment === 'PRODUCAO' && reservedSeriesMeta.agtAuthorizationCode
+          ? `${reservedSeriesMeta.agtAuthorizationCode.trim()}-${reservedSeriesMeta.sequenceNumber}`
+          : undefined;
 
       const invoice: InvoiceRecord = {
         ...draft,
@@ -10026,9 +10119,12 @@ export class SilaBillingApp {
               ...(reservedSeriesMeta.agtAuthorizationCode
                 ? { agtAuthorizationCode: reservedSeriesMeta.agtAuthorizationCode }
                 : {}),
+              ...(officialAtcud ? { atcud: officialAtcud } : {}),
             }
           : { seriesEnvironment: activeEnv }),
-        saftHash4,
+        saftHash4: hashResult.hash4,
+        saftHashFull: hashResult.fullHash,
+        ...(previousInvoiceHash ? { previousInvoiceHash } : {}),
         ...(discountAuth ? { discountAuthorizedBy: discountAuth } : {}),
         ...(draft.docType === 'FR'
           ? {
@@ -15601,11 +15697,46 @@ export class SilaBillingApp {
       establishment: activeEst,
       capturedAtIso: now,
     });
-    const ncHash4 = computeDocumentSaftHash4({
-      issuedAtIso: now,
-      number: nextNumber,
-      grandTotal: ncTotals.grandTotal,
-    }).hash4;
+    const ncSeriesCode = reservedNcSeries?.seriesCode;
+    const prevNcSeriesInv = this.invoices.find(
+      (i) =>
+        i.companyId === this.activeCompany.id &&
+        (!ncSeriesCode || i.seriesCode === ncSeriesCode) &&
+        (i.seriesEnvironment || 'SIMULACAO') === activeEnv
+    );
+    const ncPreviousHash = prevNcSeriesInv
+      ? prevNcSeriesInv.saftHashFull ||
+        generateChainedDocumentHash(prevNcSeriesInv, prevNcSeriesInv.previousInvoiceHash || '')
+      : '';
+    const ncHashResult = computeDocumentSaftHash4(
+      {
+        issuedAtIso: now,
+        number: nextNumber,
+        grandTotal: ncTotals.grandTotal,
+      },
+      ncPreviousHash
+    );
+    const ncAtcud =
+      reservedNcSeries?.environment === 'PRODUCAO' && reservedNcSeries.agtAuthorizationCode
+        ? `${reservedNcSeries.agtAuthorizationCode.trim()}-${reservedNcSeries.sequenceNumber}`
+        : undefined;
+    const originCustObj =
+      originInv.customerId && originInv.customerId !== getDirectCustomerIdForCompany(this.activeCompany.id)
+        ? this.customers.find((c) => c.id === originInv.customerId)
+        : undefined;
+    const ncCustomerType =
+      originInv.customerType ||
+      (originCustObj
+        ? inferCustomerType(originCustObj, getDirectCustomerIdForCompany(this.activeCompany.id))
+        : inferCustomerType({
+            id: originInv.customerId,
+            name: originInv.customerName,
+            nif: originInv.customerNif,
+          }));
+    const ncCustomerCountry = originInv.customerCountryCode || originCustObj?.countryCode || 'AO';
+    const ncCustomerAddr = originInv.customerAddress || originCustObj?.address;
+    const ncCustomerPhone = originInv.customerPhone || originCustObj?.phone;
+    const ncCustomerEmail = originInv.customerEmail || originCustObj?.email;
 
     const ncInvoice: InvoiceRecord = {
       id: `inv_nc_${Date.now()}_${Math.random().toString(36).slice(2, 6)}`,
@@ -15620,7 +15751,12 @@ export class SilaBillingApp {
       customerId: originInv.customerId,
       customerName: originInv.customerName,
       customerNif: originInv.customerNif,
+      customerType: ncCustomerType,
+      customerCountryCode: ncCustomerCountry,
       customerLocality: originInv.customerLocality,
+      ...(ncCustomerAddr ? { customerAddress: ncCustomerAddr } : {}),
+      ...(ncCustomerPhone ? { customerPhone: ncCustomerPhone } : {}),
+      ...(ncCustomerEmail ? { customerEmail: ncCustomerEmail } : {}),
       merchandiseTotal: ncTotals.merchandiseTotal,
       discountTotal: ncTotals.discountTotal,
       ...(ncTotals.globalDiscountPct > 0
@@ -15659,9 +15795,12 @@ export class SilaBillingApp {
             ...(reservedNcSeries.agtAuthorizationCode
               ? { agtAuthorizationCode: reservedNcSeries.agtAuthorizationCode }
               : {}),
+            ...(ncAtcud ? { atcud: ncAtcud } : {}),
           }
         : { seriesEnvironment: activeEnv }),
-      saftHash4: ncHash4,
+      saftHash4: ncHashResult.hash4,
+      saftHashFull: ncHashResult.fullHash,
+      ...(ncPreviousHash ? { previousInvoiceHash: ncPreviousHash } : {}),
       amountReceived: refundedNow,
       changeAmount: 0,
       ...(refText ? { transferReference: refText } : {}),

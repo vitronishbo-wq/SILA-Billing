@@ -2,10 +2,20 @@ import type { NextFunction, Response } from 'express';
 import type { DecodedIdToken } from 'firebase-admin/auth';
 import type { Firestore } from 'firebase-admin/firestore';
 import {
+  buildDefaultCompanyRoles,
+  normalizeLegacyMember,
+  resolveMemberBaseRole,
+  resolveMemberPermissions,
+  resolveMemberStatus,
+} from '../../src/core/rbac.ts';
+import {
   isJaimonaOwnerEmail,
   JAIMONA_COMPANY_ID,
   PLATFORM_ADMIN_EMAIL,
+  type CompanyMember,
   type CompanyRole,
+  type CompanyRoleDefinition,
+  type PermissionKey,
 } from '../../src/core/types.ts';
 import { getFirebaseAdminContext } from '../firebaseAdmin.ts';
 import type { AuthenticatedRequest } from './requireFirebaseAuth.ts';
@@ -77,13 +87,73 @@ export interface VerifiedCompanyMembership {
   existsInCloud: boolean;
   companyStatus: 'active' | 'suspended' | 'pending';
   role: CompanyRole;
+  roleId: string;
+  memberId: string;
+  memberRecord: CompanyMember | null;
+  permissions: Record<PermissionKey, boolean>;
+  establishmentIds: string[];
+  authorizedCashiers: string[];
   allowCancel: boolean;
+  isPlatformSupport?: boolean;
   companyData: Record<string, unknown> | null;
+}
+
+function resolveDocToMember(
+  docId: string,
+  companyId: string,
+  raw: Record<string, unknown>,
+  allowManagerCancel: boolean
+): CompanyMember {
+  const now = new Date().toISOString();
+  const candidate: CompanyMember = {
+    id: String(raw.id || docId),
+    companyId: String(raw.companyId || companyId),
+    uid: String(raw.uid || docId),
+    email: String(raw.email || ''),
+    emailLower: String(raw.emailLower || raw.email || '').trim().toLowerCase(),
+    ...(raw.phone ? { phone: String(raw.phone) } : {}),
+    displayName: String(raw.displayName || raw.email || 'Colaborador'),
+    role: resolveMemberBaseRole({ role: raw.role as CompanyRole }),
+    roleId: raw.roleId ? String(raw.roleId) : undefined,
+    establishmentIds: Array.isArray(raw.establishmentIds)
+      ? raw.establishmentIds.map((x) => String(x))
+      : [],
+    authorizedCashiers: Array.isArray(raw.authorizedCashiers)
+      ? raw.authorizedCashiers.map((x) => String(x))
+      : [],
+    permissionOverrides:
+      raw.permissionOverrides && typeof raw.permissionOverrides === 'object'
+        ? {
+            grant: Array.isArray((raw.permissionOverrides as { grant?: unknown[] }).grant)
+              ? ((raw.permissionOverrides as { grant: unknown[] }).grant.map((x) =>
+                  String(x)
+                ) as PermissionKey[])
+              : [],
+            revoke: Array.isArray((raw.permissionOverrides as { revoke?: unknown[] }).revoke)
+              ? ((raw.permissionOverrides as { revoke: unknown[] }).revoke.map((x) =>
+                  String(x)
+                ) as PermissionKey[])
+              : [],
+          }
+        : undefined,
+    status:
+      raw.status === 'pending_invite' || raw.status === 'active' || raw.status === 'suspended'
+        ? raw.status
+        : raw.active === true
+          ? 'active'
+          : 'suspended',
+    allowInvoiceCancel: Boolean(raw.allowInvoiceCancel),
+    active: Boolean(raw.active),
+    ...(raw.pinHash ? { pinHash: String(raw.pinHash) } : {}),
+    createdAtIso: String(raw.createdAtIso || now),
+    updatedAtIso: String(raw.updatedAtIso || now),
+  };
+  return normalizeLegacyMember(candidate, allowManagerCancel);
 }
 
 /**
  * Valida no servidor se o utilizador autenticado pertence à empresa indicada
- * e devolve o papel efetivo (owner | manager | cashier).
+ * e devolve o papel efectivo (7 funções base + funções personalizadas) e permissões granulares.
  */
 export async function verifyCompanyMembershipServer(
   db: Firestore,
@@ -98,20 +168,50 @@ export async function verifyCompanyMembershipServer(
   }
 
   const companyRef = db.collection('companies').doc(safeCompanyId);
-  const [companySnap, memberSnap] = await Promise.all([
+  const [companySnap, memberSnap, rolesSnap] = await Promise.all([
     companyRef.get(),
     companyRef.collection('members').doc(user.uid).get(),
+    companyRef.collection('roles').get().catch(() => null),
   ]);
 
+  const systemRoles = buildDefaultCompanyRoles(safeCompanyId);
+  const customRoles: CompanyRoleDefinition[] = (rolesSnap?.docs || []).map(
+    (d) => ({ id: d.id, ...(d.data() as Omit<CompanyRoleDefinition, 'id'>) })
+  );
+  const allRoles = [
+    ...systemRoles.filter((sr) => !customRoles.some((cr) => cr.id === sr.id)),
+    ...customRoles,
+  ];
+
   if (!companySnap.exists) {
-    // Compatibilidade pré-sincronização restrita ao e-mail titular da JAIMONA ou Super-Admin SILA-Billing
     const isGlobalAdmin = await checkIsPlatformAdmin(user, db);
     if (safeCompanyId === JAIMONA_COMPANY_ID && (isJaimonaOwnerEmail(user.email) || isGlobalAdmin)) {
+      const ownerStub = normalizeLegacyMember({
+        id: `${safeCompanyId}_${user.uid}`,
+        companyId: safeCompanyId,
+        uid: user.uid,
+        email: user.email || '',
+        displayName: user.name || user.email || 'Proprietário',
+        role: 'owner',
+        roleId: 'role_owner',
+        status: 'active',
+        allowInvoiceCancel: true,
+        active: true,
+        createdAtIso: new Date().toISOString(),
+        updatedAtIso: new Date().toISOString(),
+      });
       return {
         existsInCloud: false,
         companyStatus: 'active',
         role: 'owner',
+        roleId: 'role_owner',
+        memberId: ownerStub.id,
+        memberRecord: ownerStub,
+        permissions: resolveMemberPermissions(ownerStub, allRoles, true),
+        establishmentIds: [],
+        authorizedCashiers: [],
         allowCancel: true,
+        isPlatformSupport: isGlobalAdmin && !isJaimonaOwnerEmail(user.email),
         companyData: null,
       };
     }
@@ -119,6 +219,7 @@ export async function verifyCompanyMembershipServer(
   }
 
   const cData = companySnap.data() || {};
+  const allowManagerCancel = Boolean(cData.allowManagerCancel);
   const status =
     cData.status === 'suspended'
       ? 'suspended'
@@ -127,34 +228,65 @@ export async function verifyCompanyMembershipServer(
         : 'active';
 
   if (cData.ownerUid === user.uid) {
+    const ownerMember = memberSnap.exists
+      ? resolveDocToMember(memberSnap.id, safeCompanyId, memberSnap.data() || {}, allowManagerCancel)
+      : normalizeLegacyMember({
+          id: user.uid,
+          companyId: safeCompanyId,
+          uid: user.uid,
+          email: String(cData.ownerEmail || user.email || ''),
+          displayName: user.name || String(cData.ownerEmail || user.email || 'Proprietário'),
+          role: 'owner',
+          roleId: 'role_owner',
+          status: 'active',
+          allowInvoiceCancel: true,
+          active: true,
+          createdAtIso: new Date().toISOString(),
+          updatedAtIso: new Date().toISOString(),
+        });
+    const perms = resolveMemberPermissions({ ...ownerMember, role: 'owner', status: 'active', active: true }, allRoles, allowManagerCancel);
     return {
       existsInCloud: true,
       companyStatus: status,
       role: 'owner',
+      roleId: ownerMember.roleId || 'role_owner',
+      memberId: ownerMember.id,
+      memberRecord: { ...ownerMember, role: 'owner', status: 'active', active: true },
+      permissions: perms,
+      establishmentIds: [],
+      authorizedCashiers: [],
       allowCancel: true,
       companyData: cData,
     };
   }
 
-  if (memberSnap.exists && memberSnap.data()?.active === true) {
-    const mData = memberSnap.data()!;
-    const role: CompanyRole =
-      mData.role === 'owner' ? 'owner' : mData.role === 'manager' ? 'manager' : 'cashier';
-    const allowCancel =
-      role === 'owner' ||
-      (role === 'manager' &&
-        (Boolean(cData.allowManagerCancel) || Boolean(mData.allowInvoiceCancel)));
-
-    return {
-      existsInCloud: true,
-      companyStatus: status,
-      role,
-      allowCancel,
-      companyData: cData,
-    };
+  if (memberSnap.exists) {
+    const m = resolveDocToMember(
+      memberSnap.id,
+      safeCompanyId,
+      memberSnap.data() || {},
+      allowManagerCancel
+    );
+    if (resolveMemberStatus(m) === 'active') {
+      const perms = resolveMemberPermissions(m, allRoles, allowManagerCancel);
+      return {
+        existsInCloud: true,
+        companyStatus: status,
+        role: m.role,
+        roleId: m.roleId || `role_${m.role}`,
+        memberId: m.id,
+        memberRecord: m,
+        permissions: perms,
+        establishmentIds: m.establishmentIds || [],
+        authorizedCashiers: m.authorizedCashiers || [],
+        allowCancel: Boolean(perms.invoice_cancel),
+        companyData: cData,
+      };
+    }
+    return null;
   }
 
-  // Fallback por email verificado caso o proprietário tenha pré-registado o membro por email
+  // Fallback por email verificado apenas para membro explícito já activo
   const emailLower = (user.email || '').trim().toLowerCase();
   if (emailLower) {
     const byEmailSnap = await companyRef
@@ -165,33 +297,60 @@ export async function verifyCompanyMembershipServer(
 
     if (!byEmailSnap.empty) {
       const docMatch = byEmailSnap.docs[0]!;
-      const mData = docMatch.data();
-      if (mData.active === true) {
-        const role: CompanyRole =
-          mData.role === 'owner' ? 'owner' : mData.role === 'manager' ? 'manager' : 'cashier';
-        const allowCancel =
-          role === 'owner' ||
-          (role === 'manager' &&
-            (Boolean(cData.allowManagerCancel) || Boolean(mData.allowInvoiceCancel)));
+      const m = resolveDocToMember(
+        docMatch.id,
+        safeCompanyId,
+        docMatch.data() || {},
+        allowManagerCancel
+      );
+      if (resolveMemberStatus(m) === 'active') {
+        const perms = resolveMemberPermissions(m, allRoles, allowManagerCancel);
         return {
           existsInCloud: true,
           companyStatus: status,
-          role,
-          allowCancel,
+          role: m.role,
+          roleId: m.roleId || `role_${m.role}`,
+          memberId: m.id,
+          memberRecord: m,
+          permissions: perms,
+          establishmentIds: m.establishmentIds || [],
+          authorizedCashiers: m.authorizedCashiers || [],
+          allowCancel: Boolean(perms.invoice_cancel),
           companyData: cData,
         };
       }
     }
   }
 
-  // Administrador global da plataforma tem leitura de suporte auditada
+  // Administrador global VITRONIS só tem acesso de suporte auditado, separado da administração interna de cliente
   const isGlobalAdmin = await checkIsPlatformAdmin(user, db);
   if (isGlobalAdmin) {
+    const supportStub = normalizeLegacyMember({
+      id: `support_${user.uid}`,
+      companyId: safeCompanyId,
+      uid: user.uid,
+      email: user.email || '',
+      displayName: 'Suporte VITRONIS',
+      role: 'owner',
+      roleId: 'role_owner',
+      status: 'active',
+      allowInvoiceCancel: true,
+      active: true,
+      createdAtIso: new Date().toISOString(),
+      updatedAtIso: new Date().toISOString(),
+    });
     return {
       existsInCloud: true,
       companyStatus: status,
       role: 'owner',
+      roleId: 'role_owner',
+      memberId: supportStub.id,
+      memberRecord: supportStub,
+      permissions: resolveMemberPermissions(supportStub, allRoles, true),
+      establishmentIds: [],
+      authorizedCashiers: [],
       allowCancel: true,
+      isPlatformSupport: true,
       companyData: cData,
     };
   }

@@ -333,6 +333,12 @@ export function sanitizeIssuerSnapshotForCloud(
   if (snap.establishmentAddress) {
     out.establishmentAddress = String(snap.establishmentAddress).slice(0, 160);
   }
+  if (snap.establishmentMunicipality) {
+    out.establishmentMunicipality = String(snap.establishmentMunicipality).slice(0, 80);
+  }
+  if (snap.establishmentProvince) {
+    out.establishmentProvince = String(snap.establishmentProvince).slice(0, 80);
+  }
   if (snap.legalRepresentativeName) {
     out.legalRepresentativeName = String(snap.legalRepresentativeName).slice(0, 120);
   }

@@ -100,6 +100,21 @@ export interface MobileOperationalProps {
   quickProductError?: string | null;
   quickCustomerError?: string | null;
   operator: string;
+  unlockedOperatorName?: string;
+  unlockedRoleLabel?: string;
+  canSellPos?: boolean;
+  canViewProducts?: boolean;
+  canManageProducts?: boolean;
+  canViewCostPrices?: boolean;
+  canViewProfitsMargins?: boolean;
+  canViewCustomers?: boolean;
+  canCreateCustomers?: boolean;
+  canViewDocs?: boolean;
+  canExportSaft?: boolean;
+  canOperateCash?: boolean;
+  canViewMaster?: boolean;
+  canManageRbac?: boolean;
+  canViewSecurityAudit?: boolean;
 }
 
 function escapeHtml(raw: string): string {
@@ -148,12 +163,18 @@ export function renderMobileOperationalView(props: MobileOperationalProps): stri
       </div>
 
       <!-- Barra de Navegação Inferior Fixa (Thumb Zone - 5 destinos) -->
-      ${renderMobileBottomNav(mobileTab, cartItemCount)}
+      ${renderMobileBottomNav(mobileTab, cartItemCount, props)}
 
       <!-- Modais Operacionais Mobile -->
       ${
         props.showQuickProductModal
-          ? renderMobileProductModal(props.editingMobileProduct, nextSku, props.quickProductError)
+          ? renderMobileProductModal(
+              props.editingMobileProduct,
+              nextSku,
+              props.quickProductError,
+              Boolean(props.canViewCostPrices),
+              Boolean(props.canViewProfitsMargins)
+            )
           : ''
       }
       ${props.showQuickCustomerModal ? renderMobileQuickCustomerModal(props) : ''}
@@ -194,26 +215,49 @@ function renderMobileHome(props: MobileOperationalProps): string {
   );
   const todayTotal = todayInvoices.reduce((acc, inv) => acc + inv.grandTotal, 0);
 
+  const canSellPos = Boolean(props.canSellPos);
+  const canViewProducts = Boolean(props.canViewProducts);
+  const canViewCustomers = Boolean(props.canViewCustomers);
+  const canViewMaster = Boolean(props.canViewMaster);
+  const canViewDocs = Boolean(props.canViewDocs);
+  const canViewFinancialTotals = Boolean(props.canViewDocs || props.canViewProfitsMargins);
+
   return `
     <div class="p-4 flex flex-col gap-4 max-w-lg mx-auto">
-      <!-- Top Bar: SILA-Billing + Status Online / Offline -->
-      <header class="flex items-center justify-between pt-1">
-        <h1 class="text-xl font-bold tracking-tight text-white flex items-center gap-2">
-          <span>SILA-Billing</span>
-          <span class="text-[10px] font-mono px-1.5 py-0.5 rounded bg-blue-900/60 text-blue-300 font-normal">POS</span>
-        </h1>
-        <button
-          type="button"
-          data-action="mobile-open-sync"
-          class="flex items-center gap-1.5 px-3 py-1 rounded-full text-xs font-medium border ${
-            isOnline
-              ? 'bg-emerald-950/70 border-emerald-800/80 text-emerald-400'
-              : 'bg-amber-950/70 border-amber-800/80 text-amber-400'
-          } active:scale-95 transition-transform"
-        >
-          <span class="h-2 w-2 rounded-full ${isOnline ? 'bg-emerald-400' : 'bg-amber-400'}"></span>
-          <span>${isOnline ? 'Online' : 'Offline'}</span>
-        </button>
+      <!-- Top Bar: SILA-Billing + Bloquear + Status Online / Offline -->
+      <header class="flex items-center justify-between gap-2 pt-1">
+        <div class="min-w-0">
+          <h1 class="text-xl font-bold tracking-tight text-white flex items-center gap-2">
+            <span>SILA-Billing</span>
+            <span class="text-[10px] font-mono px-1.5 py-0.5 rounded bg-blue-900/60 text-blue-300 font-normal">POS</span>
+          </h1>
+          <p class="text-[11px] text-slate-400 truncate">
+            ${escapeHtml(props.unlockedOperatorName || props.operator)} · <span class="text-blue-400 font-medium">${escapeHtml(props.unlockedRoleLabel || 'Operador')}</span>
+          </p>
+        </div>
+        <div class="flex items-center gap-1.5 shrink-0">
+          <button
+            type="button"
+            data-action="lock-terminal-now"
+            class="h-8 px-2.5 rounded-full text-[11px] font-semibold bg-slate-900 border border-slate-700 text-slate-200 hover:bg-slate-800 flex items-center gap-1 active:scale-95"
+            title="Bloquear Terminal"
+          >
+            ${ICONS.lock}
+            <span>Bloquear</span>
+          </button>
+          <button
+            type="button"
+            data-action="mobile-open-sync"
+            class="flex items-center gap-1.5 px-2.5 h-8 rounded-full text-xs font-medium border ${
+              isOnline
+                ? 'bg-emerald-950/70 border-emerald-800/80 text-emerald-400'
+                : 'bg-amber-950/70 border-amber-800/80 text-amber-400'
+            } active:scale-95 transition-transform"
+          >
+            <span class="h-2 w-2 rounded-full ${isOnline ? 'bg-emerald-400' : 'bg-amber-400'}"></span>
+            <span>${isOnline ? 'Online' : 'Offline'}</span>
+          </button>
+        </div>
       </header>
 
       <!-- Cartão da Empresa Activa -->
@@ -223,113 +267,141 @@ function renderMobileHome(props: MobileOperationalProps): string {
           <h2 class="text-lg font-bold text-white tracking-tight mt-0.5 truncate">${escapeHtml(companyName)}</h2>
           <p class="text-xs text-slate-400 mt-0.5 font-mono tabular-nums truncate">${escapeHtml(activeEst.code)} · ${escapeHtml(locality)} · NIF ${escapeHtml(nif)}</p>
         </div>
-        <button
-          type="button"
-          data-action="mobile-open-quick-company"
-          class="h-10 px-3 rounded-lg bg-slate-800 hover:bg-slate-700 text-xs text-slate-200 flex items-center gap-1.5 active:scale-95 transition-all shrink-0"
-        >
-          ${ICONS.building}
-          <span>Ficha</span>
-        </button>
+        ${
+          canViewMaster
+            ? `<button
+                type="button"
+                data-action="mobile-open-quick-company"
+                class="h-10 px-3 rounded-lg bg-slate-800 hover:bg-slate-700 text-xs text-slate-200 flex items-center gap-1.5 active:scale-95 transition-all shrink-0"
+              >
+                ${ICONS.building}
+                <span>Ficha</span>
+              </button>`
+            : ''
+        }
       </section>
 
       <!-- Secção "O que pretende fazer?" -->
       <section class="flex flex-col gap-3">
         <h3 class="text-lg font-bold text-white tracking-tight">O que pretende fazer?</h3>
 
-        <!-- Grelha 2x2 com os 4 Botões Grandes -->
+        <!-- Grelha 2x2 com os Botões Autorizados -->
         <div class="grid grid-cols-2 gap-3">
-          <!-- VENDER (Azul Vibrante em Destaque) -->
-          <button
-            type="button"
-            data-action="mobile-go-sale"
-            class="bg-blue-600 hover:bg-blue-500 active:scale-[0.98] rounded-2xl p-4 flex flex-col justify-between min-h-[116px] text-left shadow-lg shadow-blue-600/20 transition-all border border-blue-500/40"
-          >
-            <div class="h-8 w-8 rounded-lg bg-white/20 flex items-center justify-center text-white">
-              ${ICONS.shoppingCart}
-            </div>
-            <div>
-              <span class="text-base font-bold text-white tracking-wide block">VENDER</span>
-              <span class="text-xs text-blue-100/90 mt-0.5 block">Iniciar nova venda</span>
-            </div>
-          </button>
+          ${
+            canSellPos
+              ? `<!-- VENDER -->
+                <button
+                  type="button"
+                  data-action="mobile-go-sale"
+                  class="bg-blue-600 hover:bg-blue-500 active:scale-[0.98] rounded-2xl p-4 flex flex-col justify-between min-h-[116px] text-left shadow-lg shadow-blue-600/20 transition-all border border-blue-500/40"
+                >
+                  <div class="h-8 w-8 rounded-lg bg-white/20 flex items-center justify-center text-white">
+                    ${ICONS.shoppingCart}
+                  </div>
+                  <div>
+                    <span class="text-base font-bold text-white tracking-wide block">VENDER</span>
+                    <span class="text-xs text-blue-100/90 mt-0.5 block">Iniciar nova venda</span>
+                  </div>
+                </button>`
+              : ''
+          }
 
-          <!-- PRODUTOS (Gestão Completa de Artigos e Stock) -->
-          <button
-            type="button"
-            data-action="mobile-go-products"
-            class="bg-slate-900 hover:bg-slate-850 active:scale-[0.98] rounded-2xl p-4 flex flex-col justify-between min-h-[116px] text-left border border-slate-800/90 transition-all"
-          >
-            <div class="h-8 w-8 rounded-lg bg-slate-800 flex items-center justify-center text-slate-200">
-              ${ICONS.package}
-            </div>
-            <div>
-              <span class="text-base font-bold text-white tracking-wide block">PRODUTOS</span>
-              <span class="text-xs text-slate-400 mt-0.5 block">Catálogo & Artigos (${props.products.length})</span>
-            </div>
-          </button>
+          ${
+            canViewProducts
+              ? `<!-- PRODUTOS -->
+                <button
+                  type="button"
+                  data-action="mobile-go-products"
+                  class="bg-slate-900 hover:bg-slate-850 active:scale-[0.98] rounded-2xl p-4 flex flex-col justify-between min-h-[116px] text-left border border-slate-800/90 transition-all"
+                >
+                  <div class="h-8 w-8 rounded-lg bg-slate-800 flex items-center justify-center text-slate-200">
+                    ${ICONS.package}
+                  </div>
+                  <div>
+                    <span class="text-base font-bold text-white tracking-wide block">PRODUTOS</span>
+                    <span class="text-xs text-slate-400 mt-0.5 block">Catálogo & Artigos (${props.products.length})</span>
+                  </div>
+                </button>`
+              : ''
+          }
 
-          <!-- CLIENTES -->
-          <button
-            type="button"
-            data-action="mobile-tab-customers"
-            class="bg-slate-900 hover:bg-slate-850 active:scale-[0.98] rounded-2xl p-4 flex flex-col justify-between min-h-[116px] text-left border border-slate-800/90 transition-all"
-          >
-            <div class="h-8 w-8 rounded-lg bg-slate-800 flex items-center justify-center text-slate-200">
-              ${ICONS.users}
-            </div>
-            <div>
-              <span class="text-base font-bold text-white tracking-wide block">CLIENTES</span>
-              <span class="text-xs text-slate-400 mt-0.5 block">Novo cliente / Lista</span>
-            </div>
-          </button>
+          ${
+            canViewCustomers
+              ? `<!-- CLIENTES -->
+                <button
+                  type="button"
+                  data-action="mobile-tab-customers"
+                  class="bg-slate-900 hover:bg-slate-850 active:scale-[0.98] rounded-2xl p-4 flex flex-col justify-between min-h-[116px] text-left border border-slate-800/90 transition-all"
+                >
+                  <div class="h-8 w-8 rounded-lg bg-slate-800 flex items-center justify-center text-slate-200">
+                    ${ICONS.users}
+                  </div>
+                  <div>
+                    <span class="text-base font-bold text-white tracking-wide block">CLIENTES</span>
+                    <span class="text-xs text-slate-400 mt-0.5 block">Novo cliente / Lista</span>
+                  </div>
+                </button>`
+              : ''
+          }
 
-          <!-- EMPRESA -->
-          <button
-            type="button"
-            data-action="mobile-open-quick-company"
-            class="bg-slate-900 hover:bg-slate-850 active:scale-[0.98] rounded-2xl p-4 flex flex-col justify-between min-h-[116px] text-left border border-slate-800/90 transition-all"
-          >
-            <div class="h-8 w-8 rounded-lg bg-slate-800 flex items-center justify-center text-slate-200">
-              ${ICONS.building}
-            </div>
-            <div>
-              <span class="text-base font-bold text-white tracking-wide block">EMPRESA</span>
-              <span class="text-xs text-slate-400 mt-0.5 block">Dados e configuração</span>
-            </div>
-          </button>
+          ${
+            canViewMaster
+              ? `<!-- EMPRESA -->
+                <button
+                  type="button"
+                  data-action="mobile-open-quick-company"
+                  class="bg-slate-900 hover:bg-slate-850 active:scale-[0.98] rounded-2xl p-4 flex flex-col justify-between min-h-[116px] text-left border border-slate-800/90 transition-all"
+                >
+                  <div class="h-8 w-8 rounded-lg bg-slate-800 flex items-center justify-center text-slate-200">
+                    ${ICONS.building}
+                  </div>
+                  <div>
+                    <span class="text-base font-bold text-white tracking-wide block">EMPRESA</span>
+                    <span class="text-xs text-slate-400 mt-0.5 block">Dados e configuração</span>
+                  </div>
+                </button>`
+              : ''
+          }
         </div>
 
-        <!-- Documentos (Card Horizontal de Largura Total) -->
-        <button
-          type="button"
-          data-action="mobile-go-docs"
-          class="bg-slate-900 hover:bg-slate-850 active:scale-[0.98] rounded-2xl p-4 flex items-center justify-between border border-slate-800/90 transition-all text-left"
-        >
-          <div class="flex items-center gap-3">
-            <div class="h-8 w-8 rounded-lg bg-slate-800 flex items-center justify-center text-slate-200 shrink-0">
-              ${ICONS.receipt}
-            </div>
-            <div>
-              <span class="text-base font-bold text-white block">Documentos</span>
-              <span class="text-xs text-slate-400 block mt-0.5">Consultar facturas e talões</span>
-            </div>
-          </div>
-          <span class="text-slate-400">${ICONS.chevronRight}</span>
-        </button>
+        ${
+          canViewDocs
+            ? `<!-- Documentos -->
+              <button
+                type="button"
+                data-action="mobile-go-docs"
+                class="bg-slate-900 hover:bg-slate-850 active:scale-[0.98] rounded-2xl p-4 flex items-center justify-between border border-slate-800/90 transition-all text-left"
+              >
+                <div class="flex items-center gap-3">
+                  <div class="h-8 w-8 rounded-lg bg-slate-800 flex items-center justify-center text-slate-200 shrink-0">
+                    ${ICONS.receipt}
+                  </div>
+                  <div>
+                    <span class="text-base font-bold text-white block">Documentos</span>
+                    <span class="text-xs text-slate-400 block mt-0.5">Consultar facturas e talões</span>
+                  </div>
+                </div>
+                <span class="text-slate-400">${ICONS.chevronRight}</span>
+              </button>`
+            : ''
+        }
       </section>
 
-      <!-- Resumo Rápido de Vendas do Dia -->
-      <section class="bg-slate-900/60 border border-slate-800/80 rounded-2xl p-3.5 flex items-center justify-between text-xs">
-        <div>
-          <span class="text-slate-400 block">Vendas hoje:</span>
-          <span class="text-sm font-semibold text-white tabular-nums">${todayInvoices.length} ${todayInvoices.length === 1 ? 'documento' : 'documentos'}</span>
-        </div>
-        <div class="text-right">
-          <span class="text-slate-400 block">Total faturado:</span>
-          <span class="text-sm font-bold text-emerald-400 tabular-nums">${formatKzNumber(todayTotal)} Kz</span>
-        </div>
-      </section>
+      ${
+        canViewFinancialTotals
+          ? `<!-- Resumo Rápido de Vendas do Dia -->
+            <section class="bg-slate-900/60 border border-slate-800/80 rounded-2xl p-3.5 flex items-center justify-between text-xs">
+              <div>
+                <span class="text-slate-400 block">Vendas hoje:</span>
+                <span class="text-sm font-semibold text-white tabular-nums">${todayInvoices.length} ${todayInvoices.length === 1 ? 'documento' : 'documentos'}</span>
+              </div>
+              <div class="text-right">
+                <span class="text-slate-400 block">Total faturado:</span>
+                <span class="text-sm font-bold text-emerald-400 tabular-nums">${formatKzNumber(todayTotal)} Kz</span>
+              </div>
+            </section>`
+          : ''
+      }
     </div>
   `;
 }
@@ -337,6 +409,10 @@ function renderMobileHome(props: MobileOperationalProps): string {
 // ==================== 2. ECRÃ COMPLETO DE PRODUTOS & STOCK (NOVO) ====================
 function renderMobileProducts(props: MobileOperationalProps): string {
   const { products, mobileProductSearchInput } = props;
+  const canManageProducts = Boolean(props.canManageProducts);
+  const canViewCostPrices = Boolean(props.canViewCostPrices);
+  const canViewProfitsMargins = Boolean(props.canViewProfitsMargins);
+  const canSellPos = Boolean(props.canSellPos);
   const query = (mobileProductSearchInput || '').trim().toLowerCase();
 
   const filtered = query
@@ -368,14 +444,18 @@ function renderMobileProducts(props: MobileOperationalProps): string {
           </div>
         </div>
 
-        <button
-          type="button"
-          data-action="mobile-open-quick-product"
-          class="h-9 px-3 rounded-xl bg-blue-600 hover:bg-blue-500 text-white text-xs font-bold flex items-center gap-1.5 shadow-md shadow-blue-600/30 active:scale-95"
-        >
-          ${ICONS.plus}
-          <span>Novo Artigo</span>
-        </button>
+        ${
+          canManageProducts
+            ? `<button
+                type="button"
+                data-action="mobile-open-quick-product"
+                class="h-9 px-3 rounded-xl bg-blue-600 hover:bg-blue-500 text-white text-xs font-bold flex items-center gap-1.5 shadow-md shadow-blue-600/30 active:scale-95"
+              >
+                ${ICONS.plus}
+                <span>Novo Artigo</span>
+              </button>`
+            : ''
+        }
       </div>
 
       <!-- Barra de Pesquisa de Artigos -->
@@ -399,18 +479,17 @@ function renderMobileProducts(props: MobileOperationalProps): string {
         }
       </div>
 
-      <!-- Lista de Artigos com Dados Completos -->
+      <!-- Lista de Artigos com Isolamento de Custos/Margens -->
       <div class="flex flex-col gap-2.5">
         ${
           filtered.length === 0
             ? `<div class="p-8 text-center text-xs text-slate-500 bg-slate-900/40 rounded-2xl border border-slate-800/80">
-                Nenhum artigo encontrado. Clique em "+ Novo Artigo" para cadastrar.
+                Nenhum artigo encontrado.
               </div>`
             : filtered.map((p) => {
-                const cost = p.costPrice || 0;
+                const cost = canViewCostPrices ? (p.costPrice || 0) : 0;
                 const profit = cost > 0 ? roundKz(p.price - cost) : 0;
                 const marginPct = cost > 0 && p.price > 0 ? roundKz((profit / p.price) * 100) : 0;
-                const markupPct = cost > 0 ? roundKz((profit / cost) * 100) : 0;
                 const isBelowCost = cost > 0 && p.price < cost;
 
                 return `
@@ -433,18 +512,26 @@ function renderMobileProducts(props: MobileOperationalProps): string {
                         <span class="text-slate-400 text-[11px] truncate">· ${escapeHtml(p.category || 'Geral')}</span>
                       </div>
 
-                      <button
-                        type="button"
-                        data-action="mobile-toggle-product-active"
-                        data-product-id="${escapeHtml(p.id)}"
-                        class="text-[10px] font-semibold px-2 py-0.5 rounded transition-colors shrink-0 ${
-                          p.active !== false
-                            ? 'bg-emerald-950/70 border border-emerald-800/70 text-emerald-400'
-                            : 'bg-red-950/70 border border-red-900/70 text-red-400'
-                        }"
-                      >
-                        ${p.active !== false ? 'Activo' : 'Inactivo'}
-                      </button>
+                      ${
+                        canManageProducts
+                          ? `<button
+                              type="button"
+                              data-action="mobile-toggle-product-active"
+                              data-product-id="${escapeHtml(p.id)}"
+                              class="text-[10px] font-semibold px-2 py-0.5 rounded transition-colors shrink-0 ${
+                                p.active !== false
+                                  ? 'bg-emerald-950/70 border border-emerald-800/70 text-emerald-400'
+                                  : 'bg-red-950/70 border border-red-900/70 text-red-400'
+                              }"
+                            >
+                              ${p.active !== false ? 'Activo' : 'Inactivo'}
+                            </button>`
+                          : `<span class="text-[10px] font-semibold px-2 py-0.5 rounded shrink-0 ${
+                              p.active !== false
+                                ? 'bg-emerald-950/70 border border-emerald-800/70 text-emerald-400'
+                                : 'bg-red-950/70 border border-red-900/70 text-red-400'
+                            }">${p.active !== false ? 'Activo' : 'Inactivo'}</span>`
+                      }
                     </div>
 
                     <!-- Linha 2: Nome do Produto e Unidade -->
@@ -455,7 +542,7 @@ function renderMobileProducts(props: MobileOperationalProps): string {
                       </p>
                     </div>
 
-                    <!-- Linha 3: Preço de Venda, Preço de Custo e Margem de Lucro -->
+                    <!-- Linha 3: Preço de Venda e Custo/Margem (Apenas perfis autorizados) -->
                     <div class="bg-slate-950/80 rounded-xl p-2.5 flex items-center justify-between text-xs border border-slate-800/70">
                       <div>
                         <span class="text-[10px] text-slate-400 block uppercase tracking-wider">Venda (Kz)</span>
@@ -465,22 +552,28 @@ function renderMobileProducts(props: MobileOperationalProps): string {
                       </div>
 
                       ${
-                        cost > 0
-                          ? `
-                          <div class="text-right">
-                            <span class="text-[10px] text-slate-400 block uppercase tracking-wider">Custo: ${formatKzNumber(cost)} Kz</span>
-                            <span class="text-xs font-bold font-mono tabular-nums ${
-                              isBelowCost ? 'text-red-400' : 'text-emerald-400'
-                            }">
-                              ${profit >= 0 ? '+' : ''}${formatKzNumber(profit)} Kz (${marginPct.toFixed(1)}% margem)
-                            </span>
-                          </div>
-                        `
-                          : `
-                          <div class="text-right text-[11px] text-slate-500">
-                            Sem custo registado
-                          </div>
-                        `
+                        canViewCostPrices
+                          ? cost > 0
+                            ? `
+                              <div class="text-right">
+                                <span class="text-[10px] text-slate-400 block uppercase tracking-wider">Custo: ${formatKzNumber(cost)} Kz</span>
+                                ${
+                                  canViewProfitsMargins
+                                    ? `<span class="text-xs font-bold font-mono tabular-nums ${
+                                        isBelowCost ? 'text-red-400' : 'text-emerald-400'
+                                      }">
+                                        ${profit >= 0 ? '+' : ''}${formatKzNumber(profit)} Kz (${marginPct.toFixed(1)}% margem)
+                                      </span>`
+                                    : ''
+                                }
+                              </div>
+                            `
+                            : `
+                              <div class="text-right text-[11px] text-slate-500">
+                                Sem custo registado
+                              </div>
+                            `
+                          : ''
                       }
                     </div>
 
@@ -502,25 +595,33 @@ function renderMobileProducts(props: MobileOperationalProps): string {
                       </div>
 
                       <div class="flex items-center gap-2">
-                        <button
-                          type="button"
-                          data-action="mobile-edit-product"
-                          data-product-id="${escapeHtml(p.id)}"
-                          class="h-8 px-3 rounded-lg bg-slate-800 hover:bg-slate-700 text-slate-200 text-xs font-medium flex items-center gap-1 active:scale-95"
-                        >
-                          ${ICONS.edit}
-                          <span>Editar</span>
-                        </button>
+                        ${
+                          canManageProducts
+                            ? `<button
+                                type="button"
+                                data-action="mobile-edit-product"
+                                data-product-id="${escapeHtml(p.id)}"
+                                class="h-8 px-3 rounded-lg bg-slate-800 hover:bg-slate-700 text-slate-200 text-xs font-medium flex items-center gap-1 active:scale-95"
+                              >
+                                ${ICONS.edit}
+                                <span>Editar</span>
+                              </button>`
+                            : ''
+                        }
 
-                        <button
-                          type="button"
-                          data-action="mobile-add-product"
-                          data-product-id="${escapeHtml(p.id)}"
-                          class="h-8 px-3 rounded-lg bg-blue-600 hover:bg-blue-500 text-white text-xs font-semibold flex items-center gap-1 active:scale-95"
-                        >
-                          ${ICONS.plus}
-                          <span>Vender</span>
-                        </button>
+                        ${
+                          canSellPos
+                            ? `<button
+                                type="button"
+                                data-action="mobile-add-product"
+                                data-product-id="${escapeHtml(p.id)}"
+                                class="h-8 px-3 rounded-lg bg-blue-600 hover:bg-blue-500 text-white text-xs font-semibold flex items-center gap-1 active:scale-95"
+                              >
+                                ${ICONS.plus}
+                                <span>Vender</span>
+                              </button>`
+                            : ''
+                        }
                       </div>
                     </div>
                   </div>
@@ -1264,6 +1365,8 @@ function renderMobileDocs(props: MobileOperationalProps): string {
 // ==================== 7. ECRÃ DE CLIENTES ====================
 function renderMobileCustomers(props: MobileOperationalProps): string {
   const { activeCompany, customers, canEditExistingCustomers } = props;
+  const canCreateCustomers = Boolean(props.canCreateCustomers);
+  const canSellPos = Boolean(props.canSellPos);
   const directCustId = getDirectCustomerIdForCompany(activeCompany.id);
 
   return `
@@ -1273,15 +1376,19 @@ function renderMobileCustomers(props: MobileOperationalProps): string {
           <h2 class="text-base font-bold text-white">Clientes Cadastrados</h2>
           <p class="text-[11px] text-slate-400 tabular-nums">${customers.length} registo(s)</p>
         </div>
-        <button
-          type="button"
-          data-action="mobile-open-quick-customer"
-          data-value="FULL"
-          class="h-10 px-3 rounded-lg bg-blue-600 hover:bg-blue-500 text-white text-xs font-semibold flex items-center gap-1 active:scale-95"
-        >
-          ${ICONS.plus}
-          <span>Novo Cliente</span>
-        </button>
+        ${
+          canCreateCustomers
+            ? `<button
+                type="button"
+                data-action="mobile-open-quick-customer"
+                data-value="FULL"
+                class="h-10 px-3 rounded-lg bg-blue-600 hover:bg-blue-500 text-white text-xs font-semibold flex items-center gap-1 active:scale-95"
+              >
+                ${ICONS.plus}
+                <span>Novo Cliente</span>
+              </button>`
+            : ''
+        }
       </div>
 
       <div class="flex flex-col gap-2">
@@ -1321,15 +1428,19 @@ function renderMobileCustomers(props: MobileOperationalProps): string {
                     >Editar</button>`
                   : ''
               }
-              <button
-                type="button"
-                data-action="mobile-select-customer-and-sale"
-                data-customer-id="${escapeHtml(c.id)}"
-                ${isInactive ? 'disabled' : ''}
-                class="h-10 px-3 rounded-lg bg-blue-600/20 hover:bg-blue-600 text-blue-300 hover:text-white disabled:opacity-35 text-xs font-semibold active:scale-95 transition-colors shrink-0"
-              >
-                Vender
-              </button>
+              ${
+                canSellPos
+                  ? `<button
+                      type="button"
+                      data-action="mobile-select-customer-and-sale"
+                      data-customer-id="${escapeHtml(c.id)}"
+                      ${isInactive ? 'disabled' : ''}
+                      class="h-10 px-3 rounded-lg bg-blue-600/20 hover:bg-blue-600 text-blue-300 hover:text-white disabled:opacity-35 text-xs font-semibold active:scale-95 transition-colors shrink-0"
+                    >
+                      Vender
+                    </button>`
+                  : ''
+              }
             </div>
           </div>
         `;
@@ -1343,104 +1454,165 @@ function renderMobileCustomers(props: MobileOperationalProps): string {
 // ==================== 8. MENU "MAIS" ====================
 function renderMobileMore(props: MobileOperationalProps): string {
   const { operator, products } = props;
+  const canViewProducts = Boolean(props.canViewProducts);
+  const canManageProducts = Boolean(props.canManageProducts);
+  const canViewMaster = Boolean(props.canViewMaster);
+  const canExportSaft = Boolean(props.canExportSaft);
+  const canOperateCash = Boolean(props.canOperateCash);
+  const canManageRbac = Boolean(props.canManageRbac);
+  const canViewSecurityAudit = Boolean(props.canViewSecurityAudit);
 
   return `
     <div class="p-3.5 flex flex-col gap-3 max-w-lg mx-auto">
-      <div class="pb-1 border-b border-slate-800">
-        <h2 class="text-base font-bold text-white">Mais Opções</h2>
-        <p class="text-xs text-slate-400">Operador: Op. ${escapeHtml(operator)}</p>
+      <div class="pb-1 border-b border-slate-800 flex items-center justify-between gap-2">
+        <div>
+          <h2 class="text-base font-bold text-white">Mais Opções</h2>
+          <p class="text-xs text-slate-400">
+            ${escapeHtml(props.unlockedOperatorName || `Op. ${operator}`)} · ${escapeHtml(props.unlockedRoleLabel || 'Operador')}
+          </p>
+        </div>
+        <button
+          type="button"
+          data-action="lock-terminal-now"
+          class="h-9 px-3 rounded-xl bg-red-950/70 border border-red-800/80 text-red-200 text-xs font-semibold flex items-center gap-1.5"
+        >
+          ${ICONS.lock}
+          <span>Bloquear</span>
+        </button>
       </div>
 
       <div class="flex flex-col gap-2">
-        <!-- Catálogo de Artigos & Stock -->
-        <button
-          type="button"
-          data-action="mobile-go-products"
-          class="bg-slate-900 hover:bg-slate-850 rounded-xl p-3.5 flex items-center justify-between border border-slate-800 text-left active:scale-[0.98]"
-        >
-          <div class="flex items-center gap-3">
-            <div class="h-8 w-8 rounded-lg bg-blue-900/60 text-blue-400 flex items-center justify-center shrink-0">
-              ${ICONS.package}
-            </div>
-            <div>
-              <span class="text-sm font-bold text-white block">Catálogo de Artigos & Stock (${products.length})</span>
-              <span class="text-xs text-slate-400 block">Preços, SKU, margem e inventário completo</span>
-            </div>
-          </div>
-          <span class="text-slate-500">${ICONS.chevronRight}</span>
-        </button>
+        ${
+          canViewProducts
+            ? `<!-- Catálogo de Artigos & Stock -->
+              <button
+                type="button"
+                data-action="mobile-go-products"
+                class="bg-slate-900 hover:bg-slate-850 rounded-xl p-3.5 flex items-center justify-between border border-slate-800 text-left active:scale-[0.98]"
+              >
+                <div class="flex items-center gap-3">
+                  <div class="h-8 w-8 rounded-lg bg-blue-900/60 text-blue-400 flex items-center justify-center shrink-0">
+                    ${ICONS.package}
+                  </div>
+                  <div>
+                    <span class="text-sm font-bold text-white block">Catálogo de Artigos & Stock (${products.length})</span>
+                    <span class="text-xs text-slate-400 block">Preços, SKU e inventário</span>
+                  </div>
+                </div>
+                <span class="text-slate-500">${ICONS.chevronRight}</span>
+              </button>`
+            : ''
+        }
 
-        <!-- Cadastrar Artigo Rápido -->
-        <button
-          type="button"
-          data-action="mobile-open-quick-product"
-          class="bg-slate-900 hover:bg-slate-850 rounded-xl p-3.5 flex items-center justify-between border border-slate-800 text-left active:scale-[0.98]"
-        >
-          <div class="flex items-center gap-3">
-            <div class="h-8 w-8 rounded-lg bg-emerald-900/60 text-emerald-400 flex items-center justify-center shrink-0">
-              ${ICONS.plus}
-            </div>
-            <div>
-              <span class="text-sm font-bold text-white block">Cadastrar Novo Artigo</span>
-              <span class="text-xs text-slate-400 block">Ficha operacional completa</span>
-            </div>
-          </div>
-          <span class="text-slate-500">${ICONS.chevronRight}</span>
-        </button>
+        ${
+          canManageProducts
+            ? `<!-- Cadastrar Artigo Rápido -->
+              <button
+                type="button"
+                data-action="mobile-open-quick-product"
+                class="bg-slate-900 hover:bg-slate-850 rounded-xl p-3.5 flex items-center justify-between border border-slate-800 text-left active:scale-[0.98]"
+              >
+                <div class="flex items-center gap-3">
+                  <div class="h-8 w-8 rounded-lg bg-emerald-900/60 text-emerald-400 flex items-center justify-center shrink-0">
+                    ${ICONS.plus}
+                  </div>
+                  <div>
+                    <span class="text-sm font-bold text-white block">Cadastrar Novo Artigo</span>
+                    <span class="text-xs text-slate-400 block">Ficha operacional completa</span>
+                  </div>
+                </div>
+                <span class="text-slate-500">${ICONS.chevronRight}</span>
+              </button>`
+            : ''
+        }
 
-        <!-- Dados da Empresa -->
-        <button
-          type="button"
-          data-action="mobile-open-quick-company"
-          class="bg-slate-900 hover:bg-slate-850 rounded-xl p-3.5 flex items-center justify-between border border-slate-800 text-left active:scale-[0.98]"
-        >
-          <div class="flex items-center gap-3">
-            <div class="h-8 w-8 rounded-lg bg-indigo-900/60 text-indigo-400 flex items-center justify-center shrink-0">
-              ${ICONS.building}
-            </div>
-            <div>
-              <span class="text-sm font-bold text-white block">Ficha Mestre da Empresa</span>
-              <span class="text-xs text-slate-400 block">Dados fiscais, logótipo, bancos, estabelecimentos e séries</span>
-            </div>
-          </div>
-          <span class="text-slate-500">${ICONS.chevronRight}</span>
-        </button>
+        ${
+          canManageRbac || canViewSecurityAudit
+            ? `<!-- Equipa, Funções e Segurança RBAC -->
+              <button
+                type="button"
+                data-action="open-rbac-mobile-modal"
+                class="bg-slate-900 hover:bg-slate-850 rounded-xl p-3.5 flex items-center justify-between border border-slate-800 text-left active:scale-[0.98]"
+              >
+                <div class="flex items-center gap-3">
+                  <div class="h-8 w-8 rounded-lg bg-blue-900/60 text-blue-300 flex items-center justify-center shrink-0">
+                    ${ICONS.users}
+                  </div>
+                  <div>
+                    <span class="text-sm font-bold text-white block">Equipa, Funções e Auditoria</span>
+                    <span class="text-xs text-slate-400 block">Utilizadores, PINs, permissões e segurança</span>
+                  </div>
+                </div>
+                <span class="text-slate-500">${ICONS.chevronRight}</span>
+              </button>`
+            : ''
+        }
 
-        <!-- SAF-T (AO) XML -->
-        <button
-          type="button"
-          data-action="mobile-open-saft"
-          class="bg-slate-900 hover:bg-slate-850 rounded-xl p-3.5 flex items-center justify-between border border-slate-800 text-left active:scale-[0.98]"
-        >
-          <div class="flex items-center gap-3">
-            <div class="h-8 w-8 rounded-lg bg-amber-900/60 text-amber-400 flex items-center justify-center shrink-0">
-              ${ICONS.shieldCheck}
-            </div>
-            <div>
-              <span class="text-sm font-bold text-white block">SAF-T (AO) Oficial XML</span>
-              <span class="text-xs text-slate-400 block">Exportação mensal e conformidade AGT</span>
-            </div>
-          </div>
-          <span class="text-slate-500">${ICONS.chevronRight}</span>
-        </button>
+        ${
+          canViewMaster
+            ? `<!-- Dados da Empresa -->
+              <button
+                type="button"
+                data-action="mobile-open-quick-company"
+                class="bg-slate-900 hover:bg-slate-850 rounded-xl p-3.5 flex items-center justify-between border border-slate-800 text-left active:scale-[0.98]"
+              >
+                <div class="flex items-center gap-3">
+                  <div class="h-8 w-8 rounded-lg bg-indigo-900/60 text-indigo-400 flex items-center justify-center shrink-0">
+                    ${ICONS.building}
+                  </div>
+                  <div>
+                    <span class="text-sm font-bold text-white block">Ficha Mestre da Empresa</span>
+                    <span class="text-xs text-slate-400 block">Dados fiscais, logótipo, bancos, estabelecimentos e séries</span>
+                  </div>
+                </div>
+                <span class="text-slate-500">${ICONS.chevronRight}</span>
+              </button>`
+            : ''
+        }
 
-        <!-- Fecho de Caixa -->
-        <button
-          type="button"
-          data-action="mobile-open-cash"
-          class="bg-slate-900 hover:bg-slate-850 rounded-xl p-3.5 flex items-center justify-between border border-slate-800 text-left active:scale-[0.98]"
-        >
-          <div class="flex items-center gap-3">
-            <div class="h-8 w-8 rounded-lg bg-purple-900/60 text-purple-400 flex items-center justify-center shrink-0">
-              ${ICONS.wallet}
-            </div>
-            <div>
-              <span class="text-sm font-bold text-white block">Caixa e Sessões</span>
-              <span class="text-xs text-slate-400 block">Abertura, reforço e fecho de turno</span>
-            </div>
-          </div>
-          <span class="text-slate-500">${ICONS.chevronRight}</span>
-        </button>
+        ${
+          canExportSaft
+            ? `<!-- SAF-T (AO) XML -->
+              <button
+                type="button"
+                data-action="mobile-open-saft"
+                class="bg-slate-900 hover:bg-slate-850 rounded-xl p-3.5 flex items-center justify-between border border-slate-800 text-left active:scale-[0.98]"
+              >
+                <div class="flex items-center gap-3">
+                  <div class="h-8 w-8 rounded-lg bg-amber-900/60 text-amber-400 flex items-center justify-center shrink-0">
+                    ${ICONS.shieldCheck}
+                  </div>
+                  <div>
+                    <span class="text-sm font-bold text-white block">SAF-T (AO) Oficial XML</span>
+                    <span class="text-xs text-slate-400 block">Exportação mensal e conformidade AGT</span>
+                  </div>
+                </div>
+                <span class="text-slate-500">${ICONS.chevronRight}</span>
+              </button>`
+            : ''
+        }
+
+        ${
+          canOperateCash
+            ? `<!-- Fecho de Caixa -->
+              <button
+                type="button"
+                data-action="mobile-open-cash"
+                class="bg-slate-900 hover:bg-slate-850 rounded-xl p-3.5 flex items-center justify-between border border-slate-800 text-left active:scale-[0.98]"
+              >
+                <div class="flex items-center gap-3">
+                  <div class="h-8 w-8 rounded-lg bg-purple-900/60 text-purple-400 flex items-center justify-center shrink-0">
+                    ${ICONS.wallet}
+                  </div>
+                  <div>
+                    <span class="text-sm font-bold text-white block">Caixa e Sessões</span>
+                    <span class="text-xs text-slate-400 block">Abertura, reforço e fecho de turno</span>
+                  </div>
+                </div>
+                <span class="text-slate-500">${ICONS.chevronRight}</span>
+              </button>`
+            : ''
+        }
 
         <!-- Sincronização Cloud -->
         <button
@@ -1460,11 +1632,29 @@ function renderMobileMore(props: MobileOperationalProps): string {
           <span class="text-slate-500">${ICONS.chevronRight}</span>
         </button>
 
+        <!-- Política de Privacidade -->
+        <button
+          type="button"
+          data-action="open-privacy-policy"
+          class="bg-slate-900 hover:bg-slate-850 rounded-xl p-3.5 flex items-center justify-between border border-slate-800 text-left active:scale-[0.98]"
+        >
+          <div class="flex items-center gap-3">
+            <div class="h-8 w-8 rounded-lg bg-slate-800 text-blue-300 flex items-center justify-center shrink-0">
+              ${ICONS.shield}
+            </div>
+            <div>
+              <span class="text-sm font-bold text-white block">Política de Privacidade</span>
+              <span class="text-xs text-slate-400 block">Isolamento de dados e protecção de acesso</span>
+            </div>
+          </div>
+          <span class="text-slate-500">${ICONS.chevronRight}</span>
+        </button>
+
         <!-- Alternar para Modo Desktop / Gestão Completa -->
         <button
           type="button"
           data-action="mobile-switch-to-desktop"
-          class="bg-slate-900 hover:bg-slate-850 rounded-xl p-3.5 flex items-center justify-between border border-slate-800 text-left active:scale-[0.98] mt-2"
+          class="bg-slate-900 hover:bg-slate-850 rounded-xl p-3.5 flex items-center justify-between border border-slate-800 text-left active:scale-[0.98] mt-1"
         >
           <div class="flex items-center gap-3">
             <div class="h-8 w-8 rounded-lg bg-slate-800 text-slate-300 flex items-center justify-center shrink-0">
@@ -1472,7 +1662,7 @@ function renderMobileMore(props: MobileOperationalProps): string {
             </div>
             <div>
               <span class="text-sm font-bold text-white block">Mudar para Vista Desktop</span>
-              <span class="text-xs text-slate-400 block">Aceder a relatórios avançados e gráficos</span>
+              <span class="text-xs text-slate-400 block">Módulos autorizados para o seu perfil</span>
             </div>
           </div>
           <span class="text-slate-500">${ICONS.chevronRight}</span>
@@ -1483,18 +1673,23 @@ function renderMobileMore(props: MobileOperationalProps): string {
 }
 
 // ==================== 9. BARRA DE NAVEGAÇÃO INFERIOR FIXA ====================
-function renderMobileBottomNav(activeTab: MobileTab, cartItemCount: number): string {
-  const tabs: { id: MobileTab; label: string; icon: string; badge?: number }[] = [
-    { id: 'HOME', label: 'Início', icon: ICONS.home },
-    { id: 'SALE', label: 'Vender', icon: ICONS.shoppingCart, badge: cartItemCount },
-    { id: 'DOCS', label: 'Docs.', icon: ICONS.receipt },
-    { id: 'CUSTOMERS', label: 'Clientes', icon: ICONS.users },
-    { id: 'MORE', label: 'Mais', icon: ICONS.menu },
+function renderMobileBottomNav(
+  activeTab: MobileTab,
+  cartItemCount: number,
+  props: MobileOperationalProps
+): string {
+  const tabs: { id: MobileTab; label: string; icon: string; badge?: number; visible: boolean }[] = [
+    { id: 'HOME', label: 'Início', icon: ICONS.home, visible: true },
+    { id: 'SALE', label: 'Vender', icon: ICONS.shoppingCart, badge: cartItemCount, visible: Boolean(props.canSellPos) },
+    { id: 'DOCS', label: 'Docs.', icon: ICONS.receipt, visible: Boolean(props.canViewDocs) },
+    { id: 'CUSTOMERS', label: 'Clientes', icon: ICONS.users, visible: Boolean(props.canViewCustomers) },
+    { id: 'MORE', label: 'Mais', icon: ICONS.menu, visible: true },
   ];
 
   return `
     <nav class="fixed bottom-0 left-0 right-0 z-40 bg-slate-900/95 backdrop-blur-md border-t border-slate-800 flex items-center justify-around h-16 safe-area-bottom">
       ${tabs
+        .filter((t) => t.visible)
         .map((t) => {
           const isActive = activeTab === t.id || (t.id === 'MORE' && activeTab === 'PRODUCTS');
           return `
@@ -1530,7 +1725,9 @@ function renderMobileBottomNav(activeTab: MobileTab, cartItemCount: number): str
 function renderMobileProductModal(
   editingProduct: Product | null,
   nextSku: string,
-  errorMsg?: string | null
+  errorMsg?: string | null,
+  canViewCostPrices = false,
+  canViewProfitsMargins = false
 ): string {
   const isEditing = Boolean(editingProduct);
   const p = editingProduct;
@@ -1540,7 +1737,7 @@ function renderMobileProductModal(
   const currentName = p?.name || '';
   const currentCategory = p?.category || 'Geral';
   const currentUnit = p?.unit || 'un';
-  const currentCost = p?.costPrice ? String(p.costPrice) : '';
+  const currentCost = canViewCostPrices && p?.costPrice ? String(p.costPrice) : '';
   const currentPrice = p?.price ? String(p.price) : '';
   const currentIva = p ? p.ivaRate : 14;
   const currentExemption = p?.exemptionReason || DEFAULT_IVA_EXEMPTION_REASONS[0];
@@ -1549,8 +1746,8 @@ function renderMobileProductModal(
   const currentStockQty = p?.stockQty ? String(p.stockQty) : '0';
   const currentMinStock = p?.minStockQty ? String(p.minStockQty) : '5';
 
-  // Pré-cálculo da margem de lucro
-  const numCost = parseFloat(currentCost.replace(',', '.')) || 0;
+  // Pré-cálculo da margem de lucro (apenas se autorizado)
+  const numCost = canViewCostPrices ? parseFloat(currentCost.replace(',', '.')) || 0 : 0;
   const numPrice = parseFloat(currentPrice.replace(',', '.')) || 0;
   const profit = numCost > 0 ? roundKz(numPrice - numCost) : 0;
   const marginPct = numCost > 0 && numPrice > 0 ? roundKz((profit / numPrice) * 100) : 0;
@@ -1582,7 +1779,7 @@ function renderMobileProductModal(
           </button>
         </div>
 
-        <!-- Formulário Scrollável com as 9 Áreas -->
+        <!-- Formulário Scrollável -->
         <form id="mobile-quick-product-form" class="flex-1 overflow-y-auto p-5 flex flex-col gap-4 text-xs">
           ${isEditing ? `<input type="hidden" name="productId" value="${escapeHtml(p!.id)}" />` : ''}
           ${
@@ -1673,25 +1870,29 @@ function renderMobileProductModal(
             </div>
           </div>
 
-          <!-- SEÇÃO 2: Preço, Custo & Margem de Lucro -->
+          <!-- SEÇÃO 2: Preço de Venda & (se autorizado) Custo & Margem -->
           <div class="flex flex-col gap-2.5 pt-2 border-t border-slate-800">
             <span class="text-[11px] font-bold text-emerald-400 uppercase tracking-wider">
-              2. Preço de Venda, Custo & Margem de Lucro
+              ${canViewCostPrices ? '2. Preço de Venda, Custo & Margem de Lucro' : '2. Preço de Venda'}
             </span>
 
-            <div class="grid grid-cols-2 gap-2.5">
-              <div>
-                <label class="font-medium text-slate-300 block mb-1">Preço de Custo / Aquisição (Kz)</label>
-                <input
-                  type="text"
-                  inputmode="decimal"
-                  id="mobile-product-cost-input"
-                  name="costPrice"
-                  value="${escapeHtml(currentCost)}"
-                  placeholder="Ex.: 1500"
-                  class="w-full h-11 px-3 rounded-xl bg-slate-950 border border-slate-700 font-mono tabular-nums text-white focus:outline-none focus:border-blue-500"
-                />
-              </div>
+            <div class="grid ${canViewCostPrices ? 'grid-cols-2' : 'grid-cols-1'} gap-2.5">
+              ${
+                canViewCostPrices
+                  ? `<div>
+                      <label class="font-medium text-slate-300 block mb-1">Preço de Custo / Aquisição (Kz)</label>
+                      <input
+                        type="text"
+                        inputmode="decimal"
+                        id="mobile-product-cost-input"
+                        name="costPrice"
+                        value="${escapeHtml(currentCost)}"
+                        placeholder="Ex.: 1500"
+                        class="w-full h-11 px-3 rounded-xl bg-slate-950 border border-slate-700 font-mono tabular-nums text-white focus:outline-none focus:border-blue-500"
+                      />
+                    </div>`
+                  : ''
+              }
 
               <div>
                 <label class="font-medium text-slate-300 block mb-1">Preço de Venda ao Público *</label>
@@ -1708,41 +1909,45 @@ function renderMobileProductModal(
               </div>
             </div>
 
-            <!-- Painel Dinâmico de Margem de Lucro em Tempo Real -->
-            <div id="mobile-product-margin-readout" class="p-3 rounded-xl ${
-              numCost > 0
-                ? isBelowCost
-                  ? 'bg-red-950/50 border border-red-900/60'
-                  : 'bg-emerald-950/40 border border-emerald-900/60'
-                : 'bg-slate-950/60 border border-slate-800'
-            } flex items-center justify-between">
-              <div>
-                <span class="text-[10px] text-slate-400 block uppercase tracking-wider">Lucro Unitário Estimado</span>
-                <span class="text-sm font-bold font-mono tabular-nums ${
-                  numCost > 0
-                    ? isBelowCost
-                      ? 'text-red-400'
-                      : 'text-emerald-400'
-                    : 'text-slate-400'
-                }">
-                  ${
+            ${
+              canViewProfitsMargins
+                ? `<!-- Painel Dinâmico de Margem de Lucro em Tempo Real -->
+                  <div id="mobile-product-margin-readout" class="p-3 rounded-xl ${
                     numCost > 0
-                      ? `${profit >= 0 ? '+' : ''}${formatKzNumber(profit)} Kz`
-                      : 'Sem custo definido'
-                  }
-                </span>
-              </div>
-              ${
-                numCost > 0
-                  ? `<div class="text-right">
-                      <span class="text-[10px] text-slate-400 block uppercase tracking-wider">Margem s/ Venda</span>
-                      <span class="text-xs font-mono font-bold ${isBelowCost ? 'text-red-400' : 'text-emerald-300'}">
-                        ${marginPct.toFixed(1)}% · Markup: ${markupPct.toFixed(1)}%
+                      ? isBelowCost
+                        ? 'bg-red-950/50 border border-red-900/60'
+                        : 'bg-emerald-950/40 border border-emerald-900/60'
+                      : 'bg-slate-950/60 border border-slate-800'
+                  } flex items-center justify-between">
+                    <div>
+                      <span class="text-[10px] text-slate-400 block uppercase tracking-wider">Lucro Unitário Estimado</span>
+                      <span class="text-sm font-bold font-mono tabular-nums ${
+                        numCost > 0
+                          ? isBelowCost
+                            ? 'text-red-400'
+                            : 'text-emerald-400'
+                          : 'text-slate-400'
+                      }">
+                        ${
+                          numCost > 0
+                            ? `${profit >= 0 ? '+' : ''}${formatKzNumber(profit)} Kz`
+                            : 'Sem custo definido'
+                        }
                       </span>
-                    </div>`
-                  : ''
-              }
-            </div>
+                    </div>
+                    ${
+                      numCost > 0
+                        ? `<div class="text-right">
+                            <span class="text-[10px] text-slate-400 block uppercase tracking-wider">Margem s/ Venda</span>
+                            <span class="text-xs font-mono font-bold ${isBelowCost ? 'text-red-400' : 'text-emerald-300'}">
+                              ${marginPct.toFixed(1)}% · Markup: ${markupPct.toFixed(1)}%
+                            </span>
+                          </div>`
+                        : ''
+                    }
+                  </div>`
+                : ''
+            }
           </div>
 
           <!-- SEÇÃO 3: Fiscalidade & Regime de IVA (Conformidade AGT) -->
@@ -2228,17 +2433,21 @@ function renderMobileCustomerPickerModal(props: MobileOperationalProps): string 
             .join('')}
         </div>
 
-        <div class="pt-2">
-          <button
-            type="button"
-            data-action="mobile-open-quick-customer"
-            data-value="QUICK"
-            class="w-full h-11 rounded-xl bg-emerald-700 hover:bg-emerald-600 text-white font-bold text-xs flex items-center justify-center gap-1.5"
-          >
-            ${ICONS.plus}
-            <span>Cadastrar Outro Cliente</span>
-          </button>
-        </div>
+        ${
+          props.canCreateCustomers
+            ? `<div class="pt-2">
+                <button
+                  type="button"
+                  data-action="mobile-open-quick-customer"
+                  data-value="QUICK"
+                  class="w-full h-11 rounded-xl bg-emerald-700 hover:bg-emerald-600 text-white font-bold text-xs flex items-center justify-center gap-1.5"
+                >
+                  ${ICONS.plus}
+                  <span>Cadastrar Outro Cliente</span>
+                </button>
+              </div>`
+            : ''
+        }
       </div>
     </div>
   `;

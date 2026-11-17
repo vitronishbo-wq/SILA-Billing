@@ -154,10 +154,15 @@ auditRouter.post('/invoices', requireFirebaseAuth, async (req: AuthenticatedRequ
   if (ctx.db && ctx.hasExplicitCredentials) {
     try {
       const membership = await verifyCompanyMembershipServer(ctx.db, safeCompanyId, user);
-      if (!membership) {
+      const canIssueThisDoc =
+        membership &&
+        ((body.docType === 'NC' && membership.permissions.credit_note_issue) ||
+          (body.docType === 'FP' && membership.permissions.a4_sell) ||
+          (body.docType !== 'NC' && (membership.permissions.pos_sell || membership.permissions.a4_sell)));
+      if (!membership || !canIssueThisDoc) {
         res.status(403).json({
           ok: false,
-          error: 'Sem permissão operacional para emitir documentos nesta empresa.',
+          error: 'Sem permissão operacional para emitir este tipo de documento nesta empresa.',
         });
         return;
       }

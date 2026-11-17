@@ -18,6 +18,7 @@ import {
 } from './cloudMasterMapper.ts';
 import {
   calculateInvoiceTotals,
+  roundKz,
 } from './billingEngine.ts';
 import {
   evaluateCompanyMasterCompleteness,
@@ -105,6 +106,7 @@ const FIRESTORE_SNAPSHOT_KEYS = new Set([
   'showLogoOnA4', 'bankName1', 'iban1', 'accountHolder1', 'swift1',
   'bankName2', 'iban2', 'accountHolder2', 'swift2', 'multicaixaExpressPhone',
   'establishmentId', 'establishmentCode', 'establishmentName', 'establishmentAddress',
+  'establishmentMunicipality', 'establishmentProvince',
   'legalRepresentativeName', 'legalRepresentativeRole', 'capturedAtIso',
 ]);
 
@@ -373,7 +375,15 @@ export async function runPhase5ValidationTests(): Promise<{ passed: number; tota
     assert(a4Html.includes('Est. 002 · Sucursal Lobito'), 'A4 deve exibir estabelecimento 002');
     assert(a4Html.includes('Av. da Restinga, N.º 14'), 'A4 deve exibir endereço específico do estabelecimento 002');
     assert(!a4Html.includes('Beta Consultoria'), 'A4 não pode vazar dados da Empresa B');
-    assert(!a4Html.includes(VITRONIS_INSTITUTIONAL.nif), 'A4 não pode vazar NIF da VITRONIS como emitente');
+    assert(
+      a4Html.includes('Contribuinte / NIF: 5001234567') &&
+        !a4Html.includes(`Contribuinte / NIF: ${VITRONIS_INSTITUTIONAL.nif}`),
+      'A4 não pode vazar NIF da VITRONIS como emitente (apenas como produtor de software)'
+    );
+    assert(
+      a4Html.includes(`NIF Produtor: ${VITRONIS_INSTITUTIONAL.nif}`),
+      'A4 deve identificar o NIF completo do produtor do software no rodapé técnico'
+    );
 
     // Garante também preservação do NIF âncora JAIMONA
     assert(JAIMONA_COMPANY_ID === 'comp_jaimona' && JAIMONA_COMPANY.nif === '5003069940', 'Empresa âncora comp_jaimona intacta');
@@ -1355,6 +1365,168 @@ export async function runPhase5ValidationTests(): Promise<{ passed: number; tota
         assert(html.includes(marker), `Modo ${viewMode} do formulário de cliente deve conter '${marker}'`);
       }
     }
+  });
+
+  await test('5.10 Estrutura POS/A4 consolidada: 25 pontos de integridade fiscal, QR SVG imediato, cliente, pagamentos, Huambo e produtor', () => {
+    const huamboProfile: CompanyProfile = {
+      ...JAIMONA_COMPANY,
+      shortName: 'Bela Vista',
+      legalName: 'Bela Vista Comércio Geral, Lda',
+      nif: '5002571293',
+      address: 'Av. Norton de Matos, N.º 45',
+      municipality: 'Huambo',
+      province: 'Huambo',
+      cityCountry: 'Huambo - Angola',
+      tagline: 'Obrigado pela preferência',
+    };
+    const estHuambo = createDefaultEstablishmentForCompany(huamboProfile);
+    assert(
+      !estHuambo.name.startsWith('Bela Vista'),
+      'Estabelecimento padrão não deve repetir o nome comercial no prefixo'
+    );
+
+    const warnShortNif = evaluateCompanyMasterCompleteness(
+      { ...huamboProfile, nif: '500257129' },
+      { series: [], requireProductionSeriesCheck: false }
+    );
+    assert(
+      warnShortNif.warnings.some((w) => w.field === 'nif' && w.message.includes('último dígito')),
+      'Deve alertar quando NIF societário começar por 5 com apenas 9 dígitos'
+    );
+
+    const totals = calculateInvoiceTotals([
+      {
+        productId: 'p_rice',
+        code: 'ARR01',
+        description: 'Arroz Agulha 25Kg',
+        unit: 'sc',
+        qty: 2,
+        unitPrice: 1250,
+        discountPct: 10,
+        ivaRate: 0,
+        exemptionCode: 'M10',
+        exemptionReason: 'Isento — Cesta Básica',
+      },
+      {
+        productId: 'p_oil',
+        code: 'OLE01',
+        description: 'Óleo Alimentar 1L',
+        unit: 'un',
+        qty: 1,
+        unitPrice: 1000,
+        discountPct: 0,
+        ivaRate: 14,
+      },
+    ]);
+
+    const invEmpresa: InvoiceRecord = {
+      id: 'inv_pos_25pts',
+      companyId: 'comp_belavista',
+      number: 'FR P2026/000012',
+      docType: 'FR',
+      issuedAtIso: '2026-07-15T14:35:00.000Z',
+      createdAtIso: '2026-07-15T14:35:00.000Z',
+      updatedAtIso: '2026-07-15T14:35:00.000Z',
+      cashier: '01',
+      operator: '001',
+      paymentMethod: 'Combinado',
+      paymentSplits: [
+        { method: 'Dinheiro', amount: 2000 },
+        { method: 'Multicaixa', amount: 1500, reference: 'TPA-441' },
+      ],
+      customerId: 'cust_emp_1',
+      customerType: 'EMPRESA',
+      customerCountryCode: 'AO',
+      customerName: 'Planalto Logística, Lda',
+      customerNif: '5001122334',
+      customerAddress: 'Rua Mariano Machado, N.º 10',
+      customerPhone: '923445566',
+      customerEmail: 'faturas@planalto.ao',
+      customerLocality: 'Huambo, Huambo',
+      merchandiseTotal: totals.merchandiseTotal,
+      discountTotal: totals.discountTotal,
+      taxBase14: totals.taxBase14,
+      taxAmount14: totals.taxAmount14,
+      taxBase0: totals.taxBase0,
+      taxAmount0: 0,
+      taxTotal: totals.taxTotal,
+      grandTotal: totals.grandTotal,
+      amountInWords: totals.amountInWords,
+      amountReceived: 3500,
+      changeAmount: roundKz(3500 - totals.grandTotal),
+      notes: '',
+      status: 'issued',
+      lines: totals.lines,
+      establishmentId: estHuambo.id,
+      establishmentCode: estHuambo.code,
+      establishmentName: estHuambo.name,
+      seriesCode: 'P2026',
+      seriesEnvironment: 'PRODUCAO',
+      atcud: 'AGT-2026-001-12',
+      saftHash4: 'pf2F',
+      issuerSnapshot: buildInvoiceIssuerSnapshot(huamboProfile, {
+        companyId: 'comp_belavista',
+        establishment: estHuambo,
+      }),
+    };
+
+    const posHtml = renderDocumentHtml(invEmpresa, 'POS', huamboProfile, '');
+    assert(posHtml.includes('Contribuinte (NIF): 5002571293'), 'POS deve mostrar NIF completo de 10 dígitos');
+    assert(posHtml.includes('Empresa'), 'POS deve distinguir tipo de cliente Empresa');
+    assert(posHtml.includes('NIF Cliente: 5001122334'), 'POS deve exibir NIF do cliente');
+    assert(posHtml.includes('Rua Mariano Machado, N.º 10'), 'POS deve exibir morada do cliente');
+    assert(posHtml.includes('923445566') && posHtml.includes('faturas@planalto.ao'), 'POS deve exibir telefone e e-mail do cliente');
+    assert(posHtml.includes('Caixa: <span class="font-semibold">01</span>') && posHtml.includes('Operador(a): <span class="font-semibold">001</span>'), 'POS deve separar visualmente Caixa e Operador');
+    assert(posHtml.includes('>Qtd.<') && posHtml.includes('>P. Unit.<') && posHtml.includes('>Subtotal<'), 'POS deve ter colunas estruturadas para artigos');
+    assert(!posHtml.includes('1.250,002.500,00'), 'POS não pode concatenar preço unitário e subtotal');
+    assert(
+      posHtml.includes('M10: Isento nos termos da Lei do IVA (Bens da Cesta Básica) (Art.º 12.º, alínea a) do CIVA)') &&
+        posHtml.includes('Isento — Cesta Básica'),
+      'POS deve apresentar código e fundamento legal de isenção'
+    );
+    assert(posHtml.includes('Desc. artigo: -10,00%'), 'POS deve discriminar desconto do artigo');
+    assert(posHtml.includes('Dinheiro') && posHtml.includes('Multicaixa (TPA-441)'), 'POS deve discriminar pagamentos múltiplos');
+    assert(posHtml.includes('Est. 001 · Sede / Loja Principal'), 'POS deve apresentar estabelecimento sem repetir Bela Vista');
+    assert(!posHtml.includes('Est. 001 · Bela Vista'), 'POS não deve duplicar o nome comercial no estabelecimento');
+    assert(posHtml.includes('DOCUMENTO FISCAL · SÉRIE P2026'), 'POS deve apresentar série documental');
+    assert(posHtml.includes('ATCUD: AGT-2026-001-12'), 'POS deve apresentar ATCUD atribuído');
+    assert(posHtml.includes('<svg '), 'POS deve renderizar QR Code SVG efectivo mesmo sem qrDataUrl PNG');
+    assert(posHtml.includes('pf2F') && posHtml.includes('RSA-SHA1'), 'POS deve identificar o mecanismo de assinatura/hash SAF-T');
+    assert(posHtml.includes('FISCAL VÁLIDO (PRODUÇÃO AGT)'), 'POS deve identificar claramente o estado fiscal');
+    assert(posHtml.includes('Huambo, Huambo'), 'POS deve exibir localidade informada do cliente');
+    assert(posHtml.includes('Huambo - Angola'), 'POS deve exibir localidade dinâmica do estabelecimento no Huambo');
+    assert(!posHtml.includes('Luanda - Angola'), 'POS do Huambo não deve exibir Luanda fixa');
+    assert(!posHtml.includes('Meio de pagamento:'), 'POS não deve repetir Meio de pagamento quando detalha Pagamentos');
+    const thankCount = (posHtml.match(/obrigado pela/gi) || []).length;
+    assert(thankCount === 1, `POS não deve duplicar mensagem de agradecimento (encontradas ${thankCount})`);
+    assert(posHtml.includes('Software SILA-Billing v1.0 · Produtor: VITRONIS, Lda · NIF 5002571293'), 'POS deve uniformizar identificação do software e produtor');
+
+    // Teste Consumidor Final herdando Huambo dinamicamente e ocultando Troco quando zero
+    const invConsumidorFinal: InvoiceRecord = {
+      ...invEmpresa,
+      id: 'inv_pos_cf_huambo',
+      customerId: 'cust_direct_comp_belavista',
+      customerType: 'CONSUMIDOR_FINAL',
+      customerName: 'Cliente de Venda Directa',
+      customerNif: 'Consumidor Final',
+      customerAddress: undefined,
+      customerPhone: undefined,
+      customerEmail: undefined,
+      customerLocality: 'Luanda - Angola',
+      paymentMethod: 'Multicaixa',
+      paymentSplits: undefined,
+      amountReceived: totals.grandTotal,
+      changeAmount: 0,
+      status: 'cancelled',
+      seriesEnvironment: 'SIMULACAO',
+      atcud: undefined,
+    };
+    const cfHtml = renderDocumentHtml(invConsumidorFinal, 'POS', huamboProfile, '');
+    assert(cfHtml.includes('Consumidor Final'), 'POS deve identificar cliente Consumidor Final');
+    assert(cfHtml.includes('Localidade: Huambo - Angola'), 'Consumidor Final deve herdar localidade dinâmica do Huambo');
+    assert(!cfHtml.includes('Luanda - Angola'), 'Consumidor Final no Huambo não deve manter Luanda antiga');
+    assert(!cfHtml.includes('Troco:'), 'Troco zero não deve ser exibido no POS');
+    assert(cfHtml.includes('ANULADO'), 'POS deve destacar estado ANULADO para documentos anulados');
   });
 
   console.log(`\n=== FASE 5 CONCLUÍDA: ${passed}/${total} TESTES PASSARAM COM SUCESSO ===\n`);

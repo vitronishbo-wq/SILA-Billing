@@ -46,10 +46,12 @@ import {
   JAIMONA_COMPANY,
   JAIMONA_COMPANY_ID,
   resolveCompanyProfileFromSnapshot,
+  resolveEstablishmentLocality,
   VITRONIS_INSTITUTIONAL,
   type CompanyRecord,
   type InvoiceRecord,
 } from './types.ts';
+import { createDirectCustomerForCompany } from './seedData.ts';
 import {
   buildAgtQrCanonicalString,
   generateAgtQrDataUrl,
@@ -57,7 +59,7 @@ import {
   parseAgtQrString,
 } from './fiscalQrGenerator.ts';
 import type { AgtDocumentPayload } from './fiscalTypes.ts';
-import { computeDocumentSaftHash4 } from './saftGenerator.ts';
+import { computeDocumentSaftHash4, generateSaftAoXml } from './saftGenerator.ts';
 import {
   generateInvoiceQrDataUrl,
   renderDocumentHtml,
@@ -1207,6 +1209,112 @@ export async function runFiscalTests(): Promise<{ passed: number; total: number 
       requireProductionSeriesCheck: true,
     });
     assert(prodCheck.readyForProductionEmission === true, 'Produção deve ficar pronta após ficha completa e série de Produção activa');
+  });
+
+  await test('ATCUD no SAF-T XML, localidade dinâmica de estabelecimento e QR SVG síncrono em POS/A4', () => {
+    const huamboEst = createDefaultEstablishmentForCompany({
+      shortName: 'Planície',
+      municipality: 'Huambo',
+      province: 'Huambo',
+      address: 'Av. Independência, 10',
+      cityCountry: 'Huambo - Angola',
+      phone: '923000111',
+      email: 'geral@planicie.ao',
+    });
+    assert(
+      resolveEstablishmentLocality(
+        { municipality: 'Huambo', province: 'Huambo', cityCountry: 'Luanda - Angola' },
+        huamboEst
+      ) === 'Huambo - Angola',
+      'Localidade do estabelecimento deve priorizar Município e Província sobre cityCountry antigo'
+    );
+
+    const huamboComp: CompanyRecord = {
+      id: 'comp_huambo_dir',
+      normalizedNif: JAIMONA_COMPANY.nif,
+      status: 'active',
+      plan: {
+        planTier: 'FREE',
+        commercialActive: false,
+        maxUsers: 2,
+        maxInvoicesPerMonth: 50,
+        updatedAtIso: '2026-08-01T10:00:00.000Z',
+      },
+      baseSequence: 1,
+      allowManagerCancel: true,
+      createdAtIso: '2026-08-01T10:00:00.000Z',
+      updatedAtIso: '2026-08-01T10:00:00.000Z',
+      profile: {
+        ...JAIMONA_COMPANY,
+        shortName: 'Planície',
+        municipality: 'Huambo',
+        province: 'Huambo',
+        cityCountry: 'Huambo - Angola',
+        establishments: [huamboEst],
+      },
+    };
+    const directCust = createDirectCustomerForCompany(huamboComp);
+    assert(directCust.customerType === 'CONSUMIDOR_FINAL', 'Cliente direto deve ter customerType CONSUMIDOR_FINAL');
+    assert(directCust.locality === 'Huambo - Angola', 'Cliente direto deve nascer com localidade do estabelecimento');
+
+    const totals = calculateInvoiceTotals([
+      {
+        productId: 'p_huambo',
+        code: 'H1',
+        description: 'Serviço Consultoria',
+        unit: 'un',
+        qty: 1,
+        unitPrice: 5000,
+        discountPct: 0,
+        ivaRate: 14,
+      },
+    ]);
+    const invAtcud: InvoiceRecord = {
+      id: 'inv_atcud_saft',
+      companyId: 'comp_huambo_dir',
+      number: 'FR H2026/000001',
+      docType: 'FR',
+      issuedAtIso: '2026-08-01T10:00:00.000Z',
+      createdAtIso: '2026-08-01T10:00:00.000Z',
+      updatedAtIso: '2026-08-01T10:00:00.000Z',
+      cashier: '01',
+      operator: '001',
+      paymentMethod: 'Multicaixa',
+      customerId: directCust.id,
+      customerType: 'CONSUMIDOR_FINAL',
+      customerCountryCode: 'AO',
+      customerName: directCust.name,
+      customerNif: directCust.nif,
+      customerLocality: directCust.locality,
+      merchandiseTotal: totals.merchandiseTotal,
+      discountTotal: totals.discountTotal,
+      taxBase14: totals.taxBase14,
+      taxAmount14: totals.taxAmount14,
+      taxBase0: 0,
+      taxAmount0: 0,
+      taxTotal: totals.taxTotal,
+      grandTotal: totals.grandTotal,
+      amountInWords: totals.amountInWords,
+      amountReceived: totals.grandTotal,
+      changeAmount: 0,
+      notes: '',
+      status: 'issued',
+      lines: totals.lines,
+      seriesCode: 'H2026',
+      seriesEnvironment: 'PRODUCAO',
+      atcud: 'AGT-HUAMBO-1',
+    };
+
+    const posNoPng = renderDocumentHtml(invAtcud, 'POS', JAIMONA_COMPANY, '');
+    assert(posNoPng.includes('<svg ') && posNoPng.includes('AGT-HUAMBO-1'), 'POS deve renderizar QR SVG síncrono e ATCUD');
+
+    const saft = generateSaftAoXml({
+      company: { ...JAIMONA_COMPANY, municipality: 'Huambo', province: 'Huambo' },
+      invoices: [invAtcud],
+      customers: [directCust],
+      options: { fiscalYear: 2026, periodMonth: 8 },
+    });
+    assert(saft.xml.includes('<ATCUD>AGT-HUAMBO-1</ATCUD>'), 'XML SAF-T deve exportar o ATCUD atribuído ao documento');
   });
 
   console.log(`\nTODOS OS ${passed}/${total} TESTES FISCAIS PASSARAM COM SUCESSO!\n`);

@@ -26,14 +26,26 @@ import {
   sanitizeIssuerSnapshotForCloud,
 } from '../core/cloudMasterMapper';
 import {
+  appendSecurityAuditBackend,
+  claimCompanyInvitesBackend,
+  deleteCompanyMemberBackend,
+  fetchCompanyWorkspaceBackend,
+  upsertCompanyMemberBackend,
+  upsertCompanyRoleBackend,
+} from '../../frontend/services/backendApi';
+import { resolveMemberBaseRole, resolveMemberStatus } from '../core/rbac';
+import {
   AppSettings,
   CalculatedLineItem,
+  canCompanyInviteCloudMembers,
   canCompanySyncCloudData,
   CashMovement,
   CashMovementType,
   CashSession,
   CompanyMember,
   CompanyRecord,
+  CompanyRole,
+  CompanyRoleDefinition,
   Customer,
   DEFAULT_SETTINGS,
   DEFAULT_WAREHOUSE_ID,
@@ -52,6 +64,7 @@ import {
   PurchaseLineItem,
   PurchasePaymentMethod,
   PurchaseRecord,
+  SecurityAuditEntry,
   StockMovement,
   StockMovementDirection,
   StockMovementType,
@@ -232,13 +245,28 @@ export async function upsertCompanyMemberCloud(
 ): Promise<void> {
   const user = auth.currentUser;
   if (!user || !user.emailVerified) return;
-  if (member.role !== 'owner' && !canCompanySyncCloudData(company)) return;
+  if (member.role !== 'owner' && !canCompanyInviteCloudMembers(company)) return;
 
   const companyId = sanitizeId(company.id);
+
+  // Via preferencial: backend confiável valida anti-escalada, gera convite Cloud e audita
+  const backendRes = await upsertCompanyMemberBackend(companyId, member);
+  if (backendRes.ok && backendRes.persistedInFirestore) {
+    return;
+  }
+  if (!backendRes.ok && backendRes.error && !backendRes.error.includes('indisponível')) {
+    throw new Error(backendRes.error);
+  }
+
+  // Fallback direto apenas quando o proprietário autenticado escreve no seu tenant e o Admin SDK local está offline
+  const ownerUid = company.ownerUid || user.uid;
+  if (ownerUid !== user.uid) return;
+
   const memberDocId = sanitizeId(member.uid || member.id);
   const path = `companies/${companyId}/members/${memberDocId}`;
   const ref = doc(db, 'companies', companyId, 'members', memberDocId);
-  const ownerUid = company.ownerUid || user.uid;
+  const resolvedRole = resolveMemberBaseRole(member);
+  const resolvedStatus = resolveMemberStatus(member);
 
   try {
     const snap = await getDoc(ref);
@@ -250,19 +278,39 @@ export async function upsertCompanyMemberCloud(
         uid: sanitizeId(member.uid || memberDocId),
         email: (member.email || '').slice(0, 120),
         emailLower: (member.email || '').trim().toLowerCase().slice(0, 120),
+        ...(member.phone ? { phone: member.phone.slice(0, 32) } : {}),
         displayName: (member.displayName || member.email || 'Operador').slice(0, 120),
-        role: member.role,
+        role: resolvedRole,
+        roleId: (member.roleId || `role_${resolvedRole}`).slice(0, 64),
+        ...(Array.isArray(member.establishmentIds)
+          ? { establishmentIds: member.establishmentIds.slice(0, 20) }
+          : {}),
+        ...(Array.isArray(member.authorizedCashiers)
+          ? { authorizedCashiers: member.authorizedCashiers.slice(0, 20) }
+          : {}),
+        status: resolvedStatus,
         allowInvoiceCancel: Boolean(member.allowInvoiceCancel),
-        active: Boolean(member.active),
+        active: resolvedStatus === 'active',
+        ...(member.pinHash ? { pinHash: member.pinHash.slice(0, 256) } : {}),
         createdAt: serverTimestamp(),
         updatedAt: serverTimestamp(),
       });
     } else {
       await updateDoc(ref, {
         displayName: (member.displayName || member.email || 'Operador').slice(0, 120),
-        role: member.role,
+        role: resolvedRole,
+        roleId: (member.roleId || `role_${resolvedRole}`).slice(0, 64),
+        ...(member.phone ? { phone: member.phone.slice(0, 32) } : {}),
+        ...(Array.isArray(member.establishmentIds)
+          ? { establishmentIds: member.establishmentIds.slice(0, 20) }
+          : {}),
+        ...(Array.isArray(member.authorizedCashiers)
+          ? { authorizedCashiers: member.authorizedCashiers.slice(0, 20) }
+          : {}),
+        status: resolvedStatus,
         allowInvoiceCancel: Boolean(member.allowInvoiceCancel),
-        active: Boolean(member.active),
+        active: resolvedStatus === 'active',
+        ...(member.pinHash ? { pinHash: member.pinHash.slice(0, 256) } : {}),
         updatedAt: serverTimestamp(),
       });
     }
@@ -271,7 +319,47 @@ export async function upsertCompanyMemberCloud(
   }
 }
 
-function sanitizePriceHistory(raw?: ProductPriceChange[]): ProductPriceChange[] {
+export async function removeCompanyMemberCloud(
+  company: CompanyRecord,
+  memberIdRaw: string
+): Promise<void> {
+  const user = auth.currentUser;
+  if (!user || !user.emailVerified || !memberIdRaw) return;
+  if (!canCompanyInviteCloudMembers(company)) return;
+  const companyId = sanitizeId(company.id);
+  const res = await deleteCompanyMemberBackend(companyId, sanitizeId(memberIdRaw));
+  if (!res.ok && res.error) {
+    throw new Error(res.error);
+  }
+}
+
+export async function upsertCompanyRoleCloud(
+  company: CompanyRecord,
+  role: CompanyRoleDefinition
+): Promise<void> {
+  const user = auth.currentUser;
+  if (!user || !user.emailVerified) return;
+  if (!canCompanyInviteCloudMembers(company)) return;
+  const companyId = sanitizeId(company.id);
+  const res = await upsertCompanyRoleBackend(companyId, role);
+  if (!res.ok && res.error) {
+    throw new Error(res.error);
+  }
+}
+
+export async function appendSecurityAuditCloud(
+  company: CompanyRecord | null,
+  entry: SecurityAuditEntry
+): Promise<void> {
+  const user = auth.currentUser;
+  if (!user || !user.emailVerified) return;
+  const companyId = sanitizeId(entry.companyId || company?.id || '');
+  if (!companyId) return;
+  if (company && !canCompanyInviteCloudMembers(company)) return;
+  await appendSecurityAuditBackend(companyId, entry);
+}
+
+function sanitizePriceHistory(raw?: ProductPriceChange[], stripCosts = false): ProductPriceChange[] {
   if (!Array.isArray(raw) || raw.length === 0) return [];
   return raw
     .slice(0, 20)
@@ -282,10 +370,20 @@ function sanitizePriceHistory(raw?: ProductPriceChange[]): ProductPriceChange[] 
         newPrice: Math.min(999999999, Math.max(0, Number(entry.newPrice) || 0)),
         changedBy: String(entry.changedBy || 'Operador').slice(0, 120) || 'Operador',
       };
-      if (typeof entry.previousCost === 'number' && Number.isFinite(entry.previousCost) && entry.previousCost >= 0) {
+      if (
+        !stripCosts &&
+        typeof entry.previousCost === 'number' &&
+        Number.isFinite(entry.previousCost) &&
+        entry.previousCost >= 0
+      ) {
         clean.previousCost = Math.min(999999999, entry.previousCost);
       }
-      if (typeof entry.newCost === 'number' && Number.isFinite(entry.newCost) && entry.newCost >= 0) {
+      if (
+        !stripCosts &&
+        typeof entry.newCost === 'number' &&
+        Number.isFinite(entry.newCost) &&
+        entry.newCost >= 0
+      ) {
         clean.newCost = Math.min(999999999, entry.newCost);
       }
       return clean;
@@ -310,18 +408,23 @@ export async function upsertProductCloud(
     return;
   }
 
-  // Sincroniza na estrutura multiempresa isolada /companies/{companyId}/products/{productId}
+  // Separação física de dados sensíveis: catálogo público sem costPrice; custo isolado em /private/costing
   const compProdPath = `companies/${companyId}/products/${productId}`;
   const compProdRef = doc(db, 'companies', companyId, 'products', productId);
+  const compCostRef = doc(db, 'companies', companyId, 'products', productId, 'private', 'costing');
 
   try {
-    const snap = await getDoc(compProdRef);
+    const [snap, costSnap] = await Promise.all([
+      getDoc(compProdRef),
+      getDoc(compCostRef).catch(() => null),
+    ]);
     const barcodeVal = String(product.barcode || '').trim().slice(0, 48);
     const costPriceVal =
       typeof product.costPrice === 'number' && Number.isFinite(product.costPrice) && product.costPrice > 0
         ? Math.min(999999999, product.costPrice)
         : 0;
-    const cleanHistory = sanitizePriceHistory(product.priceHistory);
+    const cleanPublicHistory = sanitizePriceHistory(product.priceHistory, true);
+    const cleanFullHistory = sanitizePriceHistory(product.priceHistory, false);
     const stockFields =
       typeof product.trackStock === 'boolean'
         ? {
@@ -330,7 +433,7 @@ export async function upsertProductCloud(
             minStockQty: Math.max(0, Number(product.minStockQty) || 0),
           }
         : {};
-    const historyField = cleanHistory.length > 0 ? { priceHistory: cleanHistory } : {};
+    const historyField = cleanPublicHistory.length > 0 ? { priceHistory: cleanPublicHistory } : {};
 
     const normalizedRate = normalizeTaxRate(product.ivaRate);
     const extraProductFields = {
@@ -342,8 +445,9 @@ export async function upsertProductCloud(
         : {}),
     };
 
+    const batch = writeBatch(db);
     if (!snap.exists()) {
-      await setDoc(compProdRef, {
+      batch.set(compProdRef, {
         id: productId,
         companyId,
         companyOwnerUid: ownerUid,
@@ -353,7 +457,6 @@ export async function upsertProductCloud(
         name: product.name.slice(0, 160),
         category: (product.category || 'Geral').trim().slice(0, 48) || 'Geral',
         unit: (product.unit || 'un').slice(0, 16),
-        costPrice: costPriceVal,
         price: Number(product.price) || 0,
         ivaRate: normalizedRate,
         exemptionReason: (product.exemptionReason || '').slice(0, 120),
@@ -365,14 +468,13 @@ export async function upsertProductCloud(
         updatedAt: serverTimestamp(),
       });
     } else {
-      await updateDoc(compProdRef, {
+      batch.update(compProdRef, {
         updatedByUid: user.uid,
         code: product.code.slice(0, 32),
         barcode: barcodeVal,
         name: product.name.slice(0, 160),
         category: (product.category || 'Geral').trim().slice(0, 48) || 'Geral',
         unit: (product.unit || 'un').slice(0, 16),
-        costPrice: costPriceVal,
         price: Number(product.price) || 0,
         ivaRate: normalizedRate,
         exemptionReason: (product.exemptionReason || '').slice(0, 120),
@@ -384,10 +486,30 @@ export async function upsertProductCloud(
       });
     }
 
+    // Grava o preço de custo na subcolecção privada restrita (Owner / Manager / Contabilista / Armazém autorizado)
+    const costingPayload = {
+      companyId,
+      companyOwnerUid: ownerUid,
+      updatedByUid: user.uid,
+      costPrice: costPriceVal,
+      updatedAt: serverTimestamp(),
+    };
+    if (!costSnap || !costSnap.exists()) {
+      batch.set(compCostRef, costingPayload);
+    } else {
+      batch.update(compCostRef, {
+        updatedByUid: user.uid,
+        costPrice: costPriceVal,
+        updatedAt: serverTimestamp(),
+      });
+    }
+    await batch.commit();
+
     // Mantém espelho clássico apenas para o e-mail titular real da JAIMONA
     if (companyId === JAIMONA_COMPANY_ID && ownerUid === user.uid && isJaimonaOwnerEmail(user.email)) {
       const legacyRef = doc(db, 'users', user.uid, 'products', productId);
       const legSnap = await getDoc(legacyRef);
+      const legacyHistField = cleanFullHistory.length > 0 ? { priceHistory: cleanFullHistory } : {};
       if (!legSnap.exists()) {
         await setDoc(legacyRef, {
           id: productId,
@@ -404,7 +526,7 @@ export async function upsertProductCloud(
           active: Boolean(product.active),
           ...extraProductFields,
           ...stockFields,
-          ...historyField,
+          ...legacyHistField,
           createdAt: serverTimestamp(),
           updatedAt: serverTimestamp(),
         });
@@ -422,7 +544,7 @@ export async function upsertProductCloud(
           active: Boolean(product.active),
           ...extraProductFields,
           ...stockFields,
-          ...historyField,
+          ...legacyHistField,
           updatedAt: serverTimestamp(),
         });
       }
@@ -484,7 +606,10 @@ export async function removeProductCloud(
   const productId = sanitizeId(productIdRaw);
   const path = `companies/${companyId}/products/${productId}`;
   try {
-    await deleteDoc(doc(db, 'companies', companyId, 'products', productId));
+    const batch = writeBatch(db);
+    batch.delete(doc(db, 'companies', companyId, 'products', productId, 'private', 'costing'));
+    batch.delete(doc(db, 'companies', companyId, 'products', productId));
+    await batch.commit();
     if (companyId === JAIMONA_COMPANY_ID && isJaimonaOwnerEmail(user.email)) {
       await deleteDoc(doc(db, 'users', user.uid, 'products', productId)).catch(() => null);
     }
@@ -768,6 +893,15 @@ export async function createInvoiceCloud(
       customerName: invoice.customerName.slice(0, 160),
       customerNif: (invoice.customerNif || '').slice(0, 32),
       customerLocality: (invoice.customerLocality || '').slice(0, 160),
+      ...(invoice.customerType ? { customerType: invoice.customerType } : {}),
+      ...(invoice.customerCountryCode
+        ? { customerCountryCode: invoice.customerCountryCode.slice(0, 8) }
+        : {}),
+      ...(invoice.customerAddress
+        ? { customerAddress: invoice.customerAddress.slice(0, 240) }
+        : {}),
+      ...(invoice.customerPhone ? { customerPhone: invoice.customerPhone.slice(0, 40) } : {}),
+      ...(invoice.customerEmail ? { customerEmail: invoice.customerEmail.slice(0, 120) } : {}),
       merchandiseTotal: invoice.merchandiseTotal,
       discountTotal: invoice.discountTotal,
       ...(invoice.globalDiscountPct ? { globalDiscountPct: invoice.globalDiscountPct } : {}),
@@ -805,7 +939,12 @@ export async function createInvoiceCloud(
       ...(invoice.agtAuthorizationCode
         ? { agtAuthorizationCode: invoice.agtAuthorizationCode.slice(0, 64) }
         : {}),
+      ...(invoice.atcud ? { atcud: invoice.atcud.slice(0, 64) } : {}),
       ...(invoice.saftHash4 ? { saftHash4: invoice.saftHash4.slice(0, 16) } : {}),
+      ...(invoice.saftHashFull ? { saftHashFull: invoice.saftHashFull.slice(0, 200) } : {}),
+      ...(invoice.previousInvoiceHash
+        ? { previousInvoiceHash: invoice.previousInvoiceHash.slice(0, 200) }
+        : {}),
       ...(sanitizedSnapshot ? { issuerSnapshot: sanitizedSnapshot } : {}),
       ...(invoice.sessionId ? { sessionId: sanitizeId(invoice.sessionId) } : {}),
       amountReceived: invoice.amountReceived,
@@ -1566,6 +1705,8 @@ export async function pullCompanyFromCloud(companyIdRaw: string): Promise<{
   suppliers: Supplier[];
   purchases: PurchaseRecord[];
   fiscalSeries?: AgtSeriesRecord[];
+  members?: CompanyMember[];
+  roles?: CompanyRoleDefinition[];
   settings: AppSettings | null;
 } | null> {
   const user = auth.currentUser;
@@ -1573,27 +1714,24 @@ export async function pullCompanyFromCloud(companyIdRaw: string): Promise<{
 
   const companyId = sanitizeId(companyIdRaw);
 
-  // Proteção estrita: nunca executar queries client-side de proprietário em comp_jaimona
-  // quando autenticado com outra conta (ex.: Super-Admin ou terceiros)
-  if (companyId === JAIMONA_COMPANY_ID && !isJaimonaOwnerEmail(user.email)) {
-    return null;
-  }
-
   const compDocSnap = await getDoc(doc(db, 'companies', companyId)).catch(() => null);
-  if (
-    compDocSnap &&
-    compDocSnap.exists() &&
-    compDocSnap.data().ownerUid &&
-    compDocSnap.data().ownerUid !== user.uid
-  ) {
-    return null;
-  }
-
-  if (compDocSnap && compDocSnap.exists() && companyId !== JAIMONA_COMPANY_ID) {
+  if (compDocSnap && compDocSnap.exists()) {
     const cloudTier = compDocSnap.data().planTier;
-    if (cloudTier !== 'PROFISSIONAL' && cloudTier !== 'ENTERPRISE') {
+    if (
+      companyId !== JAIMONA_COMPANY_ID &&
+      cloudTier !== 'PROFISSIONAL' &&
+      cloudTier !== 'ENTERPRISE'
+    ) {
       return null;
     }
+
+    // Colaboradores não proprietários (Gerente, Caixa, Contabilista, etc.) sincronizam via backend RBAC
+    // para que as regras allow list do Firestore nunca bloqueiem queries nem exponham dados sensíveis
+    if (compDocSnap.data().ownerUid && compDocSnap.data().ownerUid !== user.uid) {
+      return fetchCompanyWorkspaceBackend(companyId);
+    }
+  } else if (companyId === JAIMONA_COMPANY_ID && !isJaimonaOwnerEmail(user.email)) {
+    return null;
   }
 
   const prodPath = `companies/${companyId}/products`;
@@ -1605,6 +1743,8 @@ export async function pullCompanyFromCloud(companyIdRaw: string): Promise<{
   const supPath = `companies/${companyId}/suppliers`;
   const purPath = `companies/${companyId}/purchases`;
   const seriesPath = `companies/${companyId}/fiscal_series`;
+  const membersPath = `companies/${companyId}/members`;
+  const rolesPath = `companies/${companyId}/roles`;
   const settingsRef = doc(db, 'companies', companyId, 'settings', 'general');
 
   try {
@@ -1618,6 +1758,8 @@ export async function pullCompanyFromCloud(companyIdRaw: string): Promise<{
       supSnap,
       purSnap,
       seriesSnap,
+      membersSnap,
+      rolesSnap,
       settingsSnap,
     ] = await Promise.all([
       getDocs(
@@ -1683,6 +1825,20 @@ export async function pullCompanyFromCloud(companyIdRaw: string): Promise<{
           where('companyOwnerUid', '==', user.uid)
         )
       ).catch(() => null),
+      getDocs(
+        query(
+          collection(db, membersPath),
+          where('companyId', '==', companyId),
+          where('companyOwnerUid', '==', user.uid)
+        )
+      ).catch(() => null),
+      getDocs(
+        query(
+          collection(db, rolesPath),
+          where('companyId', '==', companyId),
+          where('companyOwnerUid', '==', user.uid)
+        )
+      ).catch(() => null),
       getDoc(settingsRef).catch(() => null),
     ]);
 
@@ -1698,44 +1854,108 @@ export async function pullCompanyFromCloud(companyIdRaw: string): Promise<{
       return pullLegacyJaimonaFromCloud();
     }
 
-    const products: Product[] = prodSnap.docs.map((d) => {
-      const data = d.data();
-      const history = sanitizePriceHistory(data.priceHistory as ProductPriceChange[] | undefined);
-      const pt =
-        data.productType === 'P' || data.productType === 'S' || data.productType === 'K'
-          ? (data.productType as ProductType)
-          : undefined;
+    const products: Product[] = await Promise.all(
+      prodSnap.docs.map(async (d) => {
+        const data = d.data();
+        let resolvedCostPrice =
+          typeof data.costPrice === 'number' && data.costPrice > 0 ? Number(data.costPrice) : undefined;
+        try {
+          const costSnap = await getDoc(
+            doc(db, 'companies', companyId, 'products', data.id, 'private', 'costing')
+          );
+          if (costSnap.exists() && typeof costSnap.data()?.costPrice === 'number' && costSnap.data()!.costPrice > 0) {
+            resolvedCostPrice = Number(costSnap.data()!.costPrice);
+          }
+        } catch {
+          // Sem permissão de custo ou registo inexistente
+        }
+
+        const history = sanitizePriceHistory(data.priceHistory as ProductPriceChange[] | undefined);
+        const pt =
+          data.productType === 'P' || data.productType === 'S' || data.productType === 'K'
+            ? (data.productType as ProductType)
+            : undefined;
+        return {
+          id: data.id,
+          companyId,
+          code: data.code,
+          ...(data.barcode ? { barcode: String(data.barcode) } : {}),
+          name: data.name,
+          ...(pt ? { productType: pt } : {}),
+          category: data.category || 'Geral',
+          unit: data.unit,
+          ...(typeof resolvedCostPrice === 'number' && resolvedCostPrice > 0
+            ? { costPrice: resolvedCostPrice }
+            : {}),
+          price: data.price,
+          ivaRate: normalizeTaxRate(data.ivaRate),
+          ...(data.exemptionCode
+            ? { exemptionCode: String(data.exemptionCode) as AgtIvaExemptionCode }
+            : {}),
+          exemptionReason: data.exemptionReason || '',
+          active: Boolean(data.active),
+          ...(typeof data.trackStock === 'boolean'
+            ? {
+                trackStock: data.trackStock,
+                stockQty: Number(data.stockQty) || 0,
+                minStockQty: Math.max(0, Number(data.minStockQty) || 0),
+              }
+            : {}),
+          ...(history.length > 0 ? { priceHistory: history } : {}),
+          syncState: 'synced',
+          synced: true,
+          createdAtIso: new Date().toISOString(),
+          updatedAtIso: new Date().toISOString(),
+        };
+      })
+    );
+
+    const members: CompanyMember[] = (membersSnap?.docs || []).map((md) => {
+      const m = md.data();
+      const baseRole = resolveMemberBaseRole({ role: m.role as CompanyRole });
+      const status = resolveMemberStatus({
+        status: m.status as CompanyMember['status'],
+        active: typeof m.active === 'boolean' ? m.active : true,
+        uid: String(m.uid || ''),
+      });
       return {
-        id: data.id,
+        id: String(m.id || md.id),
         companyId,
-        code: data.code,
-        ...(data.barcode ? { barcode: String(data.barcode) } : {}),
-        name: data.name,
-        ...(pt ? { productType: pt } : {}),
-        category: data.category || 'Geral',
-        unit: data.unit,
-        ...(typeof data.costPrice === 'number' && data.costPrice > 0
-          ? { costPrice: Number(data.costPrice) }
+        uid: String(m.uid || md.id),
+        email: String(m.email || ''),
+        ...(m.phone ? { phone: String(m.phone) } : {}),
+        displayName: String(m.displayName || m.email || 'Operador'),
+        role: baseRole,
+        roleId: String(m.roleId || `role_${baseRole}`),
+        ...(Array.isArray(m.establishmentIds)
+          ? { establishmentIds: (m.establishmentIds as unknown[]).map((x) => String(x)) }
           : {}),
-        price: data.price,
-        ivaRate: normalizeTaxRate(data.ivaRate),
-        ...(data.exemptionCode
-          ? { exemptionCode: String(data.exemptionCode) as AgtIvaExemptionCode }
+        ...(Array.isArray(m.authorizedCashiers)
+          ? { authorizedCashiers: (m.authorizedCashiers as unknown[]).map((x) => String(x)) }
           : {}),
-        exemptionReason: data.exemptionReason || '',
-        active: Boolean(data.active),
-        ...(typeof data.trackStock === 'boolean'
-          ? {
-              trackStock: data.trackStock,
-              stockQty: Number(data.stockQty) || 0,
-              minStockQty: Math.max(0, Number(data.minStockQty) || 0),
-            }
+        ...(m.permissionOverrides && typeof m.permissionOverrides === 'object'
+          ? { permissionOverrides: m.permissionOverrides as CompanyMember['permissionOverrides'] }
           : {}),
-        ...(history.length > 0 ? { priceHistory: history } : {}),
-        syncState: 'synced',
-        synced: true,
+        status,
+        ...(m.pinHash ? { pinHash: String(m.pinHash) } : {}),
+        allowInvoiceCancel: Boolean(m.allowInvoiceCancel),
+        active: status === 'active',
         createdAtIso: new Date().toISOString(),
         updatedAtIso: new Date().toISOString(),
+      };
+    });
+
+    const roles: CompanyRoleDefinition[] = (rolesSnap?.docs || []).map((rd) => {
+      const r = rd.data();
+      return {
+        id: String(r.id || rd.id),
+        companyId,
+        name: String(r.name || ''),
+        description: String(r.description || ''),
+        baseRole: resolveMemberBaseRole({ role: (r.baseRole || 'cashier') as CompanyRole }),
+        isSystem: Boolean(r.isSystem),
+        permissions: (r.permissions || {}) as CompanyRoleDefinition['permissions'],
+        updatedAtIso: String(r.updatedAtIso || new Date().toISOString()),
       };
     });
 
@@ -1852,6 +2072,13 @@ export async function pullCompanyFromCloud(companyIdRaw: string): Promise<{
           customerName: data.customerName,
           customerNif: data.customerNif,
           customerLocality: data.customerLocality,
+          ...(data.customerType ? { customerType: data.customerType } : {}),
+          ...(data.customerCountryCode
+            ? { customerCountryCode: String(data.customerCountryCode) }
+            : {}),
+          ...(data.customerAddress ? { customerAddress: String(data.customerAddress) } : {}),
+          ...(data.customerPhone ? { customerPhone: String(data.customerPhone) } : {}),
+          ...(data.customerEmail ? { customerEmail: String(data.customerEmail) } : {}),
           merchandiseTotal: data.merchandiseTotal,
           discountTotal: data.discountTotal,
           globalDiscountPct: typeof data.globalDiscountPct === 'number' ? data.globalDiscountPct : undefined,
@@ -1892,7 +2119,12 @@ export async function pullCompanyFromCloud(companyIdRaw: string): Promise<{
           ...(data.agtAuthorizationCode
             ? { agtAuthorizationCode: String(data.agtAuthorizationCode) }
             : {}),
+          ...(data.atcud ? { atcud: String(data.atcud) } : {}),
           ...(data.saftHash4 ? { saftHash4: String(data.saftHash4) } : {}),
+          ...(data.saftHashFull ? { saftHashFull: String(data.saftHashFull) } : {}),
+          ...(data.previousInvoiceHash
+            ? { previousInvoiceHash: String(data.previousInvoiceHash) }
+            : {}),
           sessionId: data.sessionId ? String(data.sessionId) : undefined,
           amountReceived: data.amountReceived,
           initialAmountReceived:
@@ -2254,6 +2486,8 @@ export async function pullCompanyFromCloud(companyIdRaw: string): Promise<{
       suppliers,
       purchases,
       fiscalSeries,
+      ...(members.length > 0 ? { members } : {}),
+      ...(roles.length > 0 ? { roles } : {}),
       settings,
     };
   } catch (err) {
@@ -2487,6 +2721,9 @@ async function pullLegacyJaimonaFromCloud(): Promise<{
 export async function pullOwnedCompaniesFromCloud(): Promise<CompanyRecord[]> {
   const user = auth.currentUser;
   if (!user || !user.emailVerified) return [];
+
+  // Reivindica quaisquer convites pendentes para este e-mail antes de listar as empresas
+  await claimCompanyInvitesBackend().catch(() => null);
 
   const linksPath = `users/${user.uid}/company_links`;
   try {

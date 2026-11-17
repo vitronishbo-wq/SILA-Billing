@@ -1,6 +1,16 @@
 import QRCode from 'qrcode';
 import { formatDateTimePt, formatKzNumber, roundKz } from '../../src/core/billingEngine';
-import { generateAgtQrDataUrl } from '../../src/core/fiscalQrGenerator';
+import { resolveDefaultExemptionCodeForCompany } from '../../src/core/companyValidator';
+import {
+  CUSTOMER_TYPE_LABELS,
+  inferCustomerType,
+  isFinalConsumerNif,
+} from '../../src/core/customerValidator';
+import {
+  buildAgtQrCanonicalString,
+  DEFAULT_AGT_SOFTWARE_APPROVAL,
+  generateAgtQrDataUrl,
+} from '../../src/core/fiscalQrGenerator';
 import { AGT_IVA_EXEMPTION_CODES, type AgtIvaExemptionCode } from '../../src/core/fiscalTypes';
 import { computeDocumentSaftHash4 } from '../../src/core/saftGenerator';
 import {
@@ -8,6 +18,7 @@ import {
   CashSession,
   CashSessionSummary,
   CompanyProfile,
+  CustomerType,
   deriveCompanyInitials,
   DocumentFormat,
   formatDocumentTypeLabelPt,
@@ -15,11 +26,15 @@ import {
   NEUTRAL_PLATFORM_PROFILE,
   normalizeCompanyNif,
   resolveCompanyProfileFromSnapshot,
+  resolveEstablishmentLocality,
+  VITRONIS_INSTITUTIONAL,
 } from '../../src/core/types';
 import {
   classifyInvoiceControlStatus,
   summarizeDocumentControlList,
 } from '../../src/core/documentExport';
+
+export const SILA_SOFTWARE_VERSION = '1.0';
 
 function escapeHtml(raw: string): string {
   return String(raw || '')
@@ -40,6 +55,42 @@ function formatTaxRegimeLabelPt(regime?: string): string {
     default:
       return 'Regime Geral de IVA';
   }
+}
+
+function normalizePhraseForCompare(raw?: string): string {
+  return String(raw || '')
+    .normalize('NFD')
+    .replace(/[\u0300-\u036f]/g, '')
+    .toLowerCase()
+    .replace(/[^a-z0-9]/g, '');
+}
+
+function cleanEstablishmentDisplayName(rawName: string, docCompany: CompanyProfile): string {
+  let clean = String(rawName || '').trim();
+  if (!clean) return '';
+  const prefixes = [docCompany.shortName, docCompany.legalName]
+    .map((p) => String(p || '').trim())
+    .filter(Boolean);
+  for (const prefix of prefixes) {
+    const lowerPrefix = prefix.toLowerCase();
+    const lowerClean = clean.toLowerCase();
+    if (lowerClean.startsWith(lowerPrefix)) {
+      const rest = clean.slice(prefix.length).replace(/^[\s·\-—:]+/, '').trim();
+      if (rest) {
+        clean = rest;
+        break;
+      }
+    }
+  }
+  return clean;
+}
+
+export function getInvoiceQrCacheKey(
+  invoice: Pick<InvoiceRecord, 'number' | 'grandTotal' | 'saftHash4' | 'issuerSnapshot'>,
+  fallbackCompany?: Pick<CompanyProfile, 'nif'> | null
+): string {
+  const issuerNif = invoice.issuerSnapshot?.nif || fallbackCompany?.nif || '';
+  return `${invoice.number}|${Number(invoice.grandTotal || 0).toFixed(2)}|${issuerNif}|${invoice.saftHash4 || ''}`;
 }
 
 interface RenderedTaxRow {
@@ -76,19 +127,28 @@ function buildDocumentTaxRows(invoice: InvoiceRecord, docCompany: CompanyProfile
       if (cfg.rate === 0) {
         const codes = Array.from(
           new Set(
-            matchingLines
-              .map((l) => l.exemptionCode || docCompany.defaultExemptionCode)
-              .filter(Boolean) as string[]
+            matchingLines.map((l) =>
+              resolveDefaultExemptionCodeForCompany(docCompany, l.exemptionCode)
+            )
           )
         );
-        if (codes.length > 0) {
-          exemptionNote = codes
-            .map((c) => {
-              const meta = AGT_IVA_EXEMPTION_CODES[c as AgtIvaExemptionCode];
-              return meta ? `${c}: ${meta.descriptionPt}` : c;
-            })
-            .join(' · ');
-        }
+        const customReasons = Array.from(
+          new Set(
+            matchingLines
+              .map((l) => String(l.exemptionReason || '').trim())
+              .filter(Boolean)
+          )
+        );
+        const codeText = codes
+          .map((c) => {
+            const meta = AGT_IVA_EXEMPTION_CODES[c as AgtIvaExemptionCode];
+            return meta ? `${c}: ${meta.descriptionPt} (${meta.legalBasis})` : c;
+          })
+          .join(' · ');
+        exemptionNote =
+          customReasons.length > 0 && !codeText.toLowerCase().includes(customReasons[0]!.toLowerCase())
+            ? `${codeText} — ${customReasons.join('; ')}`
+            : codeText;
       }
       rows.push({
         label: cfg.label,
@@ -125,15 +185,89 @@ function buildDocumentTaxRows(invoice: InvoiceRecord, docCompany: CompanyProfile
         amount: invoice.taxAmountReduced || 0,
       });
     }
+    const defCode = resolveDefaultExemptionCodeForCompany(docCompany);
+    const defMeta = AGT_IVA_EXEMPTION_CODES[defCode];
     rows.push({
       label: 'IVA 0%',
       rateLabel: '0,00% (ISE)',
       base: invoice.taxBase0 || 0,
       amount: 0,
+      exemptionNote: defMeta ? `${defCode}: ${defMeta.descriptionPt}` : defCode,
     });
   }
 
   return rows;
+}
+
+function buildLineTaxBadge(
+  rate: number,
+  exemptionCode: string | undefined,
+  docCompany: CompanyProfile
+): string {
+  const r = Number(rate) || 0;
+  if (r === 14) return 'NOR 14%';
+  if (r === 7) return 'INT 7%';
+  if (r === 5) return 'RED 5%';
+  if (r === 1) return 'INT-CAB 1%';
+  const code = resolveDefaultExemptionCodeForCompany(docCompany, exemptionCode);
+  return `ISE ${code}`;
+}
+
+function buildInvoiceQrPayloadInput(invoice: InvoiceRecord, docCompany: CompanyProfile) {
+  const sig4 = invoice.saftHash4 || computeDocumentSaftHash4(invoice).hash4;
+  const taxBaseIntRed = roundKz(
+    (invoice.taxBaseIntermediate || 0) + (invoice.taxBaseReduced || 0)
+  );
+  const taxAmountIntRed = roundKz(
+    (invoice.taxAmountIntermediate || 0) + (invoice.taxAmountReduced || 0)
+  );
+  const environment: 'PRODUCAO' | 'HOMOLOGACAO' =
+    invoice.seriesEnvironment === 'PRODUCAO' ? 'PRODUCAO' : 'HOMOLOGACAO';
+  const customerCountry = (invoice.customerCountryCode || 'AO').trim().toUpperCase().slice(0, 2) || 'AO';
+
+  return {
+    companyNif: docCompany.nif,
+    companyName: docCompany.legalName,
+    customerNif: invoice.customerNif,
+    customerCountry,
+    documentType: invoice.docType,
+    documentStatus: (invoice.status === 'cancelled' ? 'A' : 'N') as 'A' | 'N',
+    documentDate: invoice.issuedAtIso,
+    documentNo: invoice.number,
+    submissionGuidOrHash: invoice.id,
+    totals: {
+      taxBaseNor: invoice.taxBase14,
+      taxAmountNor: invoice.taxAmount14,
+      taxBaseIntRed,
+      taxAmountIntRed,
+      taxBaseIse: invoice.taxBase0,
+      totalTax: invoice.taxTotal,
+      grandTotal: invoice.grandTotal,
+    },
+    signatureJwsPreview: sig4,
+    environment,
+  };
+}
+
+function renderQrSvgSync(canonical: string, sizeClass: string, altLabel: string): string {
+  try {
+    const qr = QRCode.create(canonical, { errorCorrectionLevel: 'M' });
+    const count = qr.modules.size;
+    const data = qr.modules.data;
+    const margin = 2;
+    const total = count + margin * 2;
+    const rects: string[] = [];
+    for (let r = 0; r < count; r++) {
+      for (let c = 0; c < count; c++) {
+        if (data[r * count + c]) {
+          rects.push(`<rect x="${c + margin}" y="${r + margin}" width="1" height="1"/>`);
+        }
+      }
+    }
+    return `<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 ${total} ${total}" shape-rendering="crispEdges" role="img" aria-label="${escapeHtml(altLabel)}" class="${sizeClass} bg-white"><rect width="${total}" height="${total}" fill="#ffffff"/><g fill="#000000">${rects.join('')}</g></svg>`;
+  } catch {
+    return '';
+  }
 }
 
 export async function generateInvoiceQrDataUrl(
@@ -142,46 +276,13 @@ export async function generateInvoiceQrDataUrl(
 ): Promise<string> {
   try {
     const docCompany = resolveCompanyProfileFromSnapshot(invoice, company);
-    const sig4 = invoice.saftHash4 || computeDocumentSaftHash4(invoice).hash4;
-    const taxBaseIntRed = roundKz(
-      (invoice.taxBaseIntermediate || 0) + (invoice.taxBaseReduced || 0)
-    );
-    const taxAmountIntRed = roundKz(
-      (invoice.taxAmountIntermediate || 0) + (invoice.taxAmountReduced || 0)
-    );
-    const environment: 'PRODUCAO' | 'HOMOLOGACAO' =
-      invoice.seriesEnvironment === 'PRODUCAO' ? 'PRODUCAO' : 'HOMOLOGACAO';
-
-    return await generateAgtQrDataUrl(
-      {
-        companyNif: docCompany.nif,
-        companyName: docCompany.legalName,
-        customerNif: invoice.customerNif,
-        customerCountry: 'AO',
-        documentType: invoice.docType,
-        documentStatus: invoice.status === 'cancelled' ? 'A' : 'N',
-        documentDate: invoice.issuedAtIso,
-        documentNo: invoice.number,
-        submissionGuidOrHash: invoice.id,
-        totals: {
-          taxBaseNor: invoice.taxBase14,
-          taxAmountNor: invoice.taxAmount14,
-          taxBaseIntRed,
-          taxAmountIntRed,
-          taxBaseIse: invoice.taxBase0,
-          totalTax: invoice.taxTotal,
-          grandTotal: invoice.grandTotal,
-        },
-        signatureJwsPreview: sig4,
-        environment,
-      },
-      {
-        width: 350,
-        margin: 2,
-        errorCorrectionLevel: 'M',
-        version: 4,
-      }
-    );
+    const payloadInput = buildInvoiceQrPayloadInput(invoice, docCompany);
+    return await generateAgtQrDataUrl(payloadInput, {
+      width: 350,
+      margin: 2,
+      errorCorrectionLevel: 'M',
+      version: 4,
+    });
   } catch {
     return '';
   }
@@ -196,48 +297,170 @@ export function renderDocumentHtml(
     showViralFooter?: boolean;
     customerAddress?: string;
     customerPhone?: string;
+    customerEmail?: string;
+    customerType?: CustomerType;
+    customerCountryCode?: string;
     isReprint?: boolean;
   }
 ): string {
   const docCompany = resolveCompanyProfileFromSnapshot(invoice, company);
   const dt = formatDateTimePt(invoice.issuedAtIso);
   const isCreditNote = invoice.docType === 'NC';
+  const isProforma = invoice.docType === 'FP';
   const titleLabel = formatDocumentTypeLabelPt(invoice.docType).toUpperCase();
   const isSecondCopy = Boolean(options?.isReprint || (invoice.reprintCount || 0) > 0);
   const cancelledDt = invoice.cancelledAtIso ? formatDateTimePt(invoice.cancelledAtIso) : null;
   const showViralFooter = Boolean(options?.showViralFooter);
-  const custLoc = (invoice.customerLocality || docCompany.cityCountry || 'Angola').trim();
-  const custAddr = (options?.customerAddress || '').trim();
-  const hasDistinctAddr = Boolean(custAddr && custAddr.toLowerCase() !== custLoc.toLowerCase());
-  const custPhone = (options?.customerPhone || '').trim();
   const isProductionDoc = invoice.seriesEnvironment === 'PRODUCAO';
-  const docHash4 = invoice.saftHash4 || computeDocumentSaftHash4(invoice).hash4;
-  const taxRows = buildDocumentTaxRows(invoice, docCompany);
+
   const estCode = invoice.establishmentCode || invoice.issuerSnapshot?.establishmentCode || '';
-  const estName = invoice.establishmentName || invoice.issuerSnapshot?.establishmentName || '';
-  const estLabel = [estCode ? `Est. ${estCode}` : '', estName].filter(Boolean).join(' · ');
+  const rawEstName = invoice.establishmentName || invoice.issuerSnapshot?.establishmentName || '';
+  const cleanEstName = cleanEstablishmentDisplayName(rawEstName, docCompany);
+  const estLabel = [estCode ? `Est. ${estCode}` : '', cleanEstName].filter(Boolean).join(' · ');
   const estAddress =
     invoice.issuerSnapshot?.establishmentAddress &&
     invoice.issuerSnapshot.establishmentAddress.trim().toLowerCase() !==
       docCompany.address.trim().toLowerCase()
       ? invoice.issuerSnapshot.establishmentAddress.trim()
       : '';
+  const issuerLocalityLabel = resolveEstablishmentLocality(docCompany, {
+    municipality: invoice.issuerSnapshot?.establishmentMunicipality || docCompany.municipality,
+    province: invoice.issuerSnapshot?.establishmentProvince || docCompany.province,
+  });
+
+  const resolvedCustomerType: CustomerType =
+    invoice.customerType ||
+    options?.customerType ||
+    inferCustomerType({
+      id: invoice.customerId,
+      name: invoice.customerName,
+      nif: invoice.customerNif,
+      countryCode: invoice.customerCountryCode || options?.customerCountryCode,
+    });
+  const customerTypeLabel = CUSTOMER_TYPE_LABELS[resolvedCustomerType];
+  const custCountryCode = (
+    invoice.customerCountryCode ||
+    options?.customerCountryCode ||
+    'AO'
+  )
+    .trim()
+    .toUpperCase();
+
+  let custNifDisplay = 'Não informado';
+  if (resolvedCustomerType === 'CONSUMIDOR_FINAL') {
+    custNifDisplay = '999999999 (Consumidor Final)';
+  } else if (resolvedCustomerType === 'ESTRANGEIRO') {
+    const rawCustNif = String(invoice.customerNif || '').trim();
+    custNifDisplay =
+      rawCustNif && !isFinalConsumerNif(rawCustNif)
+        ? `${rawCustNif} (${custCountryCode})`
+        : `Estrangeiro (${custCountryCode})`;
+  } else if (invoice.customerNif && !isFinalConsumerNif(invoice.customerNif)) {
+    custNifDisplay = invoice.customerNif.trim();
+  }
+
+  const rawCustLoc = (invoice.customerLocality || '').trim();
+  const custLoc =
+    resolvedCustomerType === 'CONSUMIDOR_FINAL'
+      ? !rawCustLoc ||
+        rawCustLoc === 'Angola' ||
+        (rawCustLoc === 'Luanda - Angola' &&
+          issuerLocalityLabel &&
+          issuerLocalityLabel !== 'Luanda - Angola')
+        ? issuerLocalityLabel
+        : rawCustLoc
+      : rawCustLoc || issuerLocalityLabel;
+
+  const rawCustAddr = (invoice.customerAddress || options?.customerAddress || '').trim();
+  const isGenericCounterAddr =
+    resolvedCustomerType === 'CONSUMIDOR_FINAL' &&
+    rawCustAddr.toLowerCase().startsWith('venda a balcão');
+  const custAddr =
+    rawCustAddr && !isGenericCounterAddr && rawCustAddr.toLowerCase() !== custLoc.toLowerCase()
+      ? rawCustAddr
+      : '';
+  const custPhone = (invoice.customerPhone || options?.customerPhone || '').trim();
+  const custEmail = (invoice.customerEmail || options?.customerEmail || '').trim();
+
+  const docHash4 = invoice.saftHash4 || computeDocumentSaftHash4(invoice).hash4;
+  const taxRows = buildDocumentTaxRows(invoice, docCompany);
+  const qrKey = getInvoiceQrCacheKey(invoice, docCompany);
+  const qrCaption = isProductionDoc
+    ? 'QR AGT (Produção)'
+    : 'QR Verificação (Simulação)';
+  const qrImgOrSvgHtml = qrDataUrl
+    ? `<img src="${qrDataUrl}" data-qr-key="${escapeHtml(qrKey)}" alt="${escapeHtml(qrCaption)}" referrerpolicy="no-referrer" class="h-24 w-24 object-contain" />`
+    : renderQrSvgSync(
+        buildAgtQrCanonicalString(buildInvoiceQrPayloadInput(invoice, docCompany)),
+        'h-24 w-24',
+        qrCaption
+      );
+  const qrA4ImgOrSvgHtml = qrDataUrl
+    ? `<img src="${qrDataUrl}" data-qr-key="${escapeHtml(qrKey)}" alt="${escapeHtml(qrCaption)}" referrerpolicy="no-referrer" class="h-16 w-16 border border-slate-200 p-0.5" />`
+    : renderQrSvgSync(
+        buildAgtQrCanonicalString(buildInvoiceQrPayloadInput(invoice, docCompany)),
+        'h-16 w-16 border border-slate-200 p-0.5',
+        qrCaption
+      );
+
+  const docStateLabel =
+    invoice.status === 'cancelled'
+      ? 'ANULADO'
+      : isProforma
+        ? 'PROVISÓRIO / PROFORMA (SEM VALIDADE FISCAL)'
+        : isProductionDoc
+          ? 'FISCAL VÁLIDO (PRODUÇÃO AGT)'
+          : 'DEMONSTRAÇÃO / SIMULAÇÃO (SEM VALIDADE FISCAL)';
+
+  const atcudDisplay = invoice.atcud
+    ? invoice.atcud
+    : isProductionDoc
+      ? 'Pendente de atribuição AGT'
+      : 'Não atribuído (Simulação)';
+
+  const normalizedTagline = normalizePhraseForCompare(docCompany.tagline);
+  const isRedundantThankYou =
+    normalizedTagline === 'obrigadopelasuapreferencia' ||
+    normalizedTagline === 'obrigadopelapreferencia' ||
+    (normalizedTagline.includes('obrigado') && normalizedTagline.includes('preferencia'));
+  const showCustomTagline =
+    Boolean(docCompany.tagline && docCompany.tagline.trim()) && !isRedundantThankYou;
+
   const showLogoPos = Boolean(docCompany.logoUrl) && docCompany.showLogoOnPos !== false;
   const showLogoA4 = Boolean(docCompany.logoUrl) && docCompany.showLogoOnA4 !== false;
+
+  const paymentSplits = Array.isArray(invoice.paymentSplits)
+    ? invoice.paymentSplits.filter((s) => s && Number(s.amount) > 0)
+    : [];
 
   if (format === 'POS') {
     const itemsHtml = invoice.lines
       .map((line) => {
         const qtyStr = Number.isInteger(line.qty) ? String(line.qty) : formatKzNumber(line.qty);
-        const discStr = line.discountPct > 0 ? ` (-${line.discountPct}%)` : '';
+        const taxBadge = buildLineTaxBadge(line.ivaRate, line.exemptionCode, docCompany);
+        const hasLineDiscount = (line.discountPct || 0) > 0 || (line.lineDiscount || 0) > 0;
         return `
-          <div class="text-[11.5px]">
-            <div class="font-bold leading-tight">${escapeHtml(line.description)}</div>
-            <div class="flex justify-between tabular-nums pl-1.5">
-              <span>${qtyStr} x ${formatKzNumber(line.unitPrice)}${discStr}</span>
-              <span>${formatKzNumber(line.lineTotal)}</span>
-            </div>
-          </div>
+          <tr class="border-t border-dotted border-slate-300 align-top">
+            <td colspan="4" class="pt-1.5 pb-0.5 leading-tight">
+              <span class="font-bold">${escapeHtml(line.description)}</span>
+              <span class="ml-1 text-[9.5px] font-semibold text-slate-700">[${escapeHtml(taxBadge)}]</span>
+            </td>
+          </tr>
+          <tr class="align-top">
+            <td class="pb-1 text-[10px] text-slate-600">${escapeHtml(line.code || '')}${line.unit ? ` · ${escapeHtml(line.unit)}` : ''}</td>
+            <td class="pb-1 text-right whitespace-nowrap">${qtyStr}</td>
+            <td class="pb-1 text-right whitespace-nowrap">${formatKzNumber(line.unitPrice)}</td>
+            <td class="pb-1 text-right font-bold whitespace-nowrap">${formatKzNumber(line.lineTotal)}</td>
+          </tr>
+          ${
+            hasLineDiscount
+              ? `<tr>
+                  <td colspan="4" class="pb-1 text-[9.5px] text-slate-600">
+                    Desc. artigo: -${formatKzNumber(line.discountPct)}% (-${formatKzNumber(line.lineDiscount)} Kz)
+                  </td>
+                </tr>`
+              : ''
+          }
         `;
       })
       .join('');
@@ -253,6 +476,20 @@ export function renderDocumentHtml(
       )
       .join('');
 
+    const posPaymentLinesHtml =
+      paymentSplits.length > 0
+        ? paymentSplits
+            .map(
+              (sp) =>
+                `<div class="flex justify-between"><span>· ${escapeHtml(sp.method)}${sp.reference ? ` (${escapeHtml(sp.reference)})` : ''}</span><span>${formatKzNumber(sp.amount)} Kz</span></div>`
+            )
+            .join('')
+        : invoice.paymentSummary
+          ? `<div class="text-[10.5px]">${escapeHtml(invoice.paymentSummary)}</div>`
+          : !isCreditNote && invoice.paymentMethod !== 'Crédito' && invoice.amountReceived > 0
+            ? `<div class="flex justify-between"><span>· ${escapeHtml(invoice.paymentMethod)}</span><span>${formatKzNumber(Math.min(invoice.amountReceived, invoice.grandTotal))} Kz</span></div>`
+            : '';
+
     return `
       <div class="print-target mx-auto w-full max-w-[330px] bg-white p-4 text-[12px] leading-snug text-black font-sans border border-slate-200">
         <div class="text-center space-y-0.5">
@@ -263,20 +500,16 @@ export function renderDocumentHtml(
           }
           ${
             isProductionDoc
-              ? `<div class="font-bold text-[10.5px] tracking-tight">DOCUMENTO FISCAL${invoice.seriesCode ? ` · SÉRIE ${escapeHtml(invoice.seriesCode)}` : ''}</div>`
+              ? `<div class="font-bold text-[10.5px] tracking-tight">DOCUMENTO FISCAL · SÉRIE ${escapeHtml(invoice.seriesCode || 'A')}</div>`
               : `<div class="font-bold text-[11px] tracking-tight">MODELO — SEM VALIDADE FISCAL</div>`
           }
           <div class="font-bold text-[13px] leading-tight">${escapeHtml(docCompany.legalName)}</div>
-          ${estLabel ? `<div class="text-[10px] font-semibold">${escapeHtml(estLabel)}</div>` : ''}
+          ${estLabel ? `<div class="text-[10.5px] font-semibold">${escapeHtml(estLabel)}</div>` : ''}
           <div class="text-[11px]">${escapeHtml(estAddress || docCompany.address)}</div>
-          ${
-            docCompany.municipality || docCompany.province
-              ? `<div class="text-[10.5px]">${escapeHtml([docCompany.municipality, docCompany.province].filter(Boolean).join(', '))}</div>`
-              : ''
-          }
-          <div class="text-[11px]">Tel.: ${escapeHtml(docCompany.phone)}${docCompany.mobile ? ` / ${escapeHtml(docCompany.mobile)}` : ''}</div>
+          <div class="text-[10.5px]">${escapeHtml(issuerLocalityLabel)}</div>
+          ${docCompany.phone ? `<div class="text-[11px]">Tel.: ${escapeHtml(docCompany.phone)}${docCompany.mobile ? ` / ${escapeHtml(docCompany.mobile)}` : ''}</div>` : ''}
           ${docCompany.email ? `<div class="text-[11px]">${escapeHtml(docCompany.email)}</div>` : ''}
-          <div class="text-[11px]">Contribuinte: ${escapeHtml(docCompany.nif)}</div>
+          <div class="text-[11px] font-semibold tabular-nums">Contribuinte (NIF): ${escapeHtml(docCompany.nif)}</div>
           ${
             docCompany.taxRegime
               ? `<div class="text-[10px] text-slate-700">${escapeHtml(formatTaxRegimeLabelPt(docCompany.taxRegime))}</div>`
@@ -285,21 +518,25 @@ export function renderDocumentHtml(
         </div>
 
         ${
-          qrDataUrl
-            ? `<div class="my-2.5 flex justify-center">
-                <img src="${qrDataUrl}" alt="QR Fatura" referrerpolicy="no-referrer" class="h-24 w-24 object-contain" />
+          qrImgOrSvgHtml
+            ? `<div class="my-2.5 flex flex-col items-center gap-1">
+                ${qrImgOrSvgHtml}
+                <div class="text-[9px] text-slate-500">${escapeHtml(qrCaption)}</div>
               </div>`
             : ''
         }
 
-        <div class="border-y border-black py-1.5 text-center my-2">
+        <div class="border-y border-black py-1.5 text-center my-2 space-y-0.5">
           <div class="font-bold text-[13px] tabular-nums">${titleLabel} N.º ${escapeHtml(invoice.number)}</div>
-          <div class="text-[11px]">${
+          <div class="text-[10.5px] font-semibold">Estado: ${escapeHtml(docStateLabel)}</div>
+          <div class="text-[10px] tabular-nums">Série: ${escapeHtml(invoice.seriesCode || 'Não atribuída')} · Ambiente: ${isProductionDoc ? 'Produção AGT' : 'Simulação'}</div>
+          <div class="text-[10px] tabular-nums">ATCUD: ${escapeHtml(atcudDisplay)}</div>
+          <div class="text-[10.5px]">${
             isCreditNote
               ? invoice.returnOriginNumber
                 ? `Retificação / Devolução ref. ${escapeHtml(invoice.returnOriginNumber)}`
                 : 'Devolução / Retificação Comercial'
-              : invoice.docType === 'FP'
+              : isProforma
                 ? 'Orçamento / Documento Provisório'
                 : 'Venda Directa a Retalho'
           }</div>
@@ -328,26 +565,35 @@ export function renderDocumentHtml(
         </div>
 
         <div class="space-y-0.5 text-[11px] pb-2 border-b border-black">
-          <div class="font-bold tabular-nums">Data: ${dt.date} &nbsp; ${dt.time}</div>
-          <div class="flex justify-between tabular-nums">
-            <span>Caixa: ${escapeHtml(invoice.cashier)}</span>
-            <span>Operador(a): ${escapeHtml(invoice.operator)}</span>
+          <div class="font-bold tabular-nums">Data/Hora: ${dt.slashDate} ${dt.time}</div>
+          <div class="tabular-nums">Caixa: <span class="font-semibold">${escapeHtml(invoice.cashier)}</span></div>
+          <div class="tabular-nums">Operador(a): <span class="font-semibold">${escapeHtml(invoice.operator)}</span></div>
+          <div>Local de emissão: ${escapeHtml(issuerLocalityLabel)}</div>
+          <div class="pt-1 mt-1 border-t border-dotted border-slate-400 space-y-0.5">
+            <div class="font-bold text-[10.5px]">ADQUIRENTE / CLIENTE</div>
+            <div>Tipo: <span class="font-semibold">${escapeHtml(customerTypeLabel)}</span></div>
+            <div>Nome: <span class="font-semibold">${escapeHtml(invoice.customerName)}</span></div>
+            <div class="tabular-nums">NIF Cliente: ${escapeHtml(custNifDisplay)}</div>
+            ${custPhone ? `<div class="tabular-nums">Tel.: ${escapeHtml(custPhone)}</div>` : ''}
+            ${custEmail ? `<div>E-mail: ${escapeHtml(custEmail)}</div>` : ''}
+            ${custAddr ? `<div>Morada: ${escapeHtml(custAddr)}</div>` : ''}
+            <div>Localidade: ${escapeHtml(custLoc)}</div>
           </div>
-          <div>Pagamento: ${escapeHtml(invoice.paymentMethod)}</div>
-          <div>Cliente: ${escapeHtml(invoice.customerName)}</div>
-          ${
-            invoice.customerNif && invoice.customerNif !== 'Consumidor Final'
-              ? `<div class="tabular-nums">NIF Cliente: ${escapeHtml(invoice.customerNif)}</div>`
-              : ''
-          }
-          ${custPhone ? `<div class="tabular-nums">Tel. Cliente: ${escapeHtml(custPhone)}</div>` : ''}
-          ${hasDistinctAddr ? `<div>Endereço: ${escapeHtml(custAddr)}</div>` : ''}
-          <div>Localidade: ${escapeHtml(custLoc)}</div>
         </div>
 
         <div class="py-2 border-b border-dashed border-black">
           <div class="font-bold text-[12px] mb-1">ARTIGOS</div>
-          <div class="space-y-1.5">${itemsHtml}</div>
+          <table class="w-full border-collapse text-[10.5px] tabular-nums">
+            <thead>
+              <tr class="border-b border-black text-[9.5px] text-slate-700">
+                <th class="pb-1 text-left font-bold">Artigo</th>
+                <th class="pb-1 text-right font-bold">Qtd.</th>
+                <th class="pb-1 text-right font-bold">P. Unit.</th>
+                <th class="pb-1 text-right font-bold">Subtotal</th>
+              </tr>
+            </thead>
+            <tbody>${itemsHtml}</tbody>
+          </table>
         </div>
 
         <div class="py-2 border-b border-black text-[11px] space-y-1">
@@ -376,12 +622,8 @@ export function renderDocumentHtml(
         </div>
 
         <div class="py-2 border-b border-black text-[11px] space-y-0.5 tabular-nums">
-          <div class="font-bold">${isCreditNote ? 'Modo de regularização' : 'Meio de pagamento'}: ${escapeHtml(invoice.paymentMethod)}</div>
-          ${
-            invoice.paymentSummary
-              ? `<div class="text-[10.5px]">${escapeHtml(invoice.paymentSummary)}</div>`
-              : ''
-          }
+          <div class="font-bold">${isCreditNote ? 'Modo de regularização' : 'Pagamentos'}: ${escapeHtml(invoice.paymentMethod)}</div>
+          ${posPaymentLinesHtml}
           ${
             invoice.transferReference
               ? `<div class="text-[10.5px]">Ref. Pagamento: ${escapeHtml(invoice.transferReference)}</div>`
@@ -396,13 +638,18 @@ export function renderDocumentHtml(
                 }</div>`
               : ''
           }
-          <div>${isCreditNote ? 'Valor reembolsado' : 'Valor recebido'}: ${formatKzNumber(invoice.amountReceived)} Kz</div>
+          <div class="flex justify-between pt-0.5 font-semibold">
+            <span>${isCreditNote ? 'Valor reembolsado' : 'Total recebido'}:</span>
+            <span>${formatKzNumber(invoice.amountReceived)} Kz</span>
+          </div>
           ${
             isCreditNote
               ? ''
               : invoice.amountDue && invoice.amountDue > 0
-                ? `<div class="font-bold">Em dívida (Conta Corrente): ${formatKzNumber(invoice.amountDue)} Kz</div>`
-                : `<div>Troco: ${formatKzNumber(invoice.changeAmount)} Kz</div>`
+                ? `<div class="flex justify-between font-bold"><span>Em dívida (Conta Corrente):</span><span>${formatKzNumber(invoice.amountDue)} Kz</span></div>`
+                : invoice.changeAmount > 0
+                  ? `<div class="flex justify-between font-semibold"><span>Troco:</span><span>${formatKzNumber(invoice.changeAmount)} Kz</span></div>`
+                  : ''
           }
         </div>
 
@@ -417,19 +664,21 @@ export function renderDocumentHtml(
 
         <div class="pt-2.5 text-center space-y-1">
           <div class="font-bold text-[11.5px]">OBRIGADO PELA SUA PREFERÊNCIA!</div>
-          <div class="text-[11px]">${escapeHtml(docCompany.tagline)}</div>
-          <div class="border-t border-black mt-2 pt-1.5 text-[10px] space-y-0.5">
+          ${showCustomTagline ? `<div class="text-[11px]">${escapeHtml(docCompany.tagline)}</div>` : ''}
+          <div class="border-t border-black mt-2 pt-1.5 text-[9.5px] space-y-0.5">
             ${
               isProductionDoc
                 ? `<div class="font-bold tabular-nums">${escapeHtml(docHash4)}-Processado por programa validado SILA-Billing</div>
-                   <div class="tabular-nums">NIF: ${escapeHtml(docCompany.nif)} | Caixa: ${escapeHtml(invoice.cashier)}${invoice.agtAuthorizationCode ? ` | Aut.: ${escapeHtml(invoice.agtAuthorizationCode)}` : ''}</div>`
-                : `<div class="font-bold">Documento de demonstração · Hash: ${escapeHtml(docHash4)}</div>
-                   <div class="tabular-nums">NIF: ${escapeHtml(docCompany.nif)} | Caixa: ${escapeHtml(invoice.cashier)}</div>
-                   <div>Não substitui factura fiscal</div>`
+                   <div class="tabular-nums">Assinatura RSA-SHA1 SAF-T · NIF Emissor: ${escapeHtml(docCompany.nif)}${invoice.agtAuthorizationCode ? ` · Aut.: ${escapeHtml(invoice.agtAuthorizationCode)}` : ''}</div>`
+                : `<div class="font-bold tabular-nums">Assinatura de teste SAF-T (RSA-SHA1): ${escapeHtml(docHash4)} — Simulação</div>
+                   <div>Documento de demonstração · Não substitui factura fiscal perante a AGT</div>`
             }
+            <div class="pt-1 mt-1 border-t border-dashed border-black/50 text-[9px] text-slate-700 tabular-nums">
+              Software SILA-Billing v${SILA_SOFTWARE_VERSION} · Produtor: ${escapeHtml(VITRONIS_INSTITUTIONAL.shortName)}, Lda · NIF ${escapeHtml(VITRONIS_INSTITUTIONAL.nif)} · Ref. ${escapeHtml(DEFAULT_AGT_SOFTWARE_APPROVAL)}
+            </div>
             ${
               showViralFooter
-                ? `<div class="pt-1 mt-1 border-t border-dashed border-black/60 text-[9.5px] font-medium">Processado por SILA-Billing · VITRONIS (www.vitronis.co.ao)</div>`
+                ? `<div class="text-[9px] text-slate-600">${escapeHtml(VITRONIS_INSTITUTIONAL.website)}</div>`
                 : ''
             }
           </div>
@@ -444,7 +693,10 @@ export function renderDocumentHtml(
       (line) => `
         <tr>
           <td class="py-2 px-2.5 font-mono text-slate-600">${escapeHtml(line.code)}</td>
-          <td class="py-2 px-2.5 font-medium text-slate-900">${escapeHtml(line.description)}</td>
+          <td class="py-2 px-2.5 font-medium text-slate-900">
+            <div>${escapeHtml(line.description)}</div>
+            <div class="text-[9.5px] text-slate-500">${escapeHtml(buildLineTaxBadge(line.ivaRate, line.exemptionCode, docCompany))}</div>
+          </td>
           <td class="py-2 px-2.5 text-right">${formatKzNumber(line.qty)}</td>
           <td class="py-2 px-2.5 text-right">${formatKzNumber(line.unitPrice)}</td>
           <td class="py-2 px-2.5 text-right">${formatKzNumber(line.ivaRate)}</td>
@@ -469,6 +721,18 @@ export function renderDocumentHtml(
     )
     .join('');
 
+  const a4PaymentSplitsHtml =
+    paymentSplits.length > 0
+      ? `<div class="mt-1 space-y-0.5 text-[10px] text-slate-600">${paymentSplits
+          .map(
+            (sp) =>
+              `<div>· ${escapeHtml(sp.method)}: <strong>${formatKzNumber(sp.amount)} Kz</strong>${sp.reference ? ` (${escapeHtml(sp.reference)})` : ''}</div>`
+          )
+          .join('')}</div>`
+      : invoice.paymentSummary
+        ? `<div class="text-[10px] text-slate-600 mt-0.5">${escapeHtml(invoice.paymentSummary)}</div>`
+        : '';
+
   return `
     <div class="print-target mx-auto w-full max-w-[794px] bg-white p-6 sm:p-8 text-slate-900 border border-slate-200 text-xs">
       <div class="flex flex-col sm:flex-row sm:items-start justify-between gap-4 pb-5 border-b border-slate-200">
@@ -481,11 +745,15 @@ export function renderDocumentHtml(
           <div>
             <div class="text-base font-bold tracking-tight text-slate-900">${escapeHtml(docCompany.shortName)}</div>
             <div class="text-[11px] font-medium text-slate-600">${escapeHtml(docCompany.legalName)}</div>
-            <div class="text-[10px] text-blue-700 mt-0.5">${
-              normalizeCompanyNif(docCompany.nif) === '5003069940'
-                ? 'Qualidade · Confiança · Soluções'
-                : escapeHtml(docCompany.tagline || docCompany.cityCountry || 'Comércio & Serviços')
-            }</div>
+            ${
+              showCustomTagline || normalizeCompanyNif(docCompany.nif) === '5003069940'
+                ? `<div class="text-[10px] text-blue-700 mt-0.5">${
+                    normalizeCompanyNif(docCompany.nif) === '5003069940'
+                      ? 'Qualidade · Confiança · Soluções'
+                      : escapeHtml(docCompany.tagline || '')
+                  }</div>`
+                : ''
+            }
             ${
               docCompany.taxRegime || docCompany.commercialRegistry || docCompany.cae || docCompany.taxOffice
                 ? `<div class="text-[9.5px] text-slate-500 mt-0.5">
@@ -502,8 +770,8 @@ export function renderDocumentHtml(
         <div class="text-[11px] text-slate-600 space-y-0.5 sm:text-right tabular-nums">
           ${estLabel ? `<div class="font-semibold text-slate-800">${escapeHtml(estLabel)}</div>` : ''}
           <div>${escapeHtml(estAddress || docCompany.address)}${docCompany.postalCode ? ` · CP ${escapeHtml(docCompany.postalCode)}` : ''}</div>
-          <div>${escapeHtml([docCompany.municipality, docCompany.province].filter(Boolean).join(', ') || docCompany.cityCountry || 'Angola')}</div>
-          <div>Tel.: ${escapeHtml(docCompany.phone)}${docCompany.mobile ? ` / ${escapeHtml(docCompany.mobile)}` : ''}</div>
+          <div>${escapeHtml(issuerLocalityLabel)}</div>
+          ${docCompany.phone ? `<div>Tel.: ${escapeHtml(docCompany.phone)}${docCompany.mobile ? ` / ${escapeHtml(docCompany.mobile)}` : ''}</div>` : ''}
           ${docCompany.email ? `<div>${escapeHtml(docCompany.email)}</div>` : ''}
           ${docCompany.website ? `<div>${escapeHtml(docCompany.website)}</div>` : ''}
           <div class="font-semibold text-slate-900">Contribuinte / NIF: ${escapeHtml(docCompany.nif)}</div>
@@ -524,9 +792,12 @@ export function renderDocumentHtml(
               }
             </div>
             <div class="text-sm font-semibold text-slate-800 tabular-nums">N.º ${escapeHtml(invoice.number)}</div>
+            <div class="text-[10.5px] font-medium text-slate-600 tabular-nums">
+              Estado: ${escapeHtml(docStateLabel)} · ATCUD: ${escapeHtml(atcudDisplay)}
+            </div>
             ${
               invoice.seriesCode
-                ? `<div class="text-[10.5px] text-slate-500 tabular-nums">Série: ${escapeHtml(invoice.seriesCode)}${
+                ? `<div class="text-[10.5px] text-slate-500 tabular-nums">Série: ${escapeHtml(invoice.seriesCode)} · Ambiente: ${isProductionDoc ? 'Produção AGT' : 'Simulação'}${
                     invoice.agtAuthorizationCode ? ` · Aut. AGT: ${escapeHtml(invoice.agtAuthorizationCode)}` : ''
                   }</div>`
                 : ''
@@ -557,38 +828,38 @@ export function renderDocumentHtml(
             }
           </div>
           <div class="rounded-lg bg-slate-50 p-3.5 border border-slate-200/80 space-y-0.5">
-            <div class="text-[10px] font-semibold text-blue-700">Cliente</div>
+            <div class="flex items-center justify-between">
+              <div class="text-[10px] font-semibold text-blue-700">Adquirente / Cliente</div>
+              <div class="text-[10px] font-semibold text-slate-600">${escapeHtml(customerTypeLabel)}</div>
+            </div>
             <div class="text-[11px] text-slate-500">Exmo.(s) Sr.(s)</div>
             <div class="text-xs font-bold text-slate-900">${escapeHtml(invoice.customerName)}</div>
-            ${
-              invoice.customerNif
-                ? `<div class="text-[11px] text-slate-600 tabular-nums">NIF: ${escapeHtml(invoice.customerNif)}</div>`
-                : ''
-            }
+            <div class="text-[11px] text-slate-600 tabular-nums">NIF: ${escapeHtml(custNifDisplay)}</div>
             ${custPhone ? `<div class="text-[11px] text-slate-600 tabular-nums">Tel.: ${escapeHtml(custPhone)}</div>` : ''}
-            ${hasDistinctAddr ? `<div class="text-[11px] text-slate-600">${escapeHtml(custAddr)}</div>` : ''}
-            <div class="text-[11px] text-slate-600">${escapeHtml(custLoc)}</div>
+            ${custEmail ? `<div class="text-[11px] text-slate-600">E-mail: ${escapeHtml(custEmail)}</div>` : ''}
+            ${custAddr ? `<div class="text-[11px] text-slate-600">Morada: ${escapeHtml(custAddr)}</div>` : ''}
+            <div class="text-[11px] text-slate-600">Localidade: ${escapeHtml(custLoc)}</div>
           </div>
         </div>
 
         <div class="sm:col-span-5 rounded-lg bg-slate-50 p-3.5 border border-slate-200/80 flex flex-col justify-between space-y-2 tabular-nums">
           <div>
-            <div class="text-[10px] text-slate-500">Data de emissão</div>
-            <div class="font-semibold text-slate-900">${dt.slashDate} &nbsp; ${dt.time}</div>
+            <div class="text-[10px] text-slate-500">Data/Hora de emissão</div>
+            <div class="font-semibold text-slate-900">${dt.slashDate} ${dt.time}</div>
           </div>
-          <div class="flex justify-between">
-            <div>
-              <div class="text-[10px] text-slate-500">Operador(a)</div>
-              <div class="font-semibold text-slate-900">${escapeHtml(invoice.operator)}</div>
-            </div>
+          <div class="grid grid-cols-2 gap-3">
             <div>
               <div class="text-[10px] text-slate-500">Caixa</div>
               <div class="font-semibold text-slate-900">${escapeHtml(invoice.cashier)}</div>
             </div>
+            <div>
+              <div class="text-[10px] text-slate-500">Operador(a)</div>
+              <div class="font-semibold text-slate-900">${escapeHtml(invoice.operator)}</div>
+            </div>
           </div>
           <div>
-            <div class="text-[10px] text-slate-500">Modo de pagamento</div>
-            <div class="font-semibold text-slate-900">${escapeHtml(invoice.paymentMethod)}</div>
+            <div class="text-[10px] text-slate-500">Local de emissão</div>
+            <div class="font-semibold text-slate-900">${escapeHtml(issuerLocalityLabel)}</div>
           </div>
         </div>
       </div>
@@ -598,7 +869,7 @@ export function renderDocumentHtml(
           <thead>
             <tr class="bg-slate-900 text-white text-[10.5px]">
               <th class="py-2 px-2.5 font-semibold">Código</th>
-              <th class="py-2 px-2.5 font-semibold">Descrição</th>
+              <th class="py-2 px-2.5 font-semibold">Descrição / Taxa</th>
               <th class="py-2 px-2.5 font-semibold text-right">Qtd.</th>
               <th class="py-2 px-2.5 font-semibold text-right">Preço Unit.</th>
               <th class="py-2 px-2.5 font-semibold text-right">IVA %</th>
@@ -657,13 +928,9 @@ export function renderDocumentHtml(
 
         <div class="grid grid-cols-3 gap-3 rounded-lg bg-slate-50 p-3 border border-slate-200/80 text-[11px] tabular-nums">
           <div>
-            <div class="text-[10px] text-slate-500">${isCreditNote ? 'Modo de regularização' : 'Meio de pagamento'}</div>
+            <div class="text-[10px] text-slate-500">${isCreditNote ? 'Modo de regularização' : 'Pagamentos'}</div>
             <div class="font-bold text-slate-900">${escapeHtml(invoice.paymentMethod)}</div>
-            ${
-              invoice.paymentSummary
-                ? `<div class="text-[10px] text-slate-600 mt-0.5">${escapeHtml(invoice.paymentSummary)}</div>`
-                : ''
-            }
+            ${a4PaymentSplitsHtml}
             ${
               invoice.transferReference
                 ? `<div class="text-[10px] text-slate-600 mt-0.5">Ref.: ${escapeHtml(invoice.transferReference)}</div>`
@@ -685,12 +952,18 @@ export function renderDocumentHtml(
                 ? 'Abatimento / Crédito'
                 : invoice.amountDue && invoice.amountDue > 0
                   ? 'Em dívida (Conta Corrente)'
-                  : 'Troco'
+                  : invoice.changeAmount > 0
+                    ? 'Troco'
+                    : 'Situação financeira'
             }</div>
             <div class="font-bold ${!isCreditNote && invoice.amountDue && invoice.amountDue > 0 ? 'text-amber-700' : 'text-slate-900'}">${
               isCreditNote
                 ? `${formatKzNumber(Math.max(0, invoice.grandTotal - (invoice.amountReceived || 0)))} Kz`
-                : `${formatKzNumber(invoice.amountDue && invoice.amountDue > 0 ? invoice.amountDue : invoice.changeAmount)} Kz`
+                : invoice.amountDue && invoice.amountDue > 0
+                  ? `${formatKzNumber(invoice.amountDue)} Kz`
+                  : invoice.changeAmount > 0
+                    ? `${formatKzNumber(invoice.changeAmount)} Kz`
+                    : 'Liquidado'
             }</div>
           </div>
         </div>
@@ -738,26 +1011,23 @@ export function renderDocumentHtml(
 
       <div class="mt-6 pt-4 border-t border-slate-200 flex items-center justify-between gap-4">
         <div class="flex items-center gap-3">
-          ${
-            qrDataUrl
-              ? `<img src="${qrDataUrl}" alt="QR Verificação" referrerpolicy="no-referrer" class="h-16 w-16 border border-slate-200 p-0.5" />`
-              : ''
-          }
+          ${qrA4ImgOrSvgHtml}
           <div class="text-[10.5px] text-slate-600 space-y-0.5">
             <div class="font-bold text-slate-900">OBRIGADO PELA SUA PREFERÊNCIA!</div>
             <div>${escapeHtml(docCompany.legalName)}</div>
             ${
               isProductionDoc
-                ? `<div class="text-slate-700 font-medium tabular-nums">${escapeHtml(docHash4)}-Processado por programa validado SILA-Billing · Série ${escapeHtml(invoice.seriesCode || 'A')}</div>`
-                : `<div class="text-slate-500">Modelo — Sem validade fiscal · Não substitui factura fiscal · Hash: ${escapeHtml(docHash4)}</div>`
+                ? `<div class="text-slate-700 font-medium tabular-nums">${escapeHtml(docHash4)}-Processado por programa validado SILA-Billing · Série ${escapeHtml(invoice.seriesCode || 'A')} (Assinatura RSA-SHA1 SAF-T)</div>`
+                : `<div class="text-slate-500 tabular-nums">Modelo — Sem validade fiscal · Não substitui factura fiscal · Assinatura teste RSA-SHA1: ${escapeHtml(docHash4)}</div>`
             }
+            <div class="text-[9.5px] text-slate-400 tabular-nums">Software SILA-Billing v${SILA_SOFTWARE_VERSION} · Produtor: ${escapeHtml(VITRONIS_INSTITUTIONAL.shortName)}, Lda · Ref. ${escapeHtml(DEFAULT_AGT_SOFTWARE_APPROVAL)} · NIF Produtor: ${escapeHtml(VITRONIS_INSTITUTIONAL.nif)}</div>
           </div>
         </div>
-        <div class="text-right text-xs font-semibold text-slate-700">${escapeHtml(docCompany.tagline)}</div>
+        ${showCustomTagline ? `<div class="text-right text-xs font-semibold text-slate-700">${escapeHtml(docCompany.tagline)}</div>` : ''}
       </div>
       ${
         showViralFooter
-          ? `<div class="mt-3 pt-2 border-t border-slate-100 text-center text-[10px] text-slate-400">Processado por SILA-Billing · Solução institucional VITRONIS (www.vitronis.co.ao)</div>`
+          ? `<div class="mt-3 pt-2 border-t border-slate-100 text-center text-[10px] text-slate-400">${escapeHtml(VITRONIS_INSTITUTIONAL.website)}</div>`
           : ''
       }
     </div>

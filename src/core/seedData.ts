@@ -12,6 +12,7 @@ import {
   NEUTRAL_PLATFORM_PROFILE,
   normalizeCompanyNif,
   Product,
+  resolveEstablishmentLocality,
   VITRONIS_INSTITUTIONAL,
 } from './types';
 
@@ -134,12 +135,25 @@ export function createStarterProductsForCompany(companyId: string): Product[] {
 
 export function createDirectCustomerForCompany(company: CompanyRecord): Customer {
   const ts = new Date().toISOString();
-  const locality = company.profile.cityCountry || 'Angola';
+  const est =
+    company.profile.establishments?.find((e) => e.id === company.profile.defaultEstablishmentId) ||
+    company.profile.establishments?.find((e) => e.isHeadquarters && e.active) ||
+    company.profile.establishments?.find((e) => e.active);
+  const locality = resolveEstablishmentLocality(company.profile, est);
   return {
     id: getDirectCustomerIdForCompany(company.id),
     companyId: company.id,
+    customerType: 'CONSUMIDOR_FINAL',
+    active: true,
     name: 'Cliente de Venda Directa',
     nif: 'Consumidor Final',
+    countryCode: company.profile.country || 'AO',
+    ...(est?.province || company.profile.province
+      ? { province: est?.province || company.profile.province }
+      : {}),
+    ...(est?.municipality || company.profile.municipality
+      ? { municipality: est?.municipality || company.profile.municipality }
+      : {}),
     locality,
     phone: '',
     address: `Venda a Balcão — ${locality}`,

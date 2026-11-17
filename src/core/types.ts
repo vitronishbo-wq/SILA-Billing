@@ -20,8 +20,56 @@ export interface PaymentSplit {
 
 export type PlanTier = 'FREE' | 'ESSENCIAL' | 'PROFISSIONAL' | 'ENTERPRISE';
 export type CompanyOperationalStatus = 'active' | 'suspended' | 'pending';
-export type CompanyRole = 'owner' | 'manager' | 'cashier';
+export type CompanyRole =
+  | 'owner'
+  | 'admin'
+  | 'manager'
+  | 'cashier'
+  | 'accountant'
+  | 'warehouse'
+  | 'seller';
 export type SyncState = 'synced' | 'pending' | 'error';
+
+export type MemberStatus = 'pending_invite' | 'active' | 'suspended';
+
+export type PermissionKey =
+  | 'pos_sell'
+  | 'a4_sell'
+  | 'pos_discount_special'
+  | 'pos_price_edit'
+  | 'invoice_cancel'
+  | 'credit_note_issue'
+  | 'customers_view'
+  | 'customers_create'
+  | 'customers_manage'
+  | 'products_view'
+  | 'products_manage'
+  | 'cost_prices_view'
+  | 'stock_view'
+  | 'stock_manage'
+  | 'purchases_view'
+  | 'purchases_manage'
+  | 'suppliers_view'
+  | 'suppliers_manage'
+  | 'expenses_manage'
+  | 'finance_view'
+  | 'profits_margins_view'
+  | 'cash_own_shift'
+  | 'cash_all_shifts'
+  | 'reports_own_sales'
+  | 'reports_operational'
+  | 'reports_financial'
+  | 'master_view'
+  | 'master_edit'
+  | 'series_view'
+  | 'series_manage'
+  | 'saft_export'
+  | 'audit_view'
+  | 'users_view'
+  | 'users_manage'
+  | 'roles_manage'
+  | 'settings_manage'
+  | 'backup_export';
 
 export const PLATFORM_ADMIN_EMAIL = 'wtmedia0@gmail.com';
 export const JAIMONA_COMPANY_ID = 'comp_jaimona';
@@ -116,6 +164,8 @@ export interface InvoiceIssuerSnapshot {
   establishmentCode?: string;
   establishmentName?: string;
   establishmentAddress?: string;
+  establishmentMunicipality?: string;
+  establishmentProvince?: string;
   legalRepresentativeName?: string;
   legalRepresentativeRole?: string;
   capturedAtIso: string;
@@ -216,21 +266,45 @@ export const JAIMONA_COMPANY: CompanyProfile = {
   agtEnvironment: 'SIMULACAO',
 };
 
+export function resolveEstablishmentLocality(
+  profile: Pick<CompanyProfile, 'municipality' | 'province' | 'cityCountry' | 'country'>,
+  est?: Pick<EstablishmentRecord, 'municipality' | 'province'> | null
+): string {
+  const mun = String(est?.municipality || profile.municipality || '').trim();
+  const prov = String(est?.province || profile.province || '').trim();
+  const countryLabel =
+    !profile.country || profile.country.toUpperCase() === 'AO'
+      ? 'Angola'
+      : profile.country.toUpperCase();
+
+  if (mun && prov) {
+    return mun.toLowerCase() === prov.toLowerCase()
+      ? `${mun} - ${countryLabel}`
+      : `${mun}, ${prov} - ${countryLabel}`;
+  }
+  if (mun) return `${mun} - ${countryLabel}`;
+  if (prov) return `${prov} - ${countryLabel}`;
+  const fallback = String(profile.cityCountry || '').trim();
+  return fallback || countryLabel;
+}
+
 export function createDefaultEstablishmentForCompany(
   profile: Pick<CompanyProfile, 'address' | 'municipality' | 'province' | 'cityCountry' | 'phone' | 'email' | 'shortName'>,
   establishmentId = 'est_matriz'
 ): EstablishmentRecord {
   const fallbackCity = profile.cityCountry
-    ? profile.cityCountry.split('-')[0]!.trim()
-    : 'Luanda';
+    ? profile.cityCountry.split('-')[0]!.split(',')[0]!.trim()
+    : '';
+  const mun = String(profile.municipality || fallbackCity || 'Luanda').trim();
+  const prov = String(profile.province || mun).trim();
   return {
     id: establishmentId,
     code: '001',
-    name: `${(profile.shortName || 'Sede').trim()} · Sede / Loja Principal`,
+    name: 'Sede / Loja Principal',
     isHeadquarters: true,
     address: profile.address || 'Angola',
-    municipality: profile.municipality || fallbackCity,
-    province: profile.province || fallbackCity,
+    municipality: mun,
+    province: prov,
     phone: profile.phone || '',
     email: profile.email || '',
     defaultCashierCode: '01',
@@ -292,6 +366,12 @@ export function buildInvoiceIssuerSnapshot(
     establishmentCode: est.code,
     establishmentName: est.name,
     establishmentAddress: est.address,
+    ...(est.municipality || profile.municipality
+      ? { establishmentMunicipality: (est.municipality || profile.municipality || '').trim() }
+      : {}),
+    ...(est.province || profile.province
+      ? { establishmentProvince: (est.province || profile.province || '').trim() }
+      : {}),
     legalRepresentativeName: profile.legalRepresentativeName,
     legalRepresentativeRole: profile.legalRepresentativeRole,
     capturedAtIso: options?.capturedAtIso || new Date().toISOString(),
@@ -341,9 +421,23 @@ export function resolveCompanyProfileFromSnapshot(
     shareCapital: snap.shareCapital,
     cae: snap.cae,
     address: snap.address,
-    municipality: snap.municipality,
-    province: snap.province,
-    cityCountry: snap.cityCountry || fallbackCompany.cityCountry,
+    municipality: snap.establishmentMunicipality || snap.municipality,
+    province: snap.establishmentProvince || snap.province,
+    cityCountry:
+      snap.establishmentMunicipality || snap.establishmentProvince
+        ? resolveEstablishmentLocality(
+            {
+              municipality: snap.establishmentMunicipality || snap.municipality,
+              province: snap.establishmentProvince || snap.province,
+              cityCountry: snap.cityCountry || fallbackCompany.cityCountry,
+              country: fallbackCompany.country || 'AO',
+            },
+            {
+              municipality: snap.establishmentMunicipality,
+              province: snap.establishmentProvince,
+            }
+          )
+        : snap.cityCountry || fallbackCompany.cityCountry,
     postalCode: snap.postalCode,
     phone: snap.phone,
     mobile: snap.mobile,
@@ -495,6 +589,13 @@ export function canCompanySyncCloudData(
 }
 
 export function canCompanyManageMultiOperatorTeam(
+  _company?: Pick<CompanyRecord, 'id' | 'plan'>
+): boolean {
+  // Decisão 1: Utilizadores, funções, PINs, permissões e auditoria local disponíveis em TODOS os planos.
+  return true;
+}
+
+export function canCompanyInviteCloudMembers(
   company: Pick<CompanyRecord, 'id' | 'plan'>
 ): boolean {
   return canCompanySyncCloudData(company);
@@ -506,17 +607,105 @@ export function canCompanyHideViralFooter(
   return hasPaidCommercialEntitlement(company);
 }
 
+export interface CompanyRoleDefinition {
+  id: string;
+  companyId: string;
+  name: string;
+  description?: string;
+  baseRole: CompanyRole;
+  isSystem: boolean;
+  permissions: Partial<Record<PermissionKey, boolean>>;
+  createdAtIso: string;
+  updatedAtIso: string;
+}
+
+export interface MemberPermissionOverrides {
+  grant: PermissionKey[];
+  revoke: PermissionKey[];
+}
+
 export interface CompanyMember {
   id: string; // `${companyId}_${uid}`
   companyId: string;
   uid: string;
   email: string;
+  emailLower?: string;
+  phone?: string;
   displayName: string;
   role: CompanyRole;
+  roleId?: string;
+  establishmentIds?: string[]; // Vazio = acesso a todos os estabelecimentos da empresa
+  authorizedCashiers?: string[]; // Vazio = qualquer caixa
+  permissionOverrides?: MemberPermissionOverrides;
+  status?: MemberStatus;
   allowInvoiceCancel: boolean;
   active: boolean;
+  pinHash?: string; // pbkdf2_sha256$<iterations>$<saltHex>$<hashHex>
+  pinUpdatedAtIso?: string;
+  pinFailedAttempts?: number;
+  pinLockedUntilIso?: string;
+  invitedByUid?: string;
+  claimedAtIso?: string;
   createdAtIso: string;
   updatedAtIso: string;
+}
+
+export interface CompanyInviteRecord {
+  id: string;
+  companyId: string;
+  companyShortName: string;
+  memberId: string;
+  emailLower: string;
+  displayName: string;
+  role: CompanyRole;
+  roleId: string;
+  establishmentIds: string[];
+  authorizedCashiers: string[];
+  status: 'pending' | 'accepted' | 'revoked';
+  createdByUid: string;
+  acceptedByUid?: string;
+  createdAtIso: string;
+  updatedAtIso: string;
+}
+
+export type SecurityAuditAction =
+  | 'LOGIN'
+  | 'LOGOUT'
+  | 'PIN_SETUP'
+  | 'PIN_UNLOCK_OK'
+  | 'PIN_UNLOCK_FAIL'
+  | 'PIN_LOCKOUT'
+  | 'TERMINAL_LOCK'
+  | 'OPERATOR_SWITCH'
+  | 'ACCESS_DENIED'
+  | 'INVOICE_EMIT'
+  | 'INVOICE_CANCEL'
+  | 'PRICE_EDIT'
+  | 'DISCOUNT_OVERRIDE'
+  | 'USER_CREATE'
+  | 'USER_UPDATE'
+  | 'USER_SUSPEND'
+  | 'ROLE_UPDATE'
+  | 'INVITE_CLAIM'
+  | 'PRIVACY_ACCEPTED';
+
+export interface SecurityAuditEntry {
+  id: string;
+  companyId: string;
+  establishmentId?: string;
+  actorUid: string;
+  actorEmail?: string;
+  actorName: string;
+  actorRole: string;
+  action: SecurityAuditAction;
+  targetType: string;
+  targetId?: string;
+  summary: string;
+  beforeJson?: string;
+  afterJson?: string;
+  outcome: 'allowed' | 'denied';
+  createdAtIso: string;
+  synced?: boolean;
 }
 
 export interface SyncQueueEntry {
@@ -532,7 +721,9 @@ export interface SyncQueueEntry {
     | 'cash_movement'
     | 'stock_movement'
     | 'supplier'
-    | 'purchase';
+    | 'purchase'
+    | 'role'
+    | 'audit_log';
   entityId: string;
   operation: 'upsert' | 'delete' | 'cancel';
   status: SyncState;
@@ -554,8 +745,11 @@ export interface AppSettings {
   agtEnvironment?: AgtOperationEnvironment;
   hidePromotionalFooter?: boolean;
   allowCashierPriceEdit?: boolean;
-  maxCashierDiscountPct?: number; // Limite máx. de desconto permitido a operador de caixa sem PIN de supervisor (ex: 5%)
-  supervisorPin?: string; // PIN do supervisor para desbloquear descontos especiais e operações restritas
+  maxCashierDiscountPct?: number; // Limite máx. de desconto permitido a operador de caixa sem supervisor (ex: 5%)
+  supervisorPin?: string; // Legado: migrado para pinHash individual por colaborador
+  inactivityLockMinutes?: number; // Bloqueio automático por inactividade (padrão: 10 min)
+  privacyPolicyAcceptedVersion?: string;
+  privacyPolicyAcceptedAtIso?: string;
   syncState?: SyncState;
   syncError?: string;
   synced?: boolean;
@@ -727,6 +921,7 @@ export interface CartDraftItem {
   discountPct: number;
   ivaRate: TaxRate;
   exemptionCode?: AgtIvaExemptionCode;
+  exemptionReason?: string;
 }
 
 export interface CalculatedLineItem extends CartDraftItem {
@@ -781,6 +976,11 @@ export interface InvoiceRecord {
   customerName: string;
   customerNif: string;
   customerLocality: string;
+  customerType?: CustomerType;
+  customerCountryCode?: string;
+  customerAddress?: string;
+  customerPhone?: string;
+  customerEmail?: string;
   merchandiseTotal: number;
   discountTotal: number;
   globalDiscountPct?: number;
@@ -803,7 +1003,10 @@ export interface InvoiceRecord {
   seriesCode?: string;
   seriesEnvironment?: AgtSeriesEnvironment;
   agtAuthorizationCode?: string;
+  atcud?: string;
   saftHash4?: string;
+  saftHashFull?: string;
+  previousInvoiceHash?: string;
   sessionId?: string;
   amountReceived: number;
   initialAmountReceived?: number;

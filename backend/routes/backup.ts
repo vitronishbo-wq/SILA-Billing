@@ -34,10 +34,10 @@ backupRouter.get('/', requireFirebaseAuth, async (req: AuthenticatedRequest, res
 
   try {
     const membership = await verifyCompanyMembershipServer(ctx.db, rawCompanyId, user);
-    if (!membership || membership.role !== 'owner') {
+    if (!membership || !membership.permissions.backup_export) {
       res.status(403).json({
         ok: false,
-        error: 'Apenas o proprietário da empresa pode exportar o backup administrativo da cloud.',
+        error: 'O seu perfil não possui autorização para exportar o backup administrativo da cloud.',
       });
       return;
     }

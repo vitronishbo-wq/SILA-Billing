@@ -1,3 +1,12 @@
+import type {
+  AgtDocumentType,
+  AgtIvaExemptionCode,
+  AgtSeriesEnvironment,
+  AgtSeriesRecord,
+  AgtSeriesStatus,
+} from '../../src/core/fiscalTypes.ts';
+import { hydrateProfileFromCloud } from '../../src/core/cloudMasterMapper.ts';
+import { resolveMemberBaseRole, resolveMemberStatus } from '../../src/core/rbac.ts';
 import {
   DEFAULT_SETTINGS,
   DEFAULT_WAREHOUSE_ID,
@@ -6,22 +15,30 @@ import {
   type CashMovement,
   type CashMovementType,
   type CashSession,
+  type CompanyMember,
   type CompanyOperationalStatus,
   type CompanyRecord,
+  type CompanyRole,
+  type CompanyRoleDefinition,
   type Customer,
   type DirectPaymentMethod,
+  type DocumentType,
+  type InvoiceIssuerSnapshot,
   type InvoiceRecord,
   type PaymentSplit,
   type PlanTier,
   type Product,
   type ProductPriceChange,
+  type ProductType,
   type PurchaseLineItem,
   type PurchasePaymentMethod,
   type PurchaseRecord,
+  type SecurityAuditEntry,
   type StockMovement,
   type StockMovementDirection,
   type StockMovementType,
   type Supplier,
+  type TaxRate,
 } from '../../src/core/types.ts';
 import { auth } from '../../src/services/firebaseClient.ts';
 
@@ -573,6 +590,9 @@ export async function fetchCompanyWorkspaceBackend(companyId: string): Promise<{
   stockMovements: StockMovement[];
   suppliers: Supplier[];
   purchases: PurchaseRecord[];
+  fiscalSeries?: AgtSeriesRecord[];
+  members?: CompanyMember[];
+  roles?: CompanyRoleDefinition[];
   settings: AppSettings | null;
 } | null> {
   const resolvedId = String(companyId || '').trim();
@@ -591,6 +611,8 @@ export async function fetchCompanyWorkspaceBackend(companyId: string): Promise<{
 
     const json = (await res.json()) as {
       ok?: boolean;
+      members?: Array<Record<string, unknown>>;
+      roles?: Array<Record<string, unknown>>;
       products?: Array<Record<string, unknown>>;
       customers?: Array<Record<string, unknown>>;
       invoices?: Array<Record<string, unknown>>;
@@ -599,11 +621,24 @@ export async function fetchCompanyWorkspaceBackend(companyId: string): Promise<{
       stockMovements?: Array<Record<string, unknown>>;
       suppliers?: Array<Record<string, unknown>>;
       purchases?: Array<Record<string, unknown>>;
+      fiscalSeries?: Array<Record<string, unknown>>;
       settings?: Record<string, unknown> | null;
     };
     if (!json.ok) return null;
 
     const now = new Date().toISOString();
+    const normalizeRate = (raw: unknown): TaxRate => {
+      const n = Number(raw);
+      return n === 1 || n === 5 || n === 7 || n === 14 ? n : 0;
+    };
+    const VALID_DOCS: ReadonlySet<DocumentType> = new Set([
+      'FR', 'FA', 'FP', 'NC', 'ND', 'RC', 'FT', 'CS',
+    ]);
+    const normalizeDoc = (raw: unknown): DocumentType => {
+      const d = String(raw || '').trim().toUpperCase() as DocumentType;
+      return VALID_DOCS.has(d) ? d : 'FR';
+    };
+
     const products: Product[] = (json.products || []).map((p) => {
       const rawHist = Array.isArray(p.priceHistory)
         ? (p.priceHistory as Array<Record<string, unknown>>).slice(0, 20)
@@ -616,19 +651,25 @@ export async function fetchCompanyWorkspaceBackend(companyId: string): Promise<{
         ...(typeof h.newCost === 'number' ? { newCost: Number(h.newCost) } : {}),
         changedBy: String(h.changedBy || 'Operador'),
       }));
+      const pt =
+        p.productType === 'P' || p.productType === 'S' || p.productType === 'K'
+          ? (p.productType as ProductType)
+          : undefined;
       return {
         id: String(p.id || ''),
         companyId: resolvedId,
         code: String(p.code || ''),
         ...(p.barcode ? { barcode: String(p.barcode) } : {}),
         name: String(p.name || ''),
+        ...(pt ? { productType: pt } : {}),
         category: String(p.category || 'Geral'),
         unit: String(p.unit || 'UN'),
         ...(typeof p.costPrice === 'number' && p.costPrice > 0
           ? { costPrice: Number(p.costPrice) }
           : {}),
         price: Number(p.price) || 0,
-        ivaRate: Number(p.ivaRate) === 14 ? 14 : 0,
+        ivaRate: normalizeRate(p.ivaRate),
+        ...(p.exemptionCode ? { exemptionCode: String(p.exemptionCode) as AgtIvaExemptionCode } : {}),
         exemptionReason: String(p.exemptionReason || ''),
         active: Boolean(p.active ?? true),
         ...(typeof p.trackStock === 'boolean'
@@ -698,7 +739,8 @@ export async function fetchCompanyWorkspaceBackend(companyId: string): Promise<{
           qty: Number(it.qty) || 1,
           unitPrice: Number(it.unitPrice) || 0,
           discountPct: Number(it.discountPct) || 0,
-          ivaRate: Number(it.ivaRate) === 14 ? 14 : 0,
+          ivaRate: normalizeRate(it.ivaRate),
+          ...(it.exemptionCode ? { exemptionCode: String(it.exemptionCode) as AgtIvaExemptionCode } : {}),
           lineGross,
           lineDiscount: Math.max(0, lineGross - lineNet),
           lineNet,
@@ -713,7 +755,7 @@ export async function fetchCompanyWorkspaceBackend(companyId: string): Promise<{
         id: String(inv.id || ''),
         companyId: resolvedId,
         number: String(inv.number || ''),
-        docType: inv.docType === 'FP' ? 'FP' : 'FR',
+        docType: normalizeDoc(inv.docType),
         issuedAtIso,
         cashier: String(inv.cashier || '01'),
         operator: String(inv.operator || '001'),
@@ -731,17 +773,45 @@ export async function fetchCompanyWorkspaceBackend(companyId: string): Promise<{
         customerName: String(inv.customerName || 'Consumidor Final'),
         customerNif: String(inv.customerNif || ''),
         customerLocality: String(inv.customerLocality || ''),
+        ...(inv.customerType ? { customerType: inv.customerType as InvoiceRecord['customerType'] } : {}),
+        ...(inv.customerCountryCode ? { customerCountryCode: String(inv.customerCountryCode) } : {}),
+        ...(inv.customerAddress ? { customerAddress: String(inv.customerAddress) } : {}),
+        ...(inv.customerPhone ? { customerPhone: String(inv.customerPhone) } : {}),
+        ...(inv.customerEmail ? { customerEmail: String(inv.customerEmail) } : {}),
         merchandiseTotal: Number(inv.merchandiseTotal) || 0,
         discountTotal: Number(inv.discountTotal) || 0,
         globalDiscountPct: typeof inv.globalDiscountPct === 'number' ? inv.globalDiscountPct : undefined,
         globalDiscountAmount: typeof inv.globalDiscountAmount === 'number' ? inv.globalDiscountAmount : undefined,
         taxBase14: Number(inv.taxBase14) || 0,
         taxAmount14: Number(inv.taxAmount14) || 0,
+        ...(typeof inv.taxBaseIntermediate === 'number' ? { taxBaseIntermediate: inv.taxBaseIntermediate } : {}),
+        ...(typeof inv.taxAmountIntermediate === 'number' ? { taxAmountIntermediate: inv.taxAmountIntermediate } : {}),
+        ...(typeof inv.taxBaseReduced === 'number' ? { taxBaseReduced: inv.taxBaseReduced } : {}),
+        ...(typeof inv.taxAmountReduced === 'number' ? { taxAmountReduced: inv.taxAmountReduced } : {}),
         taxBase0: Number(inv.taxBase0) || 0,
         taxAmount0: 0,
         taxTotal: Number(inv.taxTotal) || 0,
         grandTotal: Number(inv.grandTotal) || 0,
         amountInWords: String(inv.amountInWords || ''),
+        ...(inv.issuerSnapshot && typeof inv.issuerSnapshot === 'object'
+          ? { issuerSnapshot: inv.issuerSnapshot as InvoiceIssuerSnapshot }
+          : {}),
+        ...(inv.establishmentId ? { establishmentId: String(inv.establishmentId) } : {}),
+        ...(inv.establishmentCode ? { establishmentCode: String(inv.establishmentCode) } : {}),
+        ...(inv.establishmentName ? { establishmentName: String(inv.establishmentName) } : {}),
+        ...(inv.seriesCode ? { seriesCode: String(inv.seriesCode) } : {}),
+        ...(inv.seriesEnvironment
+          ? {
+              seriesEnvironment: (inv.seriesEnvironment === 'PRODUCAO'
+                ? 'PRODUCAO'
+                : 'SIMULACAO') as AgtSeriesEnvironment,
+            }
+          : {}),
+        ...(inv.agtAuthorizationCode ? { agtAuthorizationCode: String(inv.agtAuthorizationCode) } : {}),
+        ...(inv.atcud ? { atcud: String(inv.atcud) } : {}),
+        ...(inv.saftHash4 ? { saftHash4: String(inv.saftHash4) } : {}),
+        ...(inv.saftHashFull ? { saftHashFull: String(inv.saftHashFull) } : {}),
+        ...(inv.previousInvoiceHash ? { previousInvoiceHash: String(inv.previousInvoiceHash) } : {}),
         sessionId: inv.sessionId ? String(inv.sessionId) : undefined,
         amountReceived: Number(inv.amountReceived) || 0,
         initialAmountReceived:
@@ -777,11 +847,15 @@ export async function fetchCompanyWorkspaceBackend(companyId: string): Promise<{
         status: inv.status === 'cancelled' ? 'cancelled' : 'issued',
         cancelReason: inv.cancelReason ? String(inv.cancelReason) : undefined,
         cancelledBy: inv.cancelledBy ? String(inv.cancelledBy) : undefined,
+        cancelledAtIso: inv.cancelledAtIso ? String(inv.cancelledAtIso) : undefined,
+        reprintCount: typeof inv.reprintCount === 'number' ? inv.reprintCount : undefined,
+        lastReprintedAtIso: inv.lastReprintedAtIso ? String(inv.lastReprintedAtIso) : undefined,
+        lastReprintedBy: inv.lastReprintedBy ? String(inv.lastReprintedBy) : undefined,
         lines,
         syncState: 'synced',
         synced: true,
         createdAtIso: issuedAtIso,
-        updatedAtIso: issuedAtIso,
+        updatedAtIso: inv.cancelledAtIso ? String(inv.cancelledAtIso) : issuedAtIso,
       };
     });
 
@@ -980,9 +1054,11 @@ export async function fetchCompanyWorkspaceBackend(companyId: string): Promise<{
     let settings: AppSettings | null = null;
     if (json.settings && typeof json.settings === 'object') {
       const sd = json.settings;
+      const hydratedCompany = hydrateProfileFromCloud(sd, resolvedId);
       settings = {
         companyId: resolvedId,
         company: {
+          ...hydratedCompany,
           legalName: String(sd.legalName || DEFAULT_SETTINGS.company.legalName),
           shortName: String(sd.shortName || DEFAULT_SETTINGS.company.shortName),
           nif: String(sd.nif || DEFAULT_SETTINGS.company.nif),
@@ -995,9 +1071,11 @@ export async function fetchCompanyWorkspaceBackend(companyId: string): Promise<{
         defaultCashier: String(sd.defaultCashier || '01'),
         defaultOperator: String(sd.defaultOperator || '001'),
         defaultFormat: sd.defaultFormat === 'A4' ? 'A4' : 'POS',
-        defaultDocType: sd.defaultDocType === 'FP' ? 'FP' : 'FR',
+        defaultDocType: normalizeDoc(sd.defaultDocType),
         defaultNotes: String(sd.defaultNotes || ''),
         autoPrintOnEmit: Boolean(sd.autoPrintOnEmit),
+        ...(sd.defaultEstablishmentId ? { defaultEstablishmentId: String(sd.defaultEstablishmentId) } : {}),
+        agtEnvironment: sd.agtEnvironment === 'PRODUCAO' ? 'PRODUCAO' : 'SIMULACAO',
         hidePromotionalFooter:
           typeof sd.hidePromotionalFooter === 'boolean' ? sd.hidePromotionalFooter : true,
         allowCashierPriceEdit: Boolean(sd.allowCashierPriceEdit ?? false),
@@ -1006,6 +1084,76 @@ export async function fetchCompanyWorkspaceBackend(companyId: string): Promise<{
         updatedAtIso: now,
       };
     }
+
+    const members: CompanyMember[] | undefined = Array.isArray(json.members)
+      ? json.members.map((m) => {
+          const baseRole = resolveMemberBaseRole({ role: m.role as CompanyRole });
+          const st = resolveMemberStatus({
+            status: m.status as CompanyMember['status'],
+            active: typeof m.active === 'boolean' ? m.active : true,
+            uid: String(m.uid || ''),
+          });
+          return {
+            id: String(m.id || m.uid || ''),
+            companyId: resolvedId,
+            uid: String(m.uid || m.id || ''),
+            email: String(m.email || ''),
+            ...(m.phone ? { phone: String(m.phone) } : {}),
+            displayName: String(m.displayName || m.email || 'Operador'),
+            role: baseRole,
+            ...(m.roleId ? { roleId: String(m.roleId) } : { roleId: `role_${baseRole}` }),
+            ...(Array.isArray(m.establishmentIds)
+              ? { establishmentIds: (m.establishmentIds as unknown[]).map((x) => String(x)) }
+              : {}),
+            ...(Array.isArray(m.authorizedCashiers)
+              ? { authorizedCashiers: (m.authorizedCashiers as unknown[]).map((x) => String(x)) }
+              : {}),
+            ...(m.permissionOverrides && typeof m.permissionOverrides === 'object'
+              ? { permissionOverrides: m.permissionOverrides as CompanyMember['permissionOverrides'] }
+              : {}),
+            status: st,
+            ...(m.pinHash ? { pinHash: String(m.pinHash) } : {}),
+            allowInvoiceCancel: Boolean(m.allowInvoiceCancel),
+            active: st === 'active',
+            createdAtIso: now,
+            updatedAtIso: now,
+          };
+        })
+      : undefined;
+
+    const roles: CompanyRoleDefinition[] | undefined = Array.isArray(json.roles)
+      ? json.roles.map((r) => ({
+          id: String(r.id || ''),
+          companyId: resolvedId,
+          name: String(r.name || ''),
+          description: String(r.description || ''),
+          baseRole: resolveMemberBaseRole({ role: (r.baseRole || 'cashier') as CompanyRole }),
+          isSystem: Boolean(r.isSystem),
+          permissions: (r.permissions || {}) as CompanyRoleDefinition['permissions'],
+          updatedAtIso: String(r.updatedAtIso || now),
+        }))
+      : undefined;
+
+    const fiscalSeries: AgtSeriesRecord[] | undefined = Array.isArray(json.fiscalSeries)
+      ? json.fiscalSeries.map((sd) => ({
+          id: String(sd.id || ''),
+          companyId: resolvedId,
+          seriesCode: String(sd.seriesCode || ''),
+          seriesYear: Number(sd.seriesYear) || new Date().getFullYear(),
+          documentType: String(sd.documentType || 'FR') as AgtDocumentType,
+          firstDocumentNumber: Number(sd.firstDocumentNumber) || 1,
+          lastDocumentNumber: Number(sd.lastDocumentNumber) || 0,
+          status: (sd.status === 'F' ? 'F' : sd.status === 'U' ? 'U' : 'A') as AgtSeriesStatus,
+          environment: (sd.environment === 'PRODUCAO' ? 'PRODUCAO' : 'SIMULACAO') as AgtSeriesEnvironment,
+          ...(sd.establishmentId ? { establishmentId: String(sd.establishmentId) } : {}),
+          ...(sd.establishmentCode ? { establishmentCode: String(sd.establishmentCode) } : {}),
+          ...(sd.agtAuthorizationCode ? { agtAuthorizationCode: String(sd.agtAuthorizationCode) } : {}),
+          requestedAtIso: String(sd.requestedAtIso || now),
+          ...(sd.authorizedAtIso ? { authorizedAtIso: String(sd.authorizedAtIso) } : {}),
+          ...(sd.closedAtIso ? { closedAtIso: String(sd.closedAtIso) } : {}),
+          ...(sd.notes ? { notes: String(sd.notes) } : {}),
+        }))
+      : undefined;
 
     return {
       products,
@@ -1016,6 +1164,9 @@ export async function fetchCompanyWorkspaceBackend(companyId: string): Promise<{
       stockMovements,
       suppliers,
       purchases,
+      fiscalSeries,
+      members,
+      roles,
       settings,
     };
   } catch {
@@ -1085,6 +1236,124 @@ export async function validateAgtDocumentBackend(
     return { ok: res.ok, validation: data.validation, error: data.error };
   } catch (err: any) {
     return { ok: false, error: err.message || 'Erro ao validar documento junto do serviço AGT.' };
+  }
+}
+
+// ==================== RBAC, CONVITES E AUDITORIA DE SEGURANÇA ====================
+
+export async function claimCompanyInvitesBackend(): Promise<{
+  ok: boolean;
+  claimedCompanyIds: string[];
+}> {
+  try {
+    const headers = await getBearerHeaders();
+    const res = await fetch(`${API_BASE}/api/companies/invites/claim`, {
+      method: 'POST',
+      headers,
+      body: JSON.stringify({}),
+    });
+    const data = (await res.json().catch(() => ({}))) as {
+      ok?: boolean;
+      claimedCompanyIds?: string[];
+    };
+    return {
+      ok: Boolean(data.ok),
+      claimedCompanyIds: Array.isArray(data.claimedCompanyIds) ? data.claimedCompanyIds : [],
+    };
+  } catch {
+    return { ok: false, claimedCompanyIds: [] };
+  }
+}
+
+export async function upsertCompanyMemberBackend(
+  companyId: string,
+  member: CompanyMember
+): Promise<{ ok: boolean; persistedInFirestore?: boolean; status?: string; error?: string }> {
+  try {
+    const headers = await getBearerHeaders();
+    const res = await fetch(`${API_BASE}/api/companies/${encodeURIComponent(companyId)}/members`, {
+      method: 'POST',
+      headers,
+      body: JSON.stringify(member),
+    });
+    return (await res.json().catch(() => ({ ok: false }))) as {
+      ok: boolean;
+      persistedInFirestore?: boolean;
+      status?: string;
+      error?: string;
+    };
+  } catch (err) {
+    return { ok: false, error: err instanceof Error ? err.message : 'Erro ao sincronizar colaborador.' };
+  }
+}
+
+export async function deleteCompanyMemberBackend(
+  companyId: string,
+  memberId: string
+): Promise<{ ok: boolean; error?: string }> {
+  try {
+    const headers = await getBearerHeaders();
+    const res = await fetch(
+      `${API_BASE}/api/companies/${encodeURIComponent(companyId)}/members/${encodeURIComponent(memberId)}`,
+      {
+        method: 'DELETE',
+        headers,
+      }
+    );
+    return (await res.json().catch(() => ({ ok: false }))) as { ok: boolean; error?: string };
+  } catch (err) {
+    return { ok: false, error: err instanceof Error ? err.message : 'Erro ao remover colaborador.' };
+  }
+}
+
+export async function upsertCompanyRoleBackend(
+  companyId: string,
+  role: CompanyRoleDefinition
+): Promise<{ ok: boolean; error?: string }> {
+  try {
+    const headers = await getBearerHeaders();
+    const res = await fetch(`${API_BASE}/api/companies/${encodeURIComponent(companyId)}/roles`, {
+      method: 'POST',
+      headers,
+      body: JSON.stringify(role),
+    });
+    return (await res.json().catch(() => ({ ok: false }))) as { ok: boolean; error?: string };
+  } catch (err) {
+    return { ok: false, error: err instanceof Error ? err.message : 'Erro ao sincronizar função.' };
+  }
+}
+
+export async function appendSecurityAuditBackend(
+  companyId: string,
+  entry: SecurityAuditEntry
+): Promise<{ ok: boolean }> {
+  try {
+    const headers = await getBearerHeaders();
+    const res = await fetch(`${API_BASE}/api/companies/${encodeURIComponent(companyId)}/audit-logs`, {
+      method: 'POST',
+      headers,
+      body: JSON.stringify(entry),
+    });
+    return { ok: res.ok };
+  } catch {
+    return { ok: false };
+  }
+}
+
+export async function fetchSecurityAuditsBackend(
+  companyId: string
+): Promise<SecurityAuditEntry[]> {
+  try {
+    const headers = await getBearerHeaders();
+    const res = await fetch(`${API_BASE}/api/companies/${encodeURIComponent(companyId)}/audit-logs`, {
+      method: 'GET',
+      headers,
+    });
+    if (!res.ok) return [];
+    const data = (await res.json()) as { ok?: boolean; logs?: SecurityAuditEntry[] };
+    return Array.isArray(data.logs) ? data.logs : [];
+  } catch {
+    return [];
   }
 }
 

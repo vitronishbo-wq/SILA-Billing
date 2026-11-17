@@ -523,6 +523,14 @@ export function evaluateCompanyMasterCompleteness(
       severity: 'error',
       message: nifCheck.error || 'O NIF da empresa emitente é inválido.',
     });
+  } else if (/^5\d{8}$/.test(nifCheck.normalized)) {
+    warnings.push({
+      section: 'fiscal',
+      field: 'nif',
+      severity: 'warning',
+      message:
+        'O NIF empresarial angolano iniciado por 5 tem normalmente 10 dígitos (ex.: 5002571293). Confirme se não falta o último dígito.',
+    });
   }
 
   const hasTaxRegime =

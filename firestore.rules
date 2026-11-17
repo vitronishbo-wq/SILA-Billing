@@ -75,6 +75,12 @@ service cloud.firestore {
         );
     }
 
+    function isValidRoleName(role) {
+      return role is string
+        && role.size() <= 16
+        && role in ['owner', 'admin', 'manager', 'cashier', 'accountant', 'warehouse', 'seller'];
+    }
+
     function hasActiveMembership(companyId) {
       return exists(/databases/$(database)/documents/companies/$(companyId)/members/$(request.auth.uid))
         && memberDocData(companyId).active == true;
@@ -84,25 +90,40 @@ service cloud.firestore {
       return hasActiveMembership(companyId) && memberDocData(companyId).role == 'owner';
     }
 
+    function isCompanyAdminOrOwner(companyId) {
+      return hasActiveMembership(companyId)
+        && memberDocData(companyId).role in ['owner', 'admin'];
+    }
+
     function isCompanyOwnerOrManager(companyId) {
       return hasActiveMembership(companyId)
-        && (memberDocData(companyId).role == 'owner' || memberDocData(companyId).role == 'manager');
+        && memberDocData(companyId).role in ['owner', 'admin', 'manager'];
     }
 
     function isCompanyAnyActiveRole(companyId) {
       return hasActiveMembership(companyId)
-        && (
-          memberDocData(companyId).role == 'owner'
-          || memberDocData(companyId).role == 'manager'
-          || memberDocData(companyId).role == 'cashier'
-        );
+        && isValidRoleName(memberDocData(companyId).role);
+    }
+
+    function canReadCompanyCosting(companyId) {
+      return hasActiveMembership(companyId)
+        && memberDocData(companyId).role in ['owner', 'admin', 'manager', 'accountant', 'warehouse'];
+    }
+
+    function canReadCompanyAudit(companyId) {
+      return hasActiveMembership(companyId)
+        && memberDocData(companyId).role in ['owner', 'admin', 'manager', 'accountant'];
+    }
+
+    function canReadCompanyPurchases(companyId) {
+      return hasActiveMembership(companyId)
+        && memberDocData(companyId).role in ['owner', 'admin', 'manager', 'accountant', 'warehouse'];
     }
 
     function canCancelCompanyInvoice(companyId) {
-      return canSyncCompanyCloudData(companyId)
-        && hasActiveMembership(companyId)
+      return hasActiveMembership(companyId)
         && (
-          memberDocData(companyId).role == 'owner'
+          memberDocData(companyId).role in ['owner', 'admin']
           || (
             memberDocData(companyId).role == 'manager'
             && (
@@ -116,12 +137,11 @@ service cloud.firestore {
     // ==================== LEGACY VALIDATION BLUEPRINTS (JAIMONA v1 CONTINUITY) ====================
 
     function isValidVatRate(rate) {
-      return rate is number && (rate == 0 || rate == 1 || rate == 5 || rate == 7 || rate == 14);
+      return rate in [0, 1, 5, 7, 14];
     }
 
     function isValidBillingDocType(dt) {
-      return dt is string && dt.size() >= 2 && dt.size() <= 8
-        && (dt == 'FR' || dt == 'FA' || dt == 'FP' || dt == 'NC' || dt == 'ND' || dt == 'RC' || dt == 'FT' || dt == 'CS');
+      return dt in ['FR', 'FA', 'FP', 'NC', 'ND', 'RC', 'FT', 'CS'];
     }
 
     function isValidPriceHistoryEntry(entry) {
@@ -184,13 +204,11 @@ service cloud.firestore {
     }
 
     function isValidCustomerType(ct) {
-      return ct is string && ct.size() <= 24
-        && (ct == 'CONSUMIDOR_FINAL' || ct == 'PARTICULAR' || ct == 'EMPRESA' || ct == 'ESTRANGEIRO');
+      return ct in ['CONSUMIDOR_FINAL', 'PARTICULAR', 'EMPRESA', 'ESTRANGEIRO'];
     }
 
     function isValidCustomerPaymentTerms(pt) {
-      return pt is string && pt.size() <= 24
-        && (pt == 'IMEDIATO' || pt == '15_DIAS' || pt == '30_DIAS' || pt == '45_DIAS' || pt == '60_DIAS' || pt == 'PERSONALIZADO');
+      return pt in ['IMEDIATO', '15_DIAS', '30_DIAS', '45_DIAS', '60_DIAS', 'PERSONALIZADO'];
     }
 
     function isValidCustomer(data, customerId) {
@@ -252,8 +270,7 @@ service cloud.firestore {
       return entry is map
         && entry.keys().hasAll(['method', 'amount'])
         && entry.keys().hasOnly(['method', 'amount', 'reference'])
-        && entry.method is string && entry.method.size() <= 24
-        && (entry.method == 'Dinheiro' || entry.method == 'Multicaixa' || entry.method == 'Transferência')
+        && entry.method in ['Dinheiro', 'Multicaixa', 'Transferência']
         && entry.amount is number && entry.amount > 0 && entry.amount <= 999999999
         && (!('reference' in entry) || (entry.reference is string && entry.reference.size() <= 80));
     }
@@ -271,52 +288,36 @@ service cloud.firestore {
           'showLogoOnA4', 'bankName1', 'iban1', 'accountHolder1', 'swift1',
           'bankName2', 'iban2', 'accountHolder2', 'swift2', 'multicaixaExpressPhone',
           'establishmentId', 'establishmentCode', 'establishmentName', 'establishmentAddress',
+          'establishmentMunicipality', 'establishmentProvince',
           'legalRepresentativeName', 'legalRepresentativeRole', 'capturedAtIso'
         ])
         && snap.companyId is string && isValidId(snap.companyId)
         && snap.legalName is string && snap.legalName.size() >= 1 && snap.legalName.size() <= 160
         && snap.nif is string && snap.nif.size() >= 1 && snap.nif.size() <= 32
-        && snap.taxRegime is string && snap.taxRegime.size() <= 24
-        && (snap.taxRegime == 'GERAL' || snap.taxRegime == 'SIMPLIFICADO' || snap.taxRegime == 'EXCLUSAO')
+        && snap.taxRegime in ['GERAL', 'SIMPLIFICADO', 'EXCLUSAO']
         && (!('logoUrl' in snap) || (snap.logoUrl is string && snap.logoUrl.size() <= 270000))
-        && (!('establishmentId' in snap) || (snap.establishmentId is string && isValidId(snap.establishmentId)))
+        && (!('establishmentId' in snap) || isValidId(snap.establishmentId))
+        && (!('establishmentMunicipality' in snap) || (snap.establishmentMunicipality is string && snap.establishmentMunicipality.size() <= 80))
+        && (!('establishmentProvince' in snap) || (snap.establishmentProvince is string && snap.establishmentProvince.size() <= 80))
         && snap.capturedAtIso is string && snap.capturedAtIso.size() >= 10 && snap.capturedAtIso.size() <= 40;
     }
 
-    function isValidInvoice(data, invoiceId) {
-      return data.keys().hasAll([
-          'id', 'ownerId', 'number', 'docType', 'issuedAtIso', 'cashier', 'operator',
-          'paymentMethod', 'customerId', 'customerName', 'customerNif', 'customerLocality',
-          'merchandiseTotal', 'discountTotal', 'taxBase14', 'taxAmount14', 'taxBase0',
-          'taxAmount0', 'taxTotal', 'grandTotal', 'amountInWords', 'amountReceived',
-          'changeAmount', 'notes', 'itemCount', 'status', 'createdAt', 'updatedAt'
-        ])
-        && data.keys().hasOnly([
-          'id', 'ownerId', 'number', 'docType', 'issuedAtIso', 'cashier', 'operator',
-          'paymentMethod', 'customerId', 'customerName', 'customerNif', 'customerLocality',
-          'merchandiseTotal', 'discountTotal', 'globalDiscountPct', 'globalDiscountAmount',
-          'taxBase14', 'taxAmount14', 'taxBaseIntermediate', 'taxAmountIntermediate',
-          'taxBaseReduced', 'taxAmountReduced', 'taxBase0', 'taxAmount0', 'taxTotal', 'grandTotal',
-          'amountInWords', 'establishmentId', 'establishmentCode', 'establishmentName',
-          'seriesCode', 'seriesEnvironment', 'agtAuthorizationCode', 'saftHash4', 'issuerSnapshot',
-          'sessionId', 'amountReceived', 'initialAmountReceived', 'changeAmount',
-          'initialChangeAmount', 'amountDue', 'transferReference', 'paymentSplits',
-          'paymentSummary', 'returnOriginInvoiceId', 'returnOriginNumber', 'returnCreditApplied',
-          'notes', 'itemCount', 'status', 'createdAt', 'updatedAt'
-        ])
-        && data.id == invoiceId
-        && data.ownerId == request.auth.uid && isValidId(data.ownerId)
-        && data.number is string && data.number.size() >= 1 && data.number.size() <= 40
+    function isValidInvoiceCommonPart1(data) {
+      return data.number is string && data.number.size() >= 1 && data.number.size() <= 40
         && isValidBillingDocType(data.docType)
         && data.issuedAtIso is string && data.issuedAtIso.size() >= 10 && data.issuedAtIso.size() <= 40
         && data.cashier is string && data.cashier.size() >= 1 && data.cashier.size() <= 16
         && data.operator is string && data.operator.size() >= 1 && data.operator.size() <= 32
-        && data.paymentMethod is string && data.paymentMethod.size() <= 24
-        && (data.paymentMethod == 'Dinheiro' || data.paymentMethod == 'Multicaixa' || data.paymentMethod == 'Transferência' || data.paymentMethod == 'Crédito' || data.paymentMethod == 'Combinado')
+        && data.paymentMethod in ['Dinheiro', 'Multicaixa', 'Transferência', 'Crédito', 'Combinado']
         && data.customerId is string && data.customerId.size() >= 1 && data.customerId.size() <= 128
         && data.customerName is string && data.customerName.size() >= 1 && data.customerName.size() <= 160
         && data.customerNif is string && data.customerNif.size() <= 32
         && data.customerLocality is string && data.customerLocality.size() <= 160
+        && (!('customerType' in data) || isValidCustomerType(data.customerType))
+        && (!('customerCountryCode' in data) || (data.customerCountryCode is string && data.customerCountryCode.size() <= 8))
+        && (!('customerAddress' in data) || (data.customerAddress is string && data.customerAddress.size() <= 240))
+        && (!('customerPhone' in data) || (data.customerPhone is string && data.customerPhone.size() <= 40))
+        && (!('customerEmail' in data) || (data.customerEmail is string && data.customerEmail.size() <= 120))
         && data.merchandiseTotal is number && data.merchandiseTotal >= 0
         && data.discountTotal is number && data.discountTotal >= 0
         && (!('globalDiscountPct' in data) || (data.globalDiscountPct is number && data.globalDiscountPct >= 0 && data.globalDiscountPct <= 100))
@@ -331,14 +332,20 @@ service cloud.firestore {
         && data.taxAmount0 is number && data.taxAmount0 == 0
         && data.taxTotal is number && data.taxTotal >= 0
         && data.grandTotal is number && data.grandTotal >= 0
-        && data.amountInWords is string && data.amountInWords.size() >= 1 && data.amountInWords.size() <= 300
-        && (!('establishmentId' in data) || (data.establishmentId is string && isValidId(data.establishmentId)))
+        && data.amountInWords is string && data.amountInWords.size() >= 1 && data.amountInWords.size() <= 300;
+    }
+
+    function isValidInvoiceCommonPart2(data) {
+      return (!('establishmentId' in data) || isValidId(data.establishmentId))
         && (!('establishmentCode' in data) || (data.establishmentCode is string && data.establishmentCode.size() <= 16))
         && (!('establishmentName' in data) || (data.establishmentName is string && data.establishmentName.size() <= 120))
         && (!('seriesCode' in data) || (data.seriesCode is string && data.seriesCode.size() <= 16))
-        && (!('seriesEnvironment' in data) || (data.seriesEnvironment is string && data.seriesEnvironment.size() <= 16 && (data.seriesEnvironment == 'SIMULACAO' || data.seriesEnvironment == 'PRODUCAO')))
+        && (!('seriesEnvironment' in data) || data.seriesEnvironment in ['SIMULACAO', 'PRODUCAO'])
         && (!('agtAuthorizationCode' in data) || (data.agtAuthorizationCode is string && data.agtAuthorizationCode.size() <= 64))
+        && (!('atcud' in data) || (data.atcud is string && data.atcud.size() <= 64))
         && (!('saftHash4' in data) || (data.saftHash4 is string && data.saftHash4.size() <= 16))
+        && (!('saftHashFull' in data) || (data.saftHashFull is string && data.saftHashFull.size() <= 200))
+        && (!('previousInvoiceHash' in data) || (data.previousInvoiceHash is string && data.previousInvoiceHash.size() <= 200))
         && (!('issuerSnapshot' in data) || isValidIssuerSnapshot(data.issuerSnapshot))
         && (!('sessionId' in data) || (data.sessionId is string && data.sessionId.size() <= 128))
         && data.amountReceived is number && data.amountReceived >= 0
@@ -358,9 +365,38 @@ service cloud.firestore {
         && (!('returnCreditApplied' in data) || (data.returnCreditApplied is number && data.returnCreditApplied >= 0))
         && data.notes is string && data.notes.size() <= 300
         && data.itemCount is number && data.itemCount >= 1 && data.itemCount <= 200
-        && data.status is string && data.status.size() <= 16 && (data.status == 'issued' || data.status == 'cancelled')
+        && data.status in ['issued', 'cancelled']
         && data.createdAt is timestamp
         && data.updatedAt is timestamp;
+    }
+
+    function isValidInvoice(data, invoiceId) {
+      return data.keys().hasAll([
+          'id', 'ownerId', 'number', 'docType', 'issuedAtIso', 'cashier', 'operator',
+          'paymentMethod', 'customerId', 'customerName', 'customerNif', 'customerLocality',
+          'merchandiseTotal', 'discountTotal', 'taxBase14', 'taxAmount14', 'taxBase0',
+          'taxAmount0', 'taxTotal', 'grandTotal', 'amountInWords', 'amountReceived',
+          'changeAmount', 'notes', 'itemCount', 'status', 'createdAt', 'updatedAt'
+        ])
+        && data.keys().hasOnly([
+          'id', 'ownerId', 'number', 'docType', 'issuedAtIso', 'cashier', 'operator',
+          'paymentMethod', 'customerId', 'customerName', 'customerNif', 'customerLocality',
+          'customerType', 'customerCountryCode', 'customerAddress', 'customerPhone', 'customerEmail',
+          'merchandiseTotal', 'discountTotal', 'globalDiscountPct', 'globalDiscountAmount',
+          'taxBase14', 'taxAmount14', 'taxBaseIntermediate', 'taxAmountIntermediate',
+          'taxBaseReduced', 'taxAmountReduced', 'taxBase0', 'taxAmount0', 'taxTotal', 'grandTotal',
+          'amountInWords', 'establishmentId', 'establishmentCode', 'establishmentName',
+          'seriesCode', 'seriesEnvironment', 'agtAuthorizationCode', 'atcud', 'saftHash4',
+          'saftHashFull', 'previousInvoiceHash', 'issuerSnapshot',
+          'sessionId', 'amountReceived', 'initialAmountReceived', 'changeAmount',
+          'initialChangeAmount', 'amountDue', 'transferReference', 'paymentSplits',
+          'paymentSummary', 'returnOriginInvoiceId', 'returnOriginNumber', 'returnCreditApplied',
+          'notes', 'itemCount', 'status', 'createdAt', 'updatedAt'
+        ])
+        && data.id == invoiceId
+        && data.ownerId == request.auth.uid && isValidId(data.ownerId)
+        && isValidInvoiceCommonPart1(data)
+        && isValidInvoiceCommonPart2(data);
     }
 
     function isValidInvoiceLineItem(data, invoiceId, itemId) {
@@ -448,8 +484,7 @@ service cloud.firestore {
         ])
         && data.companyId is string && data.companyId == companyId && isValidId(data.companyId)
         && data.uid is string && data.uid == request.auth.uid && isValidId(data.uid)
-        && data.role is string && data.role.size() <= 16
-        && (data.role == 'owner' || data.role == 'manager' || data.role == 'cashier')
+        && isValidRoleName(data.role)
         && data.shortName is string && data.shortName.size() >= 1 && data.shortName.size() <= 64
         && data.nif is string && data.nif.size() >= 1 && data.nif.size() <= 32
         && data.normalizedNif is string && isValidNifId(data.normalizedNif)
@@ -563,8 +598,10 @@ service cloud.firestore {
           'displayName', 'role', 'allowInvoiceCancel', 'active', 'createdAt', 'updatedAt'
         ])
         && data.keys().hasOnly([
-          'id', 'companyId', 'companyOwnerUid', 'uid', 'email', 'emailLower',
-          'displayName', 'role', 'allowInvoiceCancel', 'active', 'createdAt', 'updatedAt'
+          'id', 'companyId', 'companyOwnerUid', 'uid', 'email', 'emailLower', 'phone',
+          'displayName', 'role', 'roleId', 'establishmentIds', 'authorizedCashiers',
+          'permissionOverrides', 'status', 'pinHash', 'pinUpdatedAtIso', 'invitedByUid',
+          'claimedAtIso', 'allowInvoiceCancel', 'active', 'createdAt', 'updatedAt'
         ])
         && data.id is string && data.id == memberId && isValidId(data.id)
         && data.companyId is string && data.companyId == companyId && isValidId(data.companyId)
@@ -572,12 +609,31 @@ service cloud.firestore {
         && data.uid is string && isValidId(data.uid)
         && data.email is string && data.email.size() <= 120
         && data.emailLower is string && data.emailLower.size() <= 120
+        && (!('phone' in data) || (data.phone is string && data.phone.size() <= 32))
         && data.displayName is string && data.displayName.size() >= 1 && data.displayName.size() <= 120
-        && data.role is string && data.role.size() <= 16
-        && (data.role == 'owner' || data.role == 'manager' || data.role == 'cashier')
+        && isValidRoleName(data.role)
+        && (!('roleId' in data) || (data.roleId is string && data.roleId.size() <= 64))
+        && (!('establishmentIds' in data) || (data.establishmentIds is list && data.establishmentIds.size() <= 20))
+        && (!('authorizedCashiers' in data) || (data.authorizedCashiers is list && data.authorizedCashiers.size() <= 20))
+        && (!('permissionOverrides' in data) || data.permissionOverrides is map)
+        && (!('status' in data) || (data.status is string && data.status in ['pending_invite', 'active', 'suspended']))
+        && (!('pinHash' in data) || (data.pinHash is string && data.pinHash.size() <= 256))
+        && (!('pinUpdatedAtIso' in data) || (data.pinUpdatedAtIso is string && data.pinUpdatedAtIso.size() <= 40))
+        && (!('invitedByUid' in data) || (data.invitedByUid is string && data.invitedByUid.size() <= 128))
+        && (!('claimedAtIso' in data) || (data.claimedAtIso is string && data.claimedAtIso.size() <= 40))
         && data.allowInvoiceCancel is bool
         && data.active is bool
         && data.createdAt is timestamp
+        && data.updatedAt is timestamp;
+    }
+
+    function isValidCompanyProductPrivateCosting(data, companyId) {
+      return data.keys().hasAll(['companyId', 'companyOwnerUid', 'updatedByUid', 'costPrice', 'updatedAt'])
+        && data.keys().hasOnly(['companyId', 'companyOwnerUid', 'updatedByUid', 'costPrice', 'updatedAt'])
+        && data.companyId is string && data.companyId == companyId && isValidId(data.companyId)
+        && data.companyOwnerUid is string && isValidId(data.companyOwnerUid)
+        && data.updatedByUid is string && data.updatedByUid == request.auth.uid && isValidId(data.updatedByUid)
+        && data.costPrice is number && data.costPrice >= 0 && data.costPrice <= 999999999
         && data.updatedAt is timestamp;
     }
 
@@ -689,11 +745,14 @@ service cloud.firestore {
         && data.keys().hasOnly([
           'id', 'companyId', 'companyOwnerUid', 'emittedByUid', 'number', 'docType', 'issuedAtIso',
           'cashier', 'operator', 'paymentMethod', 'customerId', 'customerName', 'customerNif',
-          'customerLocality', 'merchandiseTotal', 'discountTotal', 'globalDiscountPct', 'globalDiscountAmount',
+          'customerLocality', 'customerType', 'customerCountryCode', 'customerAddress',
+          'customerPhone', 'customerEmail', 'merchandiseTotal', 'discountTotal',
+          'globalDiscountPct', 'globalDiscountAmount',
           'taxBase14', 'taxAmount14', 'taxBaseIntermediate', 'taxAmountIntermediate',
           'taxBaseReduced', 'taxAmountReduced', 'taxBase0', 'taxAmount0', 'taxTotal', 'grandTotal',
           'amountInWords', 'establishmentId', 'establishmentCode', 'establishmentName',
-          'seriesCode', 'seriesEnvironment', 'agtAuthorizationCode', 'saftHash4', 'issuerSnapshot',
+          'seriesCode', 'seriesEnvironment', 'agtAuthorizationCode', 'atcud', 'saftHash4',
+          'saftHashFull', 'previousInvoiceHash', 'issuerSnapshot',
           'sessionId', 'amountReceived', 'initialAmountReceived', 'changeAmount',
           'initialChangeAmount', 'amountDue', 'transferReference', 'paymentSplits',
           'paymentSummary', 'returnOriginInvoiceId', 'returnOriginNumber', 'returnCreditApplied',
@@ -704,67 +763,14 @@ service cloud.firestore {
         && data.companyId == companyId
         && isValidId(data.companyOwnerUid)
         && isValidId(data.emittedByUid)
-        && data.number is string && data.number.size() >= 1 && data.number.size() <= 40
-        && isValidBillingDocType(data.docType)
-        && data.issuedAtIso is string && data.issuedAtIso.size() >= 10 && data.issuedAtIso.size() <= 40
-        && data.cashier is string && data.cashier.size() >= 1 && data.cashier.size() <= 16
-        && data.operator is string && data.operator.size() >= 1 && data.operator.size() <= 32
-        && data.paymentMethod is string && data.paymentMethod.size() <= 24
-        && (data.paymentMethod == 'Dinheiro' || data.paymentMethod == 'Multicaixa' || data.paymentMethod == 'Transferência' || data.paymentMethod == 'Crédito' || data.paymentMethod == 'Combinado')
-        && data.customerId is string && data.customerId.size() >= 1 && data.customerId.size() <= 128
-        && data.customerName is string && data.customerName.size() >= 1 && data.customerName.size() <= 160
-        && data.customerNif is string && data.customerNif.size() <= 32
-        && data.customerLocality is string && data.customerLocality.size() <= 160
-        && data.merchandiseTotal is number && data.merchandiseTotal >= 0
-        && data.discountTotal is number && data.discountTotal >= 0
-        && (!('globalDiscountPct' in data) || (data.globalDiscountPct is number && data.globalDiscountPct >= 0 && data.globalDiscountPct <= 100))
-        && (!('globalDiscountAmount' in data) || (data.globalDiscountAmount is number && data.globalDiscountAmount >= 0))
-        && data.taxBase14 is number && data.taxBase14 >= 0
-        && data.taxAmount14 is number && data.taxAmount14 >= 0
-        && (!('taxBaseIntermediate' in data) || (data.taxBaseIntermediate is number && data.taxBaseIntermediate >= 0))
-        && (!('taxAmountIntermediate' in data) || (data.taxAmountIntermediate is number && data.taxAmountIntermediate >= 0))
-        && (!('taxBaseReduced' in data) || (data.taxBaseReduced is number && data.taxBaseReduced >= 0))
-        && (!('taxAmountReduced' in data) || (data.taxAmountReduced is number && data.taxAmountReduced >= 0))
-        && data.taxBase0 is number && data.taxBase0 >= 0
-        && data.taxAmount0 is number && data.taxAmount0 == 0
-        && data.taxTotal is number && data.taxTotal >= 0
-        && data.grandTotal is number && data.grandTotal >= 0
-        && data.amountInWords is string && data.amountInWords.size() >= 1 && data.amountInWords.size() <= 300
-        && (!('establishmentId' in data) || (data.establishmentId is string && isValidId(data.establishmentId)))
-        && (!('establishmentCode' in data) || (data.establishmentCode is string && data.establishmentCode.size() <= 16))
-        && (!('establishmentName' in data) || (data.establishmentName is string && data.establishmentName.size() <= 120))
-        && (!('seriesCode' in data) || (data.seriesCode is string && data.seriesCode.size() <= 16))
-        && (!('seriesEnvironment' in data) || (data.seriesEnvironment is string && data.seriesEnvironment.size() <= 16 && (data.seriesEnvironment == 'SIMULACAO' || data.seriesEnvironment == 'PRODUCAO')))
-        && (!('agtAuthorizationCode' in data) || (data.agtAuthorizationCode is string && data.agtAuthorizationCode.size() <= 64))
-        && (!('saftHash4' in data) || (data.saftHash4 is string && data.saftHash4.size() <= 16))
-        && (!('issuerSnapshot' in data) || isValidIssuerSnapshot(data.issuerSnapshot))
-        && (!('sessionId' in data) || (data.sessionId is string && data.sessionId.size() <= 128))
-        && data.amountReceived is number && data.amountReceived >= 0
-        && (!('initialAmountReceived' in data) || (data.initialAmountReceived is number && data.initialAmountReceived >= 0))
-        && data.changeAmount is number && data.changeAmount >= 0
-        && (!('initialChangeAmount' in data) || (data.initialChangeAmount is number && data.initialChangeAmount >= 0))
-        && (!('amountDue' in data) || (data.amountDue is number && data.amountDue >= 0))
-        && (!('transferReference' in data) || (data.transferReference is string && data.transferReference.size() <= 80))
-        && (!('paymentSplits' in data) || (
-          data.paymentSplits is list
-          && data.paymentSplits.size() <= 5
-          && (data.paymentSplits.size() == 0 || isValidPaymentSplitEntry(data.paymentSplits[0]))
-        ))
-        && (!('paymentSummary' in data) || (data.paymentSummary is string && data.paymentSummary.size() <= 160))
-        && (!('returnOriginInvoiceId' in data) || (data.returnOriginInvoiceId is string && data.returnOriginInvoiceId.size() <= 128))
-        && (!('returnOriginNumber' in data) || (data.returnOriginNumber is string && data.returnOriginNumber.size() <= 40))
-        && (!('returnCreditApplied' in data) || (data.returnCreditApplied is number && data.returnCreditApplied >= 0))
-        && data.notes is string && data.notes.size() <= 300
-        && data.itemCount is number && data.itemCount >= 1 && data.itemCount <= 200
-        && data.status is string && data.status.size() <= 16 && (data.status == 'issued' || data.status == 'cancelled')
+        && isValidInvoiceCommonPart1(data)
+        && isValidInvoiceCommonPart2(data)
         && (!('cancelReason' in data) || (data.cancelReason is string && data.cancelReason.size() >= 4 && data.cancelReason.size() <= 240))
         && (!('cancelledBy' in data) || (data.cancelledBy is string && data.cancelledBy.size() >= 1 && data.cancelledBy.size() <= 120))
         && (!('cancelledAtIso' in data) || (data.cancelledAtIso is string && data.cancelledAtIso.size() >= 10 && data.cancelledAtIso.size() <= 40))
         && (!('reprintCount' in data) || (data.reprintCount is number && data.reprintCount >= 0 && data.reprintCount <= 10000))
         && (!('lastReprintedAtIso' in data) || (data.lastReprintedAtIso is string && data.lastReprintedAtIso.size() >= 10 && data.lastReprintedAtIso.size() <= 40))
-        && (!('lastReprintedBy' in data) || (data.lastReprintedBy is string && data.lastReprintedBy.size() >= 1 && data.lastReprintedBy.size() <= 120))
-        && data.createdAt is timestamp
-        && data.updatedAt is timestamp;
+        && (!('lastReprintedBy' in data) || (data.lastReprintedBy is string && data.lastReprintedBy.size() >= 1 && data.lastReprintedBy.size() <= 120));
     }
 
     function isValidCompanyInvoiceItem(data, companyId, invoiceId, itemId) {
@@ -1423,6 +1429,12 @@ service cloud.firestore {
       allow delete: if false;
     }
 
+    // ==================== CLOUD INVITES (BACKEND-ONLY) ====================
+
+    match /company_invites/{inviteId} {
+      allow get, list, create, update, delete: if false;
+    }
+
     // ==================== MULTI-COMPANY ISOLATION & RBAC (/companies/{companyId}/...) ====================
 
     match /companies/{companyId} {
@@ -1515,12 +1527,13 @@ service cloud.firestore {
               && existsAfter(/databases/$(database)/documents/companies/$(companyId))
               && getAfter(/databases/$(database)/documents/companies/$(companyId)).data.ownerUid == request.auth.uid
             )
-            // Proprietário adiciona gerente ou operador de caixa (Planos Cloud Profissional / Enterprise)
+            // Proprietário ou Administrador adiciona colaborador (não-owner) em fallback sem backend
             || (
               canSyncCompanyCloudData(companyId)
-              && isCompanyOwner(companyId)
+              && isCompanyAdminOrOwner(companyId)
               && incoming().companyOwnerUid == companyDocData(companyId).ownerUid
-              && (incoming().role == 'manager' || incoming().role == 'cashier')
+              && incoming().role != 'owner'
+              && (incoming().role != 'admin' || isCompanyOwner(companyId))
             )
           );
 
@@ -1537,11 +1550,23 @@ service cloud.firestore {
           && (
             (
               canSyncCompanyCloudData(companyId)
-              && isCompanyOwner(companyId)
+              && isCompanyAdminOrOwner(companyId)
               && existing().role != 'owner'
-              && (incoming().role == 'manager' || incoming().role == 'cashier')
+              && incoming().role != 'owner'
+              && (incoming().role != 'admin' || isCompanyOwner(companyId))
               && incoming().diff(existing()).affectedKeys().hasOnly([
-                'displayName', 'role', 'allowInvoiceCancel', 'active', 'updatedAt'
+                'displayName', 'phone', 'role', 'roleId', 'establishmentIds', 'authorizedCashiers',
+                'permissionOverrides', 'status', 'pinHash', 'pinUpdatedAtIso',
+                'allowInvoiceCancel', 'active', 'updatedAt'
+              ])
+            )
+            || (
+              memberId == request.auth.uid
+              && hasActiveMembership(companyId)
+              && incoming().role == existing().role
+              && incoming().active == existing().active
+              && incoming().diff(existing()).affectedKeys().hasOnly([
+                'pinHash', 'pinUpdatedAtIso', 'updatedAt'
               ])
             )
             || isPlatformAdmin()
@@ -1552,7 +1577,21 @@ service cloud.firestore {
           && isValidId(memberId)
           && existing().role != 'owner'
           && canSyncCompanyCloudData(companyId)
-          && isCompanyOwner(companyId);
+          && isCompanyAdminOrOwner(companyId);
+      }
+
+      // Subcollection: /companies/{companyId}/roles/{roleId}
+      match /roles/{roleId} {
+        allow get: if isVerifiedUser()
+          && isValidId(companyId)
+          && isValidId(roleId)
+          && (isCompanyAnyActiveRole(companyId) || isPlatformAdmin());
+
+        allow list: if isVerifiedUser()
+          && existing().companyId == companyId
+          && existing().companyOwnerUid == request.auth.uid;
+
+        allow create, update, delete: if false;
       }
 
       // Subcollection: /companies/{companyId}/products/{productId}
@@ -1608,6 +1647,31 @@ service cloud.firestore {
           && isValidId(productId)
           && canSyncCompanyCloudData(companyId)
           && isCompanyOwnerOrManager(companyId);
+
+        // Separação física de preço de custo: /companies/{companyId}/products/{productId}/private/costing
+        match /private/{docId} {
+          allow get: if isVerifiedUser()
+            && isValidId(companyId)
+            && isValidId(productId)
+            && docId == 'costing'
+            && (canReadCompanyCosting(companyId) || isPlatformAdmin());
+
+          allow create, update: if isVerifiedUser()
+            && isValidId(companyId)
+            && isValidId(productId)
+            && docId == 'costing'
+            && isValidCompanyProductPrivateCosting(incoming(), companyId)
+            && incoming().updatedAt == request.time
+            && canSyncCompanyCloudData(companyId)
+            && (isCompanyOwnerOrManager(companyId) || isPlatformAdmin());
+
+          allow delete: if isVerifiedUser()
+            && isValidId(companyId)
+            && isValidId(productId)
+            && docId == 'costing'
+            && canSyncCompanyCloudData(companyId)
+            && isCompanyOwnerOrManager(companyId);
+        }
       }
 
       // Subcollection: /companies/{companyId}/customers/{customerId}
@@ -1842,12 +1906,12 @@ service cloud.firestore {
         allow delete: if false;
       }
 
-      // Subcollection (System-Only Writes): /companies/{companyId}/audit_logs/{logId}
+      // Subcollection (System-Only Writes, Immutable Audit): /companies/{companyId}/audit_logs/{logId}
       match /audit_logs/{logId} {
         allow get: if isVerifiedUser()
           && isValidId(companyId)
           && isValidId(logId)
-          && (isCompanyOwner(companyId) || isPlatformAdmin());
+          && (canReadCompanyAudit(companyId) || isPlatformAdmin());
 
         allow list, create, update, delete: if false;
       }
@@ -1958,7 +2022,7 @@ service cloud.firestore {
         allow get: if isVerifiedUser()
           && isValidId(companyId)
           && isValidId(supplierId)
-          && (isCompanyAnyActiveRole(companyId) || isPlatformAdmin());
+          && (canReadCompanyPurchases(companyId) || isPlatformAdmin());
 
         allow list: if isVerifiedUser()
           && existing().companyId == companyId
@@ -1971,7 +2035,7 @@ service cloud.firestore {
           && incoming().createdAt == request.time
           && incoming().updatedAt == request.time
           && canSyncCompanyCloudData(companyId)
-          && isCompanyAnyActiveRole(companyId)
+          && canReadCompanyPurchases(companyId)
           && incoming().companyOwnerUid == companyDocData(companyId).ownerUid;
 
         allow update: if isVerifiedUser()
@@ -2016,7 +2080,7 @@ service cloud.firestore {
             && isValidCompanySupplierPrivate(incoming(), companyId)
             && incoming().updatedAt == request.time
             && canSyncCompanyCloudData(companyId)
-            && isCompanyAnyActiveRole(companyId)
+            && canReadCompanyPurchases(companyId)
             && incoming().companyOwnerUid == companyDocData(companyId).ownerUid
             && existsAfter(/databases/$(database)/documents/companies/$(companyId)/suppliers/$(supplierId));
 
@@ -2053,7 +2117,7 @@ service cloud.firestore {
         allow get: if isVerifiedUser()
           && isValidId(companyId)
           && isValidId(purchaseId)
-          && (isCompanyAnyActiveRole(companyId) || isPlatformAdmin());
+          && (canReadCompanyPurchases(companyId) || isPlatformAdmin());
 
         allow list: if isVerifiedUser()
           && existing().companyId == companyId
@@ -2068,7 +2132,7 @@ service cloud.firestore {
           && incoming().createdAt == request.time
           && incoming().updatedAt == request.time
           && canSyncCompanyCloudData(companyId)
-          && isCompanyAnyActiveRole(companyId)
+          && canReadCompanyPurchases(companyId)
           && incoming().companyOwnerUid == companyDocData(companyId).ownerUid;
 
         // Terminal State Locking: compras anuladas são imutáveis
