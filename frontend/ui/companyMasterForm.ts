@@ -1606,7 +1606,7 @@ export function renderCompanyMasterSection(options: CompanyMasterRenderOptions):
               </div>
               <div class="col-span-1 sm:col-span-6">
                 <label class="${labelCls}"><span>PIN do Supervisor</span></label>
-                <input name="supervisorPin" type="password" maxlength="16" placeholder="Ex: 1234" ${!canManage ? 'disabled' : ''} value="${escapeHtml(s.supervisorPin || '')}" class="${inputCls} font-mono tracking-widest" />
+                <input name="supervisorPin" type="password" maxlength="16" placeholder="••••" ${!canManage ? 'disabled' : ''} value="${escapeHtml(s.supervisorPin || '')}" class="${inputCls} font-mono tracking-widest" />
               </div>
               <div class="col-span-2 sm:col-span-12 space-y-2 pt-1">
                 <input type="hidden" name="allowCashierPriceEditPresent" value="1" />

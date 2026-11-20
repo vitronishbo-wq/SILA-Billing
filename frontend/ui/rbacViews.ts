@@ -40,20 +40,31 @@ function escapeHtml(raw: string): string {
 }
 
 const AUDIT_ACTION_LABELS: Record<SecurityAuditAction, string> = {
-  LOGIN_SUCCESS: 'Desbloqueio OK',
-  LOGIN_FAILED: 'PIN Incorrecto',
-  PIN_LOCKED: 'Bloqueio Progressivo',
-  TERMINAL_LOCKED: 'Terminal Bloqueado',
+  LOGIN: 'Login Cloud',
+  LOGOUT: 'Logout Cloud',
+  PIN_SETUP: 'Configuração de PIN',
+  PIN_UNLOCK_OK: 'Desbloqueio OK',
+  PIN_UNLOCK_FAIL: 'PIN Incorrecto',
+  PIN_LOCKOUT: 'Bloqueio Progressivo',
+  TERMINAL_LOCK: 'Terminal Bloqueado',
   OPERATOR_SWITCH: 'Troca de Operador',
-  ROLE_CREATED: 'Função Criada',
-  ROLE_UPDATED: 'Função Actualizada',
-  MEMBER_INVITED: 'Utilizador Criado/Convidado',
-  MEMBER_UPDATED: 'Utilizador Actualizado',
-  MEMBER_SUSPENDED: 'Utilizador Suspenso/Removido',
   ACCESS_DENIED: 'Acesso Negado',
-  SUPERVISOR_OVERRIDE: 'Autorização Supervisor',
+  INVOICE_EMIT: 'Documento Emitido',
+  INVOICE_CANCEL: 'Documento Anulado',
+  PRICE_EDIT: 'Preço Alterado',
+  DISCOUNT_OVERRIDE: 'Desconto Autorizado',
+  USER_CREATE: 'Utilizador Criado/Convidado',
+  USER_UPDATE: 'Utilizador Actualizado',
+  USER_SUSPEND: 'Utilizador Suspenso/Removido',
+  ROLE_UPDATE: 'Função Criada/Actualizada',
+  INVITE_CLAIM: 'Convite Cloud Reivindicado',
   PRIVACY_ACCEPTED: 'Privacidade Aceite',
 };
+
+function formatAuditDt(iso: string): string {
+  const dt = formatDateTimePt(iso);
+  return `${dt.slashDate} ${dt.time}`;
+}
 
 function getMemberRoleDisplayName(
   member: CompanyMember,
@@ -274,7 +285,7 @@ export function renderTerminalLockScreen(params: {
                   <p class="text-xs text-slate-400 max-w-xs mx-auto leading-relaxed">
                     ${
                       anyPinConfigured
-                        ? 'Por segurança em terminal partilhado, nenhum perfil privileged é aberto automaticamente. Escolha o seu nome à esquerda e introduza o seu PIN.'
+                        ? 'Por segurança em terminal partilhado, nenhum perfil privilegiado é aberto automaticamente. Escolha o seu nome à esquerda e introduza o seu PIN.'
                         : 'Seleccione o Proprietário à esquerda para definir o PIN inicial de protecção do terminal.'
                     }
                   </p>
@@ -457,7 +468,7 @@ export function renderTerminalLockScreen(params: {
             data-action="open-privacy-policy"
             class="text-blue-400 hover:text-blue-300 underline text-xs"
           >Política de Privacidade &amp; Segurança</button>
-          <span class="text-[11px] text-slate-500">${escapeHtml(VITRONIS_INSTITUTIONAL.shortBrand || 'VITRONIS')}</span>
+          <span class="text-[11px] text-slate-500">${escapeHtml(VITRONIS_INSTITUTIONAL.shortName || 'VITRONIS')}</span>
         </div>
       </footer>
     </div>
@@ -499,7 +510,7 @@ export function renderPrivacyPolicyModal(params: {
             isCurrentAccepted && acceptedAtIso
               ? `<div class="p-3 rounded-lg border border-emerald-200 bg-emerald-50 text-emerald-900 flex items-center gap-2">
                   <span class="text-emerald-600">${ICONS.shieldCheck}</span>
-                  <span>Versão actual (${escapeHtml(PRIVACY_POLICY_VERSION)}) registada e aceite em ${escapeHtml(formatDateTimePt(acceptedAtIso))}.</span>
+                  <span>Versão actual (${escapeHtml(PRIVACY_POLICY_VERSION)}) registada e aceite em ${escapeHtml(formatAuditDt(acceptedAtIso))}.</span>
                 </div>`
               : `<div class="p-3 rounded-lg border border-blue-200 bg-blue-50 text-blue-900">
                   Leia as regras de tratamento de dados, isolamento por empresa e proteção de PIN de terminal do SILA-Billing.
@@ -1153,7 +1164,7 @@ function renderRbacRolesTab(params: {
                         r.isSystem ? 'bg-slate-100 text-slate-600' : 'bg-indigo-100 text-indigo-700'
                       }">${r.isSystem ? 'Sistema' : 'Personalizada'}</span>
                     </div>
-                    <p class="text-[11px] text-slate-500 mt-1 leading-snug">${escapeHtml(r.description)}</p>
+                    <p class="text-[11px] text-slate-500 mt-1 leading-snug">${escapeHtml(r.description || '')}</p>
                   </div>
                   <div class="flex items-center justify-between pt-2 border-t border-slate-100 text-[11px]">
                     <span class="font-mono text-slate-600">${grantedCount}/${ALL_PERMISSION_KEYS.length} permissões</span>
@@ -1301,7 +1312,8 @@ function renderRbacAuditTab(params: {
     return (
       entry.summary.toLowerCase().includes(q) ||
       entry.actorName.toLowerCase().includes(q) ||
-      (entry.targetLabel && entry.targetLabel.toLowerCase().includes(q)) ||
+      entry.targetType.toLowerCase().includes(q) ||
+      (entry.targetId && entry.targetId.toLowerCase().includes(q)) ||
       entry.action.toLowerCase().includes(q)
     );
   });
@@ -1374,9 +1386,10 @@ function renderRbacAuditTab(params: {
                   .slice(0, 120)
                   .map((entry) => {
                     const isAlert =
+                      entry.outcome === 'denied' ||
                       entry.action === 'ACCESS_DENIED' ||
-                      entry.action === 'LOGIN_FAILED' ||
-                      entry.action === 'PIN_LOCKED';
+                      entry.action === 'PIN_UNLOCK_FAIL' ||
+                      entry.action === 'PIN_LOCKOUT';
                     return `
                       <div class="p-3 bg-white text-xs flex flex-col sm:flex-row sm:items-center justify-between gap-2">
                         <div class="min-w-0 space-y-0.5">
@@ -1388,12 +1401,12 @@ function renderRbacAuditTab(params: {
                             </span>
                             <span class="font-semibold text-slate-900">${escapeHtml(entry.actorName)}</span>
                             <span class="text-[11px] text-slate-400">(${escapeHtml(formatRoleLabelPt(entry.actorRole))})</span>
-                            ${entry.targetLabel ? `<span class="text-[11px] text-slate-500">→ ${escapeHtml(entry.targetLabel)}</span>` : ''}
+                            ${entry.targetType ? `<span class="text-[11px] text-slate-500">→ ${escapeHtml(entry.targetType)}${entry.targetId ? ` #${escapeHtml(entry.targetId)}` : ''}</span>` : ''}
                           </div>
                           <p class="text-[11px] text-slate-600">${escapeHtml(entry.summary)}</p>
                         </div>
                         <span class="text-[10.5px] font-mono text-slate-400 shrink-0 tabular-nums">
-                          ${escapeHtml(formatDateTimePt(entry.createdAtIso))}
+                          ${escapeHtml(formatAuditDt(entry.createdAtIso))}
                         </span>
                       </div>
                     `;

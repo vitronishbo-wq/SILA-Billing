@@ -715,6 +715,8 @@ export async function runPhase5ValidationTests(): Promise<{ passed: number; tota
       quickProductError: 'Erro de validação inline no modal móvel',
       quickCustomerError: null,
       operator: '001',
+      canViewCostPrices: true,
+      canViewProfitsMargins: true,
     });
 
     for (const marker of [
@@ -732,6 +734,82 @@ export async function runPhase5ValidationTests(): Promise<{ passed: number; tota
     ]) {
       assert(html.includes(marker), `Modal mobile de artigo deve conter '${marker}'`);
     }
+
+    const restrictedHtml = renderMobileOperationalView({
+      activeCompany: companyRecord,
+      settings: {
+        companyId: 'comp_mob_1',
+        company: JAIMONA_COMPANY,
+        defaultCashier: '01',
+        defaultOperator: '001',
+        defaultFormat: 'POS',
+        defaultDocType: 'FR',
+        defaultNotes: '',
+        autoPrintOnEmit: false,
+        hidePromotionalFooter: false,
+        allowCashierPriceEdit: false,
+        updatedAtIso: new Date().toISOString(),
+      },
+      companyMasterDraftProfile: null,
+      companyMasterDraftSettings: null,
+      companyMasterSection: 'ALL',
+      companySeries: [],
+      canManageCompanySettings: false,
+      companyFormError: null,
+      companyFormSavedNotice: false,
+      showRequestAgtSeriesForm: false,
+      confirmFinalizeSeriesId: null,
+      agtSeriesErrorMessage: null,
+      agtSeriesSuccessMessage: null,
+      showEstablishmentForm: false,
+      editingEstablishment: null,
+      establishmentError: null,
+      showWarehouseForm: false,
+      editingWarehouse: null,
+      warehouseError: null,
+      isOnline: true,
+      user: { email: 'caixa@empresa.ao' },
+      mobileTab: 'PRODUCTS',
+      mobileCheckoutStep: 'CART',
+      cart: [],
+      products: [],
+      customers: [],
+      invoices: [],
+      selectedCustomerId: '999999999',
+      docType: 'FR',
+      paymentMethod: 'Dinheiro',
+      amountReceivedInput: '',
+      mobileSearchQuery: '',
+      mobileProductSearchInput: '',
+      lastEmittedInvoice: null,
+      showQuickProductModal: true,
+      showQuickCustomerModal: false,
+      showQuickCompanyModal: false,
+      showCustomerPickerModal: false,
+      editingMobileProduct: null,
+      editingCustomer: null,
+      editingCustomerCreditLimitInput: '',
+      showCustomerAdvancedFields: false,
+      mobileCustomerModalMode: 'QUICK',
+      canEditExistingCustomers: false,
+      quickCustomerDraft: {
+        name: '',
+        nif: '',
+        phone: '',
+        address: '',
+        locality: 'Luanda',
+        customerType: 'PARTICULAR',
+        countryCode: 'AO',
+        foreignTaxId: '',
+      },
+      quickProductError: null,
+      quickCustomerError: null,
+      operator: '001',
+      canViewCostPrices: false,
+      canViewProfitsMargins: false,
+    });
+    assert(!restrictedHtml.includes('name="costPrice"'), 'Operador sem cost_prices_view não pode ver input costPrice no mobile');
+    assert(!restrictedHtml.includes('mobile-product-margin-readout'), 'Operador sem profits_margins_view não pode ver margem de lucro no mobile');
   });
 
   // -------------------------------------------------------------------------

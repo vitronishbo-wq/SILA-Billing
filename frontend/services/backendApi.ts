@@ -1091,7 +1091,6 @@ export async function fetchCompanyWorkspaceBackend(companyId: string): Promise<{
           const st = resolveMemberStatus({
             status: m.status as CompanyMember['status'],
             active: typeof m.active === 'boolean' ? m.active : true,
-            uid: String(m.uid || ''),
           });
           return {
             id: String(m.id || m.uid || ''),
@@ -1130,6 +1129,7 @@ export async function fetchCompanyWorkspaceBackend(companyId: string): Promise<{
           baseRole: resolveMemberBaseRole({ role: (r.baseRole || 'cashier') as CompanyRole }),
           isSystem: Boolean(r.isSystem),
           permissions: (r.permissions || {}) as CompanyRoleDefinition['permissions'],
+          createdAtIso: String(r.createdAtIso || now),
           updatedAtIso: String(r.updatedAtIso || now),
         }))
       : undefined;

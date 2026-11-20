@@ -17,10 +17,30 @@ import {
   verifyCompanyMembershipServer,
 } from '../../backend/middleware/requirePlatformAdmin.ts';
 import {
+  canCompanyInviteCloudMembers,
+  canCompanyManageMultiOperatorTeam,
+  canCompanySyncCloudData,
+  CompanyMember,
+  CompanyRecord,
   isJaimonaOwnerEmail,
+  JAIMONA_COMPANY,
   JAIMONA_COMPANY_ID,
   PLATFORM_ADMIN_EMAIL,
 } from './types.ts';
+import {
+  buildDefaultCompanyRoles,
+  canActorManageRoleDefinition,
+  canActorManageTargetMember,
+  canMemberAccessEstablishment,
+  canMemberOperateCashier,
+  computeProgressiveLockout,
+  hashMemberPin,
+  isPinCurrentlyLocked,
+  normalizeLegacyMember,
+  resolveMemberPermissions,
+  validatePinFormat,
+  verifyMemberPinHash,
+} from './rbac.ts';
 
 function assert(condition: boolean, msg: string): void {
   if (!condition) {
@@ -212,6 +232,7 @@ export async function runIsolationTests(): Promise<{ passed: number; total: numb
                 }),
                 collection(subColl: string) {
                   return {
+                    get: async () => ({ docs: [] }),
                     doc(memberUid: string) {
                       const member = comp?.members?.[memberUid];
                       return {
@@ -278,6 +299,7 @@ export async function runIsolationTests(): Promise<{ passed: number; total: numb
             data: () => ({ ownerUid: 'outro_owner', status: 'active', allowManagerCancel: false }),
           }),
           collection: () => ({
+            get: async () => ({ docs: [] }),
             doc: (uid: string) => ({
               get: async () => ({
                 exists: true,
@@ -332,6 +354,285 @@ export async function runIsolationTests(): Promise<{ passed: number; total: numb
     assert(isJaimonaOwnerEmail('jaimonacomercioeservicos@gmail.com') === true, 'jaimonacomercioeservicos@gmail.com é titular reconhecido da Jaimona');
     assert(isJaimonaOwnerEmail('hacker@externo.com') === false, 'Utilizador estranho não é titular da Jaimona');
     assert(PLATFORM_ADMIN_EMAIL === 'wtmedia0@gmail.com', 'wtmedia0@gmail.com é o Super-Admin da plataforma SILA');
+  });
+
+  // =========================================================================
+  // FASE 6: RBAC, TERMINAL BLOQUEADO, PBKDF2 PIN, ISOLAMENTO & ANTI-ESCALADA
+  // =========================================================================
+
+  // Teste 9: PIN PBKDF2-SHA256 com salt aleatório único e validação estrita de formato
+  await test('RBAC 6.1: PIN PBKDF2-SHA256 gera salt único, valida formato e rejeita PIN errado', async () => {
+    assert(!validatePinFormat('').valid, 'PIN vazio deve ser rejeitado');
+    assert(!validatePinFormat('123').valid, 'PIN com menos de 4 dígitos deve ser rejeitado');
+    assert(!validatePinFormat('12a4').valid, 'PIN alfanumérico deve ser rejeitado');
+    assert(validatePinFormat('4829').valid, 'PIN de 4 dígitos deve ser aceite');
+    assert(validatePinFormat('482910').valid, 'PIN de 6 dígitos deve ser aceite');
+
+    const hashA = await hashMemberPin('4829');
+    const hashB = await hashMemberPin('4829');
+    assert(hashA.startsWith('pbkdf2_sha256$100000$'), 'Hash deve usar formato pbkdf2_sha256$100000$...');
+    assert(hashA !== hashB, 'Mesmo PIN deve gerar hashes distintos devido ao salt aleatório');
+    assert(await verifyMemberPinHash('4829', hashA), 'PIN correcto deve validar contra hashA');
+    assert(await verifyMemberPinHash('4829', hashB), 'PIN correcto deve validar contra hashB');
+    assert(!(await verifyMemberPinHash('1234', hashA)), 'PIN incorrecto não pode autenticar');
+    assert(!(await verifyMemberPinHash('4829', undefined)), 'Membro sem pinHash não pode desbloquear com PIN');
+  });
+
+  // Teste 10: Bloqueio progressivo após tentativas falhadas (3 -> 30s, 5 -> 300s, 8 -> 900s)
+  await test('RBAC 6.2: Bloqueio progressivo de PIN (3 -> 30s, 5 -> 300s, 8+ -> 900s)', () => {
+    const now = 1_700_000_000_000;
+    const f1 = computeProgressiveLockout(0, now);
+    assert(f1.failedAttempts === 1 && f1.lockoutSeconds === 0 && !f1.lockedUntilIso, '1.ª falha não bloqueia');
+
+    const f2 = computeProgressiveLockout(1, now);
+    assert(f2.failedAttempts === 2 && f2.lockoutSeconds === 0, '2.ª falha não bloqueia');
+
+    const f3 = computeProgressiveLockout(2, now);
+    assert(f3.failedAttempts === 3 && f3.lockoutSeconds === 30 && Boolean(f3.lockedUntilIso), '3.ª falha bloqueia 30s');
+    const lock3 = isPinCurrentlyLocked({ pinLockedUntilIso: f3.lockedUntilIso }, now + 5_000);
+    assert(lock3.locked && lock3.remainingSeconds === 25, 'Durante janela de 30s deve reportar 25s restantes');
+    assert(!isPinCurrentlyLocked({ pinLockedUntilIso: f3.lockedUntilIso }, now + 31_000).locked, 'Após 30s deve desbloquear');
+
+    const f5 = computeProgressiveLockout(4, now);
+    assert(f5.failedAttempts === 5 && f5.lockoutSeconds === 300, '5.ª falha bloqueia 300s (5 min)');
+
+    const f8 = computeProgressiveLockout(7, now);
+    assert(f8.failedAttempts === 8 && f8.lockoutSeconds === 900, '8.ª falha bloqueia 900s (15 min)');
+  });
+
+  // Teste 11: Decisão 1 — Disponibilidade RBAC em todos os planos (FREE vs Cloud)
+  await test('RBAC 6.3 (Decisão 1): Multi-operadores, PINs e RBAC disponíveis no plano FREE; Cloud só em planos pagos', () => {
+    const freeCompany: CompanyRecord = {
+      id: 'comp_free_loja',
+      normalizedNif: '5001112223',
+      profile: JAIMONA_COMPANY,
+      status: 'active',
+      plan: {
+        planTier: 'FREE',
+        commercialActive: false,
+        maxUsers: null,
+        maxInvoicesPerMonth: null,
+        updatedAtIso: '2026-06-01T00:00:00.000Z',
+      },
+      baseSequence: 0,
+      allowManagerCancel: false,
+      createdAtIso: '2026-06-01T00:00:00.000Z',
+      updatedAtIso: '2026-06-01T00:00:00.000Z',
+    };
+    const proCompany: CompanyRecord = {
+      ...freeCompany,
+      id: 'comp_pro_loja',
+      plan: { ...freeCompany.plan, planTier: 'PROFISSIONAL', commercialActive: true },
+    };
+
+    assert(canCompanyManageMultiOperatorTeam(freeCompany) === true, 'Plano FREE deve permitir multi-operadores locais e RBAC');
+    assert(canCompanySyncCloudData(freeCompany) === false, 'Plano FREE não tem sincronização Cloud');
+    assert(canCompanyInviteCloudMembers(freeCompany) === false, 'Plano FREE não envia convites Cloud');
+    assert(canCompanySyncCloudData(proCompany) === true, 'Plano PROFISSIONAL permite Cloud');
+    assert(canCompanyInviteCloudMembers(proCompany) === true, 'Plano PROFISSIONAL permite convites Cloud');
+  });
+
+  // Teste 12: Matriz de permissões, isolamento de custos/margens e overrides individuais
+  await test('RBAC 6.4: Matriz inicial, isolamento de preços de custo/margens e permissionOverrides', () => {
+    const companyId = 'comp_rbac_1';
+    const roles = buildDefaultCompanyRoles(companyId);
+    const now = '2026-06-01T00:00:00.000Z';
+
+    const owner: CompanyMember = {
+      id: `${companyId}_owner`,
+      companyId,
+      uid: 'u_owner',
+      email: 'dono@loja.ao',
+      displayName: 'Proprietário',
+      role: 'owner',
+      allowInvoiceCancel: true,
+      active: true,
+      status: 'active',
+      createdAtIso: now,
+      updatedAtIso: now,
+    };
+    const cashier: CompanyMember = {
+      id: `${companyId}_cashier`,
+      companyId,
+      uid: 'u_cashier',
+      email: 'caixa@loja.ao',
+      displayName: 'Caixa Turno A',
+      role: 'cashier',
+      allowInvoiceCancel: false,
+      active: true,
+      status: 'active',
+      createdAtIso: now,
+      updatedAtIso: now,
+    };
+    const managerNoCancel: CompanyMember = {
+      id: `${companyId}_mgr`,
+      companyId,
+      uid: 'u_mgr',
+      email: 'gerente@loja.ao',
+      displayName: 'Gerente Loja',
+      role: 'manager',
+      allowInvoiceCancel: false,
+      active: true,
+      status: 'active',
+      createdAtIso: now,
+      updatedAtIso: now,
+    };
+
+    const ownerPerms = resolveMemberPermissions(owner, roles, false);
+    assert(
+      Object.values(ownerPerms).every(Boolean) && Object.keys(ownerPerms).length === 37,
+      'Proprietário deve deter todas as 37 permissões activas'
+    );
+
+    const cashierPerms = resolveMemberPermissions(cashier, roles, false);
+    assert(cashierPerms.pos_sell && cashierPerms.a4_sell && cashierPerms.customers_create, 'Caixa deve poder vender e criar clientes rápidos');
+    assert(cashierPerms.reports_own_sales && cashierPerms.cash_own_shift, 'Caixa só acede às próprias vendas e turno');
+    assert(
+      !cashierPerms.cost_prices_view &&
+        !cashierPerms.profits_margins_view &&
+        !cashierPerms.finance_view &&
+        !cashierPerms.saft_export &&
+        !cashierPerms.users_manage &&
+        !cashierPerms.master_edit &&
+        !cashierPerms.invoice_cancel,
+      'Caixa não pode ver custos, margens, finanças, SAF-T, utilizadores, ficha mestre nem anular facturas'
+    );
+
+    // Gerente sem permissão condicional vs. com grant individual
+    const mgrPermsDefault = resolveMemberPermissions(managerNoCancel, roles, false);
+    assert(
+      !mgrPermsDefault.cost_prices_view && !mgrPermsDefault.invoice_cancel && !mgrPermsDefault.saft_export,
+      'Gerente sem concessão condicional não vê custos, anulação nem SAF-T'
+    );
+    const mgrWithOverrides: CompanyMember = {
+      ...managerNoCancel,
+      permissionOverrides: {
+        grant: ['cost_prices_view', 'invoice_cancel'],
+        revoke: ['purchases_manage'],
+      },
+    };
+    const mgrPermsCustom = resolveMemberPermissions(mgrWithOverrides, roles, false);
+    assert(mgrPermsCustom.cost_prices_view && mgrPermsCustom.invoice_cancel, 'Grant individual deve activar permissão condicional');
+    assert(!mgrPermsCustom.purchases_manage, 'Revoke individual deve remover permissão da função');
+
+    // Membro suspenso não detém nenhuma permissão
+    const suspendedPerms = resolveMemberPermissions({ ...owner, status: 'suspended', active: false }, roles, false);
+    assert(!suspendedPerms.pos_sell && !suspendedPerms.master_view, 'Membro suspenso não deve manter permissões operacionais');
+  });
+
+  // Teste 13: Protecção anti-escalada de privilégios
+  await test('RBAC 6.5: Anti-escalada impede auto-promoção, criação de Owner/par e atribuição de permissão não detida', () => {
+    const roles = buildDefaultCompanyRoles('comp_sec');
+    const now = '2026-06-01T00:00:00.000Z';
+
+    const adminWithUsers: CompanyMember = {
+      id: 'comp_sec_admin',
+      companyId: 'comp_sec',
+      uid: 'u_admin',
+      email: 'admin@loja.ao',
+      displayName: 'Admin Delegado',
+      role: 'admin',
+      allowInvoiceCancel: true,
+      active: true,
+      status: 'active',
+      createdAtIso: now,
+      updatedAtIso: now,
+    };
+    const adminPerms = resolveMemberPermissions(adminWithUsers, roles, false);
+
+    // Admin não pode criar/editar Owner nem outro Admin, nem editar a si próprio
+    const selfEdit = canActorManageTargetMember({
+      actor: adminWithUsers,
+      actorPermissions: adminPerms,
+      targetCurrentRole: 'admin',
+      targetNewRole: 'admin',
+      isSelfEdit: true,
+    });
+    assert(!selfEdit.allowed, 'Não-proprietário não pode editar o próprio perfil');
+
+    const promoteToOwner = canActorManageTargetMember({
+      actor: adminWithUsers,
+      actorPermissions: adminPerms,
+      targetCurrentRole: 'cashier',
+      targetNewRole: 'owner',
+    });
+    assert(!promoteToOwner.allowed, 'Administrador não pode atribuir função Proprietário');
+
+    // Admin não detém saft_export nem master_edit por defeito -> não pode conceder a outrem
+    const grantForbiddenPerm = canActorManageTargetMember({
+      actor: adminWithUsers,
+      actorPermissions: adminPerms,
+      targetCurrentRole: 'cashier',
+      targetNewRole: 'manager',
+      targetPermissions: { ...resolveMemberPermissions({ ...adminWithUsers, role: 'manager' }, roles), saft_export: true },
+    });
+    assert(!grantForbiddenPerm.allowed, 'Administrador não pode conceder saft_export que não possui');
+
+    // Gerente com users_view (sem users_manage) não pode gerir ninguém nem alterar funções
+    const manager: CompanyMember = { ...adminWithUsers, uid: 'u_mgr', role: 'manager' };
+    const mgrPerms = resolveMemberPermissions(manager, roles, false);
+    const mgrCreateCashier = canActorManageTargetMember({
+      actor: manager,
+      actorPermissions: mgrPerms,
+      targetNewRole: 'cashier',
+    });
+    assert(!mgrCreateCashier.allowed, 'Gerente sem users_manage não pode criar operadores');
+
+    const mgrCreateCustomRole = canActorManageRoleDefinition({
+      actor: manager,
+      actorPermissions: mgrPerms,
+      roleBase: 'cashier',
+      requestedPermissions: { pos_sell: true },
+    });
+    assert(!mgrCreateCustomRole.allowed, 'Gerente sem roles_manage não pode criar função personalizada');
+
+    // Proprietário pode tudo
+    const owner: CompanyMember = { ...adminWithUsers, uid: 'u_owner', role: 'owner' };
+    const ownerPerms = resolveMemberPermissions(owner, roles, false);
+    const ownerCreatesAdmin = canActorManageTargetMember({
+      actor: owner,
+      actorPermissions: ownerPerms,
+      targetNewRole: 'admin',
+      targetPermissions: roles.find((r) => r.baseRole === 'admin')?.permissions as any,
+    });
+    assert(ownerCreatesAdmin.allowed, 'Proprietário deve poder criar Administrador e conceder qualquer permissão');
+  });
+
+  // Teste 14: Isolamento por estabelecimento, caixa e compatibilidade de membros legados
+  await test('RBAC 6.6: Escopo por estabelecimento/caixa e migração segura de membros legados', () => {
+    const now = '2026-06-01T00:00:00.000Z';
+    const legacyMgr = normalizeLegacyMember(
+      {
+        id: `${JAIMONA_COMPANY_ID}_u1`,
+        companyId: JAIMONA_COMPANY_ID,
+        uid: 'u1',
+        email: 'gerente@jaimona.ao',
+        displayName: 'Gerente Legado',
+        role: 'manager',
+        allowInvoiceCancel: true,
+        active: true,
+        createdAtIso: now,
+        updatedAtIso: now,
+      },
+      false
+    );
+    assert(legacyMgr.roleId === 'role_manager', 'Membro legado deve herdar roleId canónico role_manager');
+    assert(legacyMgr.status === 'active', 'Membro legado activo deve ter status active');
+    assert(
+      Boolean(legacyMgr.permissionOverrides?.grant.includes('invoice_cancel')),
+      'Flag legada allowInvoiceCancel deve converter-se em override invoice_cancel'
+    );
+
+    const scopedCashier: CompanyMember = {
+      ...legacyMgr,
+      role: 'cashier',
+      establishmentIds: ['est_luanda_sul'],
+      authorizedCashiers: ['02', '03'],
+    };
+    assert(canMemberAccessEstablishment(scopedCashier, 'est_luanda_sul'), 'Caixa autorizado no estabelecimento permitido');
+    assert(!canMemberAccessEstablishment(scopedCashier, 'est_viana'), 'Caixa restrito não pode operar noutro estabelecimento');
+    assert(canMemberOperateCashier(scopedCashier, '02'), 'Caixa autorizado no terminal 02');
+    assert(!canMemberOperateCashier(scopedCashier, '01'), 'Caixa restrito não pode abrir terminal 01');
   });
 
   console.log(`\nTODOS OS ${passed}/${total} TESTES DE ISOLAMENTO PASSARAM COM SUCESSO!\n`);

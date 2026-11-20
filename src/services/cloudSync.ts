@@ -1916,7 +1916,6 @@ export async function pullCompanyFromCloud(companyIdRaw: string): Promise<{
       const status = resolveMemberStatus({
         status: m.status as CompanyMember['status'],
         active: typeof m.active === 'boolean' ? m.active : true,
-        uid: String(m.uid || ''),
       });
       return {
         id: String(m.id || md.id),
@@ -1955,6 +1954,7 @@ export async function pullCompanyFromCloud(companyIdRaw: string): Promise<{
         baseRole: resolveMemberBaseRole({ role: (r.baseRole || 'cashier') as CompanyRole }),
         isSystem: Boolean(r.isSystem),
         permissions: (r.permissions || {}) as CompanyRoleDefinition['permissions'],
+        createdAtIso: String(r.createdAtIso || new Date().toISOString()),
         updatedAtIso: String(r.updatedAtIso || new Date().toISOString()),
       };
     });

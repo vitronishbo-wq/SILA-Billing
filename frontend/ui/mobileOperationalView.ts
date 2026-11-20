@@ -1331,7 +1331,7 @@ function renderMobileDocs(props: MobileOperationalProps): string {
                   <span class="font-bold text-white font-mono tabular-nums">${formatKzNumber(inv.grandTotal)} Kz</span>
                 </div>
                 <div class="flex items-center justify-between text-[11px] text-slate-500 pt-1 border-t border-slate-800/80">
-                  <span>${formatDateTimePt(inv.issuedAtIso)}</span>
+                  <span>${formatDateTimePt(inv.issuedAtIso).slashDate} ${formatDateTimePt(inv.issuedAtIso).time}</span>
                   <div class="flex items-center gap-2">
                     <button
                       type="button"

@@ -43,7 +43,7 @@ import {
   AppSettings,
   buildInvoiceIssuerSnapshot,
   canCompanyHideViralFooter,
-  canCompanyManageMultiOperatorTeam,
+  canCompanyInviteCloudMembers,
   canCompanySyncCloudData,
   CalculatedLineItem,
   CartDraftItem,
@@ -58,6 +58,7 @@ import {
   CompanyProfile,
   CompanyRecord,
   CompanyRole,
+  CompanyRoleDefinition,
   Customer,
   CustomerPaymentTerms,
   CustomerType,
@@ -84,9 +85,11 @@ import {
   isPlatformAdminEmail,
   JAIMONA_COMPANY_ID,
   JAIMONA_OWNER_EMAIL,
+  MemberStatus,
   normalizeCompanyNif,
   PaymentMethod,
   PaymentSplit,
+  PermissionKey,
   PlanTier,
   Product,
   ProductPriceChange,
@@ -94,6 +97,8 @@ import {
   PurchasePaymentMethod,
   PurchaseRecord,
   resolveEstablishmentLocality,
+  SecurityAuditAction,
+  SecurityAuditEntry,
   shouldShowViralDocumentFooter,
   StockMovement,
   StockMovementDirection,
@@ -105,6 +110,28 @@ import {
   WarehouseRecord,
 } from '../src/core/types';
 import {
+  ALL_PERMISSION_KEYS,
+  BASE_ROLE_HIERARCHY,
+  buildDefaultCompanyRoles,
+  canActorManageRoleDefinition,
+  canActorManageTargetMember,
+  canMemberAccessEstablishment,
+  canMemberOperateCashier,
+  computeProgressiveLockout,
+  formatRoleLabelPt,
+  getSystemRoleId,
+  hashMemberPin,
+  hasPermission,
+  isPinCurrentlyLocked,
+  normalizeLegacyMember,
+  resolveMemberBaseRole,
+  resolveMemberPermissions,
+  resolveMemberStatus,
+  validatePinFormat,
+  verifyMemberPinHash,
+} from '../src/core/rbac';
+import { PRIVACY_POLICY_VERSION } from '../src/core/privacyTerms';
+import {
   filterCustomersSmart,
   filterInvoicesSmart,
   filterPurchasesSmart,
@@ -114,6 +141,7 @@ import {
 } from '../src/core/smartSearch';
 import { UNASSIGNED_TENANT_RECORD } from '../src/core/seedData';
 import {
+  appendSecurityAuditCloud,
   cancelInvoiceCloud,
   createCashMovementCloud,
   createInvoiceCloud,
@@ -121,12 +149,14 @@ import {
   ensureCompanyRegisteredCloud,
   pullCompanyFromCloud,
   pullOwnedCompaniesFromCloud,
+  removeCompanyMemberCloud,
   removeCustomerCloud,
   removeProductCloud,
   removeSupplierCloud,
   updateProductStockCloud,
   upsertCashSessionCloud,
   upsertCompanyMemberCloud,
+  upsertCompanyRoleCloud,
   upsertCustomerCloud,
   upsertFiscalSeriesCloud,
   upsertProductCloud,
@@ -156,9 +186,12 @@ import {
   AdminCompanyDetails,
   AdminCompanySummary,
   AdminOverviewStats,
+  appendSecurityAuditBackend,
   BackendHealthStatus,
   cancelInvoiceBackend,
+  claimCompanyInvitesBackend,
   createPlatformCompany,
+  deleteCompanyMemberBackend,
   downloadCloudBackupJson,
   fetchBackendHealth,
   fetchCompanyWorkspaceBackend,
@@ -166,6 +199,7 @@ import {
   fetchPlatformCompanyDetails,
   fetchPlatformSystemStatus,
   fetchPlatformUsers,
+  fetchSecurityAuditsBackend,
   logPlatformSupportAccess,
   PlatformUserSummary,
   registerCompanyBackend,
@@ -173,6 +207,8 @@ import {
   submitInvoiceAudit,
   SystemStatusResponse,
   updatePlatformCompanyAdmin,
+  upsertCompanyMemberBackend,
+  upsertCompanyRoleBackend,
 } from './services/backendApi';
 import {
   buildInvoicesCsvContent,
@@ -211,7 +247,6 @@ import {
 } from './ui/customerForm';
 import {
   formatPlanLabelPt,
-  formatRoleLabelPt,
   MasterAdminTab,
   renderCancelInvoiceModal,
   renderCompanySwitcherDropdown,
@@ -220,6 +255,13 @@ import {
   renderNewCompanyModal,
   renderTenantOnboardingView,
 } from './ui/multicompanyModals';
+import {
+  RbacPanelTab,
+  renderPrivacyPolicyModal,
+  renderRbacMobileModal,
+  renderRbacTeamSection,
+  renderTerminalLockScreen,
+} from './ui/rbacViews';
 
 type ActiveModule =
   | 'NEW_POS'
@@ -658,8 +700,26 @@ export class SilaBillingApp {
   private isCreatingCompany = false;
   private cancellingInvoiceId: string | null = null;
   private cancelInvoiceError: string | null = null;
-  private selectedTerminalRole: CompanyRole = 'owner';
-  private memberFormError: string | null = null;
+  private roles: CompanyRoleDefinition[] = [];
+  private securityAuditLogs: SecurityAuditEntry[] = [];
+  private terminalUnlockedMemberId: string | null = null;
+  private lockSelectedMemberId: string | null = null;
+  private lockPinInput = '';
+  private lockPinConfirmInput = '';
+  private lockErrorMessage: string | null = null;
+  private lockReasonMessage: string | null = null;
+  private isUnlockingTerminal = false;
+  private showPrivacyPolicyModal = false;
+  private showRbacMobileModal = false;
+  private rbacActiveTab: RbacPanelTab = 'USERS';
+  private rbacEditingMemberId: string | null = null;
+  private rbacEditingRoleId: string | null = null;
+  private rbacFormError: string | null = null;
+  private rbacNoticeMessage: string | null = null;
+  private rbacAuditSearch = '';
+  private rbacAuditActionFilter = 'ALL';
+  private lastUserActivityMs = Date.now();
+  private inactivityCheckTimer: number | null = null;
 
   // Estado Segurança e Controlo Operacional (Módulo 10)
   private showOperatorSwitchModal = false;
@@ -816,7 +876,11 @@ export class SilaBillingApp {
         this.adminCloudCompanies = [];
         this.adminAuditLogs = [];
         this.supportCompanyId = null;
+        this.terminalUnlockedMemberId = null;
+        this.lockPinInput = '';
+        this.lockErrorMessage = null;
         if (authChanged) {
+          this.lockReasonMessage = 'Sessão terminada — introduza o seu PIN de operador.';
           try {
             const localBundle = await bootstrapLocalStore(undefined, null);
             this.applyWorkspaceBundle(localBundle);
@@ -831,6 +895,7 @@ export class SilaBillingApp {
       if (authChanged) {
         try {
           if (this.isOnline) {
+            await claimCompanyInvitesBackend().catch(() => null);
             const ownedCloud = await pullOwnedCompaniesFromCloud();
             for (const cloudComp of ownedCloud) {
               await localDb.saveCompany(cloudComp);
@@ -841,6 +906,15 @@ export class SilaBillingApp {
             this.getViewerIdentity()
           );
           this.applyWorkspaceBundle(scopedBundle);
+          if (this.activeCompany.id && !this.requiresCompanyOnboarding) {
+            void this.appendSecurityAuditEvent({
+              action: 'LOGIN',
+              targetType: 'auth',
+              targetId: u.uid,
+              summary: `Autenticação Google (${u.email || u.uid}) verificada neste terminal.`,
+              outcome: 'allowed',
+            });
+          }
         } catch {
           // Mantém workspace seguro
         }
@@ -868,7 +942,62 @@ export class SilaBillingApp {
     this.requiresCompanyOnboarding = Boolean(
       data.requiresCompanyOnboarding || !data.activeCompany.id
     );
-    this.members = data.members;
+    // Decisão 2: O terminal partilhado arranca SEMPRE bloqueado ao carregar qualquer empresa.
+    this.terminalUnlockedMemberId = null;
+    this.lockSelectedMemberId = null;
+    this.lockPinInput = '';
+    this.lockPinConfirmInput = '';
+    this.lockErrorMessage = null;
+    this.isUnlockingTerminal = false;
+    this.showRbacMobileModal = false;
+    this.rbacEditingMemberId = null;
+    this.rbacEditingRoleId = null;
+    this.rbacFormError = null;
+    this.rbacNoticeMessage = null;
+
+    this.roles =
+      Array.isArray(data.roles) && data.roles.length > 0
+        ? data.roles
+        : data.activeCompany.id
+          ? buildDefaultCompanyRoles(data.activeCompany.id)
+          : [];
+    this.members = (data.members || []).map((m) => normalizeLegacyMember(m));
+    this.securityAuditLogs = Array.isArray(data.securityAuditLogs) ? data.securityAuditLogs : [];
+
+    // Garante perfil local do Proprietário se empresa existir sem membros (exige definição de PIN no ecrã de bloqueio)
+    if (!this.requiresCompanyOnboarding && data.activeCompany.id && this.members.length === 0) {
+      const nowIso = new Date().toISOString();
+      const ownerDisplayName = (
+        data.activeCompany.profile.legalRepresentativeName ||
+        this.user?.displayName ||
+        'Proprietário'
+      ).trim();
+      const ownerEmail = (
+        data.activeCompany.ownerEmail ||
+        this.user?.email ||
+        'proprietario@local'
+      )
+        .trim()
+        .toLowerCase();
+      const ownerMember: CompanyMember = {
+        id: `mem_${data.activeCompany.id}_owner`,
+        companyId: data.activeCompany.id,
+        uid: data.activeCompany.ownerUid || this.user?.uid || `owner_${data.activeCompany.id}`,
+        email: ownerEmail,
+        emailLower: ownerEmail,
+        displayName: ownerDisplayName || 'Proprietário',
+        role: 'owner',
+        roleId: getSystemRoleId('owner'),
+        status: 'active',
+        allowInvoiceCancel: true,
+        active: true,
+        createdAtIso: nowIso,
+        updatedAtIso: nowIso,
+      };
+      this.members = [ownerMember];
+      void localDb.saveMember(ownerMember).catch(() => null);
+    }
+
     this.hasPreMigrationBackup = data.hasPreMigrationBackup;
     this.products = data.products;
     this.customers = data.customers;
@@ -1018,7 +1147,6 @@ export class SilaBillingApp {
     this.confirmFinalizeSeriesId = null;
     this.agtSeriesErrorMessage = null;
     this.agtSeriesSuccessMessage = null;
-    this.memberFormError = null;
     this.growthModalReason = null;
     this.growthModalNotice = null;
 
@@ -1092,55 +1220,298 @@ export class SilaBillingApp {
     }
   }
 
-  private getVerifiedMaxRole(): CompanyRole {
-    if (!this.user) {
-      return 'owner';
-    }
-    const emailLower = (this.user.email || '').trim().toLowerCase();
-    if (isPlatformAdminEmail(emailLower) && this.supportCompanyId === this.activeCompany.id) {
-      return 'owner';
-    }
-    if (!this.activeCompany.ownerUid || this.activeCompany.ownerUid === this.user.uid) {
-      return 'owner';
-    }
-    const compOwnerEmail = (this.activeCompany.ownerEmail || '').trim().toLowerCase();
-    if (emailLower && compOwnerEmail && compOwnerEmail === emailLower) {
-      return 'owner';
-    }
-    if (this.activeCompany.id === JAIMONA_COMPANY_ID && isJaimonaOwnerEmail(emailLower)) {
-      return 'owner';
-    }
-    const matched = this.members.find(
-      (m) =>
-        m.active &&
-        (m.uid === this.user!.uid || (emailLower && m.email.trim().toLowerCase() === emailLower))
+  private isPlatformSupportActive(): boolean {
+    return (
+      Boolean(this.supportCompanyId && this.supportCompanyId === this.activeCompany.id) &&
+      Boolean(this.user && isPlatformAdminEmail(this.user.email))
     );
-    if (matched) {
-      return matched.role;
+  }
+
+  private getUnlockedMember(): CompanyMember | null {
+    if (!this.terminalUnlockedMemberId) return null;
+    const found = this.members.find((m) => m.id === this.terminalUnlockedMemberId) || null;
+    if (!found || resolveMemberStatus(found) !== 'active') return null;
+    return found;
+  }
+
+  private isTerminalLocked(): boolean {
+    if (this.isBooting || this.requiresCompanyOnboarding || !this.activeCompany.id) return false;
+    if (this.isPlatformSupportActive()) return false;
+    return this.getUnlockedMember() === null;
+  }
+
+  private getUnlockedPermissions(): Record<PermissionKey, boolean> {
+    if (this.isPlatformSupportActive()) {
+      const full = {} as Record<PermissionKey, boolean>;
+      for (const k of ALL_PERMISSION_KEYS) full[k] = true;
+      return full;
     }
-    return this.members.length === 0 ? 'owner' : 'cashier';
+    const unlocked = this.getUnlockedMember();
+    return resolveMemberPermissions(unlocked, this.roles, Boolean(this.activeCompany.allowManagerCancel));
+  }
+
+  private hasPerm(perm: PermissionKey): boolean {
+    if (this.isPlatformSupportActive()) return true;
+    if (this.requiresCompanyOnboarding || !this.activeCompany.id) return false;
+    if (this.isTerminalLocked()) return false;
+    return Boolean(this.getUnlockedPermissions()[perm]);
+  }
+
+  private getUnlockedRoleLabel(): string {
+    if (this.isPlatformSupportActive()) return 'Suporte VITRONIS';
+    const unlocked = this.getUnlockedMember();
+    if (!unlocked) return 'Bloqueado';
+    const roleDef = this.roles.find((r) => r.id === unlocked.roleId);
+    return roleDef?.name || formatRoleLabelPt(resolveMemberBaseRole(unlocked));
+  }
+
+  private canAccessModule(mod: ActiveModule): boolean {
+    if (mod === 'SYNC') return true;
+    if (this.isPlatformSupportActive()) return true;
+    if (this.isTerminalLocked()) return false;
+    switch (mod) {
+      case 'NEW_POS':
+        return this.hasPerm('pos_sell');
+      case 'NEW_A4':
+        return this.hasPerm('a4_sell');
+      case 'CASH':
+        return this.hasPerm('cash_own_shift') || this.hasPerm('cash_all_shifts');
+      case 'CUSTOMERS':
+        return (
+          this.hasPerm('customers_view') ||
+          this.hasPerm('customers_create') ||
+          this.hasPerm('customers_manage')
+        );
+      case 'PRODUCTS':
+        return (
+          this.hasPerm('products_view') ||
+          this.hasPerm('products_manage') ||
+          this.hasPerm('stock_view') ||
+          this.hasPerm('stock_manage')
+        );
+      case 'PURCHASES':
+        return (
+          this.hasPerm('purchases_view') ||
+          this.hasPerm('purchases_manage') ||
+          this.hasPerm('suppliers_view') ||
+          this.hasPerm('suppliers_manage')
+        );
+      case 'FINANCE':
+        return (
+          this.hasPerm('finance_view') ||
+          this.hasPerm('expenses_manage') ||
+          this.hasPerm('profits_margins_view')
+        );
+      case 'INDICATORS':
+        return this.hasPerm('reports_operational') || this.hasPerm('reports_financial');
+      case 'HISTORY':
+        return (
+          this.hasPerm('reports_own_sales') ||
+          this.hasPerm('reports_operational') ||
+          this.hasPerm('saft_export') ||
+          this.hasPerm('audit_view')
+        );
+      case 'SETTINGS':
+        return (
+          this.hasPerm('master_view') ||
+          this.hasPerm('series_view') ||
+          this.hasPerm('users_view') ||
+          this.hasPerm('roles_manage') ||
+          this.hasPerm('settings_manage') ||
+          this.hasPerm('audit_view')
+        );
+      default:
+        return false;
+    }
+  }
+
+  private getFirstAllowedModule(): ActiveModule {
+    const order: ActiveModule[] = [
+      'NEW_POS',
+      'NEW_A4',
+      'CASH',
+      'PRODUCTS',
+      'CUSTOMERS',
+      'PURCHASES',
+      'HISTORY',
+      'FINANCE',
+      'INDICATORS',
+      'SETTINGS',
+      'SYNC',
+    ];
+    for (const mod of order) {
+      if (this.canAccessModule(mod)) return mod;
+    }
+    return 'SYNC';
+  }
+
+  private enforceModulePermission(): void {
+    if (!this.canAccessModule(this.activeModule)) {
+      this.activeModule = this.getFirstAllowedModule();
+      if (this.activeModule === 'NEW_POS') this.previewFormat = 'POS';
+      else if (this.activeModule === 'NEW_A4') this.previewFormat = 'A4';
+    }
+    if (this.financeSubView === 'MARGINS' && !this.canViewProfitsMargins()) {
+      this.financeSubView = 'OVERVIEW';
+    }
+    if (this.historyActiveMainTab === 'OPERATIONAL_AUDIT' && !this.hasPerm('audit_view')) {
+      this.historyActiveMainTab = 'DOCUMENTS';
+    }
+  }
+
+  private touchActivity(): void {
+    this.lastUserActivityMs = Date.now();
+  }
+
+  private lockTerminal(reason?: string): void {
+    const previous = this.getUnlockedMember();
+    if (previous && this.activeCompany.id) {
+      void this.appendSecurityAuditEvent({
+        action: 'TERMINAL_LOCK',
+        targetType: 'terminal',
+        targetId: previous.id,
+        summary: reason || `Terminal bloqueado para ${previous.displayName}.`,
+        outcome: 'allowed',
+      });
+    }
+    this.terminalUnlockedMemberId = null;
+    this.lockPinInput = '';
+    this.lockPinConfirmInput = '';
+    this.lockErrorMessage = null;
+    this.lockReasonMessage = reason || null;
+    this.showOperatorSwitchModal = false;
+    this.showSupervisorAuthModal = false;
+    this.showRbacMobileModal = false;
+    this.showCompanyDropdown = false;
+    this.render();
+  }
+
+  private async appendSecurityAuditEvent(params: {
+    action: SecurityAuditAction;
+    targetType: string;
+    targetId?: string;
+    summary: string;
+    outcome: 'allowed' | 'denied';
+    beforeObj?: unknown;
+    afterObj?: unknown;
+    actorOverride?: CompanyMember | null;
+  }): Promise<void> {
+    if (!this.activeCompany.id) return;
+    const actor = params.actorOverride ?? this.getUnlockedMember();
+    const actorRole = actor
+      ? resolveMemberBaseRole(actor)
+      : this.isPlatformSupportActive()
+        ? 'platform_admin'
+        : 'system';
+    const entry: SecurityAuditEntry = {
+      id: `aud_${Date.now()}_${Math.random().toString(36).slice(2, 8)}`,
+      companyId: this.activeCompany.id,
+      ...(this.settings.defaultEstablishmentId
+        ? { establishmentId: this.settings.defaultEstablishmentId }
+        : {}),
+      actorUid: actor?.uid || this.user?.uid || 'local_terminal',
+      ...(actor?.email || this.user?.email
+        ? { actorEmail: (actor?.email || this.user?.email || '').toLowerCase() }
+        : {}),
+      actorName: actor?.displayName || this.user?.displayName || this.operator || 'Terminal',
+      actorRole,
+      action: params.action,
+      targetType: params.targetType,
+      ...(params.targetId ? { targetId: params.targetId } : {}),
+      summary: params.summary.slice(0, 500),
+      ...(params.beforeObj !== undefined ? { beforeJson: JSON.stringify(params.beforeObj).slice(0, 2000) } : {}),
+      ...(params.afterObj !== undefined ? { afterJson: JSON.stringify(params.afterObj).slice(0, 2000) } : {}),
+      outcome: params.outcome,
+      createdAtIso: new Date().toISOString(),
+      synced: false,
+    };
+
+    try {
+      await localDb.appendSecurityAudit(entry);
+      this.securityAuditLogs = [entry, ...this.securityAuditLogs].slice(0, 500);
+    } catch {
+      // Mantém execução sem bloquear UI
+    }
+
+    if (this.user && this.isOnline && canCompanySyncCloudData(this.activeCompany)) {
+      void appendSecurityAuditCloud(this.activeCompany, entry)
+        .then(() => {
+          this.securityAuditLogs = this.securityAuditLogs.map((l) =>
+            l.id === entry.id ? { ...l, synced: true } : l
+          );
+        })
+        .catch(() => null);
+      void appendSecurityAuditBackend(this.activeCompany.id, entry).catch(() => null);
+    }
+  }
+
+  private exportSecurityAuditCsv(): void {
+    if (!this.hasPerm('audit_view')) return;
+    const rows = this.securityAuditLogs;
+    if (rows.length === 0) {
+      this.rbacNoticeMessage = 'Sem eventos de auditoria de segurança para exportar.';
+      this.render();
+      return;
+    }
+    const header = 'Data/Hora;Acção;Resultado;Utilizador;Função;Alvo;Resumo';
+    const lines = rows.map((r) => {
+      const dt = formatDateTimePt(r.createdAtIso);
+      const esc = (v: string) => `"${v.replace(/"/g, '""')}"`;
+      return [
+        `${dt.slashDate} ${dt.time}`,
+        r.action,
+        r.outcome === 'allowed' ? 'Permitido' : 'Negado',
+        esc(r.actorName),
+        esc(r.actorRole),
+        esc(`${r.targetType}${r.targetId ? `:${r.targetId}` : ''}`),
+        esc(r.summary),
+      ].join(';');
+    });
+    const csv = [header, ...lines].join('\r\n');
+    const safeComp = (this.settings.company.shortName || 'empresa')
+      .toLowerCase()
+      .replace(/[^a-z0-9_-]+/g, '-');
+    triggerBrowserDownload(
+      csv,
+      `auditoria-seguranca-${safeComp}-${new Date().toISOString().slice(0, 10)}.csv`,
+      'text/csv;charset=utf-8'
+    );
+    this.rbacNoticeMessage = `Registo de auditoria exportado (${rows.length} evento(s)).`;
+    this.render();
+  }
+
+  private getVerifiedMaxRole(): CompanyRole {
+    if (this.isPlatformSupportActive()) return 'owner';
+    const unlocked = this.getUnlockedMember();
+    if (!unlocked) return 'cashier';
+    return resolveMemberBaseRole(unlocked);
   }
 
   private getEffectiveRole(): CompanyRole {
-    const rank: Record<CompanyRole, number> = { owner: 3, manager: 2, cashier: 1 };
-    const maxRole = this.getVerifiedMaxRole();
-    return rank[this.selectedTerminalRole] <= rank[maxRole] ? this.selectedTerminalRole : maxRole;
+    return this.getVerifiedMaxRole();
   }
 
   private isCompanySuspended(): boolean {
     return this.activeCompany.status === 'suspended';
   }
 
+  private canViewCostPrices(): boolean {
+    return this.hasPerm('cost_prices_view');
+  }
+
+  private canViewProfitsMargins(): boolean {
+    return this.hasPerm('profits_margins_view');
+  }
+
   private canManageCatalog(): boolean {
-    const role = this.getEffectiveRole();
-    return !this.isCompanySuspended() && (role === 'owner' || role === 'manager');
+    return !this.isCompanySuspended() && (this.hasPerm('products_manage') || this.hasPerm('stock_manage'));
   }
 
   private canEditCartUnitPrice(): boolean {
     if (this.isCompanySuspended()) return false;
+    if (this.hasPerm('pos_price_edit')) return true;
     const role = this.getEffectiveRole();
-    if (role === 'owner' || role === 'manager') return true;
-    return Boolean(this.settings.allowCashierPriceEdit);
+    return role === 'cashier' && Boolean(this.settings.allowCashierPriceEdit);
   }
 
   private getCustomerOpenDebt(customerId: string): number {
@@ -2100,51 +2471,116 @@ export class SilaBillingApp {
   }
 
   private canEditExistingCustomers(): boolean {
-    const role = this.getEffectiveRole();
-    return !this.isCompanySuspended() && (role === 'owner' || role === 'manager');
+    return !this.isCompanySuspended() && this.hasPerm('customers_manage');
   }
 
   private canManageCompanySettings(): boolean {
-    return !this.isCompanySuspended() && this.getEffectiveRole() === 'owner';
+    return !this.isCompanySuspended() && (this.hasPerm('master_edit') || this.hasPerm('settings_manage'));
   }
 
   private canCancelInvoices(): boolean {
     if (this.isCompanySuspended()) return false;
-    const role = this.getEffectiveRole();
-    if (role === 'owner') return true;
-    if (role === 'manager') {
-      if (this.activeCompany.allowManagerCancel) return true;
-      if (this.user) {
-        const emailLower = (this.user.email || '').trim().toLowerCase();
-        const m = this.members.find(
-          (x) =>
-            x.active &&
-            (x.uid === this.user!.uid || (emailLower && x.email.trim().toLowerCase() === emailLower))
-        );
-        if (m?.allowInvoiceCancel) return true;
-      }
-    }
-    return false;
+    return this.hasPerm('invoice_cancel') || this.hasPerm('credit_note_issue');
   }
 
   // ==================== 10. SEGURANÇA E CONTROLO OPERACIONAL ====================
 
-  private verifySupervisorPin(pinInput: string): { ok: boolean; supervisorLabel: string; error?: string } {
+  private async verifySupervisorPin(
+    pinInput: string
+  ): Promise<{ ok: boolean; supervisorLabel: string; error?: string }> {
     const cleanPin = pinInput.trim();
     if (!cleanPin) {
-      return { ok: false, supervisorLabel: '', error: 'Introduza o PIN de supervisor.' };
+      return { ok: false, supervisorLabel: '', error: 'Introduza o PIN individual de um supervisor autorizado.' };
     }
-    const configuredPin = (this.settings.supervisorPin || '').trim();
-    if (configuredPin) {
-      if (cleanPin === configuredPin) {
-        return { ok: true, supervisorLabel: `Supervisor (PIN ${cleanPin})` };
+
+    // 1. Verifica contra colaboradores activos que possuam privilégio para a operação solicitada
+    const supervisorMembers = this.members.filter((m) => {
+      if (resolveMemberStatus(m) !== 'active' || !m.pinHash) return false;
+      const perms = resolveMemberPermissions(m, this.roles, Boolean(this.activeCompany.allowManagerCancel));
+      if (this.supervisorAuthAction === 'CANCEL_INVOICE') return Boolean(perms.invoice_cancel);
+      if (this.supervisorAuthAction === 'PRICE_EDIT') return Boolean(perms.pos_price_edit);
+      return Boolean(perms.pos_discount_special);
+    });
+
+    let lockedSupervisorCount = 0;
+    for (const sup of supervisorMembers) {
+      const lockState = isPinCurrentlyLocked(sup);
+      if (lockState.locked) {
+        lockedSupervisorCount += 1;
+        continue;
       }
-      return { ok: false, supervisorLabel: '', error: 'Código PIN de supervisor incorreto.' };
+      const matched = await verifyMemberPinHash(cleanPin, sup.pinHash);
+      if (matched) {
+        if ((sup.pinFailedAttempts || 0) > 0 || sup.pinLockedUntilIso) {
+          const resetMember: CompanyMember = {
+            ...sup,
+            pinFailedAttempts: 0,
+            pinLockedUntilIso: undefined,
+            updatedAtIso: new Date().toISOString(),
+          };
+          await localDb.saveMember(resetMember).catch(() => null);
+          this.members = this.members.map((x) => (x.id === resetMember.id ? resetMember : x));
+        }
+        const roleName =
+          this.roles.find((r) => r.id === sup.roleId)?.name ||
+          formatRoleLabelPt(resolveMemberBaseRole(sup));
+        void this.appendSecurityAuditEvent({
+          action: this.supervisorAuthAction === 'PRICE_EDIT' ? 'PRICE_EDIT' : 'DISCOUNT_OVERRIDE',
+          targetType: 'supervisor_pin',
+          targetId: sup.id,
+          summary: `Autorização de supervisão concedida por ${sup.displayName} (${roleName}) para ${this.supervisorAuthAction || 'OPERAÇÃO'}.`,
+          outcome: 'allowed',
+          actorOverride: sup,
+        });
+        return { ok: true, supervisorLabel: `${sup.displayName} (${roleName})` };
+      }
     }
-    if (cleanPin === '1234' || cleanPin === '0000') {
-      return { ok: true, supervisorLabel: `Supervisor Autorizado (PIN contingência ${cleanPin})` };
+
+    // 2. Suporte transitório exclusivamente se supervisorPin tiver sido explicitamente configurado (sem códigos triviais)
+    const configuredPin = (this.settings.supervisorPin || '').trim();
+    if (
+      configuredPin.length >= 4 &&
+      cleanPin === configuredPin &&
+      !/^(\d)\1{3,5}$/.test(configuredPin) &&
+      Number(configuredPin) !== 1234
+    ) {
+      return { ok: true, supervisorLabel: 'Supervisor Autorizado' };
     }
-    return { ok: false, supervisorLabel: '', error: 'PIN incorreto. (PIN padrão inicial: 1234)' };
+
+    // Aplica bloqueio progressivo caso exista apenas 1 supervisor candidato desbloqueado
+    if (supervisorMembers.length === 1 && lockedSupervisorCount === 0) {
+      const targetSup = supervisorMembers[0]!;
+      const nextAttempts = (targetSup.pinFailedAttempts || 0) + 1;
+      const lockout = computeProgressiveLockout(nextAttempts);
+      const updatedSup: CompanyMember = {
+        ...targetSup,
+        pinFailedAttempts: nextAttempts,
+        ...(lockout.lockedUntilIso ? { pinLockedUntilIso: lockout.lockedUntilIso } : {}),
+        updatedAtIso: new Date().toISOString(),
+      };
+      await localDb.saveMember(updatedSup).catch(() => null);
+      this.members = this.members.map((x) => (x.id === updatedSup.id ? updatedSup : x));
+    }
+
+    void this.appendSecurityAuditEvent({
+      action: 'PIN_UNLOCK_FAIL',
+      targetType: 'supervisor_pin',
+      summary: `Tentativa falhada de autorização de supervisor (${this.supervisorAuthAction || 'OPERAÇÃO'}).`,
+      outcome: 'denied',
+    });
+
+    if (lockedSupervisorCount > 0 && lockedSupervisorCount === supervisorMembers.length) {
+      return {
+        ok: false,
+        supervisorLabel: '',
+        error: 'Supervisor temporariamente bloqueado por tentativas falhadas. Aguarde alguns instantes.',
+      };
+    }
+    return {
+      ok: false,
+      supervisorLabel: '',
+      error: 'PIN incorreto ou utilizador sem permissão de supervisão.',
+    };
   }
 
   private approveSupervisorAuth(supervisorLabel: string): void {
@@ -2286,7 +2722,7 @@ export class SilaBillingApp {
             actor: ph.changedBy || 'Gestor',
             title: `Alteração de PVP · ${prod.name} (${prod.code})`,
             detail: `PVP anterior: ${formatKzNumber(ph.previousPrice)} Kz → Novo PVP: ${formatKzNumber(ph.newPrice)} Kz${
-              typeof ph.newCost === 'number' && typeof ph.previousCost === 'number'
+              this.canViewCostPrices() && typeof ph.newCost === 'number' && typeof ph.previousCost === 'number'
                 ? ` · Custo: ${formatKzNumber(ph.previousCost)} Kz → ${formatKzNumber(ph.newCost)} Kz`
                 : ''
             }`,
@@ -2433,29 +2869,29 @@ export class SilaBillingApp {
             </div>
 
             <div>
-              <div class="text-xs font-semibold text-slate-700 mb-2">Alternar com 1 clique (Colaboradores cadastrados):</div>
+              <div class="text-xs font-semibold text-slate-700 mb-2">Trocar de operador (exige autenticação com PIN individual):</div>
               <div class="space-y-1.5 max-h-44 overflow-y-auto">
                 ${
-                  this.members.length === 0
+                  this.members.filter((m) => resolveMemberStatus(m) === 'active').length === 0
                     ? `<div class="text-xs text-slate-500 p-2.5 border border-dashed border-slate-200 rounded-lg bg-slate-50">
-                        Proprietário local ativo nesta empresa. Pode definir identificadores adicionais abaixo.
+                        Nenhum operador configurado nesta empresa. Crie utilizadores em Configurações → Equipa &amp; Segurança.
                       </div>`
                     : this.members
+                        .filter((m) => resolveMemberStatus(m) === 'active')
                         .map(
                           (m) => `
                         <button
                           type="button"
-                          data-action="quick-switch-operator"
-                          data-name="${escapeHtml(m.displayName)}"
-                          data-role="${m.role}"
+                          data-action="lock-and-switch-member"
+                          data-id="${escapeHtml(m.id)}"
                           class="w-full p-2.5 rounded-lg border border-slate-200 hover:border-blue-400 hover:bg-blue-50/50 flex items-center justify-between text-left transition-colors"
                         >
                           <div class="min-w-0">
                             <div class="text-xs font-semibold text-slate-900 truncate">${escapeHtml(m.displayName)}</div>
                             <div class="text-[11px] font-mono text-slate-500 truncate">${escapeHtml(m.email)}</div>
                           </div>
-                          <div class="text-[11px] font-medium text-slate-600 shrink-0">
-                            ${escapeHtml(formatRoleLabelPt(m.role))}
+                          <div class="text-[11px] font-medium text-blue-700 shrink-0">
+                            ${escapeHtml(this.roles.find((r) => r.id === m.roleId)?.name || formatRoleLabelPt(resolveMemberBaseRole(m)))} · PIN →
                           </div>
                         </button>
                       `
@@ -2567,11 +3003,7 @@ export class SilaBillingApp {
                   class="w-full h-10 px-3 text-center text-lg tracking-widest font-mono bg-slate-50 border border-slate-200 rounded-md focus:outline-none focus:border-blue-600"
                 />
                 <div class="text-[10px] text-slate-400 mt-1">
-                  ${
-                    this.settings.supervisorPin
-                      ? 'Introduza o PIN configurado nas Definições.'
-                      : 'PIN não personalizado em Definições (código padrão de contingência: 1234).'
-                  }
+                  Introduza o PIN individual de um Proprietário, Administrador ou Gerente autorizado.
                 </div>
               </div>
 
@@ -2583,7 +3015,7 @@ export class SilaBillingApp {
                         data-action="supervisor-direct-approve"
                         class="w-full py-2 px-2.5 rounded border border-blue-200 bg-blue-50 hover:bg-blue-100 text-blue-800 text-[11px] font-semibold transition-colors"
                       >
-                        Aprovar como ${escapeHtml(formatRoleLabelPt(verifiedRole))} (${escapeHtml(this.user?.displayName || this.operator)})
+                        Aprovar como ${escapeHtml(this.getUnlockedRoleLabel())} (${escapeHtml(this.getUnlockedMember()?.displayName || this.operator)})
                       </button>
                     </div>`
                   : ''
@@ -2782,6 +3214,7 @@ export class SilaBillingApp {
     await this.flushDraftNow();
     const bundle = await loadCompanyWorkspace(companyId, this.getViewerIdentity());
     this.applyWorkspaceBundle(bundle);
+    this.lockReasonMessage = 'Empresa alternada — seleccione o operador e introduza o seu PIN.';
     this.showCompanyDropdown = false;
     this.render();
 
@@ -3019,6 +3452,7 @@ export class SilaBillingApp {
       this.stockMovements.some((m) => !m.synced) ||
       this.suppliers.some((s) => !s.synced) ||
       this.purchases.some((p) => !p.synced) ||
+      this.securityAuditLogs.some((l) => !l.synced) ||
       this.settings.synced === false
     );
   }
@@ -3105,7 +3539,22 @@ export class SilaBillingApp {
 
     window.addEventListener('pagehide', () => {
       void this.flushDraftNow();
+      this.terminalUnlockedMemberId = null;
     });
+
+    // Controlo de inactividade para bloqueio automático do terminal partilhado
+    window.addEventListener('pointerdown', () => this.touchActivity(), { passive: true });
+    window.addEventListener('keydown', () => this.touchActivity(), { passive: true });
+    if (this.inactivityCheckTimer !== null) {
+      window.clearInterval(this.inactivityCheckTimer);
+    }
+    this.inactivityCheckTimer = window.setInterval(() => {
+      if (this.isTerminalLocked() || this.isBooting || this.requiresCompanyOnboarding) return;
+      const mins = Math.max(1, Number(this.settings.inactivityLockMinutes ?? 10));
+      if (Date.now() - this.lastUserActivityMs >= mins * 60_000) {
+        this.lockTerminal(`Sessão bloqueada automaticamente após ${mins} min de inactividade.`);
+      }
+    }, 15_000);
 
     // Event Delegation Centralizada + Atalhos Globais / Leitor de Código de Barras
     this.root.addEventListener('click', (e) => this.handleClick(e));
@@ -3415,6 +3864,7 @@ export class SilaBillingApp {
   // ==================== HANDLERS DE INTERAÇÃO ====================
 
   private async handleClick(e: MouseEvent): Promise<void> {
+    this.touchActivity();
     const rawEl = e.target as HTMLElement;
     const target = rawEl.closest<HTMLElement>('[data-action]');
 
@@ -3426,11 +3876,356 @@ export class SilaBillingApp {
       return;
     }
 
-    const action = target.dataset.action;
+    const action = target.dataset.action || '';
     const id = target.dataset.id || '';
     const value = target.dataset.value || '';
 
+    // Decisão 2: Quando o terminal está bloqueado, apenas acções do ecrã de bloqueio / privacidade / auth Cloud são permitidas.
+    if (this.isTerminalLocked()) {
+      const allowedWhileLocked =
+        action === 'select-lock-member' ||
+        action === 'lock-keypad-digit' ||
+        action === 'lock-keypad-clear' ||
+        action === 'lock-keypad-backspace' ||
+        action === 'open-privacy-policy' ||
+        action === 'close-privacy-policy' ||
+        action === 'accept-privacy-policy' ||
+        action === 'signin-google' ||
+        action === 'signout-google' ||
+        action === 'open-master-admin' ||
+        action === 'close-master-admin' ||
+        action.startsWith('master-') ||
+        action.startsWith('admin-');
+      if (!allowedWhileLocked) {
+        void this.appendSecurityAuditEvent({
+          action: 'ACCESS_DENIED',
+          targetType: 'ui_action',
+          targetId: action,
+          summary: `Acção "${action}" bloqueada enquanto o terminal aguarda autenticação por PIN.`,
+          outcome: 'denied',
+        });
+        return;
+      }
+    }
+
     switch (action) {
+      // ===== BLOQUEIO DO TERMINAL PARTILHADO, PRIVACIDADE & RBAC =====
+      case 'select-lock-member': {
+        if (!id) break;
+        this.lockSelectedMemberId = id;
+        this.lockPinInput = '';
+        this.lockPinConfirmInput = '';
+        this.lockErrorMessage = null;
+        this.render();
+        break;
+      }
+      case 'lock-keypad-digit': {
+        if (!value || !/^\d$/.test(value)) break;
+        if (this.lockPinInput.length < 6) {
+          this.lockPinInput += value;
+          this.lockErrorMessage = null;
+          this.render();
+        }
+        break;
+      }
+      case 'lock-keypad-clear': {
+        this.lockPinInput = '';
+        this.lockErrorMessage = null;
+        this.render();
+        break;
+      }
+      case 'lock-keypad-backspace': {
+        this.lockPinInput = this.lockPinInput.slice(0, -1);
+        this.lockErrorMessage = null;
+        this.render();
+        break;
+      }
+      case 'lock-terminal-now': {
+        this.lockTerminal('Terminal bloqueado manualmente pelo operador.');
+        break;
+      }
+      case 'lock-and-switch-member': {
+        const current = this.getUnlockedMember();
+        const targetMem = this.members.find((m) => m.id === id);
+        if (current && targetMem && current.id !== targetMem.id) {
+          void this.appendSecurityAuditEvent({
+            action: 'OPERATOR_SWITCH',
+            targetType: 'member',
+            targetId: targetMem.id,
+            summary: `Troca de operador solicitada de ${current.displayName} para ${targetMem.displayName} (PIN obrigatório).`,
+            outcome: 'allowed',
+          });
+        }
+        this.lockTerminal('Troca de operador — introduza o PIN do perfil seleccionado.');
+        if (id) {
+          this.lockSelectedMemberId = id;
+          this.render();
+        }
+        break;
+      }
+      case 'open-privacy-policy': {
+        this.showPrivacyPolicyModal = true;
+        this.render();
+        break;
+      }
+      case 'close-privacy-policy': {
+        this.showPrivacyPolicyModal = false;
+        this.render();
+        break;
+      }
+      case 'accept-privacy-policy': {
+        if (this.activeCompany.id && !this.requiresCompanyOnboarding) {
+          const nowIso = new Date().toISOString();
+          const nextSettings: AppSettings = {
+            ...this.settings,
+            privacyPolicyAcceptedVersion: PRIVACY_POLICY_VERSION,
+            privacyPolicyAcceptedAtIso: nowIso,
+            syncState: 'pending',
+            synced: false,
+            updatedAtIso: nowIso,
+          };
+          await localDb.saveSettings(nextSettings, this.activeCompany.id).catch(() => null);
+          this.settings = nextSettings;
+          void this.appendSecurityAuditEvent({
+            action: 'PRIVACY_ACCEPTED',
+            targetType: 'privacy_policy',
+            targetId: PRIVACY_POLICY_VERSION,
+            summary: `Política de Privacidade e Segurança (${PRIVACY_POLICY_VERSION}) confirmada.`,
+            outcome: 'allowed',
+          });
+        }
+        this.showPrivacyPolicyModal = false;
+        this.render();
+        break;
+      }
+      case 'open-rbac-mobile-modal': {
+        if (!this.hasPerm('users_view') && !this.hasPerm('users_manage') && !this.hasPerm('roles_manage') && !this.hasPerm('audit_view')) {
+          void this.appendSecurityAuditEvent({
+            action: 'ACCESS_DENIED',
+            targetType: 'rbac_panel',
+            summary: 'Tentativa não autorizada de abrir gestão de utilizadores e permissões.',
+            outcome: 'denied',
+          });
+          return;
+        }
+        this.rbacFormError = null;
+        this.rbacNoticeMessage = null;
+        this.showRbacMobileModal = true;
+        this.render();
+        break;
+      }
+      case 'close-rbac-mobile-modal': {
+        this.showRbacMobileModal = false;
+        this.render();
+        break;
+      }
+      case 'switch-rbac-tab': {
+        if (value === 'USERS' || value === 'ROLES' || value === 'AUDIT') {
+          if (value === 'AUDIT' && !this.hasPerm('audit_view')) {
+            void this.appendSecurityAuditEvent({
+              action: 'ACCESS_DENIED',
+              targetType: 'security_audit',
+              summary: 'Tentativa bloqueada de consulta da auditoria de segurança.',
+              outcome: 'denied',
+            });
+            return;
+          }
+          this.rbacActiveTab = value;
+          this.rbacFormError = null;
+          this.rbacNoticeMessage = null;
+          if (
+            value === 'AUDIT' &&
+            this.user &&
+            this.isOnline &&
+            canCompanySyncCloudData(this.activeCompany)
+          ) {
+            void fetchSecurityAuditsBackend(this.activeCompany.id)
+              .then(async (cloudAudits) => {
+                if (!cloudAudits || cloudAudits.length === 0) return;
+                const merged = new Map<string, SecurityAuditEntry>();
+                for (const localItem of this.securityAuditLogs) merged.set(localItem.id, localItem);
+                for (const remoteItem of cloudAudits) {
+                  if (!merged.has(remoteItem.id)) {
+                    merged.set(remoteItem.id, { ...remoteItem, synced: true });
+                    await localDb.appendSecurityAudit({ ...remoteItem, synced: true }).catch(() => null);
+                  }
+                }
+                this.securityAuditLogs = Array.from(merged.values())
+                  .sort((a, b) => b.createdAtIso.localeCompare(a.createdAtIso))
+                  .slice(0, 500);
+                this.render();
+              })
+              .catch(() => null);
+          }
+          this.render();
+        }
+        break;
+      }
+      case 'rbac-new-member':
+      case 'rbac-cancel-member-edit': {
+        this.rbacEditingMemberId = null;
+        this.rbacFormError = null;
+        this.render();
+        break;
+      }
+      case 'rbac-edit-member': {
+        if (!this.hasPerm('users_manage')) return;
+        const targetMem = this.members.find((m) => m.id === id);
+        if (!targetMem) break;
+        const actor = this.getUnlockedMember();
+        if (actor) {
+          const check = canActorManageTargetMember({
+            actor,
+            actorPermissions: this.getUnlockedPermissions(),
+            targetCurrentRole: resolveMemberBaseRole(targetMem),
+            targetNewRole: resolveMemberBaseRole(targetMem),
+            isSelfEdit: actor.id === targetMem.id,
+          });
+          if (!check.allowed) {
+            this.rbacFormError = check.reason || 'Sem autorização para editar este utilizador.';
+            void this.appendSecurityAuditEvent({
+              action: 'ACCESS_DENIED',
+              targetType: 'member',
+              targetId: targetMem.id,
+              summary: `Edição bloqueada do perfil ${targetMem.displayName}: ${this.rbacFormError}`,
+              outcome: 'denied',
+            });
+            this.render();
+            return;
+          }
+        }
+        this.rbacEditingMemberId = targetMem.id;
+        this.rbacFormError = null;
+        this.rbacNoticeMessage = null;
+        this.render();
+        break;
+      }
+      case 'rbac-toggle-member-status': {
+        if (!this.hasPerm('users_manage')) return;
+        const targetMem = this.members.find((m) => m.id === id);
+        if (!targetMem || resolveMemberBaseRole(targetMem) === 'owner') return;
+        const actor = this.getUnlockedMember();
+        if (actor) {
+          const check = canActorManageTargetMember({
+            actor,
+            actorPermissions: this.getUnlockedPermissions(),
+            targetCurrentRole: resolveMemberBaseRole(targetMem),
+            targetNewRole: resolveMemberBaseRole(targetMem),
+            isSelfEdit: actor.id === targetMem.id,
+          });
+          if (!check.allowed) {
+            this.rbacFormError = check.reason || 'Sem autorização para alterar o estado deste utilizador.';
+            this.render();
+            return;
+          }
+        }
+        const curStatus = resolveMemberStatus(targetMem);
+        const nextStatus = curStatus === 'suspended' ? 'active' : 'suspended';
+        const updatedMem: CompanyMember = {
+          ...targetMem,
+          status: nextStatus,
+          active: nextStatus === 'active',
+          updatedAtIso: new Date().toISOString(),
+        };
+        await localDb.saveMember(updatedMem);
+        this.members = this.members.map((m) => (m.id === updatedMem.id ? updatedMem : m));
+        this.rbacFormError = null;
+        this.rbacNoticeMessage = `Utilizador "${updatedMem.displayName}" ${
+          nextStatus === 'suspended' ? 'suspenso' : 'reativado'
+        } com sucesso.`;
+        void this.appendSecurityAuditEvent({
+          action: 'USER_SUSPEND',
+          targetType: 'member',
+          targetId: updatedMem.id,
+          summary: `${updatedMem.displayName}: estado alterado de ${curStatus} para ${nextStatus}.`,
+          beforeObj: { status: curStatus },
+          afterObj: { status: nextStatus },
+          outcome: 'allowed',
+        });
+        this.render();
+        if (this.user && this.isOnline && canCompanySyncCloudData(this.activeCompany)) {
+          void upsertCompanyMemberCloud(this.activeCompany, updatedMem).catch(() => null);
+          void upsertCompanyMemberBackend(this.activeCompany.id, updatedMem).catch(() => null);
+        }
+        break;
+      }
+      case 'rbac-remove-member': {
+        if (!this.hasPerm('users_manage')) return;
+        const targetMem = this.members.find((m) => m.id === id);
+        if (!targetMem || resolveMemberBaseRole(targetMem) === 'owner') return;
+        const actor = this.getUnlockedMember();
+        if (actor) {
+          const check = canActorManageTargetMember({
+            actor,
+            actorPermissions: this.getUnlockedPermissions(),
+            targetCurrentRole: resolveMemberBaseRole(targetMem),
+            targetNewRole: resolveMemberBaseRole(targetMem),
+            isSelfEdit: actor.id === targetMem.id,
+          });
+          if (!check.allowed) {
+            this.rbacFormError = check.reason || 'Sem autorização para remover este utilizador.';
+            this.render();
+            return;
+          }
+        }
+        await localDb.deleteMember(targetMem.id);
+        this.members = this.members.filter((m) => m.id !== targetMem.id);
+        if (this.rbacEditingMemberId === targetMem.id) {
+          this.rbacEditingMemberId = null;
+        }
+        this.rbacFormError = null;
+        this.rbacNoticeMessage = `Utilizador "${targetMem.displayName}" removido da empresa.`;
+        void this.appendSecurityAuditEvent({
+          action: 'USER_SUSPEND',
+          targetType: 'member',
+          targetId: targetMem.id,
+          summary: `Utilizador removido da empresa: ${targetMem.displayName} (${targetMem.role}).`,
+          beforeObj: { displayName: targetMem.displayName, role: targetMem.role, email: targetMem.email },
+          outcome: 'allowed',
+        });
+        this.render();
+        if (this.user && this.isOnline && canCompanySyncCloudData(this.activeCompany)) {
+          void removeCompanyMemberCloud(this.activeCompany, targetMem.id).catch(() => null);
+          void deleteCompanyMemberBackend(this.activeCompany.id, targetMem.id).catch(() => null);
+        }
+        break;
+      }
+      case 'rbac-new-role':
+      case 'rbac-cancel-role-edit': {
+        this.rbacEditingRoleId = null;
+        this.rbacFormError = null;
+        this.render();
+        break;
+      }
+      case 'rbac-edit-role': {
+        if (!this.hasPerm('roles_manage')) return;
+        const targetRole = this.roles.find((r) => r.id === id);
+        if (!targetRole || targetRole.isSystem) return;
+        const actor = this.getUnlockedMember();
+        if (actor) {
+          const check = canActorManageRoleDefinition({
+            actor,
+            actorPermissions: this.getUnlockedPermissions(),
+            roleBase: targetRole.baseRole,
+            requestedPermissions: targetRole.permissions,
+          });
+          if (!check.allowed) {
+            this.rbacFormError = check.reason || 'Sem autorização para editar esta função.';
+            this.render();
+            return;
+          }
+        }
+        this.rbacEditingRoleId = targetRole.id;
+        this.rbacFormError = null;
+        this.rbacNoticeMessage = null;
+        this.render();
+        break;
+      }
+      case 'export-security-audit-csv': {
+        this.exportSecurityAuditCsv();
+        break;
+      }
+
       // ===== AÇÕES OPERACIONAIS MOBILE-FIRST =====
       case 'mobile-nav-tab': {
         const tab = target.dataset.tab as MobileTab;
@@ -3441,23 +4236,27 @@ export class SilaBillingApp {
         break;
       }
       case 'mobile-go-sale': {
+        if (!this.hasPerm('pos_sell')) return;
         this.mobileTab = 'SALE';
         this.mobileCheckoutStep = 'CART';
         this.render();
         break;
       }
       case 'mobile-go-products': {
+        if (!this.hasPerm('products_view') && !this.hasPerm('products_manage') && !this.hasPerm('stock_view')) return;
         this.mobileTab = 'PRODUCTS';
         this.render();
         break;
       }
       case 'mobile-open-quick-product': {
+        if (!this.canManageCatalog()) return;
         this.editingMobileProduct = null;
         this.showQuickProductForm = true;
         this.render();
         break;
       }
       case 'mobile-edit-product': {
+        if (!this.canManageCatalog()) return;
         const prodId = target.dataset.productId;
         this.editingMobileProduct = this.products.find((p) => p.id === prodId) || null;
         this.showQuickProductForm = true;
@@ -3465,6 +4264,7 @@ export class SilaBillingApp {
         break;
       }
       case 'mobile-toggle-product-active': {
+        if (!this.canManageCatalog()) return;
         const prodId = target.dataset.productId;
         const prod = this.products.find((p) => p.id === prodId);
         if (prod) {
@@ -3479,6 +4279,7 @@ export class SilaBillingApp {
         break;
       }
       case 'mobile-open-quick-customer': {
+        if (!this.hasPerm('customers_create') && !this.hasPerm('customers_manage')) return;
         this.quickCustomerError = null;
         this.showCustomerAdvancedFields = false;
         this.editingCustomer = null;
@@ -3559,6 +4360,7 @@ export class SilaBillingApp {
         break;
       }
       case 'mobile-open-quick-company': {
+        if (!this.canManageCompanySettings()) return;
         this.settingsErrorMessage = null;
         this.settingsSavedNotice = false;
         this.companyMasterDraftProfile = null;
@@ -3568,6 +4370,7 @@ export class SilaBillingApp {
         break;
       }
       case 'mobile-go-docs': {
+        if (!this.hasPerm('reports_own_sales') && !this.hasPerm('reports_operational') && !this.hasPerm('saft_export')) return;
         this.mobileTab = 'DOCS';
         this.render();
         break;
@@ -3767,10 +4570,12 @@ export class SilaBillingApp {
         break;
       }
       case 'mobile-open-saft': {
+        if (!this.hasPerm('saft_export')) return;
         this.exportHistoryControl('SAFT');
         break;
       }
       case 'mobile-open-cash': {
+        if (!this.hasPerm('cash_own_shift') && !this.hasPerm('cash_all_shifts')) return;
         this.activeModule = 'CASH';
         this.forceDesktopView = true;
         this.render();
@@ -4274,6 +5079,16 @@ export class SilaBillingApp {
       }
       case 'nav': {
         const mod = value as ActiveModule;
+        if (!this.canAccessModule(mod)) {
+          void this.appendSecurityAuditEvent({
+            action: 'ACCESS_DENIED',
+            targetType: 'module',
+            targetId: mod,
+            summary: `Tentativa de acesso ao módulo ${mod} bloqueada pela política RBAC.`,
+            outcome: 'denied',
+          });
+          return;
+        }
         this.activeModule = mod;
         this.showCompanyDropdown = false;
         if (mod === 'NEW_POS') this.previewFormat = 'POS';
@@ -5432,7 +6247,21 @@ export class SilaBillingApp {
         break;
       }
       case 'export-history-control': {
-        if (value === 'PDF' || value === 'EXCEL' || value === 'CSV' || value === 'SAFT') {
+        if (value === 'SAFT') {
+          if (!this.hasPerm('saft_export')) {
+            void this.appendSecurityAuditEvent({
+              action: 'ACCESS_DENIED',
+              targetType: 'saft_export',
+              summary: 'Exportação SAF-T (AO) bloqueada: utilizador sem permissão saft_export.',
+              outcome: 'denied',
+            });
+            return;
+          }
+          this.exportHistoryControl('SAFT');
+        } else if (value === 'PDF' || value === 'EXCEL' || value === 'CSV') {
+          if (!this.hasPerm('reports_operational') && !this.hasPerm('reports_own_sales') && !this.hasPerm('saft_export')) {
+            return;
+          }
           this.exportHistoryControl(value);
         }
         break;
@@ -5514,16 +6343,6 @@ export class SilaBillingApp {
         this.render();
         break;
       }
-      case 'quick-switch-operator': {
-        const opName = (target.dataset.name || '001').trim();
-        const role = (target.dataset.role || 'cashier') as CompanyRole;
-        this.operator = opName.slice(0, 32);
-        this.selectedTerminalRole = role;
-        this.showOperatorSwitchModal = false;
-        this.scheduleDraftSave();
-        this.render();
-        break;
-      }
       case 'close-supervisor-auth-modal': {
         const maxAllowed = this.settings.maxCashierDiscountPct ?? 5;
         if (this.supervisorAuthAction === 'DISCOUNT_LINE') {
@@ -5554,6 +6373,15 @@ export class SilaBillingApp {
         break;
       }
       case 'set-history-main-tab': {
+        if (value === 'OPERATIONAL_AUDIT' && !this.hasPerm('audit_view')) {
+          void this.appendSecurityAuditEvent({
+            action: 'ACCESS_DENIED',
+            targetType: 'operational_audit',
+            summary: 'Tentativa bloqueada de acesso à auditoria operacional.',
+            outcome: 'denied',
+          });
+          return;
+        }
         this.historyActiveMainTab = (value || 'DOCUMENTS') as any;
         this.render();
         break;
@@ -5564,6 +6392,7 @@ export class SilaBillingApp {
         break;
       }
       case 'export-audit-csv': {
+        if (!this.hasPerm('audit_view')) return;
         this.exportOperationalAuditCsv();
         break;
       }
@@ -5582,17 +6411,9 @@ export class SilaBillingApp {
         break;
       }
       case 'open-operational-audit-from-settings': {
+        if (!this.hasPerm('audit_view')) return;
         this.activeModule = 'HISTORY';
         this.historyActiveMainTab = 'OPERATIONAL_AUDIT';
-        this.render();
-        break;
-      }
-      case 'remove-company-member': {
-        if (!this.canManageCompanySettings()) return;
-        const targetMember = this.members.find((m) => m.id === id);
-        if (!targetMember || targetMember.role === 'owner') return;
-        await localDb.deleteMember(id);
-        this.members = this.members.filter((m) => m.id !== id);
         this.render();
         break;
       }
@@ -5657,11 +6478,13 @@ export class SilaBillingApp {
       }
       case 'export-backup-local': {
         if (!this.activeCompany.id || this.requiresCompanyOnboarding) break;
+        if (!this.hasPerm('backup_export')) return;
         this.exportLocalJsonBackup();
         break;
       }
       case 'export-backup-cloud': {
         if (!this.activeCompany.id || this.requiresCompanyOnboarding) break;
+        if (!this.hasPerm('backup_export')) return;
         const isSupportInspection =
           Boolean(this.supportCompanyId && this.supportCompanyId === this.activeCompany.id) &&
           Boolean(this.user && isPlatformAdminEmail(this.user.email));
@@ -5810,6 +6633,7 @@ export class SilaBillingApp {
         break;
       }
       case 'open-cash-panel': {
+        if (!this.hasPerm('cash_own_shift') && !this.hasPerm('cash_all_shifts')) return;
         const panel = value as
           | 'OPEN'
           | 'REFORCO'
@@ -5908,6 +6732,7 @@ export class SilaBillingApp {
         break;
       }
       case 'toggle-pos-quick-cash': {
+        if (!this.hasPerm('cash_own_shift') && !this.hasPerm('cash_all_shifts')) return;
         const p = value as 'OPEN' | 'REFORCO' | 'SANGRIA';
         if (!p || this.posQuickCashPanel === p) {
           this.posQuickCashPanel = null;
@@ -5944,7 +6769,7 @@ export class SilaBillingApp {
         break;
       }
       case 'open-new-purchase': {
-        if (!this.canManageCatalog()) break;
+        if (!this.hasPerm('purchases_manage') && !this.canManageCatalog()) break;
         const activeSups = this.suppliers.filter((s) => s.active !== false);
         const defaultSup =
           activeSups.find((s) => s.id === this.selectedSupplierDetailId) || activeSups[0] || null;
@@ -6270,6 +7095,15 @@ export class SilaBillingApp {
         break;
       }
       case 'set-finance-subview': {
+        if (value === 'MARGINS' && !this.canViewProfitsMargins()) {
+          void this.appendSecurityAuditEvent({
+            action: 'ACCESS_DENIED',
+            targetType: 'finance_margins',
+            summary: 'Acesso a Lucros e Margens bloqueado pela política RBAC.',
+            outcome: 'denied',
+          });
+          return;
+        }
         if (
           value === 'OVERVIEW' ||
           value === 'ACCOUNTS' ||
@@ -6345,6 +7179,7 @@ export class SilaBillingApp {
       }
       case 'open-finance-entry': {
         if (this.isCompanySuspended()) break;
+        if (!this.hasPerm('expenses_manage') && !this.hasPerm('finance_view')) break;
         const kind =
           value === 'RECEITA_EXTRAORDINARIA' ? 'RECEITA_EXTRAORDINARIA' : 'DESPESA_OPERACIONAL';
         if (this.financeEntryPanel === kind) {
@@ -6516,6 +7351,7 @@ export class SilaBillingApp {
         break;
       }
       case 'indicators-open-margins': {
+        if (!this.canViewProfitsMargins()) return;
         this.activeModule = 'FINANCE';
         this.financeSubView = 'MARGINS';
         this.financeMarginFilter = 'ALL';
@@ -6561,7 +7397,7 @@ export class SilaBillingApp {
         break;
       }
       case 'open-finance-product-cost': {
-        if (!this.canManageCatalog()) break;
+        if (!this.canManageCatalog() || !this.canViewCostPrices()) break;
         const prod = this.products.find((p) => p.id === id);
         if (!prod) break;
         if (this.financeEditingProductId === prod.id) {
@@ -6675,6 +7511,20 @@ export class SilaBillingApp {
   }
 
   private handleKeyDown(e: KeyboardEvent): void {
+    this.touchActivity();
+    if (this.isTerminalLocked()) {
+      if (e.key === 'Escape') {
+        if (this.showPrivacyPolicyModal) {
+          this.showPrivacyPolicyModal = false;
+          this.render();
+        } else if (this.showMasterAdminModal) {
+          this.showMasterAdminModal = false;
+          this.render();
+        }
+      }
+      return;
+    }
+
     const rawTarget = e.target as HTMLElement | null;
     const inputTarget = rawTarget as HTMLInputElement | null;
     const tag = rawTarget?.tagName || '';
@@ -6996,6 +7846,29 @@ export class SilaBillingApp {
   private handleInput(e: Event): void {
     const el = e.target as HTMLInputElement;
     if (!el) return;
+    this.touchActivity();
+
+    if (el.id === 'lock-setup-pin' || el.id === 'terminal-unlock-pin-input') {
+      this.lockPinInput = el.value.replace(/\D/g, '').slice(0, 6);
+      el.value = this.lockPinInput;
+      return;
+    }
+
+    if (el.id === 'lock-setup-pin-confirm') {
+      this.lockPinConfirmInput = el.value.replace(/\D/g, '').slice(0, 6);
+      el.value = this.lockPinConfirmInput;
+      return;
+    }
+
+    if (this.isTerminalLocked()) {
+      return;
+    }
+
+    if (el.id === 'rbac-audit-search-input') {
+      this.rbacAuditSearch = el.value;
+      this.renderPreservingFocus('rbac-audit-search-input', el.selectionStart);
+      return;
+    }
 
     if (el.id === 'mobile-product-search-input') {
       this.mobileProductSearchInput = el.value;
@@ -7031,6 +7904,7 @@ export class SilaBillingApp {
     }
 
     if (el.id === 'mobile-product-cost-input' || el.id === 'mobile-product-price-input') {
+      if (!this.canViewCostPrices()) return;
       const costEl = document.getElementById('mobile-product-cost-input') as HTMLInputElement | null;
       const priceEl = document.getElementById('mobile-product-price-input') as HTMLInputElement | null;
       const readout = document.getElementById('mobile-product-margin-readout');
@@ -7121,7 +7995,7 @@ export class SilaBillingApp {
         else if (inputName === 'category') this.editingProduct.category = el.value;
         else if (inputName === 'unit') this.editingProduct.unit = el.value;
         else if (inputName === 'exemptionReason') this.editingProduct.exemptionReason = el.value;
-        else if (inputName === 'costPrice') {
+        else if (inputName === 'costPrice' && this.canViewCostPrices()) {
           this.editingProductCostInput = el.value;
           const c = parseDecimalInput(el.value);
           if (!Number.isNaN(c) && c > 0) {
@@ -7139,7 +8013,7 @@ export class SilaBillingApp {
             if (mkEl && document.activeElement !== mkEl) mkEl.value = '';
           }
           this.refreshProductFormMarginReadout();
-        } else if (inputName === 'markupPct') {
+        } else if (inputName === 'markupPct' && this.canViewCostPrices()) {
           this.editingProductMarkupInput = el.value;
           const pct = parseDecimalInput(el.value);
           const cost = this.editingProduct.costPrice ?? 0;
@@ -7156,14 +8030,16 @@ export class SilaBillingApp {
           const p = parseDecimalInput(el.value);
           if (!Number.isNaN(p) && p >= 0) {
             this.editingProduct.price = p;
-            const cost = this.editingProduct.costPrice ?? 0;
-            if (cost > 0) {
-              const mk = roundKz(((p - cost) / cost) * 100);
-              this.editingProductMarkupInput = String(mk);
-              const mkEl = parentForm.querySelector<HTMLInputElement>('input[name="markupPct"]');
-              if (mkEl && document.activeElement !== mkEl) mkEl.value = this.editingProductMarkupInput;
+            if (this.canViewCostPrices()) {
+              const cost = this.editingProduct.costPrice ?? 0;
+              if (cost > 0) {
+                const mk = roundKz(((p - cost) / cost) * 100);
+                this.editingProductMarkupInput = String(mk);
+                const mkEl = parentForm.querySelector<HTMLInputElement>('input[name="markupPct"]');
+                if (mkEl && document.activeElement !== mkEl) mkEl.value = this.editingProductMarkupInput;
+              }
+              this.refreshProductFormMarginReadout();
             }
-            this.refreshProductFormMarginReadout();
           }
         } else if (inputName === 'stockQty') {
           this.editingProductStockInput = el.value;
@@ -7179,8 +8055,9 @@ export class SilaBillingApp {
         else if (inputName === 'barcode') this.quickProductDraft.barcode = el.value;
         else if (inputName === 'name') this.quickProductDraft.name = el.value;
         else if (inputName === 'category') this.quickProductDraft.category = el.value;
-        else if (inputName === 'costPrice') this.quickProductDraft.costPrice = el.value;
-        else if (inputName === 'price') this.quickProductDraft.price = el.value;
+        else if (inputName === 'costPrice' && this.canViewCostPrices()) {
+          this.quickProductDraft.costPrice = el.value;
+        } else if (inputName === 'price') this.quickProductDraft.price = el.value;
         else if (inputName === 'unit') this.quickProductDraft.unit = el.value;
         else if (inputName === 'stockQty') this.quickProductDraft.stockQty = el.value;
       } else if (fName === 'quick-stock-form') {
@@ -7283,8 +8160,9 @@ export class SilaBillingApp {
         else if (inputName === 'reason') this.financeEntryDraft.reason = el.value;
         else if (inputName === 'reference') this.financeEntryDraft.reference = el.value;
       } else if (fName === 'finance-product-cost-form') {
-        if (inputName === 'costPrice') this.financeEditCostInput = el.value;
-        else if (inputName === 'price') this.financeEditPriceInput = el.value;
+        if (inputName === 'costPrice' && this.canViewCostPrices()) {
+          this.financeEditCostInput = el.value;
+        } else if (inputName === 'price') this.financeEditPriceInput = el.value;
       } else if (fName === 'credit-note-form') {
         if (inputName === 'creditNoteReason') this.creditNoteReason = el.value;
         else if (inputName === 'creditNoteRefundRef') this.creditNoteRefundRef = el.value;
@@ -7491,7 +8369,44 @@ export class SilaBillingApp {
 
   private async handleChange(e: Event): Promise<void> {
     const el = e.target as HTMLInputElement | HTMLSelectElement;
-    if (el && el.dataset.action === 'upload-company-logo') {
+    if (!el) return;
+    this.touchActivity();
+
+    if (el.id === 'lock-screen-company-select') {
+      if (el.value) {
+        await this.switchActiveCompany(el.value);
+      }
+      return;
+    }
+
+    if (this.isTerminalLocked()) {
+      return;
+    }
+
+    if (el.id === 'rbac-audit-action-filter') {
+      this.rbacAuditActionFilter = el.value || 'ALL';
+      this.render();
+      return;
+    }
+
+    if (el.id === 'rbac-inactivity-minutes-select') {
+      if (!this.canManageCompanySettings()) return;
+      const parsed = parseInt(el.value, 10);
+      const mins = [3, 5, 10, 15, 30].includes(parsed) ? parsed : 10;
+      const nextSettings: AppSettings = {
+        ...this.settings,
+        inactivityLockMinutes: mins,
+        syncState: 'pending',
+        synced: false,
+        updatedAtIso: new Date().toISOString(),
+      };
+      await this.persistSettings(nextSettings);
+      this.rbacNoticeMessage = `Bloqueio automático por inactividade atualizado para ${mins} minutos.`;
+      this.render();
+      return;
+    }
+
+    if (el.dataset.action === 'upload-company-logo') {
       const file = (el as HTMLInputElement).files?.[0];
       if (!file) return;
       if (!this.canManageCompanySettings()) return;
@@ -7764,17 +8679,6 @@ export class SilaBillingApp {
         this.render();
         break;
       }
-      case 'terminal-role-select': {
-        const nextRole = el.value as CompanyRole;
-        if (nextRole === 'owner' || nextRole === 'manager' || nextRole === 'cashier') {
-          this.selectedTerminalRole = nextRole;
-          this.editingProduct = null;
-          this.editingCustomer = null;
-          this.editingSupplier = null;
-          this.render();
-        }
-        break;
-      }
       case 'company-allow-manager-cancel': {
         if (!this.canManageCompanySettings()) return;
         const checked = (el as HTMLInputElement).checked;
@@ -7932,19 +8836,239 @@ export class SilaBillingApp {
   private async handleSubmit(e: SubmitEvent): Promise<void> {
     const form = e.target as HTMLFormElement;
     e.preventDefault();
+    this.touchActivity();
 
     const fd = new FormData(form);
+    const earlyFormName = form.dataset.form;
+
+    if (this.isTerminalLocked()) {
+      if (earlyFormName !== 'setup-owner-pin-form' && earlyFormName !== 'terminal-unlock-form') {
+        void this.appendSecurityAuditEvent({
+          action: 'ACCESS_DENIED',
+          targetType: 'form',
+          targetId: earlyFormName || form.id || 'unknown',
+          summary: 'Tentativa de submissão de formulário com o terminal bloqueado.',
+          outcome: 'denied',
+        });
+        return;
+      }
+    }
+
+    if (earlyFormName === 'setup-owner-pin-form') {
+      if (this.isUnlockingTerminal) return;
+      const memberId = String(fd.get('memberId') || '').trim();
+      const pin = String(fd.get('pin') || this.lockPinInput || '').trim();
+      const pinConfirm = String(fd.get('pinConfirm') || this.lockPinConfirmInput || '').trim();
+      const targetOwner = this.members.find(
+        (m) =>
+          m.id === memberId &&
+          resolveMemberStatus(m) === 'active' &&
+          resolveMemberBaseRole(m) === 'owner' &&
+          !m.pinHash
+      );
+      if (!targetOwner) {
+        this.lockErrorMessage = 'Perfil de Proprietário inválido ou PIN já configurado.';
+        this.render();
+        return;
+      }
+      const pinCheck = validatePinFormat(pin);
+      if (!pinCheck.valid) {
+        this.lockErrorMessage = pinCheck.error || 'O PIN deve ter entre 4 e 6 dígitos numéricos.';
+        this.render();
+        return;
+      }
+      if (pin !== pinConfirm) {
+        this.lockErrorMessage = 'Os dois PINs introduzidos não coincidem.';
+        this.render();
+        return;
+      }
+
+      this.isUnlockingTerminal = true;
+      this.lockErrorMessage = null;
+      this.render();
+      try {
+        const pinHash = await hashMemberPin(pin);
+        const nowIso = new Date().toISOString();
+        const updatedOwner: CompanyMember = {
+          ...targetOwner,
+          pinHash,
+          pinUpdatedAtIso: nowIso,
+          pinFailedAttempts: 0,
+          pinLockedUntilIso: undefined,
+          updatedAtIso: nowIso,
+        };
+        await localDb.saveMember(updatedOwner);
+        this.members = this.members.map((m) => (m.id === updatedOwner.id ? updatedOwner : m));
+        this.terminalUnlockedMemberId = updatedOwner.id;
+        this.lockPinInput = '';
+        this.lockPinConfirmInput = '';
+        this.lockReasonMessage = null;
+        this.operator = updatedOwner.displayName.slice(0, 32) || this.operator;
+        if (updatedOwner.authorizedCashiers && updatedOwner.authorizedCashiers.length > 0) {
+          this.cashier = updatedOwner.authorizedCashiers[0]!;
+        }
+        this.enforceModulePermission();
+        this.touchActivity();
+        void this.appendSecurityAuditEvent({
+          action: 'PIN_SETUP',
+          targetType: 'member',
+          targetId: updatedOwner.id,
+          summary: `PIN inicial do Proprietário (${updatedOwner.displayName}) configurado com PBKDF2-SHA256.`,
+          outcome: 'allowed',
+          actorOverride: updatedOwner,
+        });
+        void this.appendSecurityAuditEvent({
+          action: 'PIN_UNLOCK_OK',
+          targetType: 'terminal',
+          targetId: updatedOwner.id,
+          summary: `Terminal desbloqueado por ${updatedOwner.displayName} (Proprietário).`,
+          outcome: 'allowed',
+          actorOverride: updatedOwner,
+        });
+        if (this.user && this.isOnline && canCompanySyncCloudData(this.activeCompany)) {
+          void ensureCompanyRegisteredCloud(this.activeCompany)
+            .then(() => upsertCompanyMemberCloud(this.activeCompany, updatedOwner))
+            .catch(() => null);
+          if (updatedOwner.email) {
+            void upsertCompanyMemberBackend(this.activeCompany.id, updatedOwner).catch(() => null);
+          }
+        }
+      } catch (err) {
+        this.lockErrorMessage =
+          err instanceof Error ? err.message : 'Não foi possível guardar o PIN inicial.';
+      } finally {
+        this.isUnlockingTerminal = false;
+        this.render();
+      }
+      return;
+    }
+
+    if (earlyFormName === 'terminal-unlock-form') {
+      if (this.isUnlockingTerminal) return;
+      const memberId = String(fd.get('memberId') || this.lockSelectedMemberId || '').trim();
+      const pin = String(fd.get('pin') || this.lockPinInput || '').trim();
+      const member =
+        this.members.find((m) => m.id === memberId && resolveMemberStatus(m) === 'active') || null;
+      if (!member) {
+        this.lockErrorMessage = 'Seleccione um operador activo válido.';
+        this.render();
+        return;
+      }
+      if (!member.pinHash) {
+        this.lockErrorMessage =
+          'Este utilizador não possui PIN configurado. Solicite definição ao Proprietário.';
+        this.render();
+        return;
+      }
+      const currentLock = isPinCurrentlyLocked(member);
+      if (currentLock.locked) {
+        this.lockErrorMessage = `Operador temporariamente bloqueado. Aguarde ${currentLock.remainingSeconds} segundo(s).`;
+        this.render();
+        return;
+      }
+      const pinCheck = validatePinFormat(pin);
+      if (!pinCheck.valid) {
+        this.lockErrorMessage = pinCheck.error || 'Introduza o seu PIN de 4 a 6 dígitos.';
+        this.render();
+        return;
+      }
+
+      this.isUnlockingTerminal = true;
+      this.lockErrorMessage = null;
+      this.render();
+      try {
+        const matched = await verifyMemberPinHash(pin, member.pinHash);
+        const nowIso = new Date().toISOString();
+        if (!matched) {
+          const lockout = computeProgressiveLockout(member.pinFailedAttempts || 0);
+          const updatedFail: CompanyMember = {
+            ...member,
+            pinFailedAttempts: lockout.failedAttempts,
+            ...(lockout.lockedUntilIso
+              ? { pinLockedUntilIso: lockout.lockedUntilIso }
+              : { pinLockedUntilIso: undefined }),
+            updatedAtIso: nowIso,
+          };
+          await localDb.saveMember(updatedFail);
+          this.members = this.members.map((m) => (m.id === updatedFail.id ? updatedFail : m));
+          this.lockPinInput = '';
+          const lockNote =
+            lockout.lockoutSeconds > 0
+              ? ` Bloqueado por ${lockout.lockoutSeconds}s (${lockout.failedAttempts} tentativas).`
+              : '';
+          this.lockErrorMessage = `PIN incorreto para ${member.displayName}.${lockNote}`;
+          void this.appendSecurityAuditEvent({
+            action: lockout.lockoutSeconds > 0 ? 'PIN_LOCKOUT' : 'PIN_UNLOCK_FAIL',
+            targetType: 'member',
+            targetId: member.id,
+            summary: `Tentativa falhada de desbloqueio para ${member.displayName} (tentativa #${lockout.failedAttempts}).`,
+            outcome: 'denied',
+            actorOverride: member,
+          });
+          return;
+        }
+
+        const unlockedMember: CompanyMember =
+          (member.pinFailedAttempts || 0) > 0 || member.pinLockedUntilIso
+            ? {
+                ...member,
+                pinFailedAttempts: 0,
+                pinLockedUntilIso: undefined,
+                updatedAtIso: nowIso,
+              }
+            : member;
+        if (unlockedMember !== member) {
+          await localDb.saveMember(unlockedMember).catch(() => null);
+          this.members = this.members.map((m) => (m.id === unlockedMember.id ? unlockedMember : m));
+        }
+        this.terminalUnlockedMemberId = unlockedMember.id;
+        this.lockPinInput = '';
+        this.lockErrorMessage = null;
+        this.lockReasonMessage = null;
+        this.operator = unlockedMember.displayName.slice(0, 32) || this.operator;
+        if (unlockedMember.authorizedCashiers && unlockedMember.authorizedCashiers.length > 0) {
+          this.cashier = unlockedMember.authorizedCashiers[0]!;
+        }
+        this.enforceModulePermission();
+        this.touchActivity();
+        void this.appendSecurityAuditEvent({
+          action: 'PIN_UNLOCK_OK',
+          targetType: 'terminal',
+          targetId: unlockedMember.id,
+          summary: `Terminal desbloqueado por ${unlockedMember.displayName} (${formatRoleLabelPt(
+            resolveMemberBaseRole(unlockedMember)
+          )}).`,
+          outcome: 'allowed',
+          actorOverride: unlockedMember,
+        });
+      } finally {
+        this.isUnlockingTerminal = false;
+        this.render();
+      }
+      return;
+    }
 
     if (form.id === 'mobile-quick-product-form') {
+      if (!this.canManageCatalog()) {
+        this.quickProductError = 'Sem permissão para criar ou editar artigos no catálogo.';
+        this.render();
+        return;
+      }
       const productId = String(fd.get('productId') || '').trim();
+      const existing = productId ? this.products.find((p) => p.id === productId) : undefined;
+      const canSeeCost = this.canViewCostPrices();
       const name = String(fd.get('name') || '').trim();
       const code = String(fd.get('code') || '').trim() || `ART${String(this.products.length + 1).padStart(4, '0')}`;
       const barcode = String(fd.get('barcode') || '').trim();
       const category = String(fd.get('category') || 'Geral').trim();
       const unit = String(fd.get('unit') || 'un').trim();
 
-      const rawCost = String(fd.get('costPrice') || '').trim();
-      const costPrice = rawCost ? parseFloat(rawCost.replace(/\s/g, '').replace(',', '.')) : undefined;
+      const rawCost = canSeeCost ? String(fd.get('costPrice') || '').trim() : '';
+      const costPrice = canSeeCost
+        ? rawCost
+          ? parseFloat(rawCost.replace(/\s/g, '').replace(',', '.'))
+          : undefined
+        : existing?.costPrice;
 
       const rawPrice = String(fd.get('price') || '').trim();
       const price = parseFloat(rawPrice.replace(/\s/g, '').replace(',', '.')) || 0;
@@ -7977,31 +9101,29 @@ export class SilaBillingApp {
       this.quickProductError = null;
       const now = new Date().toISOString();
 
-      if (productId) {
+      if (productId && existing) {
         // Modo Edição de Artigo Existente
-        const existing = this.products.find((p) => p.id === productId);
-        if (existing) {
-          const updated: Product = {
-            ...existing,
-            name,
-            code,
-            barcode: barcode || undefined,
-            productType,
-            category,
-            unit,
-            costPrice,
-            price,
-            ivaRate,
-            exemptionCode,
-            exemptionReason,
-            active,
-            trackStock,
-            stockQty,
-            minStockQty,
-            synced: false,
-            syncState: 'pending',
-            updatedAtIso: now,
-          };
+        const updated: Product = {
+          ...existing,
+          name,
+          code,
+          barcode: barcode || undefined,
+          productType,
+          category,
+          unit,
+          costPrice,
+          price,
+          ivaRate,
+          exemptionCode,
+          exemptionReason,
+          active,
+          trackStock,
+          stockQty,
+          minStockQty,
+          synced: false,
+          syncState: 'pending',
+          updatedAtIso: now,
+        };
 
           await localDb.saveProduct(updated, this.activeCompany.id);
           this.products = this.products.map((p) => (p.id === productId ? updated : p));
@@ -8017,7 +9139,6 @@ export class SilaBillingApp {
             }
           }
           return;
-        }
       }
 
       // Modo Criação de Novo Artigo
@@ -8270,7 +9391,7 @@ export class SilaBillingApp {
 
     if (formName === 'supervisor-auth-form') {
       const pin = String(fd.get('supervisorPin') || '').trim();
-      const verification = this.verifySupervisorPin(pin);
+      const verification = await this.verifySupervisorPin(pin);
       if (!verification.ok) {
         this.supervisorAuthError = verification.error || 'PIN de supervisor incorreto.';
         this.render();
@@ -8781,7 +9902,10 @@ export class SilaBillingApp {
           .slice(0, 48) || 'Mercearia';
       const unit =
         String(fd.get('unit') || this.quickProductDraft.unit || 'un').trim().slice(0, 12) || 'un';
-      const rawCost = String(fd.get('costPrice') ?? this.quickProductDraft.costPrice ?? '').trim();
+      const canSeeCost = this.canViewCostPrices();
+      const rawCost = canSeeCost
+        ? String(fd.get('costPrice') ?? this.quickProductDraft.costPrice ?? '').trim()
+        : '';
       const parsedCost = rawCost ? parseDecimalInput(rawCost) : 0;
       const parsedPrice = parseDecimalInput(
         String(fd.get('price') ?? this.quickProductDraft.price ?? '')
@@ -8998,57 +10122,393 @@ export class SilaBillingApp {
       return;
     }
 
-    if (formName === 'add-member-form') {
-      if (!this.canManageCompanySettings()) return;
-      if (!canCompanyManageMultiOperatorTeam(this.activeCompany)) {
-        this.growthModalNotice = null;
-        this.growthModalReason = 'team_access';
-        this.render();
-        return;
-      }
-      this.memberFormError = null;
-
-      const displayName = String(fd.get('displayName') || '').trim();
-      const email = String(fd.get('email') || '').trim().toLowerCase();
-      const role = (fd.get('role') === 'manager' ? 'manager' : 'cashier') as CompanyRole;
-      const allowInvoiceCancel = role === 'manager' && fd.get('allowInvoiceCancel') === 'on';
-
-      if (!displayName || !email || !email.includes('@')) {
-        this.memberFormError = 'Indique o nome e email válido do colaborador.';
+    if (formName === 'rbac-member-form') {
+      if (!this.hasPerm('users_manage')) {
+        this.rbacFormError = 'Sem permissão para criar ou editar utilizadores.';
+        void this.appendSecurityAuditEvent({
+          action: 'ACCESS_DENIED',
+          targetType: 'member',
+          summary: 'Tentativa sem autorização de criar ou editar utilizador.',
+          outcome: 'denied',
+        });
         this.render();
         return;
       }
 
-      if (this.members.some((m) => m.email.trim().toLowerCase() === email)) {
-        this.memberFormError = 'Este email já faz parte da equipa desta empresa.';
+      const actor: CompanyMember | null =
+        this.getUnlockedMember() ||
+        (this.isPlatformSupportActive()
+          ? {
+              id: 'support',
+              companyId: this.activeCompany.id,
+              uid: this.user?.uid || 'support',
+              email: this.user?.email || '',
+              displayName: 'Suporte VITRONIS',
+              role: 'owner',
+              allowInvoiceCancel: true,
+              active: true,
+              createdAtIso: '',
+              updatedAtIso: '',
+            }
+          : null);
+      if (!actor) return;
+
+      this.rbacFormError = null;
+      this.rbacNoticeMessage = null;
+
+      const memberId = String(fd.get('memberId') || '').trim();
+      const existingMember = memberId ? this.members.find((m) => m.id === memberId) || null : null;
+      const displayName = String(fd.get('displayName') || '').trim().slice(0, 120);
+      const email = String(fd.get('email') || '').trim().toLowerCase().slice(0, 160);
+      const phone = String(fd.get('phone') || '').trim().slice(0, 32);
+      const requestedRoleId = String(
+        fd.get('roleId') || existingMember?.roleId || getSystemRoleId('cashier')
+      ).trim();
+      const targetRoleDef =
+        this.roles.find((r) => r.id === requestedRoleId) ||
+        this.roles.find((r) => r.baseRole === 'cashier') ||
+        null;
+      const targetNewRole: CompanyRole =
+        existingMember?.role === 'owner'
+          ? 'owner'
+          : targetRoleDef?.baseRole ||
+            resolveMemberBaseRole({ role: requestedRoleId.replace(/^role_/, '') as CompanyRole });
+      const rawPin = String(fd.get('pin') || '').trim();
+      const authorizedCashiers = String(fd.get('authorizedCashiers') || '')
+        .split(',')
+        .map((s) => s.trim())
+        .filter(Boolean)
+        .slice(0, 20);
+      const establishmentIds = fd
+        .getAll('establishmentIds')
+        .map((v) => String(v).trim())
+        .filter(Boolean);
+
+      let status: MemberStatus =
+        existingMember?.role === 'owner'
+          ? 'active'
+          : (String(fd.get('status') || 'active') as MemberStatus);
+      if (status !== 'active' && status !== 'pending_invite' && status !== 'suspended') {
+        status = 'active';
+      }
+
+      if (!displayName) {
+        this.rbacFormError = 'Indique o nome do colaborador.';
+        this.render();
+        return;
+      }
+      if (email && !email.includes('@')) {
+        this.rbacFormError = 'Indique um endereço de e-mail válido ou deixe em branco.';
+        this.render();
+        return;
+      }
+      if (
+        email &&
+        this.members.some(
+          (m) =>
+            m.id !== existingMember?.id &&
+            (m.email || '').trim().toLowerCase() === email
+        )
+      ) {
+        this.rbacFormError = 'Este e-mail já pertence a outro utilizador desta empresa.';
+        this.render();
+        return;
+      }
+      if (status === 'pending_invite' && !canCompanyInviteCloudMembers(this.activeCompany)) {
+        this.rbacFormError =
+          'Os convites Cloud multi-dispositivo estão disponíveis nos planos Cloud. Seleccione "Activo neste terminal" para criar este operador localmente em qualquer plano.';
+        this.render();
+        return;
+      }
+      if (status === 'pending_invite' && (!email || !email.includes('@'))) {
+        this.rbacFormError =
+          'Para enviar um convite Cloud pendente, indique o e-mail Google do colaborador.';
         this.render();
         return;
       }
 
-      const now = new Date().toISOString();
-      const sanitizedEmailId = email.replace(/[^a-zA-Z0-9_-]/g, '_').slice(0, 64);
-      const member: CompanyMember = {
-        id: `mem_${this.activeCompany.id}_${sanitizedEmailId}`,
-        companyId: this.activeCompany.id,
-        uid: `mem_${sanitizedEmailId}`,
-        email,
-        displayName,
-        role,
-        allowInvoiceCancel,
+      const grant: PermissionKey[] = [];
+      const revoke: PermissionKey[] = [];
+      if (targetNewRole !== 'owner') {
+        for (const k of ALL_PERMISSION_KEYS) {
+          const ov = String(fd.get(`override_${k}`) || 'inherit');
+          if (ov === 'grant') grant.push(k);
+          else if (ov === 'revoke') revoke.push(k);
+        }
+      }
+
+      const resolvedRoleId = targetRoleDef?.id || getSystemRoleId(targetNewRole);
+      const previewMember: CompanyMember = {
+        ...(existingMember || {
+          id: 'preview',
+          companyId: this.activeCompany.id,
+          uid: 'preview',
+          email,
+          displayName,
+          allowInvoiceCancel: false,
+          active: true,
+          createdAtIso: '',
+          updatedAtIso: '',
+        }),
+        role: targetNewRole,
+        roleId: resolvedRoleId,
+        status: 'active',
         active: true,
-        createdAtIso: now,
-        updatedAtIso: now,
+        permissionOverrides: { grant, revoke },
+      };
+      const targetEffectivePerms = resolveMemberPermissions(
+        previewMember,
+        this.roles,
+        Boolean(this.activeCompany.allowManagerCancel)
+      );
+
+      const actorPerms = this.getUnlockedPermissions();
+      const antiEscalation = canActorManageTargetMember({
+        actor,
+        actorPermissions: actorPerms,
+        targetCurrentRole: existingMember?.role,
+        targetNewRole,
+        targetPermissions: targetNewRole === 'owner' ? undefined : targetEffectivePerms,
+        isSelfEdit: Boolean(existingMember && existingMember.id === actor.id),
+      });
+      if (!antiEscalation.allowed) {
+        this.rbacFormError =
+          antiEscalation.reason || 'Operação bloqueada por política anti-escalada.';
+        void this.appendSecurityAuditEvent({
+          action: 'ACCESS_DENIED',
+          targetType: 'member',
+          targetId: existingMember?.id,
+          summary: this.rbacFormError,
+          outcome: 'denied',
+        });
+        this.render();
+        return;
+      }
+
+      if (!existingMember && status === 'active' && !rawPin) {
+        this.rbacFormError = 'Defina um PIN numérico de 4 a 6 dígitos para o novo operador.';
+        this.render();
+        return;
+      }
+
+      let nextPinHash = existingMember?.pinHash;
+      let nextPinUpdatedAtIso = existingMember?.pinUpdatedAtIso;
+      if (rawPin) {
+        const pinCheck = validatePinFormat(rawPin);
+        if (!pinCheck.valid) {
+          this.rbacFormError = pinCheck.error || 'O PIN deve ter entre 4 e 6 dígitos numéricos.';
+          this.render();
+          return;
+        }
+        try {
+          nextPinHash = await hashMemberPin(rawPin);
+          nextPinUpdatedAtIso = new Date().toISOString();
+        } catch (err) {
+          this.rbacFormError =
+            err instanceof Error ? err.message : 'Falha ao encriptar o PIN do utilizador.';
+          this.render();
+          return;
+        }
+      }
+
+      const nowIso = new Date().toISOString();
+      const generatedId = `mem_${this.activeCompany.id}_${Date.now().toString(36)}_${Math.random()
+        .toString(36)
+        .slice(2, 6)}`;
+      const savedId = existingMember?.id || generatedId;
+      const savedMember: CompanyMember = {
+        ...(existingMember || {}),
+        id: savedId,
+        companyId: this.activeCompany.id,
+        uid: existingMember?.uid || `local_${savedId}`,
+        email: email || existingMember?.email || '',
+        ...(email ? { emailLower: email } : {}),
+        ...(phone ? { phone } : {}),
+        displayName,
+        role: targetNewRole,
+        roleId: resolvedRoleId,
+        establishmentIds,
+        authorizedCashiers,
+        permissionOverrides: { grant, revoke },
+        status,
+        active: status === 'active',
+        ...(nextPinHash ? { pinHash: nextPinHash } : {}),
+        ...(nextPinUpdatedAtIso ? { pinUpdatedAtIso: nextPinUpdatedAtIso } : {}),
+        pinFailedAttempts: rawPin ? 0 : existingMember?.pinFailedAttempts ?? 0,
+        ...(rawPin
+          ? { pinLockedUntilIso: undefined }
+          : existingMember?.pinLockedUntilIso
+            ? { pinLockedUntilIso: existingMember.pinLockedUntilIso }
+            : {}),
+        allowInvoiceCancel:
+          targetNewRole === 'owner' || Boolean(targetEffectivePerms.invoice_cancel),
+        invitedByUid: existingMember?.invitedByUid || actor.uid,
+        createdAtIso: existingMember?.createdAtIso || nowIso,
+        updatedAtIso: nowIso,
       };
 
-      await localDb.saveMember(member);
-      this.members = [...this.members, member];
+      await localDb.saveMember(savedMember);
+      if (existingMember) {
+        this.members = this.members.map((m) => (m.id === savedMember.id ? savedMember : m));
+      } else {
+        this.members = [...this.members, savedMember];
+      }
+      this.rbacEditingMemberId = null;
+      this.rbacNoticeMessage = existingMember
+        ? `Utilizador "${savedMember.displayName}" actualizado.`
+        : `Utilizador "${savedMember.displayName}" criado com sucesso.`;
       form.reset();
+
+      void this.appendSecurityAuditEvent({
+        action: existingMember ? 'USER_UPDATE' : 'USER_CREATE',
+        targetType: 'member',
+        targetId: savedMember.id,
+        summary: `${existingMember ? 'Actualizado' : 'Criado'} utilizador ${savedMember.displayName} (${formatRoleLabelPt(
+          savedMember.role
+        )}, estado: ${savedMember.status}).`,
+        outcome: 'allowed',
+        beforeObj: existingMember
+          ? { role: existingMember.role, status: existingMember.status, email: existingMember.email }
+          : undefined,
+        afterObj: { role: savedMember.role, status: savedMember.status, email: savedMember.email },
+      });
+
       this.render();
 
-      if (this.user && this.isOnline) {
+      if (this.user && this.isOnline && canCompanySyncCloudData(this.activeCompany)) {
         try {
           await ensureCompanyRegisteredCloud(this.activeCompany);
-          await upsertCompanyMemberCloud(this.activeCompany, member);
+          await upsertCompanyMemberCloud(this.activeCompany, savedMember);
+          if (savedMember.email) {
+            await upsertCompanyMemberBackend(this.activeCompany.id, savedMember);
+          }
+        } catch {
+          // Mantém registado localmente
+        }
+      }
+      return;
+    }
+
+    if (formName === 'rbac-role-form') {
+      if (!this.hasPerm('roles_manage')) {
+        this.rbacFormError = 'Sem permissão para criar ou editar funções personalizadas.';
+        void this.appendSecurityAuditEvent({
+          action: 'ACCESS_DENIED',
+          targetType: 'role',
+          summary: 'Tentativa sem autorização de criar ou alterar função.',
+          outcome: 'denied',
+        });
+        this.render();
+        return;
+      }
+
+      const actor: CompanyMember | null =
+        this.getUnlockedMember() ||
+        (this.isPlatformSupportActive()
+          ? {
+              id: 'support',
+              companyId: this.activeCompany.id,
+              uid: this.user?.uid || 'support',
+              email: this.user?.email || '',
+              displayName: 'Suporte VITRONIS',
+              role: 'owner',
+              allowInvoiceCancel: true,
+              active: true,
+              createdAtIso: '',
+              updatedAtIso: '',
+            }
+          : null);
+      if (!actor) return;
+
+      this.rbacFormError = null;
+      this.rbacNoticeMessage = null;
+
+      const roleId = String(fd.get('roleId') || '').trim();
+      const existingRole = roleId ? this.roles.find((r) => r.id === roleId) || null : null;
+      if (existingRole?.isSystem) {
+        this.rbacFormError =
+          'As funções padrão do sistema são fixas. Crie uma função personalizada derivada.';
+        this.render();
+        return;
+      }
+
+      const name = String(fd.get('name') || '').trim().slice(0, 60);
+      const rawBaseRole = String(fd.get('baseRole') || existingRole?.baseRole || 'seller').trim();
+      const baseRole = resolveMemberBaseRole({ role: rawBaseRole as CompanyRole });
+      const description = String(fd.get('description') || '').trim().slice(0, 160);
+      if (!name) {
+        this.rbacFormError = 'Indique o nome da função personalizada.';
+        this.render();
+        return;
+      }
+
+      const requestedPermissions = {} as Record<PermissionKey, boolean>;
+      for (const k of ALL_PERMISSION_KEYS) {
+        requestedPermissions[k] = fd.get(`perm_${k}`) === 'on';
+      }
+
+      const roleCheck = canActorManageRoleDefinition({
+        actor,
+        actorPermissions: this.getUnlockedPermissions(),
+        roleBase: baseRole,
+        requestedPermissions,
+      });
+      if (!roleCheck.allowed) {
+        this.rbacFormError =
+          roleCheck.reason || 'Operação bloqueada por política anti-escalada.';
+        void this.appendSecurityAuditEvent({
+          action: 'ACCESS_DENIED',
+          targetType: 'role',
+          targetId: existingRole?.id,
+          summary: this.rbacFormError,
+          outcome: 'denied',
+        });
+        this.render();
+        return;
+      }
+
+      const nowIso = new Date().toISOString();
+      const savedRole: CompanyRoleDefinition = {
+        id:
+          existingRole?.id ||
+          `role_custom_${Date.now().toString(36)}_${Math.random().toString(36).slice(2, 5)}`,
+        companyId: this.activeCompany.id,
+        name,
+        description,
+        baseRole,
+        isSystem: false,
+        permissions: requestedPermissions,
+        createdAtIso: existingRole?.createdAtIso || nowIso,
+        updatedAtIso: nowIso,
+      };
+
+      await localDb.saveRole(savedRole);
+      if (existingRole) {
+        this.roles = this.roles.map((r) => (r.id === savedRole.id ? savedRole : r));
+      } else {
+        this.roles = [...this.roles, savedRole];
+      }
+      this.rbacEditingRoleId = null;
+      this.rbacNoticeMessage = `Função personalizada "${savedRole.name}" guardada com sucesso.`;
+      form.reset();
+
+      void this.appendSecurityAuditEvent({
+        action: 'ROLE_UPDATE',
+        targetType: 'role',
+        targetId: savedRole.id,
+        summary: `Função personalizada "${savedRole.name}" (base: ${formatRoleLabelPt(
+          savedRole.baseRole
+        )}) guardada.`,
+        outcome: 'allowed',
+      });
+
+      this.render();
+
+      if (this.user && this.isOnline && canCompanySyncCloudData(this.activeCompany)) {
+        try {
+          await ensureCompanyRegisteredCloud(this.activeCompany);
+          await upsertCompanyRoleCloud(this.activeCompany, savedRole);
+          await upsertCompanyRoleBackend(this.activeCompany.id, savedRole);
         } catch {
           // Mantém registado localmente
         }
@@ -9153,9 +10613,10 @@ export class SilaBillingApp {
           .slice(0, 48) || 'Mercearia';
       const unit =
         String(fd.get('unit') || this.editingProduct.unit || 'un').trim().slice(0, 12) || 'un';
-      const rawCost = String(
-        fd.get('costPrice') ?? this.editingProductCostInput ?? ''
-      ).trim();
+      const canSeeCost = this.canViewCostPrices();
+      const rawCost = canSeeCost
+        ? String(fd.get('costPrice') ?? this.editingProductCostInput ?? '').trim()
+        : '';
       const parsedCost = rawCost ? parseDecimalInput(rawCost) : 0;
       const rawPrice = String(fd.get('price') ?? this.editingProductPriceInput ?? '0');
       const parsedPrice = parseDecimalInput(rawPrice);
@@ -9197,7 +10658,7 @@ export class SilaBillingApp {
         return;
       }
 
-      if (rawCost && (Number.isNaN(parsedCost) || parsedCost < 0)) {
+      if (canSeeCost && rawCost && (Number.isNaN(parsedCost) || parsedCost < 0)) {
         this.productFormError = 'Indique um preço de aquisição válido em Kwanzas (ou deixe em branco).';
         this.render();
         return;
@@ -9216,10 +10677,16 @@ export class SilaBillingApp {
       const parsedMinStock = parseDecimalInput(rawMinStock);
 
       const now = new Date().toISOString();
-      const validCost = rawCost && parsedCost > 0 ? roundKz(parsedCost) : undefined;
+      const existingProd = this.products.find((p) => p.id === editingId);
+      const validCost = canSeeCost
+        ? rawCost && parsedCost > 0
+          ? roundKz(parsedCost)
+          : undefined
+        : typeof existingProd?.costPrice === 'number' && existingProd.costPrice > 0
+          ? roundKz(existingProd.costPrice)
+          : undefined;
       const finalPrice = roundKz(parsedPrice);
 
-      const existingProd = this.products.find((p) => p.id === editingId);
       const actorLabel = (this.user?.email || formatRoleLabelPt(this.getEffectiveRole())).slice(
         0,
         120
@@ -9236,15 +10703,15 @@ export class SilaBillingApp {
           typeof existingProd.costPrice === 'number' && existingProd.costPrice > 0
             ? roundKz(existingProd.costPrice)
             : undefined;
-        const costChanged = (prevCostVal ?? 0) !== (validCost ?? 0);
+        const costChanged = canSeeCost && (prevCostVal ?? 0) !== (validCost ?? 0);
 
         if (priceChanged || costChanged) {
           const entry: ProductPriceChange = {
             changedAtIso: now,
             previousPrice: roundKz(existingProd.price),
             newPrice: finalPrice,
-            ...(typeof prevCostVal === 'number' ? { previousCost: prevCostVal } : {}),
-            ...(typeof validCost === 'number' ? { newCost: validCost } : {}),
+            ...(canSeeCost && typeof prevCostVal === 'number' ? { previousCost: prevCostVal } : {}),
+            ...(canSeeCost && typeof validCost === 'number' ? { newCost: validCost } : {}),
             changedBy: actorLabel,
           };
           nextPriceHistory = [entry, ...(nextPriceHistory || [])].slice(0, 20);
@@ -10315,6 +11782,8 @@ export class SilaBillingApp {
         this.activeCompany = refreshedLocal.activeCompany;
         this.companies = refreshedLocal.companies;
         this.members = refreshedLocal.members;
+        this.roles = refreshedLocal.roles;
+        this.securityAuditLogs = refreshedLocal.securityAuditLogs;
         this.lastSyncedIso = new Date().toISOString();
         await this.refreshBackendHealth();
 
@@ -10513,6 +11982,26 @@ export class SilaBillingApp {
           };
           await localDb.saveSettings(syncedSettings, this.activeCompany.id);
         }
+
+        if (this.hasPerm('roles_manage')) {
+          for (const r of this.roles) {
+            await upsertCompanyRoleCloud(this.activeCompany, r).catch(() => null);
+          }
+        }
+        if (this.hasPerm('users_manage')) {
+          for (const m of this.members) {
+            await upsertCompanyMemberCloud(this.activeCompany, m).catch(() => null);
+          }
+        }
+        const unsyncedAudits = this.securityAuditLogs.filter((l) => !l.synced);
+        for (const aud of unsyncedAudits) {
+          try {
+            await appendSecurityAuditCloud(this.activeCompany, aud);
+            await localDb.appendSecurityAudit({ ...aud, synced: true });
+          } catch {
+            // Mantém pendente
+          }
+        }
       }
 
       // 4. Descarrega dados atualizados da empresa ativa (Admin SDK em modo suporte/membro ou Firestore direto para proprietário)
@@ -10594,6 +12083,23 @@ export class SilaBillingApp {
         if (cloudData.settings && preMergeLocal.settings.synced !== false) {
           await localDb.saveSettings(cloudData.settings, this.activeCompany.id).catch(() => null);
         }
+        for (const cr of cloudData.roles || []) {
+          await localDb.saveRole({ ...cr, companyId: this.activeCompany.id }).catch(() => null);
+        }
+        for (const cm of cloudData.members || []) {
+          const existingLocal = preMergeLocal.members.find(
+            (m) => m.id === cm.id || (cm.uid && m.uid === cm.uid)
+          );
+          await localDb
+            .saveMember({
+              ...cm,
+              companyId: this.activeCompany.id,
+              pinHash: cm.pinHash || existingLocal?.pinHash,
+              pinFailedAttempts: existingLocal?.pinFailedAttempts ?? cm.pinFailedAttempts,
+              pinLockedUntilIso: existingLocal?.pinLockedUntilIso ?? cm.pinLockedUntilIso,
+            })
+            .catch(() => null);
+        }
       }
 
       const refreshed = await loadCompanyWorkspace(
@@ -10615,6 +12121,8 @@ export class SilaBillingApp {
         refreshed.requiresCompanyOnboarding || !refreshed.activeCompany.id
       );
       this.members = refreshed.members;
+      this.roles = refreshed.roles;
+      this.securityAuditLogs = refreshed.securityAuditLogs;
 
       this.lastSyncedIso = new Date().toISOString();
       await this.refreshBackendHealth();
@@ -10628,8 +12136,9 @@ export class SilaBillingApp {
   }
 
   private exportLocalJsonBackup(): void {
+    if (!this.hasPerm('backup_export')) return;
     const bundle = {
-      schemaVersion: '2.2.0-multicompany',
+      schemaVersion: '2.3.0-multicompany-rbac',
       source: 'indexeddb-local',
       exportedAtIso: new Date().toISOString(),
       companyId: this.activeCompany.id,
@@ -10643,10 +12152,15 @@ export class SilaBillingApp {
         stockMovements: this.stockMovements.length,
         suppliers: this.suppliers.length,
         purchases: this.purchases.length,
+        members: this.members.length,
+        roles: this.roles.length,
+        securityAuditLogs: this.securityAuditLogs.length,
       },
       data: {
         companyRecord: this.activeCompany,
         members: this.members,
+        roles: this.roles,
+        securityAuditLogs: this.securityAuditLogs,
         settings: this.settings,
         products: this.products,
         customers: this.customers,
@@ -10756,6 +12270,66 @@ export class SilaBillingApp {
   // ==================== RENDERIZAÇÃO MODULAR VANILLA JS ====================
 
   private render(): void {
+    if (this.isTerminalLocked()) {
+      const selectedLockMember =
+        this.members.find((m) => m.id === this.lockSelectedMemberId) ||
+        this.members.find((m) => resolveMemberStatus(m) === 'active') ||
+        null;
+      this.root.innerHTML = `
+        ${renderTerminalLockScreen({
+          company: this.activeCompany,
+          companies: this.companies,
+          members: this.members,
+          roles: this.roles,
+          selectedMemberId: selectedLockMember?.id || '',
+          pinInput: this.lockPinInput,
+          newPinConfirmInput: this.lockPinConfirmInput,
+          isSubmitting: this.isUnlockingTerminal,
+          errorMessage: this.lockErrorMessage,
+          lockReasonMessage: this.lockReasonMessage,
+          isOnline: this.isOnline,
+          isSignedIn: Boolean(this.user),
+          signedInEmail: this.user?.email || '',
+          isPlatformAdmin: Boolean(this.user && isPlatformAdminEmail(this.user.email)),
+        })}
+        ${
+          this.showPrivacyPolicyModal
+            ? renderPrivacyPolicyModal({
+                company: this.activeCompany,
+                acceptedVersion: this.settings.privacyPolicyAcceptedVersion,
+                acceptedAtIso: this.settings.privacyPolicyAcceptedAtIso,
+              })
+            : ''
+        }
+        ${
+          this.showMasterAdminModal
+            ? renderMasterAdminModal({
+                isSignedIn: Boolean(this.user),
+                isAuthenticating: this.isAuthenticatingAdmin,
+                userEmail: this.user?.email || '',
+                isLoading: this.masterAdminLoading,
+                accessDenied: this.masterAdminDenied,
+                errorMessage: this.masterAdminError,
+                searchQuery: this.masterAdminSearch,
+                mergedCompanies: this.getMergedAdminCompanies(),
+                recentLogs: this.adminAuditLogs,
+                activeCompanyId: this.activeCompany.id,
+                stats: this.adminOverviewStats,
+                activeTab: this.masterAdminTab,
+                selectedCompanyDetails: this.selectedCompanyDetails,
+                isLoadingCompanyDetails: this.isLoadingCompanyDetails,
+                showNewCompanyForm: this.showAdminNewCompanyModal,
+                usersList: this.platformUsersList,
+                isLoadingUsers: this.isLoadingPlatformUsers,
+                systemStatus: this.systemStatusData,
+                isLoadingSystemStatus: this.isLoadingSystemStatus,
+              })
+            : ''
+        }
+      `;
+      return;
+    }
+
     const isUnassigned = this.requiresCompanyOnboarding || !this.activeCompany.id;
     const cloudSyncEntitled = !isUnassigned && canCompanySyncCloudData(this.activeCompany);
     const pendingCount = !cloudSyncEntitled
@@ -10772,6 +12346,9 @@ export class SilaBillingApp {
 
     const canInstall = !this.isInstalled && (Boolean(this.deferredPrompt) || this.isIOS);
     const effectiveRole = this.getEffectiveRole();
+    const unlockedMember = this.getUnlockedMember();
+    const unlockedPerms = this.getUnlockedPermissions();
+    const unlockedRoleLabel = this.getUnlockedRoleLabel();
     const cancellingInvoice = this.cancellingInvoiceId
       ? this.invoices.find((i) => i.id === this.cancellingInvoiceId) || null
       : null;
@@ -10831,6 +12408,27 @@ export class SilaBillingApp {
                 quickProductError: this.quickProductError,
                 quickCustomerError: this.quickCustomerError,
                 operator: this.operator,
+                unlockedOperatorName: unlockedMember?.displayName || this.operator,
+                unlockedRoleLabel,
+                canSellPos: unlockedPerms.pos_sell,
+                canViewProducts:
+                  unlockedPerms.products_view || unlockedPerms.products_manage || unlockedPerms.stock_view,
+                canManageProducts: unlockedPerms.products_manage,
+                canViewCostPrices: unlockedPerms.cost_prices_view,
+                canViewProfitsMargins: unlockedPerms.profits_margins_view,
+                canViewCustomers:
+                  unlockedPerms.customers_view || unlockedPerms.customers_create || unlockedPerms.customers_manage,
+                canCreateCustomers: unlockedPerms.customers_create || unlockedPerms.customers_manage,
+                canViewDocs: unlockedPerms.reports_own_sales || unlockedPerms.reports_operational,
+                canExportSaft: unlockedPerms.saft_export,
+                canOperateCash: unlockedPerms.cash_own_shift || unlockedPerms.cash_all_shifts,
+                canViewMaster: unlockedPerms.master_view || unlockedPerms.settings_manage,
+                canManageRbac:
+                  unlockedPerms.users_view ||
+                  unlockedPerms.users_manage ||
+                  unlockedPerms.roles_manage ||
+                  unlockedPerms.audit_view,
+                canViewSecurityAudit: unlockedPerms.audit_view,
               })}
             </div>`
           : `<div class="no-print md:hidden bg-blue-900 text-white px-3 py-2 text-xs flex justify-between items-center z-50">
@@ -10901,7 +12499,16 @@ export class SilaBillingApp {
             }
           </div>
 
-          <div class="flex items-center gap-2 shrink-0">
+          <div class="flex items-center gap-1.5 sm:gap-2 shrink-0">
+            <button
+              type="button"
+              data-action="open-privacy-policy"
+              title="Política de Privacidade e Segurança"
+              class="h-8 px-2 rounded-md bg-slate-800 hover:bg-slate-700 text-[11px] text-slate-300 hover:text-white hidden lg:flex items-center gap-1 transition-colors whitespace-nowrap"
+            >
+              ${ICONS.shieldCheck}
+              <span>Privacidade</span>
+            </button>
             <button
               type="button"
               data-action="open-operator-switch-modal"
@@ -10910,7 +12517,16 @@ export class SilaBillingApp {
             >
               ${ICONS.user}
               <span class="font-mono tabular-nums">Op. ${escapeHtml(this.operator)}</span>
-              <span class="text-slate-400 hidden sm:inline text-[10px]">(${escapeHtml(formatRoleLabelPt(effectiveRole))})</span>
+              <span class="text-slate-400 hidden sm:inline text-[10px]">(${escapeHtml(unlockedRoleLabel)})</span>
+            </button>
+            <button
+              type="button"
+              data-action="lock-terminal-now"
+              title="Bloquear terminal e exigir PIN do próximo operador"
+              class="h-8 px-2.5 rounded-md bg-slate-800 hover:bg-red-900/70 text-xs text-slate-200 hover:text-white flex items-center gap-1.5 transition-colors whitespace-nowrap"
+            >
+              ${ICONS.lock}
+              <span class="hidden sm:inline">Bloquear</span>
             </button>
             ${
               canInstall
@@ -11033,6 +12649,39 @@ export class SilaBillingApp {
       </div>
 
       ${
+        this.showPrivacyPolicyModal
+          ? renderPrivacyPolicyModal({
+              company: this.activeCompany,
+              acceptedVersion: this.settings.privacyPolicyAcceptedVersion,
+              acceptedAtIso: this.settings.privacyPolicyAcceptedAtIso,
+            })
+          : ''
+      }
+      ${
+        this.showRbacMobileModal
+          ? renderRbacMobileModal({
+              company: this.activeCompany,
+              actor: unlockedMember,
+              actorPermissions: unlockedPerms,
+              members: this.members,
+              roles: this.roles,
+              securityAuditLogs: this.securityAuditLogs,
+              inactivityLockMinutes: this.settings.inactivityLockMinutes ?? 10,
+              activeTab: this.rbacActiveTab,
+              editingMemberId: this.rbacEditingMemberId,
+              editingRoleId: this.rbacEditingRoleId,
+              formError: this.rbacFormError,
+              noticeMessage: this.rbacNoticeMessage,
+              auditSearch: this.rbacAuditSearch,
+              auditActionFilter: this.rbacAuditActionFilter,
+              establishments: this.settings.company.establishments || [],
+              isOnline: this.isOnline,
+              isCloudTeamEntitled: canCompanyInviteCloudMembers(this.activeCompany),
+            })
+          : ''
+      }
+
+      ${
         this.printJob
           ? `<div class="hidden print-only-container">
               ${renderDocumentHtml(
@@ -11116,6 +12765,7 @@ export class SilaBillingApp {
       >
         <nav class="p-1.5 space-y-1 overflow-y-auto">
           ${primaryItems
+            .filter((item) => this.canAccessModule(item.id))
             .map((item) => {
               const active = this.activeModule === item.id;
               return `
@@ -11140,6 +12790,7 @@ export class SilaBillingApp {
 
         <div class="p-1.5 border-t border-slate-800 space-y-1">
           ${bottomItems
+            .filter((item) => this.canAccessModule(item.id))
             .map((item) => {
               const active = this.activeModule === item.id;
               return `
@@ -11209,6 +12860,8 @@ export class SilaBillingApp {
       });
     }
 
+    this.enforceModulePermission();
+
     switch (this.activeModule) {
       case 'NEW_POS':
       case 'NEW_A4':
@@ -11262,6 +12915,7 @@ export class SilaBillingApp {
     const isSuspended = this.isCompanySuspended();
     const canManageCat = this.canManageCatalog();
     const canEditPrice = this.canEditCartUnitPrice();
+    const canSeeCost = this.canViewCostPrices();
 
     const selectedCustomer =
       this.customers.find((c) => c.id === this.selectedCustomerId) ||
@@ -11500,17 +13154,21 @@ export class SilaBillingApp {
                             <option value="0" ${this.quickProductDraft.ivaRate === 0 ? 'selected' : ''}>Isento</option>
                           </select>
                         </div>
-                        <div class="col-span-3">
-                          <input
-                            name="costPrice"
-                            type="text"
-                            inputmode="decimal"
-                            value="${escapeHtml(this.quickProductDraft.costPrice)}"
-                            placeholder="Aquisição Kz (opc.)"
-                            class="w-full h-8 px-2 text-xs font-mono tabular-nums bg-white border border-slate-200 rounded-md focus:outline-none focus:border-blue-600"
-                          />
-                        </div>
-                        <div class="col-span-3">
+                        ${
+                          canSeeCost
+                            ? `<div class="col-span-3">
+                                <input
+                                  name="costPrice"
+                                  type="text"
+                                  inputmode="decimal"
+                                  value="${escapeHtml(this.quickProductDraft.costPrice)}"
+                                  placeholder="Aquisição Kz (opc.)"
+                                  class="w-full h-8 px-2 text-xs font-mono tabular-nums bg-white border border-slate-200 rounded-md focus:outline-none focus:border-blue-600"
+                                />
+                              </div>`
+                            : ''
+                        }
+                        <div class="${canSeeCost ? 'col-span-3' : 'col-span-6'}">
                           <input
                             name="price"
                             type="text"
@@ -14335,6 +15993,8 @@ export class SilaBillingApp {
   private renderProductsWorkspace(): string {
     const canManageCat = this.canManageCatalog();
     const isSuspended = this.isCompanySuspended();
+    const canSeeCost = this.canViewCostPrices();
+    const canSeeMargins = this.canViewProfitsMargins();
 
     const activeCount = this.products.filter((p) => p.active !== false).length;
     const inactiveCount = this.products.length - activeCount;
@@ -14650,10 +16310,14 @@ export class SilaBillingApp {
                   ${this.isNewProduct ? 'Novo artigo ou serviço' : `Editar artigo · ${escapeHtml(this.editingProduct.code)}`}
                 </span>
                 <div id="product-form-margin-readout" class="text-[11px] truncate">
-                  ${this.renderProductMarginSummaryText(
-                    this.editingProduct.price,
-                    this.editingProduct.costPrice
-                  )}
+                  ${
+                    canSeeCost && canSeeMargins
+                      ? this.renderProductMarginSummaryText(
+                          this.editingProduct.price,
+                          this.editingProduct.costPrice
+                        )
+                      : ''
+                  }
                 </div>
               </div>
 
@@ -14733,31 +16397,35 @@ export class SilaBillingApp {
                   </datalist>
                 </div>
 
-                <div class="col-span-1 sm:col-span-2">
-                  <label class="block text-[10px] font-medium text-slate-600 mb-1">Preço Aquisição (Kz)</label>
-                  <input
-                    name="costPrice"
-                    type="text"
-                    inputmode="decimal"
-                    autocomplete="off"
-                    placeholder="0,00"
-                    value="${escapeHtml(this.editingProductCostInput)}"
-                    class="w-full h-9 px-2.5 text-xs font-mono tabular-nums bg-white border border-slate-200 rounded-md focus:outline-none focus:border-blue-600"
-                  />
-                </div>
-                <div class="col-span-1 sm:col-span-2">
-                  <label class="block text-[10px] font-medium text-slate-600 mb-1">Markup s/ Custo (%)</label>
-                  <input
-                    name="markupPct"
-                    type="text"
-                    inputmode="decimal"
-                    autocomplete="off"
-                    placeholder="Ex: 30"
-                    value="${escapeHtml(this.editingProductMarkupInput)}"
-                    class="w-full h-9 px-2.5 text-xs font-mono tabular-nums bg-white border border-slate-200 rounded-md focus:outline-none focus:border-blue-600"
-                  />
-                </div>
-                <div class="col-span-1 sm:col-span-2">
+                ${
+                  canSeeCost
+                    ? `<div class="col-span-1 sm:col-span-2">
+                        <label class="block text-[10px] font-medium text-slate-600 mb-1">Preço Aquisição (Kz)</label>
+                        <input
+                          name="costPrice"
+                          type="text"
+                          inputmode="decimal"
+                          autocomplete="off"
+                          placeholder="0,00"
+                          value="${escapeHtml(this.editingProductCostInput)}"
+                          class="w-full h-9 px-2.5 text-xs font-mono tabular-nums bg-white border border-slate-200 rounded-md focus:outline-none focus:border-blue-600"
+                        />
+                      </div>
+                      <div class="col-span-1 sm:col-span-2">
+                        <label class="block text-[10px] font-medium text-slate-600 mb-1">Markup s/ Custo (%)</label>
+                        <input
+                          name="markupPct"
+                          type="text"
+                          inputmode="decimal"
+                          autocomplete="off"
+                          placeholder="Ex: 30"
+                          value="${escapeHtml(this.editingProductMarkupInput)}"
+                          class="w-full h-9 px-2.5 text-xs font-mono tabular-nums bg-white border border-slate-200 rounded-md focus:outline-none focus:border-blue-600"
+                        />
+                      </div>`
+                    : ''
+                }
+                <div class="${canSeeCost ? 'col-span-1 sm:col-span-2' : 'col-span-2 sm:col-span-4'}">
                   <label class="block text-[10px] font-medium text-slate-600 mb-1">Preço Venda (Kz) *</label>
                   <input
                     name="price"
@@ -14886,8 +16554,8 @@ export class SilaBillingApp {
                   <th class="py-2.5 px-3 font-medium">Descrição</th>
                   <th class="py-2.5 px-3 font-medium text-right">Stock / Mín.</th>
                   <th class="py-2.5 px-3 font-medium text-right hidden md:table-cell">IVA</th>
-                  <th class="py-2.5 px-3 font-medium text-right hidden xl:table-cell">Aquisição</th>
-                  <th class="py-2.5 px-3 font-medium text-right">Venda / Margem</th>
+                  ${canSeeCost ? '<th class="py-2.5 px-3 font-medium text-right hidden xl:table-cell">Aquisição</th>' : ''}
+                  <th class="py-2.5 px-3 font-medium text-right">${canSeeCost && canSeeMargins ? 'Venda / Margem' : 'Preço Venda'}</th>
                   <th class="py-2.5 px-3 font-medium text-right hidden sm:table-cell">Estado</th>
                   <th class="py-2.5 px-3 font-medium text-right w-36">Ações</th>
                 </tr>
@@ -14896,7 +16564,7 @@ export class SilaBillingApp {
                 ${
                   showingSuggestionsOnly
                     ? `<tr class="bg-slate-50/90">
-                        <td colspan="8" class="py-2 px-3 text-[11px] text-slate-600">
+                        <td colspan="${canSeeCost ? 8 : 7}" class="py-2 px-3 text-[11px] text-slate-600">
                           Sem correspondência exata para <strong>${escapeHtml(this.productSearch)}</strong> — sugestões próximas encontradas:
                         </td>
                       </tr>`
@@ -14905,7 +16573,7 @@ export class SilaBillingApp {
                 ${
                   filtered.length === 0
                     ? `<tr>
-                        <td colspan="8" class="py-10 px-3 text-center text-xs text-slate-500">
+                        <td colspan="${canSeeCost ? 8 : 7}" class="py-10 px-3 text-center text-xs text-slate-500">
                           ${
                             this.products.length === 0
                               ? 'Nenhum artigo ou serviço registado no catálogo desta empresa.'
@@ -14929,11 +16597,12 @@ export class SilaBillingApp {
 
                           const mStats = this.getProductMarginStats(p.price, p.costPrice);
                           const marginSign = mStats.profit >= 0 ? '+' : '';
-                          const marginSubline = mStats.hasCost
-                            ? `<div class="text-[10px] font-mono tabular-nums ${
-                                mStats.belowCost ? 'text-red-600 font-semibold' : 'text-emerald-700'
-                              }">${marginSign}${mStats.marginPct.toFixed(1).replace('.', ',')}% (${marginSign}${formatKzNumber(mStats.profit)} Kz)</div>`
-                            : '';
+                          const marginSubline =
+                            canSeeCost && canSeeMargins && mStats.hasCost
+                              ? `<div class="text-[10px] font-mono tabular-nums ${
+                                  mStats.belowCost ? 'text-red-600 font-semibold' : 'text-emerald-700'
+                                }">${marginSign}${mStats.marginPct.toFixed(1).replace('.', ',')}% (${marginSign}${formatKzNumber(mStats.profit)} Kz)</div>`
+                              : '';
 
                           return `
                           <tr
@@ -14965,9 +16634,13 @@ export class SilaBillingApp {
                             <td class="py-2.5 px-3 text-right font-mono tabular-nums text-slate-600 hidden md:table-cell">
                               ${p.ivaRate === 14 ? '14%' : 'Isento 0%'}
                             </td>
-                            <td class="py-2.5 px-3 text-right font-mono tabular-nums text-slate-600 hidden xl:table-cell">
-                              ${mStats.hasCost ? `${formatKzNumber(mStats.cost)} Kz` : '—'}
-                            </td>
+                            ${
+                              canSeeCost
+                                ? `<td class="py-2.5 px-3 text-right font-mono tabular-nums text-slate-600 hidden xl:table-cell">
+                                    ${mStats.hasCost ? `${formatKzNumber(mStats.cost)} Kz` : '—'}
+                                  </td>`
+                                : ''
+                            }
                             <td class="py-2.5 px-3 text-right">
                               <div class="font-mono font-semibold tabular-nums text-slate-900">${formatKzNumber(p.price)} Kz</div>
                               ${marginSubline}
@@ -15055,39 +16728,52 @@ export class SilaBillingApp {
                   </div>
 
                   <!-- Resumo de Preços e Margem de Lucro -->
-                  <div class="grid grid-cols-3 gap-2 py-2.5 px-3 bg-white border border-slate-200 rounded-lg">
-                    <div>
-                      <div class="text-[10px] text-slate-500">Aquisição</div>
-                      <div class="text-xs font-mono font-semibold tabular-nums text-slate-800 mt-0.5">
-                        ${detailMargin.hasCost ? `${formatKzNumber(detailMargin.cost)} Kz` : 'Não def.'}
-                      </div>
-                    </div>
+                  <div class="grid ${canSeeCost ? (canSeeMargins ? 'grid-cols-3' : 'grid-cols-2') : 'grid-cols-2'} gap-2 py-2.5 px-3 bg-white border border-slate-200 rounded-lg">
+                    ${
+                      canSeeCost
+                        ? `<div>
+                            <div class="text-[10px] text-slate-500">Aquisição</div>
+                            <div class="text-xs font-mono font-semibold tabular-nums text-slate-800 mt-0.5">
+                              ${detailMargin.hasCost ? `${formatKzNumber(detailMargin.cost)} Kz` : 'Não def.'}
+                            </div>
+                          </div>`
+                        : `<div>
+                            <div class="text-[10px] text-slate-500">Regime Fiscal</div>
+                            <div class="text-xs font-mono font-semibold tabular-nums text-slate-800 mt-0.5">
+                              ${selectedProd.ivaRate === 14 ? 'IVA 14%' : `Isento ${selectedProd.ivaRate}%`}
+                            </div>
+                          </div>`
+                    }
                     <div>
                       <div class="text-[10px] text-slate-500">Preço Venda</div>
                       <div class="text-xs font-mono font-bold tabular-nums text-slate-900 mt-0.5">
                         ${formatKzNumber(selectedProd.price)} Kz
                       </div>
                     </div>
-                    <div>
-                      <div class="text-[10px] text-slate-500">Margem Lucro</div>
-                      <div class="text-xs font-mono font-semibold tabular-nums mt-0.5 ${
-                        !detailMargin.hasCost
-                          ? 'text-slate-400'
-                          : detailMargin.belowCost
-                            ? 'text-red-600'
-                            : 'text-emerald-700'
-                      }">
-                        ${
-                          detailMargin.hasCost
-                            ? `${detailMargin.profit >= 0 ? '+' : ''}${detailMargin.marginPct
-                                .toFixed(1)
-                                .replace('.', ',')}%`
-                            : '—'
-                        }
-                      </div>
-                    </div>
                     ${
-                      detailMargin.hasCost
+                      canSeeCost && canSeeMargins
+                        ? `<div>
+                            <div class="text-[10px] text-slate-500">Margem Lucro</div>
+                            <div class="text-xs font-mono font-semibold tabular-nums mt-0.5 ${
+                              !detailMargin.hasCost
+                                ? 'text-slate-400'
+                                : detailMargin.belowCost
+                                  ? 'text-red-600'
+                                  : 'text-emerald-700'
+                            }">
+                              ${
+                                detailMargin.hasCost
+                                  ? `${detailMargin.profit >= 0 ? '+' : ''}${detailMargin.marginPct
+                                      .toFixed(1)
+                                      .replace('.', ',')}%`
+                                  : '—'
+                              }
+                            </div>
+                          </div>`
+                        : ''
+                    }
+                    ${
+                      canSeeCost && canSeeMargins && detailMargin.hasCost
                         ? `<div class="col-span-3 pt-2 border-t border-slate-100 flex items-center justify-between text-[11px] font-mono tabular-nums text-slate-600">
                             <span>Lucro unitário: <strong class="${
                               detailMargin.belowCost ? 'text-red-600' : 'text-slate-900'
@@ -15281,7 +16967,8 @@ export class SilaBillingApp {
                                       }">(${diffSign}${formatKzNumber(diff)} Kz)</span></span>
                                     </div>
                                     ${
-                                      typeof h.newCost === 'number' || typeof h.previousCost === 'number'
+                                      canSeeCost &&
+                                      (typeof h.newCost === 'number' || typeof h.previousCost === 'number')
                                         ? `<div class="text-[10px] font-mono tabular-nums text-slate-500">
                                             Aquisição: ${
                                               typeof h.previousCost === 'number'
@@ -15456,8 +17143,22 @@ export class SilaBillingApp {
     };
   } {
     const smartMatched = filterInvoicesSmart(this.invoices, this.historySearch);
+    const canSeeAllOps =
+      this.hasPerm('reports_operational') ||
+      this.hasPerm('reports_financial') ||
+      this.hasPerm('saft_export');
+    const unlockedMember = this.getUnlockedMember();
+    const ownNames = new Set(
+      [this.operator, unlockedMember?.displayName]
+        .filter(Boolean)
+        .map((s) => String(s).trim().toLowerCase())
+    );
     const baseFiltered = smartMatched.filter((inv) => {
       if (!this.isIsoInHistoryPeriod(inv.issuedAtIso)) return false;
+      if (!canSeeAllOps) {
+        const invOp = (inv.operator || '').trim().toLowerCase();
+        if (!ownNames.has(invOp)) return false;
+      }
       if (
         this.historyOperatorFilter !== 'ALL' &&
         (inv.operator || '').trim().toLowerCase() !==
@@ -15974,6 +17675,26 @@ export class SilaBillingApp {
   }
 
   private exportHistoryControl(format: 'PDF' | 'EXCEL' | 'CSV' | 'SAFT'): void {
+    if (format === 'SAFT' && !this.hasPerm('saft_export')) {
+      void this.appendSecurityAuditEvent({
+        action: 'ACCESS_DENIED',
+        targetType: 'saft_export',
+        summary: 'Tentativa bloqueada de exportação SAF-T (AO) sem permissão.',
+        outcome: 'denied',
+      });
+      this.showHistoryNotice('Sem autorização para exportar ficheiros fiscais SAF-T (AO).');
+      this.render();
+      return;
+    }
+    if (
+      format !== 'SAFT' &&
+      !this.hasPerm('reports_operational') &&
+      !this.hasPerm('reports_own_sales') &&
+      !this.hasPerm('saft_export')
+    ) {
+      return;
+    }
+
     const { filtered } = this.getFilteredHistoryInvoices();
     if (filtered.length === 0) {
       this.showHistoryNotice('Não existem documentos no filtro atual para exportar.');
@@ -16422,7 +18143,10 @@ export class SilaBillingApp {
       { id: 'CUSTOM', label: 'Período' },
     ];
 
-    const isAuditActive = this.historyActiveMainTab === 'OPERATIONAL_AUDIT';
+    const canViewAudit = this.hasPerm('audit_view');
+    const canExportSaft = this.hasPerm('saft_export');
+    const canCreditNote = this.hasPerm('credit_note_issue');
+    const isAuditActive = canViewAudit && this.historyActiveMainTab === 'OPERATIONAL_AUDIT';
 
     return `
       <div class="h-full flex flex-col overflow-hidden bg-white">
@@ -16440,21 +18164,25 @@ export class SilaBillingApp {
               }"
             >
               <span>Documentos Emitidos</span>
-              <span class="font-mono tabular-nums text-[10px] text-slate-400">(${this.invoices.length})</span>
+              <span class="font-mono tabular-nums text-[10px] text-slate-400">(${counts.all})</span>
             </button>
-            <button
-              type="button"
-              data-action="set-history-main-tab"
-              data-value="OPERATIONAL_AUDIT"
-              class="h-8 px-3 text-xs font-semibold rounded-t-md transition-colors border-t border-x flex items-center gap-1.5 ${
-                isAuditActive
-                  ? 'bg-white text-blue-700 border-slate-200 -mb-px'
-                  : 'bg-transparent text-slate-500 border-transparent hover:text-slate-800'
-              }"
-            >
-              ${ICONS.shield}
-              <span>Auditoria de Operações Críticas</span>
-            </button>
+            ${
+              canViewAudit
+                ? `<button
+                    type="button"
+                    data-action="set-history-main-tab"
+                    data-value="OPERATIONAL_AUDIT"
+                    class="h-8 px-3 text-xs font-semibold rounded-t-md transition-colors border-t border-x flex items-center gap-1.5 ${
+                      isAuditActive
+                        ? 'bg-white text-blue-700 border-slate-200 -mb-px'
+                        : 'bg-transparent text-slate-500 border-transparent hover:text-slate-800'
+                    }"
+                  >
+                    ${ICONS.shield}
+                    <span>Auditoria de Operações Críticas</span>
+                  </button>`
+                : ''
+            }
           </div>
         </div>
 
@@ -16526,13 +18254,17 @@ export class SilaBillingApp {
                   title="Exportar documentos filtrados para CSV"
                   class="cursor-pointer h-9 px-2.5 rounded-md border border-slate-200 bg-white hover:bg-slate-50 text-[11px] font-semibold text-slate-700 whitespace-nowrap"
                 >CSV</button>
-                <button
-                  type="button"
-                  data-action="export-history-control"
-                  data-value="SAFT"
-                  title="Exportar ficheiro oficial SAF-T (AO) XML para submissão à AGT (Dec. Executivo 312/18)"
-                  class="cursor-pointer h-9 px-2.5 rounded-md border border-blue-600 bg-blue-50 hover:bg-blue-100 text-[11px] font-bold text-blue-800 whitespace-nowrap flex items-center gap-1 shadow-2xs transition-colors"
-                >SAF-T (AO)</button>
+                ${
+                  canExportSaft
+                    ? `<button
+                        type="button"
+                        data-action="export-history-control"
+                        data-value="SAFT"
+                        title="Exportar ficheiro oficial SAF-T (AO) XML para submissão à AGT (Dec. Executivo 312/18)"
+                        class="cursor-pointer h-9 px-2.5 rounded-md border border-blue-600 bg-blue-50 hover:bg-blue-100 text-[11px] font-bold text-blue-800 whitespace-nowrap flex items-center gap-1 shadow-2xs transition-colors"
+                      >SAF-T (AO)</button>`
+                    : ''
+                }
               </div>
             </div>
 
@@ -16775,7 +18507,7 @@ export class SilaBillingApp {
                       : ''
                   }
                   ${
-                    active.status !== 'cancelled' && active.docType === 'FR'
+                    active.status !== 'cancelled' && active.docType === 'FR' && canCreditNote
                       ? `<button
                           type="button"
                           data-action="open-credit-note-panel"
@@ -16971,14 +18703,15 @@ export class SilaBillingApp {
 
   private renderSettingsWorkspace(): string {
     const canManage = this.canManageCompanySettings();
-    const maxRole = this.getVerifiedMaxRole();
-    const effectiveRole = this.getEffectiveRole();
-    const roleOptions: CompanyRole[] =
-      maxRole === 'owner'
-        ? ['owner', 'manager', 'cashier']
-        : maxRole === 'manager'
-          ? ['manager', 'cashier']
-          : ['cashier'];
+    const canViewMaster = this.hasPerm('master_view') || canManage;
+    const canSeeRbac =
+      this.hasPerm('users_view') ||
+      this.hasPerm('users_manage') ||
+      this.hasPerm('roles_manage') ||
+      this.hasPerm('audit_view') ||
+      this.hasPerm('settings_manage');
+    const unlockedMember = this.getUnlockedMember();
+    const unlockedPerms = this.getUnlockedPermissions();
     const companySeries = listarSeries({ companyId: this.activeCompany.id });
 
     return `
@@ -16986,258 +18719,119 @@ export class SilaBillingApp {
         <div class="max-w-5xl space-y-6">
           <div class="flex flex-col sm:flex-row sm:items-center justify-between gap-3 pb-3 border-b border-slate-200">
             <div>
-              <h1 class="text-sm font-bold text-slate-900">Ficha Mestre da Empresa</h1>
+              <h1 class="text-sm font-bold text-slate-900">Configurações, Ficha Mestre &amp; Segurança</h1>
               <p
                 class="text-xs text-slate-500"
-                title="Identificação jurídica, enquadramento fiscal AGT, endereço, contactos, logótipo, séries, dados bancários, estabelecimentos e responsáveis."
+                title="Identificação jurídica, enquadramento fiscal AGT, utilizadores, funções RBAC, PINs e auditoria."
               >
-                Dados fiscais, séries e estabelecimentos
+                Dados fiscais, séries, utilizadores, permissões e privacidade
               </p>
             </div>
-            <div class="flex items-center gap-2 shrink-0">
+            <div class="flex items-center gap-2 shrink-0 flex-wrap">
               <button
                 type="button"
-                data-action="reset-settings"
-                ${!canManage ? 'disabled' : ''}
-                class="h-9 px-3 rounded-lg border border-slate-200 text-xs font-medium text-slate-600 hover:bg-slate-50 disabled:opacity-40 flex items-center gap-1.5 whitespace-nowrap"
+                data-action="open-privacy-policy"
+                class="h-9 px-3 rounded-lg border border-slate-200 text-xs font-medium text-slate-700 hover:bg-slate-50 flex items-center gap-1.5 whitespace-nowrap"
               >
-                ${ICONS.reset}
-                <span>Repor padrão</span>
+                ${ICONS.shieldCheck}
+                <span>Privacidade</span>
               </button>
-              <button
-                type="submit"
-                form="settings-form"
-                ${!canManage ? 'disabled' : ''}
-                class="h-9 px-4 rounded-lg bg-slate-900 text-white text-xs font-semibold hover:bg-slate-800 disabled:opacity-40 flex items-center gap-1.5 whitespace-nowrap"
-              >
-                ${ICONS.check}
-                <span>${this.settingsSavedNotice ? 'Guardado' : 'Guardar Ficha Mestre'}</span>
-              </button>
+              ${
+                canViewMaster
+                  ? `<button
+                      type="button"
+                      data-action="reset-settings"
+                      ${!canManage ? 'disabled' : ''}
+                      class="h-9 px-3 rounded-lg border border-slate-200 text-xs font-medium text-slate-600 hover:bg-slate-50 disabled:opacity-40 flex items-center gap-1.5 whitespace-nowrap"
+                    >
+                      ${ICONS.reset}
+                      <span>Repor padrão</span>
+                    </button>
+                    <button
+                      type="submit"
+                      form="settings-form"
+                      ${!canManage ? 'disabled' : ''}
+                      class="h-9 px-4 rounded-lg bg-slate-900 text-white text-xs font-semibold hover:bg-slate-800 disabled:opacity-40 flex items-center gap-1.5 whitespace-nowrap"
+                    >
+                      ${ICONS.check}
+                      <span>${this.settingsSavedNotice ? 'Guardado' : 'Guardar Ficha Mestre'}</span>
+                    </button>`
+                  : ''
+              }
             </div>
           </div>
 
           ${
-            !canManage
-              ? `<div class="p-3 rounded-lg border border-slate-200 bg-slate-50 text-xs text-slate-600">
-                  Modo de leitura para o perfil <strong>${escapeHtml(
-                    formatRoleLabelPt(effectiveRole)
-                  )}</strong>. Apenas o Proprietário pode alterar os dados fiscais da empresa.
+            canViewMaster
+              ? `
+              ${
+                !canManage
+                  ? `<div class="p-3 rounded-lg border border-slate-200 bg-slate-50 text-xs text-slate-600">
+                      Modo de leitura para o perfil <strong>${escapeHtml(
+                        this.getUnlockedRoleLabel()
+                      )}</strong>. Apenas perfis autorizados podem alterar os dados fiscais da empresa.
+                    </div>`
+                  : ''
+              }
+
+              ${renderCompanyMasterSection({
+                mode: 'DESKTOP',
+                company: this.activeCompany,
+                settings: this.settings,
+                draftProfile: this.companyMasterDraftProfile,
+                draftSettings: this.companyMasterDraftSettings,
+                series: companySeries,
+                canManage,
+                activeSection: this.companyMasterSection,
+                formId: 'settings-form',
+                showRequestAgtSeriesForm: this.showRequestAgtSeriesForm,
+                confirmFinalizeSeriesId: this.confirmFinalizeSeriesId,
+                agtSeriesErrorMessage: this.agtSeriesErrorMessage,
+                agtSeriesSuccessMessage: this.agtSeriesSuccessMessage,
+                showEstablishmentForm: this.showEstablishmentForm,
+                editingEstablishment: this.editingEstablishment,
+                establishmentError: this.establishmentError,
+                showWarehouseForm: this.showWarehouseForm,
+                editingWarehouse: this.editingWarehouse,
+                warehouseError: this.warehouseError,
+                errorMessage: this.settingsErrorMessage,
+                savedNotice: this.settingsSavedNotice,
+                operator: this.operator,
+              })}
+              `
+              : `<div class="p-3 rounded-lg border border-slate-200 bg-slate-50 text-xs text-slate-600">
+                  Ficha Mestre e Séries Fiscais restritas para a função <strong>${escapeHtml(
+                    this.getUnlockedRoleLabel()
+                  )}</strong>.
                 </div>`
-              : ''
           }
 
-          ${renderCompanyMasterSection({
-            mode: 'DESKTOP',
-            company: this.activeCompany,
-            settings: this.settings,
-            draftProfile: this.companyMasterDraftProfile,
-            draftSettings: this.companyMasterDraftSettings,
-            series: companySeries,
-            canManage,
-            activeSection: this.companyMasterSection,
-            formId: 'settings-form',
-            showRequestAgtSeriesForm: this.showRequestAgtSeriesForm,
-            confirmFinalizeSeriesId: this.confirmFinalizeSeriesId,
-            agtSeriesErrorMessage: this.agtSeriesErrorMessage,
-            agtSeriesSuccessMessage: this.agtSeriesSuccessMessage,
-            showEstablishmentForm: this.showEstablishmentForm,
-            editingEstablishment: this.editingEstablishment,
-            establishmentError: this.establishmentError,
-            showWarehouseForm: this.showWarehouseForm,
-            editingWarehouse: this.editingWarehouse,
-            warehouseError: this.warehouseError,
-            errorMessage: this.settingsErrorMessage,
-            savedNotice: this.settingsSavedNotice,
-            operator: this.operator,
-          })}
-
-          <!-- Permissões por Empresa e Perfil Operacional no Terminal -->
-          <section class="space-y-4 pt-6 border-t border-slate-200">
-            <div class="flex flex-col sm:flex-row sm:items-center justify-between gap-3">
-              <div>
-                <h2 class="text-xs font-semibold text-slate-900">Permissões e Equipa da Empresa</h2>
-                <p class="text-xs text-slate-500">
-                  Emissão POS/A4 ativa · ${this.canManageCatalog() ? 'Gestão de catálogo autorizada' : 'Catálogo em leitura'} · ${
-                    this.canCancelInvoices() ? 'Anulação com justificação autorizada' : 'Anulação bloqueada (requer supervisor)'
-                  }
-                </p>
-              </div>
-              <div class="flex items-center gap-2 shrink-0 flex-wrap">
-                <button
-                  type="button"
-                  data-action="open-operational-audit-from-settings"
-                  class="h-8 px-3 rounded-md border border-blue-200 bg-blue-50 hover:bg-blue-100 text-blue-800 text-xs font-semibold flex items-center gap-1.5 transition-colors"
-                >
-                  ${ICONS.shield}
-                  <span>Auditoria de Operações</span>
-                </button>
-                <div class="flex items-center gap-1.5">
-                  <label class="text-[11px] text-slate-600 whitespace-nowrap" for="terminal-role-select">Modo terminal:</label>
-                  <select
-                    id="terminal-role-select"
-                    data-field="terminal-role-select"
-                    class="h-8 px-2.5 text-xs bg-slate-50 border border-slate-200 rounded-md focus:outline-none focus:border-blue-600"
-                  >
-                    ${roleOptions
-                      .map(
-                        (r) =>
-                          `<option value="${r}" ${effectiveRole === r ? 'selected' : ''}>${escapeHtml(
-                            formatRoleLabelPt(r)
-                          )}</option>`
-                      )
-                      .join('')}
-                  </select>
-                </div>
-              </div>
-            </div>
-
-            <!-- Matriz de Permissões por Perfil -->
-            <div class="p-3 bg-slate-50 rounded-lg border border-slate-200 space-y-2">
-              <div class="text-[11px] font-bold text-slate-700">Matriz de Controlo Operacional por Perfil:</div>
-              <div class="grid grid-cols-1 sm:grid-cols-3 gap-2 text-[11.5px]">
-                <div class="p-2.5 rounded bg-white border border-slate-200 space-y-1">
-                  <div class="font-bold text-slate-900 flex items-center justify-between">
-                    <span>Proprietário (Owner)</span>
-                    <span class="text-[10px] text-emerald-700 font-semibold bg-emerald-50 px-1.5 py-0.5 rounded">Acesso Total</span>
-                  </div>
-                  <ul class="text-slate-600 space-y-0.5 text-[11px]">
-                    <li>✓ Emissão e fecho de caixa</li>
-                    <li>✓ Gestão de catálogo e custos</li>
-                    <li>✓ Descontos especiais ilimitados</li>
-                    <li>✓ Anulação e reversão de faturas</li>
-                    <li>✓ Definições fiscais e equipa</li>
-                  </ul>
-                </div>
-                <div class="p-2.5 rounded bg-white border border-slate-200 space-y-1">
-                  <div class="font-bold text-slate-900 flex items-center justify-between">
-                    <span>Gerente (Manager)</span>
-                    <span class="text-[10px] text-blue-700 font-semibold bg-blue-50 px-1.5 py-0.5 rounded">Supervisão</span>
-                  </div>
-                  <ul class="text-slate-600 space-y-0.5 text-[11px]">
-                    <li>✓ Emissão e fecho de caixa</li>
-                    <li>✓ Gestão de catálogo e compras</li>
-                    <li>✓ Aprovação de descontos especiais</li>
-                    <li>${this.activeCompany.allowManagerCancel ? '✓' : '⚠'} Anulação (${this.activeCompany.allowManagerCancel ? 'Autorizada' : 'Com PIN'})</li>
-                    <li>— Definições de empresa restritas</li>
-                  </ul>
-                </div>
-                <div class="p-2.5 rounded bg-white border border-slate-200 space-y-1">
-                  <div class="font-bold text-slate-900 flex items-center justify-between">
-                    <span>Operador de Caixa</span>
-                    <span class="text-[10px] text-slate-700 font-semibold bg-slate-100 px-1.5 py-0.5 rounded">Faturação</span>
-                  </div>
-                  <ul class="text-slate-600 space-y-0.5 text-[11px]">
-                    <li>✓ Emissão rápida POS & A4</li>
-                    <li>✓ Abertura e contagem de caixa</li>
-                    <li>✓ Desconto até ${this.settings.maxCashierDiscountPct ?? 5}% (limite)</li>
-                    <li>⚠ Desconto especial requer PIN</li>
-                    <li>⚠ Anulação requer PIN de Supervisor</li>
-                  </ul>
-                </div>
-              </div>
-            </div>
-
-            <label class="flex items-center gap-2 text-xs text-slate-700 select-none ${canManage ? 'cursor-pointer' : 'opacity-60'}">
-              <input
-                type="checkbox"
-                data-field="company-allow-manager-cancel"
-                ${!canManage ? 'disabled' : ''}
-                ${this.activeCompany.allowManagerCancel ? 'checked' : ''}
-                class="h-4 w-4 rounded border-slate-300 text-blue-600"
-              />
-              <span>Permitir que Gerentes anulem faturas emitidas mediante justificação obrigatória</span>
-            </label>
-
-            ${
-              this.memberFormError
-                ? `<div class="p-2.5 rounded-lg border border-red-200 bg-red-50 text-xs text-red-700">${escapeHtml(
-                    this.memberFormError
-                  )}</div>`
-                : ''
-            }
-
-            <div class="border border-slate-200 rounded-lg overflow-hidden">
-              <table class="w-full text-left border-collapse text-xs">
-                <thead class="bg-slate-50 border-b border-slate-200 text-[11px] text-slate-500">
-                  <tr>
-                    <th class="py-2 px-3 font-medium">Colaborador</th>
-                    <th class="py-2 px-3 font-medium">Email</th>
-                    <th class="py-2 px-3 font-medium">Perfil</th>
-                    <th class="py-2 px-3 font-medium">Anulação</th>
-                    <th class="py-2 px-3 font-medium text-right w-16">Ação</th>
-                  </tr>
-                </thead>
-                <tbody class="divide-y divide-slate-100">
-                  ${
-                    this.members.length === 0
-                      ? `<tr><td colspan="5" class="py-4 px-3 text-xs text-slate-500">Proprietário local ativo nesta empresa. Adicione gerentes ou operadores abaixo quando necessário.</td></tr>`
-                      : this.members
-                          .map(
-                            (m) => `
-                            <tr>
-                              <td class="py-2 px-3 font-medium text-slate-900">${escapeHtml(m.displayName)}</td>
-                              <td class="py-2 px-3 font-mono text-slate-600">${escapeHtml(m.email)}</td>
-                              <td class="py-2 px-3 text-slate-700">${escapeHtml(formatRoleLabelPt(m.role))}</td>
-                              <td class="py-2 px-3 text-slate-500">${
-                                m.role === 'owner' ||
-                                (m.role === 'manager' &&
-                                  (this.activeCompany.allowManagerCancel || m.allowInvoiceCancel))
-                                  ? 'Autorizada'
-                                  : 'Não'
-                              }</td>
-                              <td class="py-2 px-3 text-right">
-                                ${
-                                  canManage && m.role !== 'owner'
-                                    ? `<button
-                                        type="button"
-                                        data-action="remove-company-member"
-                                        data-id="${escapeHtml(m.id)}"
-                                        title="Remover colaborador"
-                                        class="h-7 w-7 inline-flex items-center justify-center rounded text-slate-400 hover:text-red-600 hover:bg-red-50"
-                                      >${ICONS.trash}</button>`
-                                    : `<span class="text-[11px] text-slate-400">—</span>`
-                                }
-                              </td>
-                            </tr>
-                          `
-                          )
-                          .join('')
-                  }
-                </tbody>
-              </table>
-            </div>
-
-            ${
-              canManage
-                ? `<form data-form="add-member-form" class="grid grid-cols-1 sm:grid-cols-12 gap-2 items-end">
-                    <div class="sm:col-span-4">
-                      <label class="block text-[10px] font-medium text-slate-600 mb-1">Nome do colaborador</label>
-                      <input name="displayName" type="text" required maxlength="120" placeholder="Ex: Maria Manuel" class="w-full h-9 px-2.5 text-xs bg-slate-50 border border-slate-200 rounded-md focus:outline-none focus:border-blue-600" />
-                    </div>
-                    <div class="sm:col-span-4">
-                      <label class="block text-[10px] font-medium text-slate-600 mb-1">Email autenticado</label>
-                      <input name="email" type="email" required maxlength="120" placeholder="operador@empresa.ao" class="w-full h-9 px-2.5 text-xs font-mono bg-slate-50 border border-slate-200 rounded-md focus:outline-none focus:border-blue-600" />
-                    </div>
-                    <div class="sm:col-span-2">
-                      <label class="block text-[10px] font-medium text-slate-600 mb-1">Perfil</label>
-                      <select name="role" class="w-full h-9 px-2 text-xs bg-slate-50 border border-slate-200 rounded-md focus:outline-none focus:border-blue-600">
-                        <option value="cashier">Caixa</option>
-                        <option value="manager">Gerente</option>
-                      </select>
-                    </div>
-                    <div class="sm:col-span-2">
-                      <button type="submit" class="w-full h-9 px-3 rounded-md bg-slate-900 text-white text-xs font-semibold hover:bg-slate-800 whitespace-nowrap">Adicionar</button>
-                    </div>
-                    <div class="sm:col-span-12">
-                      <label class="inline-flex items-center gap-2 text-[11px] text-slate-600 cursor-pointer select-none">
-                        <input name="allowInvoiceCancel" type="checkbox" class="h-3.5 w-3.5 rounded border-slate-300 text-blue-600" />
-                        <span>Autorizar este Gerente individualmente a anular faturas</span>
-                      </label>
-                    </div>
-                  </form>`
-                : ''
-            }
-          </section>
+          <!-- Gestão de Utilizadores, Funções, PINs e Auditoria de Segurança (RBAC) -->
+          ${
+            canSeeRbac
+              ? `<section class="pt-4 border-t border-slate-200">
+                  ${renderRbacTeamSection({
+                    company: this.activeCompany,
+                    actor: unlockedMember,
+                    actorPermissions: unlockedPerms,
+                    members: this.members,
+                    roles: this.roles,
+                    securityAuditLogs: this.securityAuditLogs,
+                    inactivityLockMinutes: this.settings.inactivityLockMinutes ?? 10,
+                    activeTab: this.rbacActiveTab,
+                    editingMemberId: this.rbacEditingMemberId,
+                    editingRoleId: this.rbacEditingRoleId,
+                    formError: this.rbacFormError,
+                    noticeMessage: this.rbacNoticeMessage,
+                    auditSearch: this.rbacAuditSearch,
+                    auditActionFilter: this.rbacAuditActionFilter,
+                    establishments: this.settings.company.establishments || [],
+                    isOnline: this.isOnline,
+                    isCloudTeamEntitled: canCompanyInviteCloudMembers(this.activeCompany),
+                  })}
+                </section>`
+              : ''
+          }
 
           <!-- Entidade Institucional & Recursos Empresariais -->
           <section class="space-y-3 pt-6 border-t border-slate-200">
@@ -17285,6 +18879,7 @@ export class SilaBillingApp {
   // ==================== 4. CAIXA E PAGAMENTOS (TURNOS, GAVETA, SANGRIA, REFORÇO E FECHO) ====================
 
   private renderPosQuickCashBar(isSuspended: boolean): string {
+    if (!this.hasPerm('cash_own_shift') && !this.hasPerm('cash_all_shifts')) return '';
     const openSession = this.getActiveOpenCashSession();
     const liveSummary = openSession
       ? calculateCashSessionSummary(openSession, this.invoices, this.cashMovements)
@@ -17467,11 +19062,25 @@ export class SilaBillingApp {
 
   private renderCashWorkspace(): string {
     const isSuspended = this.isCompanySuspended();
-    const openSession = this.getActiveOpenCashSession();
+    const canAllShifts = this.hasPerm('cash_all_shifts');
+    const unlockedMember = this.getUnlockedMember();
+    const ownNames = new Set(
+      [this.operator, unlockedMember?.displayName]
+        .filter(Boolean)
+        .map((s) => String(s).trim().toLowerCase())
+    );
+    const visibleCashSessions = canAllShifts
+      ? this.cashSessions
+      : this.cashSessions.filter((s) => ownNames.has((s.operator || '').trim().toLowerCase()));
+    const visibleCashMovements = canAllShifts
+      ? this.cashMovements
+      : this.cashMovements.filter((m) => ownNames.has((m.operator || '').trim().toLowerCase()));
+
+    const openSession = visibleCashSessions.find((s) => s.status === 'open') || null;
     const selectedSession =
-      this.cashSessions.find((s) => s.id === this.selectedCashSessionId) ||
+      visibleCashSessions.find((s) => s.id === this.selectedCashSessionId) ||
       openSession ||
-      this.cashSessions[0] ||
+      visibleCashSessions[0] ||
       null;
 
     const parsedLiveCounted =
@@ -17490,13 +19099,13 @@ export class SilaBillingApp {
       ? calculateCashSessionSummary(
           selectedSession,
           this.invoices,
-          this.cashMovements,
+          visibleCashMovements,
           validLiveCounted
         )
       : null;
 
     // Controlo acumulado de diferenças de caixa nos turnos encerrados
-    const closedSessions = this.cashSessions.filter((s) => s.status === 'closed');
+    const closedSessions = visibleCashSessions.filter((s) => s.status === 'closed');
     let exactClosures = 0;
     let totalOverage = 0;
     let totalShortage = 0;
@@ -17562,7 +19171,7 @@ export class SilaBillingApp {
         });
       }
 
-      for (const mov of this.cashMovements) {
+      for (const mov of visibleCashMovements) {
         if (mov.sessionId !== selectedSession.id) continue;
         const isOut = mov.type === 'SANGRIA' || mov.type === 'SAIDA';
         const kindMap: Record<CashMovementType, UnifiedLedgerRow['kind']> = {
@@ -17616,7 +19225,7 @@ export class SilaBillingApp {
       }
     } else {
       // Movimentos avulsos (ex: liquidações de dívida registadas sem turno aberto)
-      for (const mov of this.cashMovements) {
+      for (const mov of visibleCashMovements) {
         const isOut = mov.type === 'SANGRIA' || mov.type === 'SAIDA';
         ledgerRows.push({
           id: mov.id,
@@ -17713,18 +19322,18 @@ export class SilaBillingApp {
 
           <div class="flex-1 overflow-y-auto divide-y divide-slate-100">
             ${
-              this.cashSessions.length === 0
+              visibleCashSessions.length === 0
                 ? `<div class="p-6 text-center space-y-2">
                     <p class="text-xs text-slate-600 font-medium">Nenhum turno de caixa aberto ou encerrado.</p>
                     <p class="text-[11px] text-slate-500">Abra o turno com o fundo inicial para controlar entradas, saídas, sangrias, reforços e fecho por operador.</p>
                   </div>`
-                : this.cashSessions
+                : visibleCashSessions
                     .map((sess) => {
                       const isSel = selectedSession?.id === sess.id;
                       const dtOpen = formatDateTimePt(sess.openedAtIso);
                       const sessSum =
                         sess.status === 'open'
-                          ? calculateCashSessionSummary(sess, this.invoices, this.cashMovements)
+                          ? calculateCashSessionSummary(sess, this.invoices, visibleCashMovements)
                           : null;
                       const displayCash =
                         sess.status === 'open'
@@ -17788,7 +19397,7 @@ export class SilaBillingApp {
 
           <!-- Formulário de Abertura de Caixa (quando acionado ou quando não há turnos) -->
           ${
-            this.activeCashActionPanel === 'OPEN' || (!selectedSession && this.cashSessions.length === 0)
+            this.activeCashActionPanel === 'OPEN' || (!selectedSession && visibleCashSessions.length === 0)
               ? `<form
                   data-form="open-cash-session-form"
                   class="rounded-xl border border-slate-200 bg-white p-4 space-y-3.5"
@@ -21289,7 +22898,7 @@ export class SilaBillingApp {
   }
 
   private async submitFinanceProductCostEdit(productId: string, fd: FormData): Promise<void> {
-    if (!this.canManageCatalog() || !this.activeCompany.id) return;
+    if (!this.canManageCatalog() || !this.canViewCostPrices() || !this.activeCompany.id) return;
     const prod = this.products.find((p) => p.id === productId);
     if (!prod) return;
 
@@ -22723,6 +24332,11 @@ export class SilaBillingApp {
     const snap = this.computeFinancialSnapshot();
     const openCashSession = this.getActiveOpenCashSession();
     const canManageCat = this.canManageCatalog();
+    const canSeeCost = this.canViewCostPrices();
+    const canSeeMargins = this.canViewProfitsMargins();
+    const canManageExpenses = this.hasPerm('expenses_manage');
+    const canViewIndicators =
+      this.hasPerm('reports_operational') || this.hasPerm('reports_financial');
     const suspended = this.isCompanySuspended();
     const netWorkingBalance = roundKz(snap.totalReceivablesDue - snap.totalPayablesDue);
 
@@ -22749,7 +24363,9 @@ export class SilaBillingApp {
         })`,
       },
       { id: 'CASHFLOW', label: `Fluxo de Caixa (${snap.cashflowItems.length})` },
-      { id: 'MARGINS', label: `Margem por Produto (${snap.productMargins.length})` },
+      ...(canSeeCost && canSeeMargins
+        ? [{ id: 'MARGINS' as const, label: `Margem por Produto (${snap.productMargins.length})` }]
+        : []),
     ];
 
     return `
@@ -22789,43 +24405,51 @@ export class SilaBillingApp {
 
           <!-- Ações Rápidas: Indicadores Comerciais, Despesa Operacional & Receita Extraordinária -->
           <div class="flex items-center gap-2 shrink-0">
-            <button
-              type="button"
-              data-action="nav"
-              data-value="INDICATORS"
-              class="h-8 px-3 rounded-md border border-slate-200 bg-white hover:bg-slate-50 text-slate-700 text-xs font-medium flex items-center gap-1.5 whitespace-nowrap shrink-0"
-            >
-              ${ICONS.trendingUp}
-              <span>Indicadores comerciais</span>
-            </button>
-            <button
-              type="button"
-              data-action="open-finance-entry"
-              data-value="RECEITA_EXTRAORDINARIA"
-              ${suspended ? 'disabled' : ''}
-              class="h-8 px-3 rounded-md border ${
-                this.financeEntryPanel === 'RECEITA_EXTRAORDINARIA'
-                  ? 'border-emerald-600 bg-emerald-50 text-emerald-800'
-                  : 'border-slate-200 bg-white hover:bg-slate-50 text-slate-700'
-              } text-xs font-medium flex items-center gap-1.5 whitespace-nowrap shrink-0 disabled:opacity-40"
-            >
-              ${ICONS.plus}
-              <span>Receita extraordinária</span>
-            </button>
-            <button
-              type="button"
-              data-action="open-finance-entry"
-              data-value="DESPESA_OPERACIONAL"
-              ${suspended ? 'disabled' : ''}
-              class="h-8 px-3 rounded-md ${
-                this.financeEntryPanel === 'DESPESA_OPERACIONAL'
-                  ? 'bg-slate-700 text-white'
-                  : 'bg-slate-900 hover:bg-slate-800 text-white'
-              } text-xs font-semibold flex items-center gap-1.5 whitespace-nowrap shrink-0 disabled:opacity-40"
-            >
-              ${ICONS.plus}
-              <span>Despesa operacional</span>
-            </button>
+            ${
+              canViewIndicators
+                ? `<button
+                    type="button"
+                    data-action="nav"
+                    data-value="INDICATORS"
+                    class="h-8 px-3 rounded-md border border-slate-200 bg-white hover:bg-slate-50 text-slate-700 text-xs font-medium flex items-center gap-1.5 whitespace-nowrap shrink-0"
+                  >
+                    ${ICONS.trendingUp}
+                    <span>Indicadores comerciais</span>
+                  </button>`
+                : ''
+            }
+            ${
+              canManageExpenses
+                ? `<button
+                    type="button"
+                    data-action="open-finance-entry"
+                    data-value="RECEITA_EXTRAORDINARIA"
+                    ${suspended ? 'disabled' : ''}
+                    class="h-8 px-3 rounded-md border ${
+                      this.financeEntryPanel === 'RECEITA_EXTRAORDINARIA'
+                        ? 'border-emerald-600 bg-emerald-50 text-emerald-800'
+                        : 'border-slate-200 bg-white hover:bg-slate-50 text-slate-700'
+                    } text-xs font-medium flex items-center gap-1.5 whitespace-nowrap shrink-0 disabled:opacity-40"
+                  >
+                    ${ICONS.plus}
+                    <span>Receita extraordinária</span>
+                  </button>
+                  <button
+                    type="button"
+                    data-action="open-finance-entry"
+                    data-value="DESPESA_OPERACIONAL"
+                    ${suspended ? 'disabled' : ''}
+                    class="h-8 px-3 rounded-md ${
+                      this.financeEntryPanel === 'DESPESA_OPERACIONAL'
+                        ? 'bg-slate-700 text-white'
+                        : 'bg-slate-900 hover:bg-slate-800 text-white'
+                    } text-xs font-semibold flex items-center gap-1.5 whitespace-nowrap shrink-0 disabled:opacity-40"
+                  >
+                    ${ICONS.plus}
+                    <span>Despesa operacional</span>
+                  </button>`
+                : ''
+            }
           </div>
         </div>
 
@@ -22870,7 +24494,7 @@ export class SilaBillingApp {
         <!-- Conteúdo Principal Rolável -->
         <div class="flex-1 overflow-y-auto p-4 space-y-5">
           <!-- Faixa Global de Indicadores Financeiros (Sempre Visível e Clicável) -->
-          <div class="grid grid-cols-2 lg:grid-cols-5 gap-3">
+          <div class="grid grid-cols-2 ${canSeeCost && canSeeMargins ? 'lg:grid-cols-5' : 'lg:grid-cols-4'} gap-3">
             <button
               type="button"
               data-action="set-finance-accounts-side"
@@ -22937,30 +24561,36 @@ export class SilaBillingApp {
               </div>
             </button>
 
-            <button
-              type="button"
-              data-action="set-finance-subview"
-              data-value="OVERVIEW"
-              class="col-span-2 lg:col-span-1 p-3 rounded-lg border border-slate-200 bg-white hover:border-slate-300 text-left transition-colors"
-            >
-              <div class="text-[11px] font-medium text-slate-500">Resultado Comercial (${escapeHtml(snap.periodLabel)})</div>
-              <div class="mt-1 text-base font-bold font-mono tabular-nums ${
-                snap.netCommercialResult >= 0 ? 'text-emerald-700' : 'text-red-700'
-              }">${snap.netCommercialResult >= 0 ? '+' : ''}${formatKzNumber(snap.netCommercialResult)} Kz</div>
-              <div class="mt-1 text-[11px] text-slate-500 font-mono tabular-nums">
-                Margem líquida: ${formatKzNumber(snap.netResultMarginPct)}% · Balanço C/C: ${netWorkingBalance >= 0 ? '+' : ''}${formatKzNumber(netWorkingBalance)}
-              </div>
-            </button>
+            ${
+              canSeeCost && canSeeMargins
+                ? `<button
+                    type="button"
+                    data-action="set-finance-subview"
+                    data-value="OVERVIEW"
+                    class="col-span-2 lg:col-span-1 p-3 rounded-lg border border-slate-200 bg-white hover:border-slate-300 text-left transition-colors"
+                  >
+                    <div class="text-[11px] font-medium text-slate-500">Resultado Comercial (${escapeHtml(snap.periodLabel)})</div>
+                    <div class="mt-1 text-base font-bold font-mono tabular-nums ${
+                      snap.netCommercialResult >= 0 ? 'text-emerald-700' : 'text-red-700'
+                    }">${snap.netCommercialResult >= 0 ? '+' : ''}${formatKzNumber(snap.netCommercialResult)} Kz</div>
+                    <div class="mt-1 text-[11px] text-slate-500 font-mono tabular-nums">
+                      Margem líquida: ${formatKzNumber(snap.netResultMarginPct)}% · Balanço C/C: ${netWorkingBalance >= 0 ? '+' : ''}${formatKzNumber(netWorkingBalance)}
+                    </div>
+                  </button>`
+                : ''
+            }
           </div>
 
           ${
             this.financeSubView === 'OVERVIEW'
-              ? this.renderFinanceOverviewTab(snap)
+              ? this.renderFinanceOverviewTab(snap, canSeeCost, canSeeMargins)
               : this.financeSubView === 'ACCOUNTS'
                 ? this.renderFinanceAccountsTab(snap, openCashSession)
                 : this.financeSubView === 'CASHFLOW'
                   ? this.renderFinanceCashflowTab(snap)
-                  : this.renderFinanceMarginsTab(snap, canManageCat)
+                  : canSeeCost && canSeeMargins
+                    ? this.renderFinanceMarginsTab(snap, canManageCat && canSeeCost)
+                    : this.renderFinanceOverviewTab(snap, canSeeCost, canSeeMargins)
           }
         </div>
       </div>
@@ -22968,12 +24598,17 @@ export class SilaBillingApp {
   }
 
   private renderFinanceOverviewTab(
-    snap: ReturnType<SilaBillingApp['computeFinancialSnapshot']>
+    snap: ReturnType<SilaBillingApp['computeFinancialSnapshot']>,
+    canSeeCost: boolean,
+    canSeeMargins: boolean
   ): string {
-    const topMargins = [...snap.productMargins]
-      .filter((m) => m.soldQty > 0)
-      .sort((a, b) => b.realizedProfit - a.realizedProfit)
-      .slice(0, 5);
+    const topMargins =
+      canSeeCost && canSeeMargins
+        ? [...snap.productMargins]
+            .filter((m) => m.soldQty > 0)
+            .sort((a, b) => b.realizedProfit - a.realizedProfit)
+            .slice(0, 5)
+        : [];
 
     return `
       <div class="grid grid-cols-1 lg:grid-cols-12 gap-4 items-start">
@@ -23012,22 +24647,26 @@ export class SilaBillingApp {
               <span class="text-slate-900">(=) Receita Líquida de Vendas (s/ IVA)</span>
               <span class="font-mono tabular-nums text-slate-900">${formatKzNumber(snap.periodNetSalesRevenue)} Kz</span>
             </div>
-            <div class="px-4 py-2 flex items-center justify-between gap-2 text-slate-600">
-              <span>
-                (-) Custo das Mercadorias Vendidas (CMV estimado)${
-                  snap.periodUncostedLinesCount > 0
-                    ? ` · <button type="button" data-action="set-finance-margin-filter" data-value="NO_COST" class="text-amber-700 hover:underline">${snap.periodUncostedLinesCount} linha(s) s/ custo</button>`
-                    : ''
-                }
-              </span>
-              <span class="font-mono tabular-nums text-red-700">-${formatKzNumber(snap.periodEstimatedCogs)} Kz</span>
-            </div>
-            <div class="px-4 py-2.5 flex items-center justify-between gap-2 bg-slate-50 font-semibold">
-              <span class="text-slate-900">(=) Lucro Bruto Comercial (Margem Bruta: ${formatKzNumber(snap.grossMarginPct)}%)</span>
-              <span class="font-mono tabular-nums ${
-                snap.grossProfit >= 0 ? 'text-emerald-700' : 'text-red-700'
-              }">${formatKzNumber(snap.grossProfit)} Kz</span>
-            </div>
+            ${
+              canSeeCost && canSeeMargins
+                ? `<div class="px-4 py-2 flex items-center justify-between gap-2 text-slate-600">
+                    <span>
+                      (-) Custo das Mercadorias Vendidas (CMV estimado)${
+                        snap.periodUncostedLinesCount > 0
+                          ? ` · <button type="button" data-action="set-finance-margin-filter" data-value="NO_COST" class="text-amber-700 hover:underline">${snap.periodUncostedLinesCount} linha(s) s/ custo</button>`
+                          : ''
+                      }
+                    </span>
+                    <span class="font-mono tabular-nums text-red-700">-${formatKzNumber(snap.periodEstimatedCogs)} Kz</span>
+                  </div>
+                  <div class="px-4 py-2.5 flex items-center justify-between gap-2 bg-slate-50 font-semibold">
+                    <span class="text-slate-900">(=) Lucro Bruto Comercial (Margem Bruta: ${formatKzNumber(snap.grossMarginPct)}%)</span>
+                    <span class="font-mono tabular-nums ${
+                      snap.grossProfit >= 0 ? 'text-emerald-700' : 'text-red-700'
+                    }">${formatKzNumber(snap.grossProfit)} Kz</span>
+                  </div>`
+                : ''
+            }
             <div class="px-4 py-2 flex items-center justify-between gap-2 text-slate-600">
               <span>(+) Receitas Extraordinárias e Outras Entradas</span>
               <span class="font-mono tabular-nums text-emerald-700">+${formatKzNumber(snap.inflowExtraRevenues)} Kz</span>
@@ -23036,19 +24675,25 @@ export class SilaBillingApp {
               <span>(-) Despesas Operacionais do Período</span>
               <span class="font-mono tabular-nums text-red-700">-${formatKzNumber(snap.outflowOperationalExpenses)} Kz</span>
             </div>
-            <div class="px-4 py-3 flex items-center justify-between gap-2 bg-slate-900 text-white font-bold">
-              <div>
-                <div>(=) Resultado Comercial Líquido</div>
-                <div class="text-[11px] font-normal text-slate-300 font-mono tabular-nums">
-                  Rentabilidade líquida: ${formatKzNumber(snap.netResultMarginPct)}%
-                </div>
-              </div>
-              <div class="text-sm font-mono tabular-nums ${
-                snap.netCommercialResult >= 0 ? 'text-emerald-400' : 'text-red-400'
-              }">
-                ${snap.netCommercialResult >= 0 ? '+' : ''}${formatKzNumber(snap.netCommercialResult)} Kz
-              </div>
-            </div>
+            ${
+              canSeeCost && canSeeMargins
+                ? `<div class="px-4 py-3 flex items-center justify-between gap-2 bg-slate-900 text-white font-bold">
+                    <div>
+                      <div>(=) Resultado Comercial Líquido</div>
+                      <div class="text-[11px] font-normal text-slate-300 font-mono tabular-nums">
+                        Rentabilidade líquida: ${formatKzNumber(snap.netResultMarginPct)}%
+                      </div>
+                    </div>
+                    <div class="text-sm font-mono tabular-nums ${
+                      snap.netCommercialResult >= 0 ? 'text-emerald-400' : 'text-red-400'
+                    }">
+                      ${snap.netCommercialResult >= 0 ? '+' : ''}${formatKzNumber(snap.netCommercialResult)} Kz
+                    </div>
+                  </div>`
+                : `<div class="px-4 py-3 text-[11px] text-slate-500 bg-slate-50">
+                    Apuramento de custos de aquisição (CMV) e margens de lucro restrito a perfis autorizados.
+                  </div>`
+            }
           </div>
         </div>
 
@@ -23151,46 +24796,50 @@ export class SilaBillingApp {
             }
           </div>
 
-          <div class="rounded-lg border border-slate-200 bg-white p-4 space-y-2.5">
-            <div class="flex items-center justify-between gap-2">
-              <h2 class="text-xs font-bold text-slate-900">Top Lucro por Produto (${escapeHtml(snap.periodLabel)})</h2>
-              <button
-                type="button"
-                data-action="set-finance-subview"
-                data-value="MARGINS"
-                class="text-[11px] font-medium text-blue-600 hover:underline whitespace-nowrap shrink-0"
-              >Análise completa</button>
-            </div>
-            ${
-              topMargins.length === 0
-                ? `<p class="text-xs text-slate-500">Sem vendas registadas no período selecionado.</p>`
-                : `
-                  <div class="divide-y divide-slate-100 text-xs">
-                    ${topMargins
-                      .map(
-                        (m) => `
-                          <div class="py-1.5 flex items-center justify-between gap-2">
-                            <div class="min-w-0">
-                              <div class="font-medium text-slate-900 truncate">${escapeHtml(m.product.name)}</div>
-                              <div class="text-[11px] text-slate-500 font-mono tabular-nums">
-                                Qtd ${formatKzNumber(m.soldQty)} · ${
-                                  m.marginPct !== null
-                                    ? `Margem ${formatKzNumber(m.marginPct)}%`
-                                    : 'Custo não definido'
-                                }
-                              </div>
-                            </div>
-                            <span class="font-mono tabular-nums font-semibold ${
-                              m.realizedProfit >= 0 ? 'text-emerald-700' : 'text-red-700'
-                            } shrink-0">${formatKzNumber(m.realizedProfit)} Kz</span>
-                          </div>
-                        `
-                      )
-                      .join('')}
+          ${
+            canSeeCost && canSeeMargins
+              ? `<div class="rounded-lg border border-slate-200 bg-white p-4 space-y-2.5">
+                  <div class="flex items-center justify-between gap-2">
+                    <h2 class="text-xs font-bold text-slate-900">Top Lucro por Produto (${escapeHtml(snap.periodLabel)})</h2>
+                    <button
+                      type="button"
+                      data-action="set-finance-subview"
+                      data-value="MARGINS"
+                      class="text-[11px] font-medium text-blue-600 hover:underline whitespace-nowrap shrink-0"
+                    >Análise completa</button>
                   </div>
-                `
-            }
-          </div>
+                  ${
+                    topMargins.length === 0
+                      ? `<p class="text-xs text-slate-500">Sem vendas registadas no período selecionado.</p>`
+                      : `
+                        <div class="divide-y divide-slate-100 text-xs">
+                          ${topMargins
+                            .map(
+                              (m) => `
+                                <div class="py-1.5 flex items-center justify-between gap-2">
+                                  <div class="min-w-0">
+                                    <div class="font-medium text-slate-900 truncate">${escapeHtml(m.product.name)}</div>
+                                    <div class="text-[11px] text-slate-500 font-mono tabular-nums">
+                                      Qtd ${formatKzNumber(m.soldQty)} · ${
+                                        m.marginPct !== null
+                                          ? `Margem ${formatKzNumber(m.marginPct)}%`
+                                          : 'Custo não definido'
+                                      }
+                                    </div>
+                                  </div>
+                                  <span class="font-mono tabular-nums font-semibold ${
+                                    m.realizedProfit >= 0 ? 'text-emerald-700' : 'text-red-700'
+                                  } shrink-0">${formatKzNumber(m.realizedProfit)} Kz</span>
+                                </div>
+                              `
+                            )
+                            .join('')}
+                        </div>
+                      `
+                  }
+                </div>`
+              : ''
+          }
         </div>
       </div>
     `;
@@ -24221,6 +25870,15 @@ export class SilaBillingApp {
     snap: ReturnType<SilaBillingApp['computeFinancialSnapshot']>,
     canManageCat: boolean
   ): string {
+    if (!this.canViewCostPrices() || !this.canViewProfitsMargins()) {
+      return `
+        <div class="p-6 rounded-lg border border-slate-200 bg-slate-50 text-center text-xs text-slate-600">
+          Consulta de preços de custo, margens e lucros restrita ao perfil <strong>${escapeHtml(
+            this.getUnlockedRoleLabel()
+          )}</strong>.
+        </div>
+      `;
+    }
     const q = this.financeMarginSearch.trim().toLowerCase();
     const filterButtons: Array<{
       id: 'ALL' | 'SOLD_IN_PERIOD' | 'LOW_MARGIN' | 'NO_COST';
@@ -24523,6 +26181,10 @@ export class SilaBillingApp {
   private renderIndicatorsWorkspace(): string {
     const snap = this.computeFinancialSnapshot();
     const canManageCat = this.canManageCatalog();
+    const canSeeCost = this.canViewCostPrices();
+    const canSeeMargins = this.canViewProfitsMargins();
+    const canSeeFinance = this.hasPerm('finance_view') || this.hasPerm('expenses_manage');
+    const canManageExpenses = this.hasPerm('expenses_manage');
     const suspended = this.isCompanySuspended();
 
     const periodButtons: Array<{
@@ -24600,15 +26262,19 @@ export class SilaBillingApp {
           </div>
 
           <div class="flex items-center gap-2 shrink-0">
-            <button
-              type="button"
-              data-action="nav"
-              data-value="FINANCE"
-              class="h-8 px-3 rounded-md border border-slate-200 bg-white hover:bg-slate-50 text-xs font-medium text-slate-700 flex items-center gap-1.5 whitespace-nowrap shrink-0"
-            >
-              ${ICONS.chartBar}
-              <span>Gestão financeira</span>
-            </button>
+            ${
+              canSeeFinance
+                ? `<button
+                    type="button"
+                    data-action="nav"
+                    data-value="FINANCE"
+                    class="h-8 px-3 rounded-md border border-slate-200 bg-white hover:bg-slate-50 text-xs font-medium text-slate-700 flex items-center gap-1.5 whitespace-nowrap shrink-0"
+                  >
+                    ${ICONS.chartBar}
+                    <span>Gestão financeira</span>
+                  </button>`
+                : ''
+            }
             <button
               type="button"
               data-action="nav"
@@ -24920,7 +26586,7 @@ export class SilaBillingApp {
           </div>
 
           <!-- Secção 3: Rankings de Produtos (Mais Vendidos, Menos Vendidos e Maior Margem) -->
-          <div class="grid grid-cols-1 lg:grid-cols-3 gap-4">
+          <div class="grid grid-cols-1 ${canSeeCost && canSeeMargins ? 'lg:grid-cols-3' : 'lg:grid-cols-2'} gap-4">
             <!-- 5. Produtos Mais Vendidos -->
             <div class="rounded-lg border border-slate-200 bg-white p-4 flex flex-col justify-between gap-3">
               <div class="flex items-center justify-between gap-2 pb-2 border-b border-slate-100">
@@ -24928,12 +26594,16 @@ export class SilaBillingApp {
                   <h2 class="text-xs font-bold text-slate-900">Produtos Mais Vendidos</h2>
                   <p class="text-[11px] text-slate-500">Ranking por quantidade líquida (${escapeHtml(snap.periodLabel)})</p>
                 </div>
-                <button
-                  type="button"
-                  data-action="indicators-open-margins"
-                  data-value="QTY_DESC"
-                  class="text-[11px] font-medium text-blue-600 hover:underline whitespace-nowrap shrink-0"
-                >Ver grelha</button>
+                ${
+                  canSeeCost && canSeeMargins
+                    ? `<button
+                        type="button"
+                        data-action="indicators-open-margins"
+                        data-value="QTY_DESC"
+                        class="text-[11px] font-medium text-blue-600 hover:underline whitespace-nowrap shrink-0"
+                      >Ver grelha</button>`
+                    : ''
+                }
               </div>
 
               ${
@@ -25057,16 +26727,22 @@ export class SilaBillingApp {
                     snap.leastSellingAllActive.filter((x) => x.soldQty === 0).length
                   }</strong> artigo(s)
                 </span>
-                <button
-                  type="button"
-                  data-action="indicators-open-margins"
-                  data-value="QTY_ASC"
-                  class="font-medium text-blue-600 hover:underline whitespace-nowrap"
-                >Ver todos</button>
+                ${
+                  canSeeCost && canSeeMargins
+                    ? `<button
+                        type="button"
+                        data-action="indicators-open-margins"
+                        data-value="QTY_ASC"
+                        class="font-medium text-blue-600 hover:underline whitespace-nowrap"
+                      >Ver todos</button>`
+                    : ''
+                }
               </div>
             </div>
 
-            <!-- 7. Produtos com Maior Margem -->
+            ${
+              canSeeCost && canSeeMargins
+                ? `<!-- 7. Produtos com Maior Margem -->
             <div class="rounded-lg border border-slate-200 bg-white p-4 flex flex-col justify-between gap-3">
               <div class="flex items-center justify-between gap-2 pb-2 border-b border-slate-100">
                 <div>
@@ -25157,7 +26833,9 @@ export class SilaBillingApp {
                   class="font-medium text-blue-600 hover:underline whitespace-nowrap"
                 >Gerir margens</button>
               </div>
-            </div>
+            </div>`
+                : ''
+            }
           </div>
 
           <!-- Secção 4: Dívidas de Clientes, Despesas & Resultados, e Stock Disponível & Crítico -->
@@ -25238,16 +26916,20 @@ export class SilaBillingApp {
                   <h2 class="text-xs font-bold text-slate-900">Despesas e Resultados</h2>
                   <p class="text-[11px] text-slate-500">Demonstração comercial (${escapeHtml(snap.periodLabel)})</p>
                 </div>
-                <div class="text-right shrink-0">
-                  <div class="text-sm font-bold font-mono tabular-nums ${
-                    snap.netCommercialResult >= 0 ? 'text-emerald-700' : 'text-red-700'
-                  } whitespace-nowrap">
-                    ${snap.netCommercialResult >= 0 ? '+' : ''}${formatKzNumber(snap.netCommercialResult)} Kz
-                  </div>
-                  <div class="text-[10px] text-slate-400 font-mono tabular-nums">
-                    Margem líq. ${formatKzNumber(snap.netResultMarginPct)}%
-                  </div>
-                </div>
+                ${
+                  canSeeCost && canSeeMargins
+                    ? `<div class="text-right shrink-0">
+                        <div class="text-sm font-bold font-mono tabular-nums ${
+                          snap.netCommercialResult >= 0 ? 'text-emerald-700' : 'text-red-700'
+                        } whitespace-nowrap">
+                          ${snap.netCommercialResult >= 0 ? '+' : ''}${formatKzNumber(snap.netCommercialResult)} Kz
+                        </div>
+                        <div class="text-[10px] text-slate-400 font-mono tabular-nums">
+                          Margem líq. ${formatKzNumber(snap.netResultMarginPct)}%
+                        </div>
+                      </div>`
+                    : ''
+                }
               </div>
 
               <div class="space-y-1.5 text-xs">
@@ -25255,16 +26937,20 @@ export class SilaBillingApp {
                   <span class="text-slate-600">Vendas líquidas (s/ IVA)</span>
                   <span class="font-mono tabular-nums font-medium text-slate-900">${formatKzNumber(snap.periodNetSalesRevenue)} Kz</span>
                 </div>
-                <div class="flex items-center justify-between gap-2">
-                  <span class="text-slate-600">Custo mercadorias (CMV)</span>
-                  <span class="font-mono tabular-nums text-slate-700">-${formatKzNumber(snap.periodEstimatedCogs)} Kz</span>
-                </div>
-                <div class="flex items-center justify-between gap-2 pt-1 border-t border-slate-100">
-                  <span class="font-medium text-slate-800">Lucro bruto (${formatKzNumber(snap.grossMarginPct)}%)</span>
-                  <span class="font-mono tabular-nums font-semibold ${
-                    snap.grossProfit >= 0 ? 'text-emerald-700' : 'text-red-700'
-                  }">${formatKzNumber(snap.grossProfit)} Kz</span>
-                </div>
+                ${
+                  canSeeCost && canSeeMargins
+                    ? `<div class="flex items-center justify-between gap-2">
+                        <span class="text-slate-600">Custo mercadorias (CMV)</span>
+                        <span class="font-mono tabular-nums text-slate-700">-${formatKzNumber(snap.periodEstimatedCogs)} Kz</span>
+                      </div>
+                      <div class="flex items-center justify-between gap-2 pt-1 border-t border-slate-100">
+                        <span class="font-medium text-slate-800">Lucro bruto (${formatKzNumber(snap.grossMarginPct)}%)</span>
+                        <span class="font-mono tabular-nums font-semibold ${
+                          snap.grossProfit >= 0 ? 'text-emerald-700' : 'text-red-700'
+                        }">${formatKzNumber(snap.grossProfit)} Kz</span>
+                      </div>`
+                    : ''
+                }
                 ${
                   snap.inflowExtraRevenues > 0
                     ? `
@@ -25314,7 +27000,7 @@ export class SilaBillingApp {
                 </span>
                 <div class="flex items-center gap-2 shrink-0">
                   ${
-                    !suspended
+                    !suspended && canManageExpenses
                       ? `<button
                           type="button"
                           data-action="indicators-open-dre"
@@ -25323,12 +27009,16 @@ export class SilaBillingApp {
                         >+ Despesa</button>`
                       : ''
                   }
-                  <button
-                    type="button"
-                    data-action="indicators-open-dre"
-                    data-value="OVERVIEW"
-                    class="font-medium text-blue-600 hover:underline whitespace-nowrap"
-                  >Ver DRE</button>
+                  ${
+                    canSeeFinance
+                      ? `<button
+                          type="button"
+                          data-action="indicators-open-dre"
+                          data-value="OVERVIEW"
+                          class="font-medium text-blue-600 hover:underline whitespace-nowrap"
+                        >Ver DRE</button>`
+                      : ''
+                  }
                 </div>
               </div>
             </div>
@@ -25359,9 +27049,9 @@ export class SilaBillingApp {
                   data-value="ACTIVE"
                   class="p-2 rounded border border-slate-200 hover:bg-slate-50 text-left"
                 >
-                  <div class="text-[10px] text-slate-500">Valor Custo</div>
+                  <div class="text-[10px] text-slate-500">${canSeeCost ? 'Valor Custo' : 'Artigos Activos'}</div>
                   <div class="text-xs font-bold text-slate-900 font-mono tabular-nums truncate">
-                    ${formatKzNumber(snap.stockSummary.stockCostValuation)}
+                    ${canSeeCost ? formatKzNumber(snap.stockSummary.stockCostValuation) : snap.stockSummary.activeCatalogCount}
                   </div>
                 </button>
                 <button
