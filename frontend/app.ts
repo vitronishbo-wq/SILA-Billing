@@ -27,6 +27,7 @@ import {
   type ProximoNumeroFiscalResult,
 } from '../src/core/seriesManager';
 import {
+  evaluateCompanyMasterCompleteness,
   resolveActiveEstablishment,
   validateEstablishmentRecord,
 } from '../src/core/companyValidator';
@@ -40,6 +41,7 @@ import {
   validateCustomerForInvoiceEmission,
 } from '../src/core/customerValidator';
 import {
+  AngolaTaxRegime,
   AppSettings,
   buildInvoiceIssuerSnapshot,
   canCompanyHideViralFooter,
@@ -4436,7 +4438,7 @@ export class SilaBillingApp {
         break;
       }
       case 'mobile-open-quick-company': {
-        if (!this.canManageCompanySettings()) return;
+        if (!this.hasPerm('master_view') && !this.canManageCompanySettings()) return;
         this.settingsErrorMessage = null;
         this.settingsSavedNotice = false;
         this.companyMasterDraftProfile = null;
@@ -4980,10 +4982,15 @@ export class SilaBillingApp {
         const nif = String(formData.get('nif') || '').trim();
         const cityCountry = String(formData.get('cityCountry') || 'Angola').trim();
         const ownerEmail = String(formData.get('ownerEmail') || '').trim();
+        const taxRegimeRaw = String(formData.get('taxRegime') || '').trim();
+        const taxRegime =
+          taxRegimeRaw === 'GERAL' || taxRegimeRaw === 'SIMPLIFICADO' || taxRegimeRaw === 'EXCLUSAO'
+            ? (taxRegimeRaw as AngolaTaxRegime)
+            : null;
         const planTier = (formData.get('planTier') || 'FREE') as PlanTier;
 
-        if (!shortName || !nif || !ownerEmail) {
-          this.masterAdminError = 'Preencha Nome Curto, NIF e E-mail do Proprietário.';
+        if (!shortName || !nif || !ownerEmail || !taxRegime) {
+          this.masterAdminError = 'Preencha Nome Curto, NIF, E-mail do Proprietário e Regime de IVA.';
           this.render();
           break;
         }
@@ -4997,6 +5004,7 @@ export class SilaBillingApp {
             nif,
             cityCountry,
             ownerEmail,
+            taxRegime,
             planTier,
             status: 'active',
           });
@@ -5011,6 +5019,7 @@ export class SilaBillingApp {
             nif,
             cityCountry,
             ownerEmail,
+            taxRegime,
             planTier,
             status: 'active',
           });
@@ -5186,6 +5195,15 @@ export class SilaBillingApp {
       }
       case 'hide-sidebar': {
         this.sidebarState = 'HIDDEN';
+        this.render();
+        break;
+      }
+      case 'open-company-master-direct': {
+        if (!this.canAccessModule('SETTINGS')) return;
+        this.activeModule = 'SETTINGS';
+        this.companyMasterSection = 'ALL';
+        this.settingsErrorMessage = null;
+        this.showCompanyDropdown = false;
         this.render();
         break;
       }
@@ -9428,6 +9446,17 @@ export class SilaBillingApp {
         const legalName = String(fd.get('legalName') || '').trim();
         const shortName = String(fd.get('shortName') || '').trim();
         const nif = String(fd.get('nif') || '').trim();
+        const taxRegimeRaw = String(fd.get('taxRegime') || '').trim();
+        if (
+          taxRegimeRaw !== 'GERAL' &&
+          taxRegimeRaw !== 'SIMPLIFICADO' &&
+          taxRegimeRaw !== 'EXCLUSAO'
+        ) {
+          throw new Error(
+            'Seleccione obrigatoriamente o Regime de IVA (Geral, Simplificado ou Exclusão).'
+          );
+        }
+        const taxRegime = taxRegimeRaw as AngolaTaxRegime;
         const cityCountry = String(fd.get('cityCountry') || 'Luanda - Angola').trim();
         const phone = String(fd.get('phone') || '').trim();
         const address = String(fd.get('address') || '').trim();
@@ -9438,6 +9467,8 @@ export class SilaBillingApp {
           legalName,
           shortName,
           nif,
+          taxRegime,
+          agtEnvironment: 'SIMULACAO',
           cityCountry,
           phone,
           address,
@@ -12563,6 +12594,13 @@ export class SilaBillingApp {
       : null;
     const showViralFooter = shouldShowViralDocumentFooter(this.activeCompany, this.settings);
     const monthlyUsage = isUnassigned ? null : this.getMonthlyInvoiceUsage();
+    const canViewMaster = unlockedPerms.master_view || unlockedPerms.settings_manage;
+    const masterCheck = !isUnassigned
+      ? evaluateCompanyMasterCompleteness(this.settings.company, {
+          series: listarSeries({ companyId: this.activeCompany.id }),
+          requireProductionSeriesCheck: true,
+        })
+      : null;
 
     this.root.innerHTML = `
       ${
@@ -12678,7 +12716,9 @@ export class SilaBillingApp {
                   canViewDocs: unlockedPerms.reports_own_sales || unlockedPerms.reports_operational,
                   canExportSaft: unlockedPerms.saft_export,
                   canOperateCash: unlockedPerms.cash_own_shift || unlockedPerms.cash_all_shifts,
-                  canViewMaster: unlockedPerms.master_view || unlockedPerms.settings_manage,
+                  canViewMaster,
+                  masterCompletionPct: masterCheck?.completionPct ?? 0,
+                  isMasterProductionReady: Boolean(masterCheck?.readyForProductionEmission),
                   canManageRbac:
                     unlockedPerms.users_view ||
                     unlockedPerms.users_manage ||
@@ -12760,6 +12800,19 @@ export class SilaBillingApp {
           </div>
 
           <div class="flex items-center gap-1.5 sm:gap-2 shrink-0">
+            ${
+              !isUnassigned && this.canAccessModule('SETTINGS')
+                ? `<button
+                    type="button"
+                    data-action="open-company-master-direct"
+                    title="Configurações & Ficha Mestre da Empresa"
+                    class="h-8 px-2 rounded-md bg-slate-800 hover:bg-slate-700 text-[11px] text-slate-300 hover:text-white flex items-center gap-1 transition-colors whitespace-nowrap"
+                  >
+                    ${ICONS.settings}
+                    <span class="hidden xl:inline">Ficha / Def.</span>
+                  </button>`
+                : ''
+            }
             <button
               type="button"
               data-action="open-privacy-policy"
@@ -12828,6 +12881,25 @@ export class SilaBillingApp {
                       data-action="retry-db-boot"
                       class="h-7 px-2.5 rounded bg-red-600 text-white font-semibold hover:bg-red-700 whitespace-nowrap shrink-0"
                     >Tentar novamente</button>
+                  </div>`
+                : ''
+            }
+            ${
+              !this.isBooting &&
+              !isUnassigned &&
+              this.activeModule !== 'SETTINGS' &&
+              canViewMaster &&
+              masterCheck &&
+              !masterCheck.readyForProductionEmission
+                ? `<div class="px-4 py-1.5 bg-slate-50 border-b border-slate-200 flex items-center justify-between gap-3 text-xs shrink-0">
+                    <span class="text-slate-600 truncate tabular-nums">
+                      <strong class="font-semibold text-slate-900">Modo Simulação</strong> · Ficha Mestre a ${masterCheck.completionPct}% — complete os dados fiscais para activar Produção AGT.
+                    </span>
+                    <button
+                      type="button"
+                      data-action="open-company-master-direct"
+                      class="text-xs font-semibold text-blue-600 hover:text-blue-700 hover:underline whitespace-nowrap shrink-0"
+                    >Completar Ficha Mestre →</button>
                   </div>`
                 : ''
             }

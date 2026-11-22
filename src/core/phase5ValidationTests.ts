@@ -59,7 +59,7 @@ import {
   type Supplier,
   type TaxRate,
 } from './types.ts';
-import { normalizeCompanyMasterProfile } from '../services/localStore.ts';
+import { normalizeCompanyMasterProfile, registerNewCompanyLocal } from '../services/localStore.ts';
 import {
   generateNextCustomerInternalCode,
   validateAndBuildCustomer,
@@ -67,7 +67,9 @@ import {
 } from './customerValidator.ts';
 import { renderCustomerMasterForm } from '../../frontend/ui/customerForm.ts';
 import { renderDocumentHtml } from '../../frontend/ui/documentRenderer.ts';
+import { renderMasterGovernanceModal } from '../../frontend/ui/masterGovernanceModal.ts';
 import { renderMobileOperationalView } from '../../frontend/ui/mobileOperationalView.ts';
+import { renderNewCompanyModal } from '../../frontend/ui/multicompanyModals.ts';
 
 function assert(condition: boolean, message: string): void {
   if (!condition) {
@@ -1608,6 +1610,200 @@ export async function runPhase5ValidationTests(): Promise<{ passed: number; tota
     assert(!cfHtml.includes('Luanda - Angola'), 'Consumidor Final no Huambo não deve manter Luanda antiga');
     assert(!cfHtml.includes('Troco:'), 'Troco zero não deve ser exibido no POS');
     assert(cfHtml.includes('ANULADO'), 'POS deve destacar estado ANULADO para documentos anulados');
+  });
+
+  await test('5.10 Registo Inicial de Empresa: selector obrigatório de Regime de IVA (zero auto-selecção), Simulação obrigatória e atalho discreto para Ficha Mestre', async () => {
+    // 1. Modal inicial de cadastro não pode pré-seleccionar regime de IVA
+    const newCompanyHtml = renderNewCompanyModal({
+      errorMessage: null,
+      isSubmitting: false,
+      isSignedIn: false,
+    });
+    assert(
+      newCompanyHtml.includes('name="taxRegime"') &&
+        newCompanyHtml.includes('<option value="" selected disabled>Seleccionar regime fiscal de IVA...</option>'),
+      'Modal de registo inicial deve exigir selecção manual do regime de IVA sem valor pré-seleccionado'
+    );
+    for (const regime of ['value="GERAL"', 'value="SIMPLIFICADO"', 'value="EXCLUSAO"']) {
+      assert(newCompanyHtml.includes(regime), `Modal inicial deve listar opção ${regime}`);
+      assert(
+        !newCompanyHtml.includes(`${regime} selected`),
+        `Opção ${regime} nunca pode vir pré-seleccionada automaticamente`
+      );
+    }
+    assert(
+      newCompanyHtml.includes('Inicia em') && newCompanyHtml.includes('Simulação'),
+      'Modal inicial deve informar que a empresa inicia em Simulação até completar a Ficha Mestre'
+    );
+
+    // 2. Modal Master de criação administrativa de empresa também exige regime de IVA sem pré-selecção
+    const masterHtml = renderMasterGovernanceModal({
+      isSignedIn: true,
+      userEmail: 'wtmedia0@gmail.com',
+      isLoading: false,
+      accessDenied: false,
+      errorMessage: null,
+      searchQuery: '',
+      mergedCompanies: [],
+      recentLogs: [],
+      activeCompanyId: 'comp_test',
+      activeTab: 'companies',
+      showNewCompanyForm: true,
+    });
+    assert(
+      masterHtml.includes('id="master-new-company-form"') &&
+        masterHtml.includes('name="taxRegime"') &&
+        masterHtml.includes('<option value="" selected disabled>Seleccionar regime fiscal de IVA...</option>'),
+      'Modal Master de nova empresa deve exigir selecção manual do regime de IVA'
+    );
+
+    // 3. registerNewCompanyLocal rejeita estritamente registo sem taxRegime explícito
+    let rejectedMissingRegime = false;
+    try {
+      await registerNewCompanyLocal({
+        legalName: 'Kiala Comercial, Lda',
+        shortName: 'KIALA',
+        nif: '5401122330',
+        taxRegime: '' as any,
+      });
+    } catch (err) {
+      rejectedMissingRegime =
+        err instanceof Error && err.message.includes('Regime Fiscal de IVA');
+    }
+    assert(rejectedMissingRegime, 'registerNewCompanyLocal deve rejeitar registo sem Regime de IVA explícito');
+
+    // 4. Empresa recém-registada com dados simplificados fica bloqueada de Produção até Ficha Mestre completa
+    const partialProfile: CompanyProfile = {
+      legalName: 'Kiala Comercial, Lda',
+      shortName: 'KIALA',
+      nif: '5401122330',
+      taxRegime: 'SIMPLIFICADO',
+      agtEnvironment: 'SIMULACAO',
+      address: 'Rua 1, Talatona',
+      cityCountry: 'Luanda - Angola',
+      phone: '+244 923 000 111',
+      email: '',
+      tagline: 'Obrigado pela preferência',
+    };
+    const incompleteEval = evaluateCompanyMasterCompleteness(partialProfile, {
+      series: [],
+      requireProductionSeriesCheck: true,
+    });
+    assert(
+      !incompleteEval.readyForProductionEmission && incompleteEval.completionPct < 100,
+      'Empresa com registo inicial incompleto não pode estar pronta para Produção AGT'
+    );
+
+    // 5. No telemóvel, exibe indicação discreta + acesso imediato à Ficha Mestre apenas quando incompleta
+    const mobileCompany = {
+      id: 'comp_kiala',
+      normalizedNif: '5401122330',
+      profile: partialProfile,
+      status: 'active' as const,
+      plan: {
+        planTier: 'FREE' as const,
+        commercialActive: false,
+        maxUsers: null,
+        maxInvoicesPerMonth: null,
+        updatedAtIso: new Date().toISOString(),
+      },
+      baseSequence: 0,
+      allowManagerCancel: false,
+      createdAtIso: new Date().toISOString(),
+      updatedAtIso: new Date().toISOString(),
+    };
+    const baseMobileProps = {
+      activeCompany: mobileCompany,
+      settings: {
+        companyId: 'comp_kiala',
+        company: partialProfile,
+        defaultCashier: '01',
+        defaultOperator: '001',
+        defaultFormat: 'POS' as const,
+        defaultDocType: 'FR' as const,
+        defaultNotes: '',
+        autoPrintOnEmit: false,
+        hidePromotionalFooter: false,
+        allowCashierPriceEdit: false,
+        updatedAtIso: new Date().toISOString(),
+      },
+      companyMasterDraftProfile: null,
+      companyMasterDraftSettings: null,
+      companyMasterSection: 'ALL' as const,
+      companySeries: [],
+      canManageCompanySettings: true,
+      companyFormError: null,
+      companyFormSavedNotice: false,
+      showRequestAgtSeriesForm: false,
+      confirmFinalizeSeriesId: null,
+      agtSeriesErrorMessage: null,
+      agtSeriesSuccessMessage: null,
+      showEstablishmentForm: false,
+      editingEstablishment: null,
+      establishmentError: null,
+      showWarehouseForm: false,
+      editingWarehouse: null,
+      warehouseError: null,
+      isOnline: true,
+      user: { email: 'kiala@empresa.ao' },
+      mobileTab: 'HOME' as const,
+      mobileCheckoutStep: 'CART' as const,
+      cart: [],
+      products: [],
+      customers: [],
+      invoices: [],
+      selectedCustomerId: '999999999',
+      docType: 'FR' as const,
+      paymentMethod: 'Dinheiro' as const,
+      amountReceivedInput: '',
+      mobileSearchQuery: '',
+      mobileProductSearchInput: '',
+      lastEmittedInvoice: null,
+      showQuickProductModal: false,
+      showQuickCustomerModal: false,
+      showQuickCompanyModal: false,
+      showCustomerPickerModal: false,
+      editingMobileProduct: null,
+      editingCustomer: null,
+      editingCustomerCreditLimitInput: '',
+      showCustomerAdvancedFields: false,
+      mobileCustomerModalMode: 'QUICK' as const,
+      canEditExistingCustomers: true,
+      quickCustomerDraft: {
+        name: '',
+        nif: '',
+        phone: '',
+        address: '',
+        locality: 'Luanda',
+        customerType: 'PARTICULAR' as const,
+        countryCode: 'AO',
+        foreignTaxId: '',
+      },
+      quickProductError: null,
+      quickCustomerError: null,
+      operator: '001',
+      canViewMaster: true,
+      masterCompletionPct: incompleteEval.completionPct,
+      isMasterProductionReady: false,
+    };
+
+    const mobileIncompleteHtml = renderMobileOperationalView(baseMobileProps);
+    assert(
+      mobileIncompleteHtml.includes(`Modo Simulação · Ficha Mestre (${incompleteEval.completionPct}%)`) &&
+        mobileIncompleteHtml.includes('data-action="mobile-open-quick-company"') &&
+        mobileIncompleteHtml.includes('Completar →'),
+      'Home Mobile deve exibir indicação minimalista de Ficha Mestre incompleta com acesso directo em 1 toque'
+    );
+
+    const mobileReadyHtml = renderMobileOperationalView({
+      ...baseMobileProps,
+      masterCompletionPct: 100,
+      isMasterProductionReady: true,
+    });
+    assert(
+      !mobileReadyHtml.includes('Modo Simulação · Ficha Mestre'),
+      'Home Mobile deve ocultar a barra discreta quando a Ficha Mestre e Produção estiverem completas'
+    );
   });
 
   console.log(`\n=== FASE 5 CONCLUÍDA: ${passed}/${total} TESTES PASSARAM COM SUCESSO ===\n`);

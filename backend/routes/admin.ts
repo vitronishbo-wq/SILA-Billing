@@ -378,6 +378,7 @@ adminRouter.post('/companies', async (req: AuthenticatedRequest, res) => {
     nif?: string;
     cityCountry?: string;
     ownerEmail?: string;
+    taxRegime?: 'GERAL' | 'SIMPLIFICADO' | 'EXCLUSAO';
     planTier?: PlanTier;
     status?: CompanyOperationalStatus;
   };
@@ -388,13 +389,17 @@ adminRouter.post('/companies', async (req: AuthenticatedRequest, res) => {
   const normalizedNif = normalizeCompanyNif(rawNif);
   const cityCountry = String(body?.cityCountry || 'Angola').trim().slice(0, 60);
   const ownerEmail = String(body?.ownerEmail || adminUser.email || '').trim().toLowerCase().slice(0, 120);
+  const taxRegime =
+    body?.taxRegime === 'GERAL' || body?.taxRegime === 'SIMPLIFICADO' || body?.taxRegime === 'EXCLUSAO'
+      ? body.taxRegime
+      : null;
   const planTier = body?.planTier && VALID_PLANS.includes(body.planTier) ? body.planTier : 'FREE';
   const status = body?.status && VALID_STATUSES.includes(body.status) ? body.status : 'active';
 
-  if (!shortName || !normalizedNif || !ownerEmail) {
+  if (!shortName || !normalizedNif || !ownerEmail || !taxRegime) {
     res.status(400).json({
       ok: false,
-      error: 'Preencha obrigatoriamente Nome Curto, NIF válido e E-mail do proprietário.',
+      error: 'Preencha obrigatoriamente Nome Curto, NIF válido, E-mail do proprietário e Regime de IVA.',
     });
     return;
   }
@@ -424,6 +429,10 @@ adminRouter.post('/companies', async (req: AuthenticatedRequest, res) => {
       phone: '',
       email: ownerEmail,
       tagline: 'Obrigado pela preferência',
+      masterProfile: {
+        taxRegime,
+        agtEnvironment: 'SIMULACAO',
+      },
       ownerEmail,
       ownerUid: adminUser.uid,
       planTier,

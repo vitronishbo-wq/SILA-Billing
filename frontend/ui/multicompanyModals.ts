@@ -186,6 +186,20 @@ export function renderNewCompanyModal(params: {
             </div>
           </div>
 
+          <div>
+            <label class="block text-[11px] font-medium text-slate-700 mb-1">Regime de IVA *</label>
+            <select
+              name="taxRegime"
+              required
+              class="w-full h-9 px-2.5 text-xs bg-slate-50 border border-slate-200 rounded-md focus:outline-none focus:border-blue-600 text-slate-900"
+            >
+              <option value="" selected disabled>Seleccionar regime fiscal de IVA...</option>
+              <option value="GERAL">Regime Geral de IVA (14%)</option>
+              <option value="SIMPLIFICADO">Regime Simplificado de IVA</option>
+              <option value="EXCLUSAO">Regime de Exclusão de IVA</option>
+            </select>
+          </div>
+
           <div class="grid grid-cols-2 gap-2.5">
             <div>
               <label class="block text-[11px] font-medium text-slate-700 mb-1">Cidade / Província</label>
@@ -243,8 +257,8 @@ export function renderNewCompanyModal(params: {
           </label>
 
           <div class="text-[11px] text-slate-500 pt-1">
-            Numeração própria iniciada em <span class="font-mono tabular-nums font-semibold">000001</span> · Armazenamento autónomo neste dispositivo${
-              isSignedIn ? ' · Identidade empresarial vinculada' : ''
+            Inicia em <strong class="text-slate-700">Simulação</strong> com série <span class="font-mono tabular-nums font-semibold">000001</span> até completar a Ficha Mestre fiscal para Produção${
+              isSignedIn ? ' · Identidade vinculada' : ''
             }.
           </div>
 

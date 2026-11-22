@@ -146,7 +146,7 @@ export interface RegisterCompanyInput {
   cae?: string;
   commercialRegistry?: string;
   shareCapital?: string;
-  taxRegime?: AngolaTaxRegime;
+  taxRegime: AngolaTaxRegime;
   taxOffice?: string;
   taxEntity?: string;
   specialTaxTerritory?: AngolaTaxTerritory;
@@ -1407,6 +1407,13 @@ export async function bootstrapLocalStore(
 export async function registerNewCompanyLocal(
   input: RegisterCompanyInput
 ): Promise<CompanyRecord> {
+  const validTaxRegimes: ReadonlyArray<AngolaTaxRegime> = ['GERAL', 'SIMPLIFICADO', 'EXCLUSAO'];
+  if (!input.taxRegime || !validTaxRegimes.includes(input.taxRegime)) {
+    throw new Error(
+      'Seleccione obrigatoriamente o Regime Fiscal de IVA (Geral, Simplificado ou Exclusão). O sistema não escolhe um regime automaticamente.'
+    );
+  }
+
   await ensureMulticompanyInitialized({
     uid: input.ownerUid,
     email: input.ownerEmail,
@@ -1458,7 +1465,7 @@ export async function registerNewCompanyLocal(
     commercialRegistry: input.commercialRegistry?.trim().slice(0, 80),
     shareCapital: input.shareCapital?.trim().slice(0, 40),
     nif: input.nif.trim().slice(0, 32),
-    taxRegime: input.taxRegime || 'GERAL',
+    taxRegime: input.taxRegime,
     taxOffice: input.taxOffice?.trim().slice(0, 120),
     taxEntity: input.taxEntity?.trim().slice(0, 120),
     specialTaxTerritory: input.specialTaxTerritory,
@@ -1488,10 +1495,13 @@ export async function registerNewCompanyLocal(
   });
 
   if (normalizedProfile.agtEnvironment === 'PRODUCAO') {
-    const prodCheck = evaluateCompanyMasterCompleteness(normalizedProfile);
+    const prodCheck = evaluateCompanyMasterCompleteness(normalizedProfile, {
+      series: [],
+      requireProductionSeriesCheck: true,
+    });
     if (!prodCheck.readyForProductionEmission) {
       throw new Error(
-        `Para iniciar directamente em Produção complete a Ficha Mestre: ${prodCheck.blockingIssues.map((i) => i.message).join(' ')}`
+        `A empresa deve iniciar em Simulação até completar a Ficha Mestre e activar série de Produção: ${prodCheck.blockingIssues.map((i) => i.message).join(' ')}`
       );
     }
   }

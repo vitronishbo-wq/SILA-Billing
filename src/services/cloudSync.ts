@@ -3371,6 +3371,7 @@ export async function createPlatformCompanyClient(payload: {
   nif: string;
   cityCountry?: string;
   ownerEmail?: string;
+  taxRegime?: 'GERAL' | 'SIMPLIFICADO' | 'EXCLUSAO';
   planTier?: PlanTier;
   status?: CompanyOperationalStatus;
 }): Promise<{ ok: boolean; companyId?: string; error?: string }> {
@@ -3388,10 +3389,14 @@ export async function createPlatformCompanyClient(payload: {
   const legalName = (payload.legalName || shortName).trim().slice(0, 160) || shortName;
   const cityCountry = (payload.cityCountry || 'Angola').trim().slice(0, 80) || 'Angola';
   const ownerEmail = (payload.ownerEmail || user.email || '').trim().toLowerCase().slice(0, 120);
+  const taxRegime =
+    payload.taxRegime === 'GERAL' || payload.taxRegime === 'SIMPLIFICADO' || payload.taxRegime === 'EXCLUSAO'
+      ? payload.taxRegime
+      : null;
   const planTier = payload.planTier && VALID_ADMIN_PLANS.has(payload.planTier) ? payload.planTier : 'FREE';
   const status = payload.status && VALID_ADMIN_STATUSES.has(payload.status) ? payload.status : 'active';
-  if (!shortName || !ownerEmail) {
-    return { ok: false, error: 'Preencha Nome Curto, NIF válido e E-mail do proprietário.' };
+  if (!shortName || !ownerEmail || !taxRegime) {
+    return { ok: false, error: 'Preencha Nome Curto, NIF válido, E-mail do proprietário e Regime de IVA.' };
   }
 
   const companyId = sanitizeId(
@@ -3427,6 +3432,10 @@ export async function createPlatformCompanyClient(payload: {
       phone: '',
       email: ownerEmail,
       tagline: 'Obrigado pela preferência',
+      masterProfile: {
+        taxRegime,
+        agtEnvironment: 'SIMULACAO',
+      },
       status: 'active',
       planTier: 'FREE',
       commercialActive: false,

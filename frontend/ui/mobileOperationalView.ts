@@ -113,6 +113,8 @@ export interface MobileOperationalProps {
   canExportSaft?: boolean;
   canOperateCash?: boolean;
   canViewMaster?: boolean;
+  masterCompletionPct?: number;
+  isMasterProductionReady?: boolean;
   canManageRbac?: boolean;
   canViewSecurityAudit?: boolean;
   companiesCount?: number;
@@ -284,6 +286,22 @@ function renderMobileHome(props: MobileOperationalProps): string {
             : ''
         }
       </section>
+
+      ${
+        canViewMaster && !props.isMasterProductionReady
+          ? `<section class="px-3.5 py-2.5 rounded-xl bg-slate-900/70 border border-slate-800 flex items-center justify-between gap-3">
+              <div class="min-w-0">
+                <span class="text-xs font-semibold text-white block tabular-nums">Modo Simulação · Ficha Mestre (${props.masterCompletionPct ?? 0}%)</span>
+                <span class="text-[11px] text-slate-400 block truncate">Complete os dados fiscais para activar Produção AGT</span>
+              </div>
+              <button
+                type="button"
+                data-action="mobile-open-quick-company"
+                class="text-xs font-semibold text-blue-400 hover:text-blue-300 whitespace-nowrap shrink-0"
+              >Completar →</button>
+            </section>`
+          : ''
+      }
 
       ${
         !props.user
@@ -1601,8 +1619,8 @@ function renderMobileMore(props: MobileOperationalProps): string {
                     ${ICONS.building}
                   </div>
                   <div>
-                    <span class="text-sm font-bold text-white block">Ficha Mestre da Empresa</span>
-                    <span class="text-xs text-slate-400 block">Dados fiscais, logótipo, bancos, estabelecimentos e séries</span>
+                    <span class="text-sm font-bold text-white block">Ficha Mestre &amp; Definições</span>
+                    <span class="text-xs text-slate-400 block">Caixa, impressão, dados fiscais, logótipo, bancos e séries</span>
                   </div>
                 </div>
                 <span class="text-slate-500">${ICONS.chevronRight}</span>

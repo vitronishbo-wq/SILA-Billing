@@ -491,6 +491,7 @@ export async function createPlatformCompany(payload: {
   nif: string;
   cityCountry?: string;
   ownerEmail?: string;
+  taxRegime?: 'GERAL' | 'SIMPLIFICADO' | 'EXCLUSAO';
   planTier?: PlanTier;
   status?: CompanyOperationalStatus;
 }): Promise<{ ok: boolean; companyId?: string; persistedInFirestore?: boolean; error?: string }> {

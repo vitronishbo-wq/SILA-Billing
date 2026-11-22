@@ -1319,6 +1319,20 @@ function renderNewCompanyMasterModal(): string {
           </div>
 
           <div>
+            <label class="block font-medium text-slate-700 mb-1">Regime de IVA *</label>
+            <select
+              name="taxRegime"
+              required
+              class="w-full h-8 px-2.5 text-xs bg-white border border-slate-200 rounded-md focus:outline-none focus:border-blue-600"
+            >
+              <option value="" selected disabled>Seleccionar regime fiscal de IVA...</option>
+              <option value="GERAL">Regime Geral de IVA (14%)</option>
+              <option value="SIMPLIFICADO">Regime Simplificado de IVA</option>
+              <option value="EXCLUSAO">Regime de Exclusão de IVA</option>
+            </select>
+          </div>
+
+          <div>
             <label class="block font-medium text-slate-700 mb-1">Plano Comercial Inicial</label>
             <select
               name="planTier"
