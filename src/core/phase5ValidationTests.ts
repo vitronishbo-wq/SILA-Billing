@@ -1555,12 +1555,13 @@ export async function runPhase5ValidationTests(): Promise<{ passed: number; tota
     assert(posHtml.includes('Rua Mariano Machado, N.º 10'), 'POS deve exibir morada do cliente');
     assert(posHtml.includes('923445566') && posHtml.includes('faturas@planalto.ao'), 'POS deve exibir telefone e e-mail do cliente');
     assert(posHtml.includes('Caixa: <span class="font-semibold">01</span>') && posHtml.includes('Operador(a): <span class="font-semibold">001</span>'), 'POS deve separar visualmente Caixa e Operador');
-    assert(posHtml.includes('>Qtd.<') && posHtml.includes('>P. Unit.<') && posHtml.includes('>Subtotal<'), 'POS deve ter colunas estruturadas para artigos');
+    assert(posHtml.includes('Artigo · Qtd × P. Unit.') && posHtml.includes('>Subtotal<'), 'POS deve ter barra estruturada para artigos sem tabela de células vazias');
+    assert(!posHtml.includes('<table'), 'POS não deve usar tabela rígida com células vazias nos artigos');
     assert(!posHtml.includes('1.250,002.500,00'), 'POS não pode concatenar preço unitário e subtotal');
     assert(
-      posHtml.includes('M10: Isento nos termos da Lei do IVA (Bens da Cesta Básica) (Art.º 12.º, alínea a) do CIVA)') &&
-        posHtml.includes('Isento — Cesta Básica'),
-      'POS deve apresentar código e fundamento legal de isenção'
+      posHtml.includes('M10: Isento, Art.º 12.º, alínea a) do CIVA') &&
+        !posHtml.includes('Isento nos termos da Lei do IVA (Bens da Cesta Básica) (Art.º 12.º, alínea a) do CIVA) —'),
+      'POS deve apresentar código e fundamento legal conciso de isenção sem repetitividade'
     );
     assert(posHtml.includes('Desc. artigo: -10,00%'), 'POS deve discriminar desconto do artigo');
     assert(posHtml.includes('Dinheiro') && posHtml.includes('Multicaixa (TPA-441)'), 'POS deve discriminar pagamentos múltiplos');
@@ -1568,8 +1569,10 @@ export async function runPhase5ValidationTests(): Promise<{ passed: number; tota
     assert(!posHtml.includes('Est. 001 · Bela Vista'), 'POS não deve duplicar o nome comercial no estabelecimento');
     assert(posHtml.includes('DOCUMENTO FISCAL · SÉRIE P2026'), 'POS deve apresentar série documental');
     assert(posHtml.includes('ATCUD: AGT-2026-001-12'), 'POS deve apresentar ATCUD atribuído');
-    assert(posHtml.includes('<svg '), 'POS deve renderizar QR Code SVG efectivo mesmo sem qrDataUrl PNG');
-    assert(posHtml.includes('pf2F') && posHtml.includes('RSA-SHA1'), 'POS deve identificar o mecanismo de assinatura/hash SAF-T');
+    const qrSvgMatches = (posHtml.match(/<svg /g) || []).length;
+    assert(qrSvgMatches === 1, `POS deve renderizar exactamente 1 QR Code SVG efectivo (encontrados ${qrSvgMatches})`);
+    assert(!posHtml.includes('QR AGT (Produção)</div>') && !posHtml.includes('QR Verificação (Simulação)</div>'), 'POS não deve duplicar legenda abaixo do QR Code');
+    assert(posHtml.includes('pf2F-Processado por programa validado SILA-Billing') && posHtml.includes('RSA-SHA1'), 'POS deve preservar integralmente a assinatura/hash SAF-T');
     assert(posHtml.includes('FISCAL VÁLIDO (PRODUÇÃO AGT)'), 'POS deve identificar claramente o estado fiscal');
     assert(posHtml.includes('Huambo, Huambo'), 'POS deve exibir localidade informada do cliente');
     assert(posHtml.includes('Huambo - Angola'), 'POS deve exibir localidade dinâmica do estabelecimento no Huambo');

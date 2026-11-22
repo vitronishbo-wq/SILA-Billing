@@ -92,11 +92,16 @@
     padding: 0 !important;
   }
 
-  body[data-print-mode="POS"] .print-target {
+  body[data-print-mode="POS"] .print-target,
+  body[data-print-mode="POS"] .pos-thermal-sheet {
     width: 80mm !important;
     max-width: 80mm !important;
     margin: 0 auto !important;
-    padding: 2mm !important;
+    padding: 1.5mm 2mm !important;
+    border: none !important;
+    box-shadow: none !important;
+    -webkit-print-color-adjust: exact;
+    print-color-adjust: exact;
   }
 
   body[data-print-mode="A4"] .a4-screen-frame {

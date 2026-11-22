@@ -101,6 +101,37 @@ interface RenderedTaxRow {
   exemptionNote?: string;
 }
 
+function formatConciseExemptionLegalNote(
+  code: AgtIvaExemptionCode,
+  meta: (typeof AGT_IVA_EXEMPTION_CODES)[AgtIvaExemptionCode] | undefined
+): string {
+  if (!meta) return code;
+  if (code === 'M80') return `${code}: Regime de Exclusão, ${meta.legalBasis}`;
+  if (code === 'M81') return `${code}: Regime Simplificado, ${meta.legalBasis}`;
+  if (code === 'M82' || code === 'M83') return `${code}: Não Sujeito, ${meta.legalBasis}`;
+  if (code === 'M02') return `${code}: Autoliquidação, ${meta.legalBasis}`;
+  if (code === 'M04') return `${code}: Margem de Lucro, ${meta.legalBasis}`;
+  if (code === 'M84' || code === 'M85') return `${code}: ${meta.legalBasis}`;
+  return `${code}: Isento, ${meta.legalBasis}`;
+}
+
+function isRedundantExemptionReason(reason: string): boolean {
+  const norm = normalizePhraseForCompare(reason);
+  if (!norm) return true;
+  return (
+    norm.includes('isento') ||
+    norm.includes('isencao') ||
+    norm.includes('cestabasica') ||
+    norm.includes('leidova') ||
+    norm.includes('leidoiva') ||
+    norm.includes('civa') ||
+    norm.includes('naosujeit') ||
+    norm.includes('regimeexclusao') ||
+    norm.includes('regimedeexclusao') ||
+    norm.includes('regimesimplificado')
+  );
+}
+
 function buildDocumentTaxRows(invoice: InvoiceRecord, docCompany: CompanyProfile): RenderedTaxRow[] {
   const rows: RenderedTaxRow[] = [];
   const globalPct = Math.min(100, Math.max(0, Number(invoice.globalDiscountPct || 0)));
@@ -132,23 +163,21 @@ function buildDocumentTaxRows(invoice: InvoiceRecord, docCompany: CompanyProfile
             )
           )
         );
-        const customReasons = Array.from(
+        const bespokeReasons = Array.from(
           new Set(
             matchingLines
               .map((l) => String(l.exemptionReason || '').trim())
-              .filter(Boolean)
+              .filter((r) => Boolean(r) && !isRedundantExemptionReason(r))
           )
         );
         const codeText = codes
           .map((c) => {
             const meta = AGT_IVA_EXEMPTION_CODES[c as AgtIvaExemptionCode];
-            return meta ? `${c}: ${meta.descriptionPt} (${meta.legalBasis})` : c;
+            return formatConciseExemptionLegalNote(c as AgtIvaExemptionCode, meta);
           })
           .join(' · ');
         exemptionNote =
-          customReasons.length > 0 && !codeText.toLowerCase().includes(customReasons[0]!.toLowerCase())
-            ? `${codeText} — ${customReasons.join('; ')}`
-            : codeText;
+          bespokeReasons.length > 0 ? `${codeText} (${bespokeReasons.join('; ')})` : codeText;
       }
       rows.push({
         label: cfg.label,
@@ -192,7 +221,7 @@ function buildDocumentTaxRows(invoice: InvoiceRecord, docCompany: CompanyProfile
       rateLabel: '0,00% (ISE)',
       base: invoice.taxBase0 || 0,
       amount: 0,
-      exemptionNote: defMeta ? `${defCode}: ${defMeta.descriptionPt}` : defCode,
+      exemptionNote: formatConciseExemptionLegalNote(defCode, defMeta),
     });
   }
 
@@ -389,10 +418,10 @@ export function renderDocumentHtml(
     ? 'QR AGT (Produção)'
     : 'QR Verificação (Simulação)';
   const qrImgOrSvgHtml = qrDataUrl
-    ? `<img src="${qrDataUrl}" data-qr-key="${escapeHtml(qrKey)}" alt="${escapeHtml(qrCaption)}" referrerpolicy="no-referrer" class="h-24 w-24 object-contain" />`
+    ? `<img src="${qrDataUrl}" data-qr-key="${escapeHtml(qrKey)}" alt="${escapeHtml(qrCaption)}" referrerpolicy="no-referrer" class="h-16 w-16 shrink-0 bg-white object-contain" />`
     : renderQrSvgSync(
         buildAgtQrCanonicalString(buildInvoiceQrPayloadInput(invoice, docCompany)),
-        'h-24 w-24',
+        'h-16 w-16 shrink-0 bg-white',
         qrCaption
       );
   const qrA4ImgOrSvgHtml = qrDataUrl
@@ -439,28 +468,25 @@ export function renderDocumentHtml(
         const qtyStr = Number.isInteger(line.qty) ? String(line.qty) : formatKzNumber(line.qty);
         const taxBadge = buildLineTaxBadge(line.ivaRate, line.exemptionCode, docCompany);
         const hasLineDiscount = (line.discountPct || 0) > 0 || (line.lineDiscount || 0) > 0;
+        const unitStr = line.unit ? ` ${escapeHtml(line.unit)}` : '';
         return `
-          <tr class="border-t border-dotted border-slate-300 align-top">
-            <td colspan="4" class="pt-1.5 pb-0.5 leading-tight">
-              <span class="font-bold">${escapeHtml(line.description)}</span>
-              <span class="ml-1 text-[9.5px] font-semibold text-slate-700">[${escapeHtml(taxBadge)}]</span>
-            </td>
-          </tr>
-          <tr class="align-top">
-            <td class="pb-1 text-[10px] text-slate-600">${escapeHtml(line.code || '')}${line.unit ? ` · ${escapeHtml(line.unit)}` : ''}</td>
-            <td class="pb-1 text-right whitespace-nowrap">${qtyStr}</td>
-            <td class="pb-1 text-right whitespace-nowrap">${formatKzNumber(line.unitPrice)}</td>
-            <td class="pb-1 text-right font-bold whitespace-nowrap">${formatKzNumber(line.lineTotal)}</td>
-          </tr>
-          ${
-            hasLineDiscount
-              ? `<tr>
-                  <td colspan="4" class="pb-1 text-[9.5px] text-slate-600">
-                    Desc. artigo: -${formatKzNumber(line.discountPct)}% (-${formatKzNumber(line.lineDiscount)} Kz)
-                  </td>
-                </tr>`
-              : ''
-          }
+          <div class="py-0.5 text-[10px] leading-tight tabular-nums">
+            <div class="flex justify-between items-baseline gap-2">
+              <div class="min-w-0">
+                <span class="font-bold">${escapeHtml(line.description)}</span>
+                <span class="ml-0.5 text-[8.5px] font-semibold text-slate-700">[${escapeHtml(taxBadge)}]</span>
+              </div>
+              <span class="font-bold shrink-0">${formatKzNumber(line.lineTotal)}</span>
+            </div>
+            <div class="flex justify-between items-baseline gap-2 text-[9px] text-slate-700">
+              <span class="truncate">${qtyStr}${unitStr} × ${formatKzNumber(line.unitPrice)}${line.code ? ` · ${escapeHtml(line.code)}` : ''}</span>
+              ${
+                hasLineDiscount
+                  ? `<span class="shrink-0">Desc. artigo: -${formatKzNumber(line.discountPct)}% (-${formatKzNumber(line.lineDiscount)} Kz)</span>`
+                  : ''
+              }
+            </div>
+          </div>
         `;
       })
       .join('');
@@ -468,94 +494,128 @@ export function renderDocumentHtml(
     const posTaxRowsHtml = taxRows
       .map(
         (tr) =>
-          `<div class="tabular-nums">${escapeHtml(tr.label)} — Base: ${formatKzNumber(tr.base)} — IVA: ${formatKzNumber(tr.amount)}</div>${
+          `<div class="flex justify-between tabular-nums"><span>${escapeHtml(tr.label)} (Base ${formatKzNumber(tr.base)})</span><span class="font-semibold">${formatKzNumber(tr.amount)}</span></div>${
             tr.exemptionNote
-              ? `<div class="text-[9.5px] text-slate-600 pl-1.5">${escapeHtml(tr.exemptionNote)}</div>`
+              ? `<div class="text-[8.5px] leading-tight text-slate-700">${escapeHtml(tr.exemptionNote)}</div>`
               : ''
           }`
       )
       .join('');
 
-    const posPaymentLinesHtml =
+    const posHeaderContactLine = [
+      docCompany.phone
+        ? `Tel.: ${escapeHtml(docCompany.phone)}${docCompany.mobile ? ` / ${escapeHtml(docCompany.mobile)}` : ''}`
+        : '',
+      docCompany.email ? escapeHtml(docCompany.email) : '',
+    ]
+      .filter(Boolean)
+      .join(' · ');
+
+    const posHeaderAddressLine = [
+      escapeHtml(estAddress || docCompany.address),
+      escapeHtml(issuerLocalityLabel),
+    ]
+      .filter(Boolean)
+      .join(' · ');
+
+    const posFiscalGroupLine = [
+      `<span class="font-semibold">Contribuinte (NIF): ${escapeHtml(docCompany.nif)}</span>`,
+      docCompany.taxRegime ? escapeHtml(formatTaxRegimeLabelPt(docCompany.taxRegime)) : '',
+    ]
+      .filter(Boolean)
+      .join(' · ');
+
+    const posCustomerContactsLine = [
+      custPhone ? `Tel.: ${escapeHtml(custPhone)}` : '',
+      custEmail ? `E-mail: ${escapeHtml(custEmail)}` : '',
+    ]
+      .filter(Boolean)
+      .join(' · ');
+
+    const posPaymentSummaryHtml =
       paymentSplits.length > 0
-        ? paymentSplits
+        ? `
+          <div class="flex flex-wrap justify-between gap-x-2">
+            <span><span class="font-bold">${isCreditNote ? 'Regularização' : 'Pagamentos'}:</span> ${escapeHtml(invoice.paymentMethod)}</span>
+            <span class="font-semibold">Total recebido: ${formatKzNumber(invoice.amountReceived)} Kz</span>
+          </div>
+          <div class="text-[9px] text-slate-800">${paymentSplits
             .map(
               (sp) =>
-                `<div class="flex justify-between"><span>· ${escapeHtml(sp.method)}${sp.reference ? ` (${escapeHtml(sp.reference)})` : ''}</span><span>${formatKzNumber(sp.amount)} Kz</span></div>`
+                `· ${escapeHtml(sp.method)}${sp.reference ? ` (${escapeHtml(sp.reference)})` : ''}: ${formatKzNumber(sp.amount)} Kz`
             )
-            .join('')
-        : invoice.paymentSummary
-          ? `<div class="text-[10.5px]">${escapeHtml(invoice.paymentSummary)}</div>`
-          : !isCreditNote && invoice.paymentMethod !== 'Crédito' && invoice.amountReceived > 0
-            ? `<div class="flex justify-between"><span>· ${escapeHtml(invoice.paymentMethod)}</span><span>${formatKzNumber(Math.min(invoice.amountReceived, invoice.grandTotal))} Kz</span></div>`
-            : '';
+            .join(' · ')}</div>
+          ${
+            !isCreditNote && invoice.amountDue && invoice.amountDue > 0
+              ? `<div class="flex justify-between font-bold"><span>Em dívida (Conta Corrente):</span><span>${formatKzNumber(invoice.amountDue)} Kz</span></div>`
+              : !isCreditNote && invoice.changeAmount > 0
+                ? `<div class="flex justify-between font-semibold"><span>Troco:</span><span>${formatKzNumber(invoice.changeAmount)} Kz</span></div>`
+                : ''
+          }
+        `
+        : `
+          <div class="flex flex-wrap justify-between gap-x-2">
+            <span><span class="font-bold">${isCreditNote ? 'Modo de regularização' : 'Pagamento'}:</span> ${escapeHtml(invoice.paymentMethod)}${invoice.paymentSummary ? ` (${escapeHtml(invoice.paymentSummary)})` : ''}</span>
+            <span class="font-semibold">${isCreditNote ? 'Valor reembolsado' : 'Recebido'}: ${formatKzNumber(invoice.amountReceived)} Kz${
+              !isCreditNote && invoice.amountDue && invoice.amountDue > 0
+                ? ` · Em dívida: ${formatKzNumber(invoice.amountDue)} Kz`
+                : !isCreditNote && invoice.changeAmount > 0
+                  ? ` · Troco: ${formatKzNumber(invoice.changeAmount)} Kz`
+                  : ''
+            }</span>
+          </div>
+        `;
 
     return `
-      <div class="print-target mx-auto w-full max-w-[330px] bg-white p-4 text-[12px] leading-snug text-black font-sans border border-slate-200">
+      <div class="print-target pos-thermal-sheet mx-auto w-full max-w-[318px] bg-white p-2.5 text-[10.5px] leading-tight text-black font-sans border border-slate-200">
         <div class="text-center space-y-0.5">
           ${
             showLogoPos && docCompany.logoUrl
-              ? `<div class="mb-2 flex justify-center"><img src="${escapeHtml(docCompany.logoUrl)}" class="max-h-12 max-w-[140px] object-contain" alt="Logótipo" /></div>`
+              ? `<div class="mb-1 flex justify-center"><img src="${escapeHtml(docCompany.logoUrl)}" class="max-h-9 max-w-[120px] object-contain" alt="Logótipo" /></div>`
               : ''
           }
           ${
             isProductionDoc
-              ? `<div class="font-bold text-[10.5px] tracking-tight">DOCUMENTO FISCAL · SÉRIE ${escapeHtml(invoice.seriesCode || 'A')}</div>`
-              : `<div class="font-bold text-[11px] tracking-tight">MODELO — SEM VALIDADE FISCAL</div>`
+              ? `<div class="font-bold text-[10px] tracking-tight">DOCUMENTO FISCAL · SÉRIE ${escapeHtml(invoice.seriesCode || 'A')}</div>`
+              : `<div class="font-bold text-[10px] tracking-tight">MODELO — SEM VALIDADE FISCAL</div>`
           }
-          <div class="font-bold text-[13px] leading-tight">${escapeHtml(docCompany.legalName)}</div>
-          ${estLabel ? `<div class="text-[10.5px] font-semibold">${escapeHtml(estLabel)}</div>` : ''}
-          <div class="text-[11px]">${escapeHtml(estAddress || docCompany.address)}</div>
-          <div class="text-[10.5px]">${escapeHtml(issuerLocalityLabel)}</div>
-          ${docCompany.phone ? `<div class="text-[11px]">Tel.: ${escapeHtml(docCompany.phone)}${docCompany.mobile ? ` / ${escapeHtml(docCompany.mobile)}` : ''}</div>` : ''}
-          ${docCompany.email ? `<div class="text-[11px]">${escapeHtml(docCompany.email)}</div>` : ''}
-          <div class="text-[11px] font-semibold tabular-nums">Contribuinte (NIF): ${escapeHtml(docCompany.nif)}</div>
-          ${
-            docCompany.taxRegime
-              ? `<div class="text-[10px] text-slate-700">${escapeHtml(formatTaxRegimeLabelPt(docCompany.taxRegime))}</div>`
-              : ''
-          }
+          <div class="font-bold text-[12px] leading-tight">${escapeHtml(docCompany.legalName)}</div>
+          ${estLabel ? `<div class="text-[9.5px] font-semibold">${escapeHtml(estLabel)}</div>` : ''}
+          <div class="text-[9.5px]">${posHeaderAddressLine}</div>
+          ${posHeaderContactLine ? `<div class="text-[9.5px] tabular-nums">${posHeaderContactLine}</div>` : ''}
+          <div class="text-[9.5px] tabular-nums">${posFiscalGroupLine}</div>
         </div>
 
-        ${
-          qrImgOrSvgHtml
-            ? `<div class="my-2.5 flex flex-col items-center gap-1">
-                ${qrImgOrSvgHtml}
-                <div class="text-[9px] text-slate-500">${escapeHtml(qrCaption)}</div>
-              </div>`
-            : ''
-        }
-
-        <div class="border-y border-black py-1.5 text-center my-2 space-y-0.5">
-          <div class="font-bold text-[13px] tabular-nums">${titleLabel} N.º ${escapeHtml(invoice.number)}</div>
-          <div class="text-[10.5px] font-semibold">Estado: ${escapeHtml(docStateLabel)}</div>
-          <div class="text-[10px] tabular-nums">Série: ${escapeHtml(invoice.seriesCode || 'Não atribuída')} · Ambiente: ${isProductionDoc ? 'Produção AGT' : 'Simulação'}</div>
-          <div class="text-[10px] tabular-nums">ATCUD: ${escapeHtml(atcudDisplay)}</div>
-          <div class="text-[10.5px]">${
-            isCreditNote
-              ? invoice.returnOriginNumber
-                ? `Retificação / Devolução ref. ${escapeHtml(invoice.returnOriginNumber)}`
-                : 'Devolução / Retificação Comercial'
-              : isProforma
-                ? 'Orçamento / Documento Provisório'
-                : 'Venda Directa a Retalho'
-          }</div>
-          ${
+        <div class="border-y border-black py-1 my-1 text-[9.5px] leading-tight space-y-0.5">
+          <div class="text-center font-bold text-[11.5px] tabular-nums">${titleLabel} N.º ${escapeHtml(invoice.number)}${
             isSecondCopy
-              ? `<div class="mt-0.5 font-semibold text-[10px] tracking-tight">2.ª VIA · REIMPRESSÃO${
-                  invoice.reprintCount && invoice.reprintCount > 1 ? ` (#${invoice.reprintCount})` : ''
-                }</div>`
+              ? ` · 2.ª VIA${invoice.reprintCount && invoice.reprintCount > 1 ? ` #${invoice.reprintCount}` : ''}`
               : ''
+          }</div>
+          <div class="text-center tabular-nums"><span class="font-semibold">Estado: ${escapeHtml(docStateLabel)}</span> · Série: ${escapeHtml(invoice.seriesCode || 'Não atribuída')} (${isProductionDoc ? 'Produção AGT' : 'Simulação'})</div>
+          <div class="flex justify-between gap-2 tabular-nums">
+            <span>ATCUD: ${escapeHtml(atcudDisplay)}</span>
+            <span class="font-semibold shrink-0">${dt.slashDate} ${dt.time}</span>
+          </div>
+          <div class="tabular-nums">Caixa: <span class="font-semibold">${escapeHtml(invoice.cashier)}</span> · Operador(a): <span class="font-semibold">${escapeHtml(invoice.operator)}</span> · Local: ${escapeHtml(issuerLocalityLabel)}</div>
+          ${
+            isCreditNote
+              ? `<div class="font-medium">${
+                  invoice.returnOriginNumber
+                    ? `Retificação / Devolução ref. ${escapeHtml(invoice.returnOriginNumber)}`
+                    : 'Devolução / Retificação Comercial'
+                }</div>`
+              : isProforma
+                ? `<div>Orçamento / Documento Provisório</div>`
+                : ''
           }
           ${
             invoice.status === 'cancelled'
-              ? `<div class="mt-0.5 font-bold text-red-700 text-[11px]">DOCUMENTO ANULADO</div>${
-                  invoice.cancelReason
-                    ? `<div class="text-[10px] text-red-700">Motivo: ${escapeHtml(invoice.cancelReason)}</div>`
-                    : ''
-                }${
+              ? `<div class="font-bold text-red-700 text-[10px]">DOCUMENTO ANULADO${
+                  invoice.cancelReason ? ` · Motivo: ${escapeHtml(invoice.cancelReason)}` : ''
+                }</div>${
                   invoice.cancelledBy
-                    ? `<div class="text-[9.5px] text-red-700 tabular-nums">Por: ${escapeHtml(invoice.cancelledBy)}${
+                    ? `<div class="text-[9px] text-red-700 tabular-nums">Anulado por: ${escapeHtml(invoice.cancelledBy)}${
                         cancelledDt ? ` · ${cancelledDt.slashDate} ${cancelledDt.time}` : ''
                       }</div>`
                     : ''
@@ -564,123 +624,90 @@ export function renderDocumentHtml(
           }
         </div>
 
-        <div class="space-y-0.5 text-[11px] pb-2 border-b border-black">
-          <div class="font-bold tabular-nums">Data/Hora: ${dt.slashDate} ${dt.time}</div>
-          <div class="tabular-nums">Caixa: <span class="font-semibold">${escapeHtml(invoice.cashier)}</span></div>
-          <div class="tabular-nums">Operador(a): <span class="font-semibold">${escapeHtml(invoice.operator)}</span></div>
-          <div>Local de emissão: ${escapeHtml(issuerLocalityLabel)}</div>
-          <div class="pt-1 mt-1 border-t border-dotted border-slate-400 space-y-0.5">
-            <div class="font-bold text-[10.5px]">ADQUIRENTE / CLIENTE</div>
-            <div>Tipo: <span class="font-semibold">${escapeHtml(customerTypeLabel)}</span></div>
-            <div>Nome: <span class="font-semibold">${escapeHtml(invoice.customerName)}</span></div>
-            <div class="tabular-nums">NIF Cliente: ${escapeHtml(custNifDisplay)}</div>
-            ${custPhone ? `<div class="tabular-nums">Tel.: ${escapeHtml(custPhone)}</div>` : ''}
-            ${custEmail ? `<div>E-mail: ${escapeHtml(custEmail)}</div>` : ''}
-            ${custAddr ? `<div>Morada: ${escapeHtml(custAddr)}</div>` : ''}
-            <div>Localidade: ${escapeHtml(custLoc)}</div>
+        <div class="pb-1 mb-1 border-b border-black text-[9.5px] leading-tight space-y-0.5 tabular-nums">
+          ${
+            resolvedCustomerType === 'CONSUMIDOR_FINAL'
+              ? `<div><span class="font-bold">Cliente:</span> <span class="font-semibold">${escapeHtml(invoice.customerName)}</span> · ${escapeHtml(customerTypeLabel)} · NIF: ${escapeHtml(custNifDisplay)}</div>
+                 <div>Localidade: ${escapeHtml(custLoc)}</div>`
+              : `<div><span class="font-bold">Adquirente (${escapeHtml(customerTypeLabel)}):</span> <span class="font-semibold">${escapeHtml(invoice.customerName)}</span> · NIF Cliente: ${escapeHtml(custNifDisplay)}</div>
+                 <div>${custAddr ? `Morada: ${escapeHtml(custAddr)} · ` : ''}Localidade: ${escapeHtml(custLoc)}</div>
+                 ${posCustomerContactsLine ? `<div>${posCustomerContactsLine}</div>` : ''}`
+          }
+        </div>
+
+        <div class="pb-1 border-b border-dashed border-black">
+          <div class="flex justify-between items-center border-b border-black pb-0.5 mb-0.5 text-[9px] font-bold">
+            <span>Artigo · Qtd × P. Unit.</span>
+            <span>Subtotal</span>
+          </div>
+          <div class="divide-y divide-dotted divide-slate-400">
+            ${itemsHtml}
           </div>
         </div>
 
-        <div class="py-2 border-b border-dashed border-black">
-          <div class="font-bold text-[12px] mb-1">ARTIGOS</div>
-          <table class="w-full border-collapse text-[10.5px] tabular-nums">
-            <thead>
-              <tr class="border-b border-black text-[9.5px] text-slate-700">
-                <th class="pb-1 text-left font-bold">Artigo</th>
-                <th class="pb-1 text-right font-bold">Qtd.</th>
-                <th class="pb-1 text-right font-bold">P. Unit.</th>
-                <th class="pb-1 text-right font-bold">Subtotal</th>
-              </tr>
-            </thead>
-            <tbody>${itemsHtml}</tbody>
-          </table>
-        </div>
-
-        <div class="py-2 border-b border-black text-[11px] space-y-1">
-          <div class="font-bold text-[12px]">RESUMO DE IMPOSTOS</div>
+        <div class="py-1 border-b border-black text-[9.5px] leading-tight space-y-0.5">
           ${posTaxRowsHtml}
-          <div class="pt-1 space-y-0.5 tabular-nums">
-            <div class="flex justify-between">
-              <span>Total de mercadorias</span>
-              <span class="font-bold">${formatKzNumber(invoice.merchandiseTotal)}</span>
-            </div>
-            <div class="flex justify-between">
-              <span>Desconto comercial${invoice.globalDiscountPct ? ` (incl. global ${formatKzNumber(invoice.globalDiscountPct)}%)` : ''}</span>
-              <span>${formatKzNumber(invoice.discountTotal)}</span>
-            </div>
-            <div class="flex justify-between">
-              <span>Total de impostos</span>
-              <span>${formatKzNumber(invoice.taxTotal)}</span>
-            </div>
+          <div class="pt-0.5 mt-0.5 border-t border-dotted border-slate-400 flex flex-wrap justify-between gap-x-2 text-[9px] tabular-nums">
+            <span>Mercadorias: <strong>${formatKzNumber(invoice.merchandiseTotal)}</strong></span>
+            <span>Desc.${invoice.globalDiscountPct ? ` (${formatKzNumber(invoice.globalDiscountPct)}%)` : ''}: <strong>${formatKzNumber(invoice.discountTotal)}</strong></span>
+            <span>Impostos: <strong>${formatKzNumber(invoice.taxTotal)}</strong></span>
           </div>
+          <div class="pt-0.5 mt-0.5 border-t border-black flex justify-between items-baseline tabular-nums">
+            <span class="font-bold text-[11px]">${isCreditNote ? 'TOTAL A CREDITAR' : 'TOTAL A PAGAR'}</span>
+            <span class="font-bold text-[14px]">${formatKzNumber(invoice.grandTotal)} Kz</span>
+          </div>
+          <div class="text-[9px] leading-tight"><span class="font-semibold">Por extenso:</span> ${escapeHtml(invoice.amountInWords)}</div>
         </div>
 
-        <div class="py-2 border-b border-dashed border-black">
-          <div class="font-bold text-[13px]">${isCreditNote ? 'TOTAL A CREDITAR' : 'TOTAL A PAGAR'}</div>
-          <div class="text-right font-bold text-[16px] tabular-nums">${formatKzNumber(invoice.grandTotal)} Kz</div>
-          <div class="mt-1.5 text-[10.5px] font-bold leading-snug">Por extenso: ${escapeHtml(invoice.amountInWords)}</div>
-        </div>
-
-        <div class="py-2 border-b border-black text-[11px] space-y-0.5 tabular-nums">
-          <div class="font-bold">${isCreditNote ? 'Modo de regularização' : 'Pagamentos'}: ${escapeHtml(invoice.paymentMethod)}</div>
-          ${posPaymentLinesHtml}
+        <div class="py-1 border-b border-black text-[9.5px] leading-tight space-y-0.5 tabular-nums">
+          ${posPaymentSummaryHtml}
           ${
-            invoice.transferReference
-              ? `<div class="text-[10.5px]">Ref. Pagamento: ${escapeHtml(invoice.transferReference)}</div>`
+            invoice.transferReference || invoice.returnOriginNumber
+              ? `<div class="text-[9px]">${[
+                  invoice.transferReference ? `Ref. Pagamento: ${escapeHtml(invoice.transferReference)}` : '',
+                  invoice.returnOriginNumber
+                    ? `${isCreditNote ? 'Fatura Retificada' : 'Ref. Troca/Devolução'}: ${escapeHtml(invoice.returnOriginNumber)}${
+                        !isCreditNote && invoice.returnCreditApplied
+                          ? ` (Crédito: ${formatKzNumber(invoice.returnCreditApplied)} Kz)`
+                          : ''
+                      }`
+                    : '',
+                ]
+                  .filter(Boolean)
+                  .join(' · ')}</div>`
               : ''
-          }
-          ${
-            invoice.returnOriginNumber
-              ? `<div class="text-[10.5px]">${isCreditNote ? 'Fatura Retificada' : 'Ref. Troca/Devolução'}: ${escapeHtml(invoice.returnOriginNumber)}${
-                  !isCreditNote && invoice.returnCreditApplied
-                    ? ` (Crédito: ${formatKzNumber(invoice.returnCreditApplied)} Kz)`
-                    : ''
-                }</div>`
-              : ''
-          }
-          <div class="flex justify-between pt-0.5 font-semibold">
-            <span>${isCreditNote ? 'Valor reembolsado' : 'Total recebido'}:</span>
-            <span>${formatKzNumber(invoice.amountReceived)} Kz</span>
-          </div>
-          ${
-            isCreditNote
-              ? ''
-              : invoice.amountDue && invoice.amountDue > 0
-                ? `<div class="flex justify-between font-bold"><span>Em dívida (Conta Corrente):</span><span>${formatKzNumber(invoice.amountDue)} Kz</span></div>`
-                : invoice.changeAmount > 0
-                  ? `<div class="flex justify-between font-semibold"><span>Troco:</span><span>${formatKzNumber(invoice.changeAmount)} Kz</span></div>`
-                  : ''
           }
         </div>
 
         ${
           invoice.notes
-            ? `<div class="py-2 border-b border-dashed border-black text-[11px]">
-                <div class="font-bold">Observações</div>
-                <div>${escapeHtml(invoice.notes)}</div>
+            ? `<div class="py-1 border-b border-dashed border-black text-[9px] leading-tight">
+                <span class="font-bold">Obs.:</span> ${escapeHtml(invoice.notes)}
               </div>`
             : ''
         }
 
-        <div class="pt-2.5 text-center space-y-1">
-          <div class="font-bold text-[11.5px]">OBRIGADO PELA SUA PREFERÊNCIA!</div>
-          ${showCustomTagline ? `<div class="text-[11px]">${escapeHtml(docCompany.tagline)}</div>` : ''}
-          <div class="border-t border-black mt-2 pt-1.5 text-[9.5px] space-y-0.5">
-            ${
-              isProductionDoc
-                ? `<div class="font-bold tabular-nums">${escapeHtml(docHash4)}-Processado por programa validado SILA-Billing</div>
-                   <div class="tabular-nums">Assinatura RSA-SHA1 SAF-T · NIF Emissor: ${escapeHtml(docCompany.nif)}${invoice.agtAuthorizationCode ? ` · Aut.: ${escapeHtml(invoice.agtAuthorizationCode)}` : ''}</div>`
-                : `<div class="font-bold tabular-nums">Assinatura de teste SAF-T (RSA-SHA1): ${escapeHtml(docHash4)} — Simulação</div>
-                   <div>Documento de demonstração · Não substitui factura fiscal perante a AGT</div>`
-            }
-            <div class="pt-1 mt-1 border-t border-dashed border-black/50 text-[9px] text-slate-700 tabular-nums">
-              Software SILA-Billing v${SILA_SOFTWARE_VERSION} · Produtor: ${escapeHtml(VITRONIS_INSTITUTIONAL.shortName)}, Lda · NIF ${escapeHtml(VITRONIS_INSTITUTIONAL.nif)} · Ref. ${escapeHtml(DEFAULT_AGT_SOFTWARE_APPROVAL)}
+        <div class="pt-1.5 space-y-1">
+          <div class="text-center font-bold text-[10px] leading-tight">OBRIGADO PELA SUA PREFERÊNCIA!${showCustomTagline ? ` · <span class="font-normal">${escapeHtml(docCompany.tagline)}</span>` : ''}</div>
+          <div class="flex items-center gap-2 border-t border-black pt-1 text-[8.5px] leading-tight">
+            ${qrImgOrSvgHtml}
+            <div class="min-w-0 space-y-0.5">
+              ${
+                isProductionDoc
+                  ? `<div class="font-bold text-[9px] tabular-nums">${escapeHtml(docHash4)}-Processado por programa validado SILA-Billing</div>
+                     <div class="tabular-nums text-slate-800">Assinatura RSA-SHA1 SAF-T · NIF Emissor: ${escapeHtml(docCompany.nif)}${invoice.agtAuthorizationCode ? ` · Aut.: ${escapeHtml(invoice.agtAuthorizationCode)}` : ''}</div>`
+                  : `<div class="font-bold text-[9px] tabular-nums">Assinatura de teste SAF-T (RSA-SHA1): ${escapeHtml(docHash4)} — Simulação</div>
+                     <div class="text-slate-800">Documento de demonstração · Não substitui factura fiscal perante a AGT</div>`
+              }
+              <div class="text-slate-700 tabular-nums">
+                Software SILA-Billing v${SILA_SOFTWARE_VERSION} · Produtor: ${escapeHtml(VITRONIS_INSTITUTIONAL.shortName)}, Lda · NIF ${escapeHtml(VITRONIS_INSTITUTIONAL.nif)} · Ref. ${escapeHtml(DEFAULT_AGT_SOFTWARE_APPROVAL)}
+              </div>
+              ${
+                showViralFooter
+                  ? `<div class="text-slate-600">${escapeHtml(VITRONIS_INSTITUTIONAL.website)}</div>`
+                  : ''
+              }
             </div>
-            ${
-              showViralFooter
-                ? `<div class="text-[9px] text-slate-600">${escapeHtml(VITRONIS_INSTITUTIONAL.website)}</div>`
-                : ''
-            }
           </div>
         </div>
       </div>
