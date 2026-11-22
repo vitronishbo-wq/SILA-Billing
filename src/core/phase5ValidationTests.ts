@@ -70,6 +70,14 @@ import { renderDocumentHtml } from '../../frontend/ui/documentRenderer.ts';
 import { renderMasterGovernanceModal } from '../../frontend/ui/masterGovernanceModal.ts';
 import { renderMobileOperationalView } from '../../frontend/ui/mobileOperationalView.ts';
 import { renderNewCompanyModal } from '../../frontend/ui/multicompanyModals.ts';
+import {
+  CATALOG_VIEW_MODE_STORAGE_KEY,
+  readCatalogViewModePreference,
+  renderCatalogProductCollection,
+  renderCatalogViewModeSelector,
+  resolveInitialCatalogViewMode,
+  writeCatalogViewModePreference,
+} from '../../frontend/ui/posCatalogView.ts';
 
 function assert(condition: boolean, message: string): void {
   if (!condition) {
@@ -1803,6 +1811,144 @@ export async function runPhase5ValidationTests(): Promise<{ passed: number; tota
     assert(
       !mobileReadyHtml.includes('Modo Simulação · Ficha Mestre'),
       'Home Mobile deve ocultar a barra discreta quando a Ficha Mestre e Produção estiverem completas'
+    );
+  });
+
+  await test('5.11 Catálogo POS/A4 (Lista vs Touch): matchMedia inicial, localStorage sem sobrescrever escolha manual, lista responsiva e cartões touch preservados', () => {
+    const store = new Map<string, string>();
+    const mockStorage = {
+      getItem: (k: string) => (store.has(k) ? store.get(k)! : null),
+      setItem: (k: string, v: string) => {
+        store.set(k, v);
+      },
+    };
+
+    // 1. Detecção inicial via matchMedia('(pointer: fine)') apenas sem escolha guardada
+    assert(
+      resolveInitialCatalogViewMode((q) => ({ matches: q === '(pointer: fine)' })) === 'list',
+      'Ponteiro fino (rato) deve iniciar em modo list quando não há escolha guardada'
+    );
+    assert(
+      resolveInitialCatalogViewMode(() => ({ matches: false })) === 'touch',
+      'Dispositivo sem ponteiro fino deve iniciar em modo touch quando não há escolha guardada'
+    );
+    assert(
+      readCatalogViewModePreference(mockStorage, () => ({ matches: true })) === 'list',
+      'Sem valor no localStorage, deve usar matchMedia inicial (list)'
+    );
+
+    // 2. Escolha manual em localStorage nunca é sobrescrita por matchMedia
+    writeCatalogViewModePreference('touch', mockStorage);
+    assert(
+      store.get(CATALOG_VIEW_MODE_STORAGE_KEY) === 'touch',
+      'localStorage deve guardar valor permitido touch'
+    );
+    assert(
+      readCatalogViewModePreference(mockStorage, () => ({ matches: true })) === 'touch',
+      'Escolha manual touch deve prevalecer mesmo com (pointer: fine) activo'
+    );
+
+    writeCatalogViewModePreference('list', mockStorage);
+    assert(
+      readCatalogViewModePreference(mockStorage, () => ({ matches: false })) === 'list',
+      'Escolha manual list deve prevalecer mesmo em dispositivo touch'
+    );
+
+    // 3. Selector minimalista Lista / Touch
+    const selectorHtml = renderCatalogViewModeSelector('list');
+    assert(
+      selectorHtml.includes('data-action="set-catalog-view-mode"') &&
+        selectorHtml.includes('data-value="list"') &&
+        selectorHtml.includes('aria-pressed="true"') &&
+        selectorHtml.includes('data-value="touch"') &&
+        selectorHtml.includes('aria-pressed="false"'),
+      'Selector minimalista deve expor os dois modos (list/touch) com estado aria-pressed consistente'
+    );
+
+    // 4. Motor único: mesmos produtos, cart, data-action="add-to-cart" nos dois modos
+    const sampleProducts: Product[] = [
+      {
+        id: 'prod_excel_1',
+        code: 'ARR-25KG',
+        name: 'Arroz Tio Lucas Agulha Longo Especial Saco 25 Kilogramas Importado',
+        productType: 'P',
+        category: 'Mercearia',
+        unit: 'sc',
+        price: 24500,
+        ivaRate: 0,
+        exemptionCode: 'M10',
+        exemptionReason: 'Cesta Básica',
+        trackStock: true,
+        stockQty: 18,
+        minStockQty: 5,
+        active: true,
+        createdAtIso: '2026-06-01T09:00:00.000Z',
+        updatedAtIso: '2026-06-01T09:00:00.000Z',
+      },
+      {
+        id: 'prod_excel_2',
+        code: 'SERV-IT',
+        name: 'Assistência Técnica Remota e Presencial Mensal',
+        productType: 'S',
+        category: 'Serviços',
+        unit: 'hr',
+        price: 11400,
+        ivaRate: 14,
+        exemptionReason: '',
+        trackStock: false,
+        active: true,
+        createdAtIso: '2026-06-01T09:00:00.000Z',
+        updatedAtIso: '2026-06-01T09:00:00.000Z',
+      },
+    ];
+    const sampleCart = [
+      {
+        productId: 'prod_excel_1',
+        code: 'ARR-25KG',
+        description: sampleProducts[0]!.name,
+        unit: 'sc',
+        qty: 2,
+        unitPrice: 24500,
+        discountPct: 0,
+        ivaRate: 0 as const,
+        exemptionCode: 'M10' as const,
+      },
+    ];
+
+    const listHtml = renderCatalogProductCollection({
+      products: sampleProducts,
+      cart: sampleCart,
+      mode: 'list',
+      action: 'add-to-cart',
+      isSuspended: false,
+    });
+    assert(
+      listHtml.includes('@container') &&
+        listHtml.includes('min-h-[30px]') &&
+        listHtml.includes('data-action="add-to-cart"') &&
+        listHtml.includes('data-id="prod_excel_1"') &&
+        listHtml.includes('24.500,00 Kz') &&
+        listHtml.includes('×2') &&
+        listHtml.includes('18 sc') &&
+        listHtml.includes('title="ARR-25KG · Arroz Tio Lucas') &&
+        listHtml.includes('line-clamp-2 @sm:line-clamp-1'),
+      'Modo Lista deve renderizar linhas horizontais compactas estilo Excel responsivas com nomes longos legíveis, stock, preço e mesmo add-to-cart'
+    );
+
+    const touchHtml = renderCatalogProductCollection({
+      products: sampleProducts,
+      cart: sampleCart,
+      mode: 'touch',
+      action: 'add-to-cart',
+      isSuspended: false,
+    });
+    assert(
+      touchHtml.includes('grid grid-cols-2 sm:grid-cols-3 lg:grid-cols-2 xl:grid-cols-3') &&
+        touchHtml.includes('min-h-[92px]') &&
+        touchHtml.includes('data-action="add-to-cart"') &&
+        touchHtml.includes('data-id="prod_excel_1"') &&
+        touchHtml.includes('×2'),
+      'Modo Touch deve preservar integralmente a grelha e dimensão min-h-[92px] dos cartões táteis'
     );
   });
 

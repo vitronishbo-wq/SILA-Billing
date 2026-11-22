@@ -255,6 +255,13 @@ import {
   renderCustomerMasterForm,
 } from './ui/customerForm';
 import {
+  CatalogViewMode,
+  readCatalogViewModePreference,
+  renderCatalogProductCollection,
+  renderCatalogViewModeSelector,
+  writeCatalogViewModePreference,
+} from './ui/posCatalogView';
+import {
   formatPlanLabelPt,
   MasterAdminTab,
   renderCancelInvoiceModal,
@@ -383,6 +390,7 @@ export class SilaBillingApp {
   private posCategoryFilter = 'ALL';
   private posTaxFilter: 'ALL' | 14 | 0 = 'ALL';
   private posStockOnlyFilter = false;
+  private catalogViewMode: CatalogViewMode = readCatalogViewModePreference();
   private cart: CartDraftItem[] = [];
   private globalDiscountPct = 0;
   private globalDiscountInput = '';
@@ -5296,6 +5304,16 @@ export class SilaBillingApp {
       case 'pos-category': {
         this.posCategoryFilter = value || 'ALL';
         this.render();
+        break;
+      }
+      case 'set-catalog-view-mode': {
+        const nextMode: CatalogViewMode | null =
+          value === 'list' ? 'list' : value === 'touch' ? 'touch' : null;
+        if (nextMode && nextMode !== this.catalogViewMode) {
+          this.catalogViewMode = nextMode;
+          writeCatalogViewModePreference(nextMode);
+          this.render();
+        }
         break;
       }
       case 'clear-pos-search': {
@@ -13272,18 +13290,6 @@ export class SilaBillingApp {
     const isA4 = this.previewFormat === 'A4';
     const returnCreditApplied = liveInvoice.returnCreditApplied || 0;
     const netPayable = Math.max(0, roundKz(totals.grandTotal - returnCreditApplied));
-    const renderProductStockMeta = (prod: Product): string => {
-      if (!prod.trackStock) return '';
-      const qty = prod.stockQty ?? 0;
-      const minQty = prod.minStockQty ?? 0;
-      if (qty <= 0) {
-        return `<span class="text-[10px] font-mono tabular-nums text-red-600 font-semibold shrink-0">Sem stock (0)</span>`;
-      }
-      if (qty <= minQty) {
-        return `<span class="text-[10px] font-mono tabular-nums text-amber-700 font-medium shrink-0">Baixo · ${qty} ${escapeHtml(prod.unit)}</span>`;
-      }
-      return `<span class="text-[10px] font-mono tabular-nums text-slate-500 shrink-0">Stock: ${qty} ${escapeHtml(prod.unit)}</span>`;
-    };
 
     return `
       <div class="flex h-full flex-col overflow-hidden">
@@ -13559,36 +13565,39 @@ export class SilaBillingApp {
                   : ''
               }
 
-              <!-- Categorias de produtos em seletores compactos -->
-              <div class="flex items-center gap-1 overflow-x-auto pb-0.5 no-scrollbar">
-                <button
-                  type="button"
-                  data-action="pos-category"
-                  data-value="ALL"
-                  class="h-7 px-2.5 rounded-md text-[11px] font-medium transition-colors whitespace-nowrap shrink-0 tabular-nums ${
-                    this.posCategoryFilter === 'ALL'
-                      ? 'bg-slate-900 text-white'
-                      : 'bg-slate-100 text-slate-600 hover:bg-slate-200/70 hover:text-slate-900'
-                  }"
-                >Todas · ${activeProducts.length}</button>
-                ${orderedCategories
-                  .map((cat) => {
-                    const active = this.posCategoryFilter === cat;
-                    const count = categoryCounts.get(cat) || 0;
-                    return `
-                      <button
-                        type="button"
-                        data-action="pos-category"
-                        data-value="${escapeHtml(cat)}"
-                        class="h-7 px-2.5 rounded-md text-[11px] font-medium transition-colors whitespace-nowrap shrink-0 tabular-nums ${
-                          active
-                            ? 'bg-slate-900 text-white'
-                            : 'bg-slate-100 text-slate-600 hover:bg-slate-200/70 hover:text-slate-900'
-                        }"
-                      >${escapeHtml(cat)} · ${count}</button>
-                    `;
-                  })
-                  .join('')}
+              <!-- Categorias de produtos + selector minimalista Lista / Touch -->
+              <div class="flex items-center justify-between gap-2">
+                <div class="flex-1 min-w-0 flex items-center gap-1 overflow-x-auto pb-0.5 no-scrollbar">
+                  <button
+                    type="button"
+                    data-action="pos-category"
+                    data-value="ALL"
+                    class="h-7 px-2.5 rounded-md text-[11px] font-medium transition-colors whitespace-nowrap shrink-0 tabular-nums ${
+                      this.posCategoryFilter === 'ALL'
+                        ? 'bg-slate-900 text-white'
+                        : 'bg-slate-100 text-slate-600 hover:bg-slate-200/70 hover:text-slate-900'
+                    }"
+                  >Todas · ${activeProducts.length}</button>
+                  ${orderedCategories
+                    .map((cat) => {
+                      const active = this.posCategoryFilter === cat;
+                      const count = categoryCounts.get(cat) || 0;
+                      return `
+                        <button
+                          type="button"
+                          data-action="pos-category"
+                          data-value="${escapeHtml(cat)}"
+                          class="h-7 px-2.5 rounded-md text-[11px] font-medium transition-colors whitespace-nowrap shrink-0 tabular-nums ${
+                            active
+                              ? 'bg-slate-900 text-white'
+                              : 'bg-slate-100 text-slate-600 hover:bg-slate-200/70 hover:text-slate-900'
+                          }"
+                        >${escapeHtml(cat)} · ${count}</button>
+                      `;
+                    })
+                    .join('')}
+                </div>
+                ${renderCatalogViewModeSelector(this.catalogViewMode)}
               </div>
             </div>
 
@@ -13616,33 +13625,14 @@ export class SilaBillingApp {
                             >Limpar</button>
                           </div>
                         </div>
-                        <div class="grid grid-cols-2 sm:grid-cols-3 lg:grid-cols-2 xl:grid-cols-3 gap-2">
-                          ${posSuggestions
-                            .map((prod) => {
-                              const outOfStock = Boolean(prod.trackStock && (prod.stockQty ?? 0) <= 0);
-                              return `
-                                <button
-                                  type="button"
-                                  data-action="add-suggested-to-cart"
-                                  data-id="${escapeHtml(prod.id)}"
-                                  ${isSuspended ? 'disabled' : ''}
-                                  class="text-left p-2.5 rounded-lg border transition-colors min-h-[88px] flex flex-col justify-between disabled:opacity-50 ${
-                                    outOfStock
-                                      ? 'border-amber-200 bg-amber-50/30 hover:border-amber-400'
-                                      : 'border-slate-200 bg-white hover:border-blue-600 active:bg-slate-50'
-                                  }"
-                                >
-                                  <div class="flex items-center justify-between gap-1 text-[10px] font-mono text-slate-400">
-                                    <span class="truncate">${escapeHtml(prod.code)} · ${escapeHtml(prod.category || 'Geral')}</span>
-                                    ${renderProductStockMeta(prod)}
-                                  </div>
-                                  <div class="text-xs font-semibold text-slate-900 line-clamp-2 leading-snug my-1">${escapeHtml(prod.name)}</div>
-                                  <div class="text-xs font-bold text-slate-900 font-mono tabular-nums pt-1 border-t border-slate-100">${formatKzNumber(prod.price)} Kz</div>
-                                </button>
-                              `;
-                            })
-                            .join('')}
-                        </div>
+                        ${renderCatalogProductCollection({
+                          products: posSuggestions,
+                          cart: this.cart,
+                          mode: this.catalogViewMode,
+                          action: 'add-suggested-to-cart',
+                          isSuspended,
+                          isSuggestion: true,
+                        })}
                       </div>`
                     : `<div class="h-44 flex flex-col items-center justify-center gap-2 text-xs text-slate-500 text-center px-4">
                         <span>${
@@ -13680,46 +13670,13 @@ export class SilaBillingApp {
                           }
                         </div>
                       </div>`
-                  : `<div class="grid grid-cols-2 sm:grid-cols-3 lg:grid-cols-2 xl:grid-cols-3 gap-2">
-                      ${visibleProducts
-                        .map((prod) => {
-                          const inCart = this.cart.find((c) => c.productId === prod.id);
-                          const outOfStock = Boolean(prod.trackStock && (prod.stockQty ?? 0) <= 0);
-                          return `
-                            <button
-                              type="button"
-                              data-action="add-to-cart"
-                              data-id="${escapeHtml(prod.id)}"
-                              ${isSuspended ? 'disabled' : ''}
-                              class="text-left p-2.5 rounded-lg border transition-colors min-h-[92px] flex flex-col justify-between active:bg-slate-50 disabled:opacity-50 disabled:pointer-events-none ${
-                                inCart
-                                  ? 'bg-white border-blue-600 ring-1 ring-blue-600/20'
-                                  : outOfStock
-                                    ? 'bg-amber-50/25 border-amber-200 hover:border-amber-400'
-                                    : 'bg-white border-slate-200 hover:border-blue-600'
-                              }"
-                            >
-                              <div class="flex items-center justify-between gap-1.5 w-full text-[10px] text-slate-400">
-                                <span class="font-mono truncate">${escapeHtml(prod.code)} · ${escapeHtml(prod.category || 'Geral')}</span>
-                                <span class="tabular-nums shrink-0 text-slate-500">${prod.ivaRate === 14 ? '14%' : 'Isento'}</span>
-                              </div>
-                              <div class="text-xs font-semibold text-slate-900 line-clamp-2 leading-snug my-1">${escapeHtml(prod.name)}</div>
-                              <div class="space-y-1 w-full pt-1 border-t border-slate-100">
-                                <div class="flex items-center justify-between gap-1 w-full">
-                                  <span class="text-xs font-bold text-slate-900 font-mono tabular-nums">${formatKzNumber(prod.price)} Kz</span>
-                                  ${
-                                    inCart
-                                      ? `<span class="text-[11px] font-mono font-bold text-blue-600 tabular-nums">×${inCart.qty}</span>`
-                                      : ''
-                                  }
-                                </div>
-                                ${prod.trackStock ? `<div class="flex items-center justify-between">${renderProductStockMeta(prod)}</div>` : ''}
-                              </div>
-                            </button>
-                          `;
-                        })
-                        .join('')}
-                    </div>`
+                  : renderCatalogProductCollection({
+                      products: visibleProducts,
+                      cart: this.cart,
+                      mode: this.catalogViewMode,
+                      action: 'add-to-cart',
+                      isSuspended,
+                    })
               }
             </div>
           </section>
