@@ -1,5 +1,12 @@
 import { initializeApp } from 'firebase/app';
-import { GoogleAuthProvider, getAuth, signInWithPopup, signOut } from 'firebase/auth';
+import {
+  GoogleAuthProvider,
+  getAuth,
+  getRedirectResult,
+  signInWithPopup,
+  signInWithRedirect,
+  signOut,
+} from 'firebase/auth';
 import { doc, getDocFromServer, getFirestore } from 'firebase/firestore';
 import firebaseConfig from '../../firebase-applet-config.json';
 
@@ -117,8 +124,33 @@ export function formatFirebaseAuthErrorPt(err: unknown, autoAuthorized = false):
   return err instanceof Error ? err.message : 'Não foi possível concluir a autenticação Google.';
 }
 
+function isTopLevelWindow(): boolean {
+  try {
+    return typeof window !== 'undefined' && window.self === window.top;
+  } catch {
+    return false;
+  }
+}
+
+export async function consumeGoogleRedirectResult() {
+  if (!isTopLevelWindow()) return null;
+  return getRedirectResult(auth);
+}
+
 export async function signInWithGoogle() {
-  return signInWithPopup(auth, googleProvider);
+  try {
+    return await signInWithPopup(auth, googleProvider);
+  } catch (err) {
+    const code = extractFirebaseErrorCode(err);
+    if (
+      isTopLevelWindow() &&
+      (code === 'auth/popup-blocked' || code === 'auth/operation-not-supported-in-this-environment')
+    ) {
+      await signInWithRedirect(auth, googleProvider);
+      return null;
+    }
+    throw err;
+  }
 }
 
 export async function signOutFirebase() {

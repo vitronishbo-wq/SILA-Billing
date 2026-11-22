@@ -2,8 +2,11 @@ import {
   collection,
   deleteDoc,
   doc,
+  getCountFromServer,
   getDoc,
   getDocs,
+  limit,
+  orderBy,
   query,
   serverTimestamp,
   setDoc,
@@ -32,6 +35,11 @@ import {
   fetchCompanyWorkspaceBackend,
   upsertCompanyMemberBackend,
   upsertCompanyRoleBackend,
+  type AdminAuditEntry,
+  type AdminCompanyDetails,
+  type AdminCompanySummary,
+  type AdminOverviewResponse,
+  type PlatformUserSummary,
 } from '../../frontend/services/backendApi';
 import { resolveMemberBaseRole, resolveMemberStatus } from '../core/rbac';
 import {
@@ -43,6 +51,7 @@ import {
   CashMovementType,
   CashSession,
   CompanyMember,
+  CompanyOperationalStatus,
   CompanyRecord,
   CompanyRole,
   CompanyRoleDefinition,
@@ -54,10 +63,13 @@ import {
   InvoiceIssuerSnapshot,
   InvoiceRecord,
   isJaimonaOwnerEmail,
+  isPlatformAdminEmail,
+  JAIMONA_COMPANY,
   JAIMONA_COMPANY_ID,
   JAIMONA_OWNER_EMAIL,
   normalizeCompanyNif,
   PaymentSplit,
+  PlanTier,
   Product,
   ProductPriceChange,
   ProductType,
@@ -133,6 +145,14 @@ export async function ensureCompanyRegisteredCloud(
   try {
     if (!company.id) return;
 
+    const safeShortName =
+      (company.profile.shortName || company.profile.legalName || company.profile.nif || 'Empresa').trim().slice(0, 64) || 'Empresa';
+    const safeLegalName =
+      (company.profile.legalName || safeShortName).trim().slice(0, 160) || safeShortName;
+    const safeCityCountry = (company.profile.cityCountry || 'Angola').trim().slice(0, 80) || 'Angola';
+    const safeAddress =
+      (company.profile.address || safeCityCountry || 'Angola').trim().slice(0, 160) || 'Angola';
+
     const existingComp = await getDoc(companyRef).catch(() => null);
 
     if (!existingComp || !existingComp.exists()) {
@@ -147,7 +167,7 @@ export async function ensureCompanyRegisteredCloud(
         normalizedNif,
         companyId,
         ownerUid: user.uid,
-        shortName: (company.profile.shortName || company.profile.legalName).slice(0, 64),
+        shortName: safeShortName,
         createdAt: serverTimestamp(),
         updatedAt: serverTimestamp(),
       });
@@ -167,11 +187,11 @@ export async function ensureCompanyRegisteredCloud(
         normalizedNif,
         ownerUid: user.uid,
         ownerEmail: resolvedOwnerEmail,
-        legalName: company.profile.legalName.slice(0, 160),
-        shortName: company.profile.shortName.slice(0, 64),
+        legalName: safeLegalName,
+        shortName: safeShortName,
         nif: company.profile.nif.slice(0, 32),
-        address: (company.profile.address || company.profile.cityCountry || 'Angola').slice(0, 160),
-        cityCountry: (company.profile.cityCountry || 'Angola').slice(0, 80),
+        address: safeAddress,
+        cityCountry: safeCityCountry,
         phone: (company.profile.phone || '').slice(0, 40),
         email: (company.profile.email || '').slice(0, 120),
         tagline: (company.profile.tagline || '').slice(0, 120),
@@ -212,7 +232,7 @@ export async function ensureCompanyRegisteredCloud(
         companyId,
         uid: user.uid,
         role: 'owner',
-        shortName: company.profile.shortName.slice(0, 64),
+        shortName: safeShortName,
         nif: company.profile.nif.slice(0, 32),
         normalizedNif,
         updatedAt: serverTimestamp(),
@@ -220,11 +240,45 @@ export async function ensureCompanyRegisteredCloud(
 
       await batch.commit();
     } else if (existingComp.data()?.ownerUid === user.uid) {
+      const [existingMember, existingLink] = await Promise.all([
+        getDoc(memberRef).catch(() => null),
+        getDoc(userLinkRef).catch(() => null),
+      ]);
+
+      if (!existingMember || !existingMember.exists()) {
+        await setDoc(memberRef, {
+          id: user.uid,
+          companyId,
+          companyOwnerUid: user.uid,
+          uid: user.uid,
+          email: (user.email || '').slice(0, 120),
+          emailLower: (user.email || '').trim().toLowerCase().slice(0, 120),
+          displayName: (user.displayName || user.email || 'Proprietário').slice(0, 120),
+          role: 'owner',
+          allowInvoiceCancel: true,
+          active: true,
+          createdAt: serverTimestamp(),
+          updatedAt: serverTimestamp(),
+        }).catch(() => null);
+      }
+
+      if (!existingLink || !existingLink.exists()) {
+        await setDoc(userLinkRef, {
+          companyId,
+          uid: user.uid,
+          role: 'owner',
+          shortName: safeShortName,
+          nif: company.profile.nif.slice(0, 32),
+          normalizedNif,
+          updatedAt: serverTimestamp(),
+        }).catch(() => null);
+      }
+
       await updateDoc(companyRef, {
-        legalName: company.profile.legalName.slice(0, 160),
-        shortName: company.profile.shortName.slice(0, 64),
-        address: (company.profile.address || company.profile.cityCountry || 'Angola').slice(0, 160),
-        cityCountry: (company.profile.cityCountry || 'Angola').slice(0, 80),
+        legalName: safeLegalName,
+        shortName: safeShortName,
+        address: safeAddress,
+        cityCountry: safeCityCountry,
         phone: (company.profile.phone || '').slice(0, 40),
         email: (company.profile.email || '').slice(0, 120),
         tagline: (company.profile.tagline || '').slice(0, 120),
@@ -2833,5 +2887,619 @@ export async function pullOwnedCompaniesFromCloud(): Promise<CompanyRecord[]> {
 export async function pullAllFromCloud(companyId = '') {
   if (!companyId) return null;
   return pullCompanyFromCloud(companyId);
+}
+
+// ==================== PAINEL MASTER — FALLBACK DIRETO FIRESTORE CLIENT SDK ====================
+// Utilizado automaticamente quando o servidor REST está sem credenciais de Service Account explícitas,
+// mantendo total proteção via token verificado do Administrador Global (wtmedia0@gmail.com) nas Regras.
+
+const VALID_ADMIN_PLANS: ReadonlySet<PlanTier> = new Set([
+  'FREE',
+  'ESSENCIAL',
+  'PROFISSIONAL',
+  'ENTERPRISE',
+]);
+
+const VALID_ADMIN_STATUSES: ReadonlySet<CompanyOperationalStatus> = new Set([
+  'active',
+  'suspended',
+  'pending',
+]);
+
+function normalizeAdminPlan(raw: unknown, companyId: string): PlanTier {
+  const candidate = String(raw || '').toUpperCase() as PlanTier;
+  if (companyId === JAIMONA_COMPANY_ID && (!raw || candidate === 'FREE')) {
+    return 'PROFISSIONAL';
+  }
+  return VALID_ADMIN_PLANS.has(candidate) ? candidate : 'FREE';
+}
+
+function normalizeAdminStatus(raw: unknown): CompanyOperationalStatus {
+  const candidate = String(raw || '') as CompanyOperationalStatus;
+  return VALID_ADMIN_STATUSES.has(candidate) ? candidate : 'active';
+}
+
+function toIsoStringSafe(tsOrIso: unknown, fallback = ''): string {
+  if (tsOrIso && typeof tsOrIso === 'object' && 'toDate' in tsOrIso) {
+    try {
+      return (tsOrIso as { toDate: () => Date }).toDate().toISOString();
+    } catch {
+      return fallback;
+    }
+  }
+  if (typeof tsOrIso === 'string' && tsOrIso.trim()) return tsOrIso.trim();
+  return fallback;
+}
+
+async function writePlatformAuditLogClient(params: {
+  companyId: string;
+  companyName: string;
+  action: string;
+  details: string;
+}): Promise<void> {
+  const user = auth.currentUser;
+  if (!user || !user.emailVerified || !isPlatformAdminEmail(user.email)) return;
+  const logId = `adm_${Date.now()}_${Math.random().toString(36).slice(2, 7)}`;
+  try {
+    await setDoc(doc(db, 'platform_audit_logs', sanitizeId(logId)), {
+      adminUid: sanitizeId(user.uid),
+      adminEmail: (user.email || '').slice(0, 120),
+      companyId: sanitizeId(params.companyId || 'platform'),
+      companyName: (params.companyName || 'Plataforma').slice(0, 80) || 'Plataforma',
+      action: (params.action || 'ADMIN_ACTION').slice(0, 64) || 'ADMIN_ACTION',
+      details: (params.details || 'Operação administrativa').slice(0, 240) || 'Operação administrativa',
+      createdAt: serverTimestamp(),
+    });
+  } catch {
+    // Não bloqueia a ação administrativa se a auditoria falhar
+  }
+}
+
+export async function pullPlatformAdminOverviewClient(): Promise<AdminOverviewResponse> {
+  const user = auth.currentUser;
+  if (!user || !user.emailVerified || !isPlatformAdminEmail(user.email)) {
+    return {
+      ok: false,
+      statusCode: 403,
+      error: 'Acesso restrito ao Administrador Global da Plataforma SILA-Billing.',
+    };
+  }
+
+  try {
+    const [companiesSnap, logsSnap] = await Promise.all([
+      getDocs(query(collection(db, 'companies'), limit(200))),
+      getDocs(query(collection(db, 'platform_audit_logs'), orderBy('createdAt', 'desc'), limit(50))).catch(
+        () => null
+      ),
+    ]);
+
+    let totalInvoices = 0;
+    const userEmailsSet = new Set<string>();
+    if (user.email) userEmailsSet.add(user.email.toLowerCase());
+
+    const companies: AdminCompanySummary[] = await Promise.all(
+      companiesSnap.docs.map(async (docSnap) => {
+        const d = docSnap.data();
+        let invoiceCount = 0;
+        try {
+          const countSnap = await getCountFromServer(
+            collection(db, 'companies', docSnap.id, 'invoices')
+          );
+          invoiceCount = countSnap.data().count;
+          totalInvoices += invoiceCount;
+        } catch {
+          try {
+            const invSnap = await getDocs(
+              query(collection(db, 'companies', docSnap.id, 'invoices'), limit(500))
+            );
+            invoiceCount = invSnap.size;
+            totalInvoices += invoiceCount;
+          } catch {
+            // Fallback silencioso
+          }
+        }
+
+        const ownerMail = String(
+          docSnap.id === JAIMONA_COMPANY_ID
+            ? JAIMONA_OWNER_EMAIL
+            : d.ownerEmail || d.email || ''
+        )
+          .trim()
+          .toLowerCase();
+        if (ownerMail) userEmailsSet.add(ownerMail);
+
+        const rawPlan = normalizeAdminPlan(d.planTier, docSnap.id);
+        const isCommercial =
+          docSnap.id === JAIMONA_COMPANY_ID
+            ? true
+            : rawPlan !== 'FREE' && Boolean(d.commercialActive ?? true);
+
+        return {
+          id: docSnap.id,
+          shortName: String(d.shortName || d.legalName || docSnap.id),
+          legalName: String(d.legalName || d.shortName || docSnap.id),
+          nif: String(d.nif || d.normalizedNif || ''),
+          normalizedNif: String(d.normalizedNif || normalizeCompanyNif(String(d.nif || ''))),
+          cityCountry: String(d.cityCountry || 'Angola'),
+          ownerEmail: ownerMail || JAIMONA_OWNER_EMAIL,
+          status: normalizeAdminStatus(d.status),
+          planTier: rawPlan,
+          commercialActive: isCommercial,
+          invoiceCount,
+          createdAtIso: toIsoStringSafe(d.createdAt, new Date().toISOString()),
+        };
+      })
+    );
+
+    if (!companies.some((c) => c.id === JAIMONA_COMPANY_ID)) {
+      companies.push({
+        id: JAIMONA_COMPANY_ID,
+        shortName: JAIMONA_COMPANY.shortName,
+        legalName: JAIMONA_COMPANY.legalName,
+        nif: JAIMONA_COMPANY.nif,
+        normalizedNif: normalizeCompanyNif(JAIMONA_COMPANY.nif),
+        cityCountry: JAIMONA_COMPANY.cityCountry,
+        ownerEmail: JAIMONA_OWNER_EMAIL,
+        status: 'active',
+        planTier: 'PROFISSIONAL',
+        commercialActive: true,
+        invoiceCount: 0,
+        createdAtIso: '2026-01-01T08:00:00.000Z',
+      });
+    }
+
+    const plansBreakdown = {
+      FREE: 0,
+      ESSENCIAL: 0,
+      PROFISSIONAL: 0,
+      ENTERPRISE: 0,
+    };
+    let activeCompanies = 0;
+    let suspendedCompanies = 0;
+    let commercialActiveCount = 0;
+    let baseOrganicCount = 0;
+
+    for (const c of companies) {
+      if (c.status === 'active') activeCompanies++;
+      if (c.status === 'suspended') suspendedCompanies++;
+      if (c.planTier in plansBreakdown) {
+        plansBreakdown[c.planTier]++;
+      }
+      if (c.planTier === 'FREE') {
+        baseOrganicCount++;
+      } else if (c.commercialActive) {
+        commercialActiveCount++;
+      }
+    }
+
+    const recentLogs: AdminAuditEntry[] = (logsSnap?.docs || []).map((l) => {
+      const ld = l.data();
+      return {
+        id: l.id,
+        action: String(ld.action || ''),
+        companyId: String(ld.companyId || ''),
+        companyName: String(ld.companyName || ''),
+        adminEmail: String(ld.adminEmail || ''),
+        details: String(ld.details || ''),
+        createdAtIso: toIsoStringSafe(ld.createdAt, new Date().toISOString()),
+      };
+    });
+
+    return {
+      ok: true,
+      statusCode: 200,
+      adminEmail: user.email || '',
+      cloudPersisted: true,
+      stats: {
+        totalCompanies: companies.length,
+        activeCompanies,
+        suspendedCompanies,
+        totalInvoicesCount: totalInvoices,
+        totalUsersCount: Math.max(userEmailsSet.size, 1),
+        commercialActiveCount,
+        baseOrganicCount,
+        plansBreakdown,
+      },
+      companies,
+      recentLogs,
+    };
+  } catch (err) {
+    return {
+      ok: false,
+      statusCode: 500,
+      error:
+        err instanceof Error
+          ? err.message
+          : 'Erro ao consultar empresas no Cloud Firestore.',
+    };
+  }
+}
+
+export async function pullPlatformAdminCompanyDetailsClient(
+  companyId: string
+): Promise<AdminCompanyDetails | null> {
+  const user = auth.currentUser;
+  if (!user || !user.emailVerified || !isPlatformAdminEmail(user.email)) return null;
+  const resolvedId = sanitizeId(companyId);
+
+  try {
+    const compRef = doc(db, 'companies', resolvedId);
+    const compSnap = await getDoc(compRef);
+    if (!compSnap.exists() && resolvedId !== JAIMONA_COMPANY_ID) {
+      return null;
+    }
+
+    const d = compSnap.data() || {};
+    const countCol = async (sub: string) => {
+      try {
+        const snap = await getCountFromServer(collection(db, 'companies', resolvedId, sub));
+        return snap.data().count;
+      } catch {
+        return 0;
+      }
+    };
+
+    const [invoices, products, customers, cashSessions, membersSnap, logsSnap] = await Promise.all([
+      countCol('invoices'),
+      countCol('products'),
+      countCol('customers'),
+      countCol('cash_sessions'),
+      getDocs(query(collection(db, 'companies', resolvedId, 'members'), limit(50))).catch(() => null),
+      getDocs(
+        query(
+          collection(db, 'platform_audit_logs'),
+          where('companyId', '==', resolvedId),
+          limit(20)
+        )
+      ).catch(() => null),
+    ]);
+
+    const members = (membersSnap?.docs || []).map((m) => {
+      const md = m.data();
+      return {
+        uid: m.id,
+        email: String(md.email || md.emailLower || ''),
+        role: String(md.role || 'cashier'),
+        active: md.active !== false,
+        allowInvoiceCancel: Boolean(md.allowInvoiceCancel),
+        addedAtIso: toIsoStringSafe(md.createdAt),
+      };
+    });
+
+    const auditHistory = (logsSnap?.docs || [])
+      .map((l) => {
+        const ld = l.data();
+        return {
+          id: l.id,
+          action: String(ld.action || ''),
+          adminEmail: String(ld.adminEmail || ''),
+          details: String(ld.details || ''),
+          createdAtIso: toIsoStringSafe(ld.createdAt),
+        };
+      })
+      .sort((a, b) => b.createdAtIso.localeCompare(a.createdAtIso))
+      .slice(0, 15);
+
+    const planTier = normalizeAdminPlan(d.planTier, resolvedId);
+
+    return {
+      cloudPersisted: true,
+      company: {
+        id: resolvedId,
+        legalName: String(
+          d.legalName || (resolvedId === JAIMONA_COMPANY_ID ? JAIMONA_COMPANY.legalName : resolvedId)
+        ),
+        shortName: String(
+          d.shortName || (resolvedId === JAIMONA_COMPANY_ID ? JAIMONA_COMPANY.shortName : resolvedId)
+        ),
+        nif: String(d.nif || (resolvedId === JAIMONA_COMPANY_ID ? JAIMONA_COMPANY.nif : '')),
+        normalizedNif: String(
+          d.normalizedNif || normalizeCompanyNif(String(d.nif || ''))
+        ),
+        cityCountry: String(d.cityCountry || 'Angola'),
+        address: String(d.address || ''),
+        phone: String(d.phone || ''),
+        email: String(d.email || d.ownerEmail || ''),
+        status: normalizeAdminStatus(d.status),
+        planTier,
+        commercialActive:
+          resolvedId === JAIMONA_COMPANY_ID
+            ? true
+            : Boolean(d.commercialActive ?? planTier !== 'FREE'),
+        baseSequence: Number(d.baseSequence || (resolvedId === JAIMONA_COMPANY_ID ? 15678 : 1)),
+        allowManagerCancel: Boolean(d.allowManagerCancel),
+        createdAtIso: toIsoStringSafe(d.createdAt, '2026-01-01T08:00:00.000Z'),
+        updatedAtIso: toIsoStringSafe(d.updatedAt, new Date().toISOString()),
+      },
+      counts: { invoices, products, customers, cashSessions },
+      members,
+      auditHistory,
+    };
+  } catch {
+    return null;
+  }
+}
+
+export async function pullPlatformAdminUsersClient(): Promise<PlatformUserSummary[]> {
+  const user = auth.currentUser;
+  if (!user || !user.emailVerified || !isPlatformAdminEmail(user.email)) return [];
+
+  try {
+    const companiesSnap = await getDocs(query(collection(db, 'companies'), limit(150)));
+    const userMap = new Map<string, PlatformUserSummary>();
+
+    userMap.set(user.uid, {
+      uid: user.uid,
+      email: user.email || '',
+      emailVerified: true,
+      isPlatformAdmin: true,
+      companies: [],
+    });
+
+    for (const compDoc of companiesSnap.docs) {
+      const cd = compDoc.data();
+      const compId = compDoc.id;
+      const compName = String(cd.shortName || cd.legalName || compId);
+
+      if (cd.ownerUid && cd.ownerEmail) {
+        const uid = String(cd.ownerUid);
+        const existing: PlatformUserSummary = userMap.get(uid) || {
+          uid,
+          email: String(cd.ownerEmail),
+          emailVerified: true,
+          isPlatformAdmin: isPlatformAdminEmail(String(cd.ownerEmail)),
+          companies: [],
+        };
+        if (!existing.companies.some((c) => c.companyId === compId)) {
+          existing.companies.push({
+            companyId: compId,
+            companyName: compName,
+            role: 'owner',
+            active: true,
+          });
+        }
+        userMap.set(uid, existing);
+      }
+
+      try {
+        const membersSnap = await getDocs(
+          query(collection(db, 'companies', compId, 'members'), limit(30))
+        );
+        for (const mDoc of membersSnap.docs) {
+          const md = mDoc.data();
+          const uid = String(md.uid || mDoc.id);
+          const email = String(md.email || md.emailLower || '');
+          const existing: PlatformUserSummary = userMap.get(uid) || {
+            uid,
+            email,
+            emailVerified: true,
+            isPlatformAdmin: isPlatformAdminEmail(email),
+            companies: [],
+          };
+          if (!existing.email && email) existing.email = email;
+          const prevIdx = existing.companies.findIndex((c) => c.companyId === compId);
+          if (prevIdx >= 0) {
+            existing.companies[prevIdx] = {
+              companyId: compId,
+              companyName: compName,
+              role: String(md.role || existing.companies[prevIdx]!.role),
+              active: md.active !== false,
+            };
+          } else {
+            existing.companies.push({
+              companyId: compId,
+              companyName: compName,
+              role: String(md.role || 'cashier'),
+              active: md.active !== false,
+            });
+          }
+          userMap.set(uid, existing);
+        }
+      } catch {
+        // Ignora erro de subcoleção pontual
+      }
+    }
+
+    return Array.from(userMap.values());
+  } catch {
+    return [];
+  }
+}
+
+export async function updatePlatformCompanyAdminClient(
+  companyId: string,
+  patch: { status?: CompanyOperationalStatus; planTier?: PlanTier; reason?: string }
+): Promise<{ ok: boolean; error?: string }> {
+  const user = auth.currentUser;
+  if (!user || !user.emailVerified || !isPlatformAdminEmail(user.email)) {
+    return { ok: false, error: 'Acesso restrito ao Administrador Global.' };
+  }
+  const resolvedId = sanitizeId(companyId);
+
+  try {
+    const compRef = doc(db, 'companies', resolvedId);
+    const compSnap = await getDoc(compRef);
+    if (!compSnap.exists()) {
+      return {
+        ok: false,
+        error: 'Empresa ainda não sincronizada no Firestore pelo dispositivo de origem.',
+      };
+    }
+
+    const updates: Record<string, unknown> = {
+      updatedAt: serverTimestamp(),
+    };
+    if (patch.status && VALID_ADMIN_STATUSES.has(patch.status)) {
+      updates.status = patch.status;
+    }
+    if (patch.planTier && VALID_ADMIN_PLANS.has(patch.planTier)) {
+      updates.planTier = patch.planTier;
+      updates.commercialActive = patch.planTier !== 'FREE';
+    }
+
+    await updateDoc(compRef, updates);
+
+    const companyName = String(
+      compSnap.data()?.shortName ||
+        (resolvedId === JAIMONA_COMPANY_ID ? JAIMONA_COMPANY.shortName : resolvedId)
+    );
+    await writePlatformAuditLogClient({
+      companyId: resolvedId,
+      companyName,
+      action: patch.status
+        ? `COMPANY_STATUS_${patch.status.toUpperCase()}`
+        : `PLAN_SET_${patch.planTier || 'FREE'}`,
+      details:
+        patch.reason ||
+        (patch.status
+          ? `Estado operacional alterado para ${patch.status}`
+          : `Plano comercial alterado para ${patch.planTier} (${patch.planTier === 'FREE' ? 'Base Orgânico' : 'Comercial Ativo'})`),
+    });
+
+    return { ok: true };
+  } catch (err) {
+    return {
+      ok: false,
+      error: err instanceof Error ? err.message : 'Erro ao atualizar empresa no Firestore.',
+    };
+  }
+}
+
+export async function createPlatformCompanyClient(payload: {
+  shortName: string;
+  legalName?: string;
+  nif: string;
+  cityCountry?: string;
+  ownerEmail?: string;
+  planTier?: PlanTier;
+  status?: CompanyOperationalStatus;
+}): Promise<{ ok: boolean; companyId?: string; error?: string }> {
+  const user = auth.currentUser;
+  if (!user || !user.emailVerified || !isPlatformAdminEmail(user.email)) {
+    return { ok: false, error: 'Acesso restrito ao Administrador Global.' };
+  }
+
+  const nifCheck = validateCompanyNif(payload.nif);
+  if (!nifCheck.valid) {
+    return { ok: false, error: nifCheck.error || 'NIF inválido.' };
+  }
+
+  const shortName = (payload.shortName || payload.legalName || '').trim().slice(0, 64);
+  const legalName = (payload.legalName || shortName).trim().slice(0, 160) || shortName;
+  const cityCountry = (payload.cityCountry || 'Angola').trim().slice(0, 80) || 'Angola';
+  const ownerEmail = (payload.ownerEmail || user.email || '').trim().toLowerCase().slice(0, 120);
+  const planTier = payload.planTier && VALID_ADMIN_PLANS.has(payload.planTier) ? payload.planTier : 'FREE';
+  const status = payload.status && VALID_ADMIN_STATUSES.has(payload.status) ? payload.status : 'active';
+  if (!shortName || !ownerEmail) {
+    return { ok: false, error: 'Preencha Nome Curto, NIF válido e E-mail do proprietário.' };
+  }
+
+  const companyId = sanitizeId(
+    `comp_${nifCheck.normalized.toLowerCase().replace(/[^a-z0-9]/g, '')}_${Date.now().toString(36)}`
+  );
+
+  try {
+    const batch = writeBatch(db);
+    const companyRef = doc(db, 'companies', companyId);
+    const nifRef = doc(db, 'company_nifs', nifCheck.normalized);
+    const memberRef = doc(db, 'companies', companyId, 'members', user.uid);
+    const userLinkRef = doc(db, 'users', user.uid, 'company_links', companyId);
+
+    batch.set(nifRef, {
+      normalizedNif: nifCheck.normalized,
+      companyId,
+      ownerUid: user.uid,
+      shortName,
+      createdAt: serverTimestamp(),
+      updatedAt: serverTimestamp(),
+    });
+
+    batch.set(companyRef, {
+      id: companyId,
+      normalizedNif: nifCheck.normalized,
+      ownerUid: user.uid,
+      ownerEmail,
+      legalName,
+      shortName,
+      nif: payload.nif.trim().slice(0, 32),
+      address: cityCountry,
+      cityCountry,
+      phone: '',
+      email: ownerEmail,
+      tagline: 'Obrigado pela preferência',
+      status: 'active',
+      planTier: 'FREE',
+      commercialActive: false,
+      baseSequence: 1,
+      allowManagerCancel: false,
+      createdAt: serverTimestamp(),
+      updatedAt: serverTimestamp(),
+    });
+
+    batch.set(memberRef, {
+      id: user.uid,
+      companyId,
+      companyOwnerUid: user.uid,
+      uid: user.uid,
+      email: (user.email || '').slice(0, 120),
+      emailLower: (user.email || '').trim().toLowerCase().slice(0, 120),
+      displayName: (user.displayName || user.email || 'Admin Master').slice(0, 120),
+      role: 'owner',
+      allowInvoiceCancel: true,
+      active: true,
+      createdAt: serverTimestamp(),
+      updatedAt: serverTimestamp(),
+    });
+
+    batch.set(userLinkRef, {
+      companyId,
+      uid: user.uid,
+      role: 'owner',
+      shortName,
+      nif: payload.nif.trim().slice(0, 32),
+      normalizedNif: nifCheck.normalized,
+      updatedAt: serverTimestamp(),
+    });
+
+    await batch.commit();
+
+    if (planTier !== 'FREE' || status !== 'active') {
+      await updateDoc(companyRef, {
+        status,
+        planTier,
+        commercialActive: planTier !== 'FREE',
+        updatedAt: serverTimestamp(),
+      }).catch(() => null);
+    }
+
+    await writePlatformAuditLogClient({
+      companyId,
+      companyName: shortName,
+      action: 'ADMIN_COMPANY_CREATE',
+      details: `Nova empresa registada: ${shortName} (NIF: ${payload.nif.trim()}, Plano: ${planTier})`,
+    });
+
+    return { ok: true, companyId };
+  } catch (err) {
+    return {
+      ok: false,
+      error:
+        err instanceof Error
+          ? err.message
+          : 'Não foi possível criar a empresa (verifique se o NIF já existe).',
+    };
+  }
+}
+
+export async function logPlatformSupportAccessClient(
+  companyId: string,
+  companyName: string
+): Promise<void> {
+  await writePlatformAuditLogClient({
+    companyId,
+    companyName,
+    action: 'SUPPORT_CONTEXT_ENTER',
+    details: `Acesso de suporte técnico à empresa ${companyName}`,
+  });
 }
 

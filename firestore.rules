@@ -52,6 +52,27 @@ service cloud.firestore {
         );
     }
 
+    // Verificação token-only do Administrador Global (sem get()/exists(), segura para queries allow list)
+    function isVerifiedPlatformAdminToken() {
+      return isVerifiedUser() && request.auth.token.email == 'wtmedia0@gmail.com';
+    }
+
+    function isValidPlatformAuditLog(data) {
+      return data.keys().hasAll([
+          'adminUid', 'adminEmail', 'companyId', 'companyName', 'action', 'details', 'createdAt'
+        ])
+        && data.keys().hasOnly([
+          'adminUid', 'adminEmail', 'companyId', 'companyName', 'action', 'details', 'createdAt'
+        ])
+        && data.adminUid is string && data.adminUid == request.auth.uid && isValidId(data.adminUid)
+        && data.adminEmail is string && data.adminEmail.size() >= 3 && data.adminEmail.size() <= 120
+        && data.companyId is string && isValidId(data.companyId)
+        && data.companyName is string && data.companyName.size() >= 1 && data.companyName.size() <= 80
+        && data.action is string && data.action.size() >= 1 && data.action.size() <= 64
+        && data.details is string && data.details.size() >= 1 && data.details.size() <= 240
+        && data.createdAt is timestamp;
+    }
+
     // Master Gate Multiempresa (usado apenas em operações pontuais; proibido em allow list)
     function companyDocData(companyId) {
       return get(/databases/$(database)/documents/companies/$(companyId)).data;
@@ -1392,7 +1413,12 @@ service cloud.firestore {
 
     match /platform_audit_logs/{logId} {
       allow get: if isValidId(logId) && isPlatformAdmin();
-      allow list, create, update, delete: if false;
+      allow list: if isVerifiedPlatformAdminToken();
+      allow create: if isValidId(logId)
+        && isPlatformAdmin()
+        && isValidPlatformAuditLog(incoming())
+        && incoming().createdAt == request.time;
+      allow update, delete: if false;
     }
 
     // ==================== GLOBAL UNIQUE NIF REGISTRY (1 NIF = 1 EMPRESA) ====================
@@ -1443,7 +1469,7 @@ service cloud.firestore {
         && (existing().ownerUid == request.auth.uid || isCompanyAnyActiveRole(companyId) || isPlatformAdmin());
 
       allow list: if isVerifiedUser()
-        && existing().ownerUid == request.auth.uid;
+        && (existing().ownerUid == request.auth.uid || isVerifiedPlatformAdminToken());
 
       allow create: if isVerifiedUser()
         && isValidId(companyId)
@@ -1479,7 +1505,7 @@ service cloud.firestore {
           // Action 1: Owner updates operational/identity details of an active company
           (
             existing().status == 'active'
-            && isCompanyOwner(companyId)
+            && (isCompanyOwner(companyId) || existing().ownerUid == request.auth.uid)
             && incoming().status == existing().status
             && incoming().planTier == existing().planTier
             && incoming().commercialActive == existing().commercialActive
@@ -1508,8 +1534,10 @@ service cloud.firestore {
           && (memberId == request.auth.uid || isCompanyOwnerOrManager(companyId) || isPlatformAdmin());
 
         allow list: if isVerifiedUser()
-          && existing().companyId == companyId
-          && existing().companyOwnerUid == request.auth.uid;
+          && (
+            (existing().companyId == companyId && existing().companyOwnerUid == request.auth.uid)
+            || isVerifiedPlatformAdminToken()
+          );
 
         allow create: if isVerifiedUser()
           && isValidId(companyId)
@@ -1602,8 +1630,10 @@ service cloud.firestore {
           && (isCompanyAnyActiveRole(companyId) || isPlatformAdmin());
 
         allow list: if isVerifiedUser()
-          && existing().companyId == companyId
-          && existing().companyOwnerUid == request.auth.uid;
+          && (
+            (existing().companyId == companyId && existing().companyOwnerUid == request.auth.uid)
+            || isVerifiedPlatformAdminToken()
+          );
 
         allow create: if isVerifiedUser()
           && isValidId(companyId)
@@ -1682,8 +1712,10 @@ service cloud.firestore {
           && (isCompanyAnyActiveRole(companyId) || isPlatformAdmin());
 
         allow list: if isVerifiedUser()
-          && existing().companyId == companyId
-          && existing().companyOwnerUid == request.auth.uid;
+          && (
+            (existing().companyId == companyId && existing().companyOwnerUid == request.auth.uid)
+            || isVerifiedPlatformAdminToken()
+          );
 
         // Owner, Manager e Cashier podem criar cliente rápido durante a emissão (em planos Cloud ativos)
         allow create: if isVerifiedUser()
@@ -1782,8 +1814,10 @@ service cloud.firestore {
           && (isCompanyAnyActiveRole(companyId) || isPlatformAdmin());
 
         allow list: if isVerifiedUser()
-          && existing().companyId == companyId
-          && existing().companyOwnerUid == request.auth.uid;
+          && (
+            (existing().companyId == companyId && existing().companyOwnerUid == request.auth.uid)
+            || isVerifiedPlatformAdminToken()
+          );
 
         allow create: if isVerifiedUser()
           && isValidId(companyId)
@@ -1924,8 +1958,10 @@ service cloud.firestore {
           && (isCompanyAnyActiveRole(companyId) || isPlatformAdmin());
 
         allow list: if isVerifiedUser()
-          && existing().companyId == companyId
-          && existing().companyOwnerUid == request.auth.uid;
+          && (
+            (existing().companyId == companyId && existing().companyOwnerUid == request.auth.uid)
+            || isVerifiedPlatformAdminToken()
+          );
 
         allow create: if isVerifiedUser()
           && isValidId(companyId)

@@ -130,6 +130,7 @@ export interface AdminOverviewStats {
 }
 
 export interface AdminCompanyDetails {
+  cloudPersisted?: boolean;
   company: {
     id: string;
     legalName: string;
@@ -492,7 +493,7 @@ export async function createPlatformCompany(payload: {
   ownerEmail?: string;
   planTier?: PlanTier;
   status?: CompanyOperationalStatus;
-}): Promise<{ ok: boolean; companyId?: string; error?: string }> {
+}): Promise<{ ok: boolean; companyId?: string; persistedInFirestore?: boolean; error?: string }> {
   try {
     const headers = await getBearerHeaders();
     const res = await fetch(`${API_BASE}/api/admin/companies`, {
@@ -504,7 +505,11 @@ export async function createPlatformCompany(payload: {
     if (!res.ok) {
       return { ok: false, error: json.error || `Erro HTTP ${res.status}` };
     }
-    return { ok: true, companyId: json.companyId };
+    return {
+      ok: true,
+      companyId: json.companyId,
+      persistedInFirestore: json.persistedInFirestore,
+    };
   } catch (err) {
     return {
       ok: false,
@@ -515,6 +520,7 @@ export async function createPlatformCompany(payload: {
 
 export async function fetchPlatformUsers(): Promise<{
   ok: boolean;
+  cloudPersisted?: boolean;
   users?: PlatformUserSummary[];
   error?: string;
 }> {
@@ -529,7 +535,7 @@ export async function fetchPlatformUsers(): Promise<{
       return { ok: false, error: json.error || `Erro HTTP ${res.status}` };
     }
     const json = await res.json();
-    return { ok: true, users: json.users };
+    return { ok: true, cloudPersisted: json.cloudPersisted, users: json.users };
   } catch (err) {
     return {
       ok: false,
@@ -555,14 +561,25 @@ export async function fetchPlatformSystemStatus(): Promise<SystemStatusResponse 
 export async function updatePlatformCompanyAdmin(
   companyId: string,
   patch: { status?: CompanyOperationalStatus; planTier?: PlanTier; reason?: string }
-): Promise<{ ok: boolean; error?: string }> {
-  const headers = await getBearerHeaders();
-  const res = await fetch(`${API_BASE}/api/admin/companies/${encodeURIComponent(companyId)}`, {
-    method: 'PATCH',
-    headers,
-    body: JSON.stringify(patch),
-  });
-  return (await res.json().catch(() => ({ ok: false }))) as { ok: boolean; error?: string };
+): Promise<{ ok: boolean; persistedInFirestore?: boolean; error?: string }> {
+  try {
+    const headers = await getBearerHeaders();
+    const res = await fetch(`${API_BASE}/api/admin/companies/${encodeURIComponent(companyId)}`, {
+      method: 'PATCH',
+      headers,
+      body: JSON.stringify(patch),
+    });
+    return (await res.json().catch(() => ({ ok: false }))) as {
+      ok: boolean;
+      persistedInFirestore?: boolean;
+      error?: string;
+    };
+  } catch (err) {
+    return {
+      ok: false,
+      error: err instanceof Error ? err.message : 'Falha de comunicação com o servidor.',
+    };
+  }
 }
 
 export async function logPlatformSupportAccess(

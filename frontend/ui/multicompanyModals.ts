@@ -116,9 +116,9 @@ export function renderNewCompanyModal(params: {
   const { errorMessage, isSubmitting, isSignedIn } = params;
 
   return `
-    <div class="fixed inset-0 z-50 bg-black/50 flex items-center justify-center p-4">
-      <div class="bg-white rounded-xl border border-slate-200 w-full max-w-md overflow-hidden shadow-xl">
-        <div class="px-4 py-3 border-b border-slate-200 flex items-center justify-between">
+    <div class="fixed inset-0 z-50 bg-black/50 flex items-center justify-center p-3 sm:p-4">
+      <div class="bg-white text-slate-900 rounded-xl border border-slate-200 w-full max-w-md max-h-[92dvh] flex flex-col overflow-hidden shadow-xl">
+        <div class="px-4 py-3 border-b border-slate-200 flex items-center justify-between shrink-0">
           <div>
             <h2 class="text-sm font-bold text-slate-900">Cadastrar Nova Empresa</h2>
             <p class="text-[11px] text-slate-500">Registo simplificado · 1 NIF cria apenas 1 empresa no sistema.</p>
@@ -130,10 +130,22 @@ export function renderNewCompanyModal(params: {
           >${ICONS.close}</button>
         </div>
 
-        <form data-form="new-company-form" class="p-4 space-y-3">
+        <form data-form="new-company-form" class="p-4 space-y-3 overflow-y-auto">
           ${
             errorMessage
               ? `<div class="p-2.5 rounded-lg border border-red-200 bg-red-50 text-xs text-red-700">${escapeHtml(errorMessage)}</div>`
+              : ''
+          }
+          ${
+            !isSignedIn
+              ? `<div class="p-2.5 rounded-lg border border-amber-200 bg-amber-50 text-[11px] text-amber-900 flex items-center justify-between gap-2">
+                  <span>Sem conta Google ligada, a empresa fica apenas neste dispositivo até iniciar sessão.</span>
+                  <button
+                    type="button"
+                    data-action="signin-google"
+                    class="h-7 px-2.5 rounded-md bg-slate-900 text-white text-[11px] font-semibold hover:bg-slate-800 whitespace-nowrap shrink-0"
+                  >Entrar Google</button>
+                </div>`
               : ''
           }
 

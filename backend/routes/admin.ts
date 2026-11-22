@@ -245,6 +245,7 @@ adminRouter.get('/companies/:companyId/details', async (req: AuthenticatedReques
   if (!ctx.db || !ctx.hasExplicitCredentials) {
     res.status(200).json({
       ok: true,
+      cloudPersisted: false,
       company: {
         id: companyId,
         legalName: companyId === JAIMONA_COMPANY_ID ? JAIMONA_COMPANY.legalName : 'Empresa Local',
@@ -418,7 +419,11 @@ adminRouter.post('/companies', async (req: AuthenticatedRequest, res) => {
       legalName,
       nif: rawNif,
       normalizedNif,
-      cityCountry,
+      address: cityCountry || 'Angola',
+      cityCountry: cityCountry || 'Angola',
+      phone: '',
+      email: ownerEmail,
+      tagline: 'Obrigado pela preferência',
       ownerEmail,
       ownerUid: adminUser.uid,
       planTier,
@@ -464,6 +469,7 @@ adminRouter.get('/users', async (req: AuthenticatedRequest, res) => {
   if (!ctx.db || !ctx.hasExplicitCredentials) {
     res.status(200).json({
       ok: true,
+      cloudPersisted: false,
       users: [
         {
           uid: adminUser.uid,

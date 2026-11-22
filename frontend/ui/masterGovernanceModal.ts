@@ -96,12 +96,14 @@ export function renderMasterGovernanceModal(params: MasterGovernanceModalParams)
       c.ownerEmail.toLowerCase().includes(q)
   );
 
-  const activeCount = stats?.activeCompanies ?? mergedCompanies.filter((c) => c.status === 'active').length;
-  const suspendedCount = stats?.suspendedCompanies ?? mergedCompanies.filter((c) => c.status === 'suspended').length;
-  const commercialCount = stats?.commercialActiveCount ?? mergedCompanies.filter((c) => c.planTier !== 'FREE').length;
-  const organicCount = stats?.baseOrganicCount ?? mergedCompanies.filter((c) => c.planTier === 'FREE').length;
-  const totalInvoices = stats?.totalInvoicesCount ?? mergedCompanies.reduce((acc, c) => acc + c.invoiceCount, 0);
-  const totalUsers = stats?.totalUsersCount ?? Math.max(usersList.length, 1);
+  const totalCompanies = mergedCompanies.length;
+  const activeCount = mergedCompanies.filter((c) => c.status === 'active').length;
+  const suspendedCount = mergedCompanies.filter((c) => c.status === 'suspended').length;
+  const commercialCount = mergedCompanies.filter((c) => c.planTier !== 'FREE' && c.commercialActive).length;
+  const organicCount = mergedCompanies.filter((c) => c.planTier === 'FREE').length;
+  const mergedInvoices = mergedCompanies.reduce((acc, c) => acc + c.invoiceCount, 0);
+  const totalInvoices = Math.max(stats?.totalInvoicesCount ?? 0, mergedInvoices);
+  const totalUsers = Math.max(stats?.totalUsersCount ?? 0, usersList.length, 1);
 
   return `
     <div class="fixed inset-0 z-50 bg-slate-950/75 flex items-center justify-center p-2 sm:p-4">
@@ -323,7 +325,7 @@ export function renderMasterGovernanceModal(params: MasterGovernanceModalParams)
                   title="Clique para gerir empresas"
                 >
                   <div class="text-[10.5px] text-slate-500 font-medium">Empresas registadas</div>
-                  <div class="text-base font-bold font-mono text-slate-900 mt-0.5">${stats?.totalCompanies ?? mergedCompanies.length}</div>
+                  <div class="text-base font-bold font-mono text-slate-900 mt-0.5">${totalCompanies}</div>
                 </button>
                 <button
                   type="button"
@@ -430,8 +432,8 @@ function renderOverviewTab(params: {
   mergedCompanies: AdminCompanySummary[];
   recentLogs: AdminAuditEntry[];
 }): string {
-  const { stats, mergedCompanies, recentLogs } = params;
-  const pb = stats?.plansBreakdown || {
+  const { mergedCompanies, recentLogs } = params;
+  const pb = {
     FREE: mergedCompanies.filter((c) => c.planTier === 'FREE').length,
     ESSENCIAL: mergedCompanies.filter((c) => c.planTier === 'ESSENCIAL').length,
     PROFISSIONAL: mergedCompanies.filter((c) => c.planTier === 'PROFISSIONAL').length,
@@ -695,8 +697,8 @@ function renderPlansTab(params: {
   stats?: AdminOverviewStats | null;
   mergedCompanies: AdminCompanySummary[];
 }): string {
-  const { stats, mergedCompanies } = params;
-  const pb = stats?.plansBreakdown || {
+  const { mergedCompanies } = params;
+  const pb = {
     FREE: mergedCompanies.filter((c) => c.planTier === 'FREE').length,
     ESSENCIAL: mergedCompanies.filter((c) => c.planTier === 'ESSENCIAL').length,
     PROFISSIONAL: mergedCompanies.filter((c) => c.planTier === 'PROFISSIONAL').length,

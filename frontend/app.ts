@@ -145,14 +145,20 @@ import {
   cancelInvoiceCloud,
   createCashMovementCloud,
   createInvoiceCloud,
+  createPlatformCompanyClient,
   createStockMovementCloud,
   ensureCompanyRegisteredCloud,
+  logPlatformSupportAccessClient,
   pullCompanyFromCloud,
   pullOwnedCompaniesFromCloud,
+  pullPlatformAdminCompanyDetailsClient,
+  pullPlatformAdminOverviewClient,
+  pullPlatformAdminUsersClient,
   removeCompanyMemberCloud,
   removeCustomerCloud,
   removeProductCloud,
   removeSupplierCloud,
+  updatePlatformCompanyAdminClient,
   updateProductStockCloud,
   upsertCashSessionCloud,
   upsertCompanyMemberCloud,
@@ -166,6 +172,7 @@ import {
 } from '../src/services/cloudSync';
 import {
   auth,
+  consumeGoogleRedirectResult,
   formatFirebaseAuthErrorPt,
   isUnauthorizedDomainError,
   signInWithGoogle,
@@ -837,9 +844,9 @@ export class SilaBillingApp {
 
     validateFirestoreConnection();
 
-    // Aguarda brevemente pela restauração da sessão Firebase Auth (com timeout curto de 600ms
-    // para nunca atrasar terminais offline/Windows 7), evitando injetar empresas alheias no arranque.
+    // Aguarda brevemente pela restauração da sessão Firebase Auth (e eventual retorno de signInWithRedirect em smartphones)
     try {
+      await consumeGoogleRedirectResult().catch(() => null);
       if (typeof auth.authStateReady === 'function') {
         await Promise.race([
           auth.authStateReady(),
@@ -3275,7 +3282,22 @@ export class SilaBillingApp {
     this.masterAdminError = null;
     this.render();
 
-    const res = await fetchPlatformAdminOverview();
+    let res = await fetchPlatformAdminOverview();
+
+    if (res.statusCode === 403 && !isPlatformAdminEmail(this.user.email)) {
+      this.masterAdminLoading = false;
+      this.masterAdminDenied = true;
+      this.render();
+      return;
+    }
+
+    if ((!res.ok || res.cloudPersisted === false) && isPlatformAdminEmail(this.user.email)) {
+      const clientRes = await pullPlatformAdminOverviewClient();
+      if (clientRes.ok || !res.ok) {
+        res = clientRes;
+      }
+    }
+
     this.masterAdminLoading = false;
 
     if (res.statusCode === 403) {
@@ -3288,6 +3310,7 @@ export class SilaBillingApp {
       this.masterAdminError =
         res.error || 'Vista administrativa local apresentada (API em atualização).';
     } else {
+      this.masterAdminError = null;
       this.adminCloudCompanies = res.companies || [];
       this.adminAuditLogs = res.recentLogs || [];
       this.adminOverviewStats = res.stats || null;
@@ -3300,6 +3323,20 @@ export class SilaBillingApp {
     this.isLoadingPlatformUsers = true;
     this.render();
     const res = await fetchPlatformUsers();
+    if ((!res.ok || res.cloudPersisted === false) && isPlatformAdminEmail(this.user.email)) {
+      const clientUsers = await pullPlatformAdminUsersClient();
+      this.isLoadingPlatformUsers = false;
+      if (clientUsers.length > 0) {
+        this.platformUsersList = clientUsers;
+        this.masterAdminError = null;
+      } else if (res.ok && res.users) {
+        this.platformUsersList = res.users;
+      } else if (res.error) {
+        this.masterAdminError = res.error;
+      }
+      this.render();
+      return;
+    }
     this.isLoadingPlatformUsers = false;
     if (res.ok && res.users) {
       this.platformUsersList = res.users;
@@ -3326,6 +3363,23 @@ export class SilaBillingApp {
     this.isLoadingCompanyDetails = true;
     this.render();
     const res = await fetchPlatformCompanyDetails(companyId);
+    if (
+      (!res.ok || !res.data || res.data.cloudPersisted === false) &&
+      isPlatformAdminEmail(this.user.email)
+    ) {
+      const clientDetails = await pullPlatformAdminCompanyDetailsClient(companyId);
+      this.isLoadingCompanyDetails = false;
+      if (clientDetails) {
+        this.selectedCompanyDetails = clientDetails;
+        this.masterAdminError = null;
+      } else if (res.ok && res.data) {
+        this.selectedCompanyDetails = res.data;
+      } else {
+        this.masterAdminError = res.error || 'Erro ao carregar detalhes da empresa.';
+      }
+      this.render();
+      return;
+    }
     this.isLoadingCompanyDetails = false;
     if (res.ok && res.data) {
       this.selectedCompanyDetails = res.data;
@@ -3438,6 +3492,13 @@ export class SilaBillingApp {
   }
 
   private hasUnsyncedLocalRecords(): boolean {
+    const hasUnsyncedCompany = this.companies.some(
+      (c) =>
+        Boolean(c.id) &&
+        !c.synced &&
+        (c.id !== JAIMONA_COMPANY_ID || isJaimonaOwnerEmail(this.user?.email))
+    );
+    if (hasUnsyncedCompany) return true;
     if (!this.activeCompany.id || this.requiresCompanyOnboarding) return false;
     if (!canCompanySyncCloudData(this.activeCompany)) {
       return !this.activeCompany.synced;
@@ -4914,19 +4975,39 @@ export class SilaBillingApp {
 
         this.masterAdminLoading = true;
         this.render();
-        const createRes = await createPlatformCompany({
-          shortName,
-          legalName,
-          nif,
-          cityCountry,
-          ownerEmail,
-          planTier,
-          status: 'active',
-        });
+        let createRes: { ok: boolean; companyId?: string; persistedInFirestore?: boolean; error?: string } =
+          await createPlatformCompany({
+            shortName,
+            legalName,
+            nif,
+            cityCountry,
+            ownerEmail,
+            planTier,
+            status: 'active',
+          });
+        if (
+          (!createRes.ok || createRes.persistedInFirestore === false) &&
+          this.user &&
+          isPlatformAdminEmail(this.user.email)
+        ) {
+          const clientCreate = await createPlatformCompanyClient({
+            shortName,
+            legalName,
+            nif,
+            cityCountry,
+            ownerEmail,
+            planTier,
+            status: 'active',
+          });
+          if (clientCreate.ok || !createRes.ok) {
+            createRes = clientCreate;
+          }
+        }
         this.masterAdminLoading = false;
         if (!createRes.ok) {
           this.masterAdminError = createRes.error || 'Erro ao registar nova empresa.';
         } else {
+          this.masterAdminError = null;
           this.showAdminNewCompanyModal = false;
           await this.refreshMasterAdminData();
         }
@@ -4944,7 +5025,17 @@ export class SilaBillingApp {
       case 'admin-toggle-company-status': {
         const nextStatus = (value === 'suspended' ? 'suspended' : 'active') as CompanyOperationalStatus;
         if (this.user && this.isOnline) {
-          const res = await updatePlatformCompanyAdmin(id, { status: nextStatus });
+          let res: { ok: boolean; persistedInFirestore?: boolean; error?: string } =
+            await updatePlatformCompanyAdmin(id, { status: nextStatus });
+          if (
+            (!res.ok || res.persistedInFirestore === false) &&
+            isPlatformAdminEmail(this.user.email)
+          ) {
+            const clientRes = await updatePlatformCompanyAdminClient(id, { status: nextStatus });
+            if (clientRes.ok || !res.ok) {
+              res = clientRes;
+            }
+          }
           if (!res.ok) {
             this.masterAdminError = res.error || 'Não foi possível alterar o estado da empresa.';
             this.render();
@@ -4971,7 +5062,13 @@ export class SilaBillingApp {
         if (!id) break;
         const targetSummary = this.getMergedAdminCompanies().find((c) => c.id === id);
         if (this.user && this.isOnline && targetSummary) {
-          void logPlatformSupportAccess(id, targetSummary.shortName);
+          if (this.backendHealth?.hasServiceAccount) {
+            void logPlatformSupportAccess(id, targetSummary.shortName);
+          } else if (isPlatformAdminEmail(this.user.email)) {
+            void logPlatformSupportAccessClient(id, targetSummary.shortName);
+          } else {
+            void logPlatformSupportAccess(id, targetSummary.shortName);
+          }
         }
 
         this.supportCompanyId = id;
@@ -8720,7 +8817,17 @@ export class SilaBillingApp {
       case 'admin-company-plan': {
         const planTier = el.value as PlanTier;
         if (this.user && this.isOnline) {
-          const res = await updatePlatformCompanyAdmin(id, { planTier });
+          let res: { ok: boolean; persistedInFirestore?: boolean; error?: string } =
+            await updatePlatformCompanyAdmin(id, { planTier });
+          if (
+            (!res.ok || res.persistedInFirestore === false) &&
+            isPlatformAdminEmail(this.user.email)
+          ) {
+            const clientRes = await updatePlatformCompanyAdminClient(id, { planTier });
+            if (clientRes.ok || !res.ok) {
+              res = clientRes;
+            }
+          }
           if (!res.ok) {
             this.masterAdminError = res.error || 'Erro ao atualizar plano comercial.';
             this.render();
@@ -9344,12 +9451,29 @@ export class SilaBillingApp {
             await ensureCompanyRegisteredCloud(createdCompany, true);
             const syncedComp: CompanyRecord = {
               ...createdCompany,
+              ownerUid: createdCompany.ownerUid || this.user.uid,
+              ownerEmail: createdCompany.ownerEmail || this.user.email || undefined,
               syncState: 'synced',
               synced: true,
+              syncError: undefined,
             };
             await localDb.saveCompany(syncedComp);
-          } catch {
-            // Se o backend Admin SDK já reservou o NIF, mantém operacional
+            this.syncMessage = null;
+          } catch (cloudErr) {
+            const errMsg =
+              cloudErr instanceof Error ? cloudErr.message : 'Falha ao registar empresa na Cloud.';
+            if (/NIF|já se encontra registado|conflito/i.test(errMsg)) {
+              await localDb.deleteCompanyRollback(createdCompany.id);
+              throw cloudErr;
+            }
+            const errComp: CompanyRecord = {
+              ...createdCompany,
+              syncState: 'error',
+              synced: false,
+              syncError: errMsg,
+            };
+            await localDb.saveCompany(errComp);
+            this.syncMessage = `Empresa guardada localmente, mas pendente na Cloud: ${errMsg}`;
           }
         }
 
@@ -11420,10 +11544,35 @@ export class SilaBillingApp {
             defaultEstablishmentId: syncedCompany.profile.defaultEstablishmentId,
             agtEnvironment: syncedCompany.profile.agtEnvironment,
           };
-          this.render();
+        } else {
+          const markedCompany: CompanyRecord = {
+            ...this.activeCompany,
+            ownerUid:
+              this.activeCompany.ownerUid ||
+              (this.activeCompany.id !== JAIMONA_COMPANY_ID ? this.user.uid : undefined),
+            ownerEmail:
+              this.activeCompany.ownerEmail ||
+              (this.activeCompany.id !== JAIMONA_COMPANY_ID
+                ? this.user.email || undefined
+                : JAIMONA_OWNER_EMAIL),
+            syncState: 'synced',
+            synced: true,
+            syncError: undefined,
+          };
+          await localDb.saveCompany(markedCompany);
+          this.activeCompany = markedCompany;
+          this.companies = this.companies.map((c) =>
+            c.id === markedCompany.id ? markedCompany : c
+          );
         }
-      } catch {
-        // Mantém pendente
+        this.syncMessage = null;
+        this.render();
+      } catch (cloudErr) {
+        this.syncMessage =
+          cloudErr instanceof Error
+            ? `Ficha guardada localmente, mas pendente na Cloud: ${cloudErr.message}`
+            : 'Ficha guardada localmente, mas pendente de sincronização Cloud.';
+        this.render();
       }
     }
   }
@@ -11752,25 +11901,68 @@ export class SilaBillingApp {
         isPlatformAdminEmail(this.user.email) &&
         this.activeCompany.ownerUid !== this.user.uid;
 
-      if (!isSupportInspection) {
-        // 2. Regista/atualiza sempre a identidade leve da empresa e NIF único no Firestore
-        await ensureCompanyRegisteredCloud(this.activeCompany, !this.activeCompany.synced);
-        const canClaimCompanyOwnership =
-          this.activeCompany.id !== JAIMONA_COMPANY_ID || isJaimonaOwnerEmail(this.user.email);
-        if (!this.activeCompany.synced && canClaimCompanyOwnership) {
-          const markedComp: CompanyRecord = {
-            ...this.activeCompany,
-            ownerUid: this.activeCompany.ownerUid || this.user.uid,
-            ownerEmail:
-              this.activeCompany.id === JAIMONA_COMPANY_ID
-                ? JAIMONA_OWNER_EMAIL
-                : this.activeCompany.ownerEmail || this.user.email || undefined,
-            syncState: 'synced',
-            synced: true,
-          };
-          await localDb.saveCompany(markedComp);
-          this.activeCompany = markedComp;
+      // 2. Regista/atualiza sempre todas as empresas locais próprias ou ainda não vinculadas no Firestore (incluindo plano Base Orgânico e Essencial)
+      const companiesToEnsure = new Map<string, CompanyRecord>();
+      for (const lc of this.companies) {
+        if (!lc.id) continue;
+        if (lc.id === JAIMONA_COMPANY_ID && !isJaimonaOwnerEmail(this.user.email)) continue;
+        if (lc.ownerUid && lc.ownerUid !== this.user.uid && !isPlatformAdminEmail(this.user.email)) {
+          continue;
         }
+        companiesToEnsure.set(lc.id, lc);
+      }
+      if (
+        !isSupportInspection &&
+        this.activeCompany.id &&
+        !this.requiresCompanyOnboarding &&
+        (this.activeCompany.id !== JAIMONA_COMPANY_ID || isJaimonaOwnerEmail(this.user.email))
+      ) {
+        companiesToEnsure.set(this.activeCompany.id, this.activeCompany);
+      }
+
+      const companySyncErrors: string[] = [];
+      for (const localComp of companiesToEnsure.values()) {
+        try {
+          await ensureCompanyRegisteredCloud(localComp, !localComp.synced);
+          const canClaimCompanyOwnership =
+            localComp.id !== JAIMONA_COMPANY_ID || isJaimonaOwnerEmail(this.user.email);
+          if ((!localComp.synced || !localComp.ownerUid || localComp.syncError) && canClaimCompanyOwnership) {
+            const markedComp: CompanyRecord = {
+              ...localComp,
+              ownerUid: localComp.ownerUid || this.user.uid,
+              ownerEmail:
+                localComp.id === JAIMONA_COMPANY_ID
+                  ? JAIMONA_OWNER_EMAIL
+                  : localComp.ownerEmail || this.user.email || undefined,
+              syncState: 'synced',
+              synced: true,
+              syncError: undefined,
+            };
+            await localDb.saveCompany(markedComp);
+            this.companies = this.companies.map((c) => (c.id === markedComp.id ? markedComp : c));
+            if (this.activeCompany.id === markedComp.id) {
+              this.activeCompany = markedComp;
+            }
+          }
+        } catch (compErr) {
+          const errText =
+            compErr instanceof Error ? compErr.message : 'Erro ao registar empresa na Cloud.';
+          companySyncErrors.push(`${localComp.profile.shortName}: ${errText}`);
+          const erroredComp: CompanyRecord = {
+            ...localComp,
+            syncState: 'error',
+            synced: false,
+            syncError: errText,
+          };
+          await localDb.saveCompany(erroredComp).catch(() => null);
+          this.companies = this.companies.map((c) => (c.id === erroredComp.id ? erroredComp : c));
+          if (this.activeCompany.id === erroredComp.id) {
+            this.activeCompany = erroredComp;
+          }
+        }
+      }
+      if (companySyncErrors.length > 0) {
+        this.syncMessage = companySyncErrors[0]!;
       }
 
       // Empresas em plano Base Orgânico (FREE) ou Essencial (1.000 Kz) operam com base de dados 100% local (custo zero de subcoleções Cloud)
@@ -11787,7 +11979,7 @@ export class SilaBillingApp {
         this.lastSyncedIso = new Date().toISOString();
         await this.refreshBackendHealth();
 
-        if (manualTrigger) {
+        if (manualTrigger && companySyncErrors.length === 0) {
           if (this.activeCompany.plan.planTier === 'ESSENCIAL') {
             this.syncMessage =
               'Licença Essencial verificada — faturação local ilimitada ativa neste dispositivo. Para backup automático na Cloud, conheça o Plano Cloud Profissional.';
@@ -12358,79 +12550,130 @@ export class SilaBillingApp {
     this.root.innerHTML = `
       ${
         !this.forceDesktopView
-          ? `<div class="no-print flex md:hidden h-dvh w-screen flex-col overflow-hidden">
-              ${renderMobileOperationalView({
-                activeCompany: this.activeCompany,
-                settings: this.settings,
-                companyMasterDraftProfile: this.companyMasterDraftProfile,
-                companyMasterDraftSettings: this.companyMasterDraftSettings,
-                companyMasterSection: this.companyMasterSection,
-                companySeries: listarSeries({ companyId: this.activeCompany.id }),
-                canManageCompanySettings: this.canManageCompanySettings(),
-                companyFormError: this.settingsErrorMessage,
-                companyFormSavedNotice: this.settingsSavedNotice,
-                showRequestAgtSeriesForm: this.showRequestAgtSeriesForm,
-                confirmFinalizeSeriesId: this.confirmFinalizeSeriesId,
-                agtSeriesErrorMessage: this.agtSeriesErrorMessage,
-                agtSeriesSuccessMessage: this.agtSeriesSuccessMessage,
-                showEstablishmentForm: this.showEstablishmentForm,
-                editingEstablishment: this.editingEstablishment,
-                establishmentError: this.establishmentError,
-                showWarehouseForm: this.showWarehouseForm,
-                editingWarehouse: this.editingWarehouse,
-                warehouseError: this.warehouseError,
-                isOnline: this.isOnline,
-                user: this.user,
-                mobileTab: this.mobileTab,
-                mobileCheckoutStep: this.mobileCheckoutStep,
-                cart: this.cart,
-                products: this.products,
-                customers: this.customers,
-                invoices: this.invoices,
-                selectedCustomerId: this.selectedCustomerId,
-                docType: this.docType,
-                paymentMethod: this.paymentMethod,
-                amountReceivedInput: this.amountReceivedInput,
-                mobileSearchQuery: this.mobileDocsSearchQuery,
-                mobileProductSearchInput: this.mobileProductSearchInput,
-                lastEmittedInvoice: this.lastEmitted,
-                showQuickProductModal: this.showQuickProductForm,
-                showQuickCustomerModal: this.showQuickCustomerForm,
-                showQuickCompanyModal: this.showMobileQuickCompanyModal,
-                showCustomerPickerModal: this.showMobileCustomerPicker,
-                editingMobileProduct: this.editingMobileProduct,
-                editingCustomer: this.editingCustomer,
-                editingCustomerCreditLimitInput: this.editingCustomerCreditLimitInput,
-                showCustomerAdvancedFields: this.showCustomerAdvancedFields,
-                mobileCustomerModalMode: this.mobileCustomerModalMode,
-                canEditExistingCustomers: this.canEditExistingCustomers(),
-                quickCustomerDraft: this.quickCustomerDraft,
-                quickProductError: this.quickProductError,
-                quickCustomerError: this.quickCustomerError,
-                operator: this.operator,
-                unlockedOperatorName: unlockedMember?.displayName || this.operator,
-                unlockedRoleLabel,
-                canSellPos: unlockedPerms.pos_sell,
-                canViewProducts:
-                  unlockedPerms.products_view || unlockedPerms.products_manage || unlockedPerms.stock_view,
-                canManageProducts: unlockedPerms.products_manage,
-                canViewCostPrices: unlockedPerms.cost_prices_view,
-                canViewProfitsMargins: unlockedPerms.profits_margins_view,
-                canViewCustomers:
-                  unlockedPerms.customers_view || unlockedPerms.customers_create || unlockedPerms.customers_manage,
-                canCreateCustomers: unlockedPerms.customers_create || unlockedPerms.customers_manage,
-                canViewDocs: unlockedPerms.reports_own_sales || unlockedPerms.reports_operational,
-                canExportSaft: unlockedPerms.saft_export,
-                canOperateCash: unlockedPerms.cash_own_shift || unlockedPerms.cash_all_shifts,
-                canViewMaster: unlockedPerms.master_view || unlockedPerms.settings_manage,
-                canManageRbac:
-                  unlockedPerms.users_view ||
-                  unlockedPerms.users_manage ||
-                  unlockedPerms.roles_manage ||
-                  unlockedPerms.audit_view,
-                canViewSecurityAudit: unlockedPerms.audit_view,
-              })}
-            </div>`
+          ? isUnassigned && this.activeModule !== 'SYNC'
+            ? `<div class="no-print flex md:hidden h-dvh w-screen flex-col overflow-hidden bg-slate-50 text-slate-900">
+                <header class="min-h-12 py-1.5 px-3 safe-area-top bg-slate-900 text-white border-b border-slate-800 flex items-center justify-between gap-2 shrink-0">
+                  <div class="flex items-center gap-2 min-w-0">
+                    <span class="text-sm font-bold tracking-tight whitespace-nowrap">SILA-Billing</span>
+                    <button
+                      type="button"
+                      data-action="open-master-admin"
+                      aria-label="Administração SILA-Billing"
+                      class="h-2.5 w-2.5 rounded-sm bg-emerald-600 hover:bg-emerald-500 transition-colors shrink-0"
+                    ></button>
+                  </div>
+                  <div class="flex items-center gap-1.5 shrink-0">
+                    ${
+                      this.user
+                        ? `<button
+                            type="button"
+                            data-action="sync-now"
+                            ${!this.isOnline || this.isSyncing ? 'disabled' : ''}
+                            class="h-8 px-2.5 rounded-md bg-slate-800 hover:bg-slate-700 text-xs font-medium text-slate-200 disabled:opacity-40 flex items-center gap-1.5 whitespace-nowrap"
+                          >
+                            ${ICONS.refresh}
+                            <span>${this.isSyncing ? 'A sincronizar...' : 'Sincronizar'}</span>
+                          </button>`
+                        : `<button
+                            type="button"
+                            data-action="signin-google"
+                            ${!this.isOnline ? 'disabled' : ''}
+                            class="h-8 px-2.5 rounded-md bg-blue-600 hover:bg-blue-700 text-xs font-semibold text-white disabled:opacity-40 whitespace-nowrap"
+                          >Entrar Google</button>`
+                    }
+                  </div>
+                </header>
+                <div class="flex-1 overflow-y-auto">
+                  ${
+                    this.isBooting
+                      ? this.renderBooting()
+                      : renderTenantOnboardingView({
+                          userEmail: this.user?.email || '',
+                          isSignedIn: Boolean(this.user),
+                          isOnline: this.isOnline,
+                          isSyncing: this.isSyncing,
+                          syncMessage: this.syncMessage,
+                        })
+                  }
+                </div>
+              </div>`
+            : `<div class="no-print flex md:hidden h-dvh w-screen flex-col overflow-hidden">
+                ${renderMobileOperationalView({
+                  activeCompany: this.activeCompany,
+                  settings: this.settings,
+                  companyMasterDraftProfile: this.companyMasterDraftProfile,
+                  companyMasterDraftSettings: this.companyMasterDraftSettings,
+                  companyMasterSection: this.companyMasterSection,
+                  companySeries: listarSeries({ companyId: this.activeCompany.id }),
+                  canManageCompanySettings: this.canManageCompanySettings(),
+                  companyFormError: this.settingsErrorMessage,
+                  companyFormSavedNotice: this.settingsSavedNotice,
+                  showRequestAgtSeriesForm: this.showRequestAgtSeriesForm,
+                  confirmFinalizeSeriesId: this.confirmFinalizeSeriesId,
+                  agtSeriesErrorMessage: this.agtSeriesErrorMessage,
+                  agtSeriesSuccessMessage: this.agtSeriesSuccessMessage,
+                  showEstablishmentForm: this.showEstablishmentForm,
+                  editingEstablishment: this.editingEstablishment,
+                  establishmentError: this.establishmentError,
+                  showWarehouseForm: this.showWarehouseForm,
+                  editingWarehouse: this.editingWarehouse,
+                  warehouseError: this.warehouseError,
+                  isOnline: this.isOnline,
+                  user: this.user,
+                  mobileTab: this.mobileTab,
+                  mobileCheckoutStep: this.mobileCheckoutStep,
+                  cart: this.cart,
+                  products: this.products,
+                  customers: this.customers,
+                  invoices: this.invoices,
+                  selectedCustomerId: this.selectedCustomerId,
+                  docType: this.docType,
+                  paymentMethod: this.paymentMethod,
+                  amountReceivedInput: this.amountReceivedInput,
+                  mobileSearchQuery: this.mobileDocsSearchQuery,
+                  mobileProductSearchInput: this.mobileProductSearchInput,
+                  lastEmittedInvoice: this.lastEmitted,
+                  showQuickProductModal: this.showQuickProductForm,
+                  showQuickCustomerModal: this.showQuickCustomerForm,
+                  showQuickCompanyModal: this.showMobileQuickCompanyModal,
+                  showCustomerPickerModal: this.showMobileCustomerPicker,
+                  editingMobileProduct: this.editingMobileProduct,
+                  editingCustomer: this.editingCustomer,
+                  editingCustomerCreditLimitInput: this.editingCustomerCreditLimitInput,
+                  showCustomerAdvancedFields: this.showCustomerAdvancedFields,
+                  mobileCustomerModalMode: this.mobileCustomerModalMode,
+                  canEditExistingCustomers: this.canEditExistingCustomers(),
+                  quickCustomerDraft: this.quickCustomerDraft,
+                  quickProductError: this.quickProductError,
+                  quickCustomerError: this.quickCustomerError,
+                  operator: this.operator,
+                  unlockedOperatorName: unlockedMember?.displayName || this.operator,
+                  unlockedRoleLabel,
+                  canSellPos: unlockedPerms.pos_sell,
+                  canViewProducts:
+                    unlockedPerms.products_view || unlockedPerms.products_manage || unlockedPerms.stock_view,
+                  canManageProducts: unlockedPerms.products_manage,
+                  canViewCostPrices: unlockedPerms.cost_prices_view,
+                  canViewProfitsMargins: unlockedPerms.profits_margins_view,
+                  canViewCustomers:
+                    unlockedPerms.customers_view || unlockedPerms.customers_create || unlockedPerms.customers_manage,
+                  canCreateCustomers: unlockedPerms.customers_create || unlockedPerms.customers_manage,
+                  canViewDocs: unlockedPerms.reports_own_sales || unlockedPerms.reports_operational,
+                  canExportSaft: unlockedPerms.saft_export,
+                  canOperateCash: unlockedPerms.cash_own_shift || unlockedPerms.cash_all_shifts,
+                  canViewMaster: unlockedPerms.master_view || unlockedPerms.settings_manage,
+                  canManageRbac:
+                    unlockedPerms.users_view ||
+                    unlockedPerms.users_manage ||
+                    unlockedPerms.roles_manage ||
+                    unlockedPerms.audit_view,
+                  canViewSecurityAudit: unlockedPerms.audit_view,
+                  companiesCount: this.companies.length,
+                  syncPendingCount: pendingCount,
+                  syncMessage: this.syncMessage,
+                  isSyncing: this.isSyncing,
+                })}
+              </div>`
           : `<div class="no-print md:hidden bg-blue-900 text-white px-3 py-2 text-xs flex justify-between items-center z-50">
               <span class="font-medium">Modo Gestão Desktop activo</span>
               <button type="button" data-action="mobile-switch-to-mobile" class="px-2.5 py-1 rounded bg-blue-700 hover:bg-blue-600 font-bold text-white text-xs">
@@ -12577,76 +12820,77 @@ export class SilaBillingApp {
           </main>
         </div>
 
-        ${this.showIOSGuide ? this.renderIOSModal() : ''}
-        ${
-          this.showOperatorSwitchModal
-            ? this.renderOperatorSwitchModal()
-            : ''
-        }
-        ${
-          this.showSupervisorAuthModal
-            ? this.renderSupervisorAuthModal()
-            : ''
-        }
-        ${
-          this.showNewCompanyModal
-            ? renderNewCompanyModal({
-                errorMessage: this.newCompanyError,
-                isSubmitting: this.isCreatingCompany,
-                isSignedIn: Boolean(this.user),
-              })
-            : ''
-        }
-        ${
-          cancellingInvoice
-            ? renderCancelInvoiceModal({
-                invoice: cancellingInvoice,
-                errorMessage: this.cancelInvoiceError,
-              })
-            : ''
-        }
-        ${
-          this.growthModalReason && !isUnassigned && monthlyUsage
-            ? renderFriendlyGrowthModal({
-                reason: this.growthModalReason,
-                company: this.activeCompany,
-                monthlyUsed: monthlyUsage.usedCount,
-                monthlyLimit: monthlyUsage.effectiveLimit,
-                canActivateCourtesy: !monthlyUsage.courtesyActive,
-                isSignedIn: Boolean(this.user),
-                isOnline: this.isOnline,
-                isVerifyingPlan: this.isVerifyingPlan,
-                copiedIbanFeedback: this.copiedIbanFeedback,
-                noticeMessage: this.growthModalNotice,
-              })
-            : ''
-        }
-        ${
-          this.showMasterAdminModal
-            ? renderMasterAdminModal({
-                isSignedIn: Boolean(this.user),
-                isAuthenticating: this.isAuthenticatingAdmin,
-                userEmail: this.user?.email || '',
-                isLoading: this.masterAdminLoading,
-                accessDenied: this.masterAdminDenied,
-                errorMessage: this.masterAdminError,
-                searchQuery: this.masterAdminSearch,
-                mergedCompanies: this.getMergedAdminCompanies(),
-                recentLogs: this.adminAuditLogs,
-                activeCompanyId: this.activeCompany.id,
-                stats: this.adminOverviewStats,
-                activeTab: this.masterAdminTab,
-                selectedCompanyDetails: this.selectedCompanyDetails,
-                isLoadingCompanyDetails: this.isLoadingCompanyDetails,
-                showNewCompanyForm: this.showAdminNewCompanyModal,
-                usersList: this.platformUsersList,
-                isLoadingUsers: this.isLoadingPlatformUsers,
-                systemStatus: this.systemStatusData,
-                isLoadingSystemStatus: this.isLoadingSystemStatus,
-              })
-            : ''
-        }
       </div>
+
+      ${this.showIOSGuide ? this.renderIOSModal() : ''}
+      ${
+        this.showOperatorSwitchModal
+          ? this.renderOperatorSwitchModal()
+          : ''
+      }
+      ${
+        this.showSupervisorAuthModal
+          ? this.renderSupervisorAuthModal()
+          : ''
+      }
+      ${
+        this.showNewCompanyModal
+          ? renderNewCompanyModal({
+              errorMessage: this.newCompanyError,
+              isSubmitting: this.isCreatingCompany,
+              isSignedIn: Boolean(this.user),
+            })
+          : ''
+      }
+      ${
+        cancellingInvoice
+          ? renderCancelInvoiceModal({
+              invoice: cancellingInvoice,
+              errorMessage: this.cancelInvoiceError,
+            })
+          : ''
+      }
+      ${
+        this.growthModalReason && !isUnassigned && monthlyUsage
+          ? renderFriendlyGrowthModal({
+              reason: this.growthModalReason,
+              company: this.activeCompany,
+              monthlyUsed: monthlyUsage.usedCount,
+              monthlyLimit: monthlyUsage.effectiveLimit,
+              canActivateCourtesy: !monthlyUsage.courtesyActive,
+              isSignedIn: Boolean(this.user),
+              isOnline: this.isOnline,
+              isVerifyingPlan: this.isVerifyingPlan,
+              copiedIbanFeedback: this.copiedIbanFeedback,
+              noticeMessage: this.growthModalNotice,
+            })
+          : ''
+      }
+      ${
+        this.showMasterAdminModal
+          ? renderMasterAdminModal({
+              isSignedIn: Boolean(this.user),
+              isAuthenticating: this.isAuthenticatingAdmin,
+              userEmail: this.user?.email || '',
+              isLoading: this.masterAdminLoading,
+              accessDenied: this.masterAdminDenied,
+              errorMessage: this.masterAdminError,
+              searchQuery: this.masterAdminSearch,
+              mergedCompanies: this.getMergedAdminCompanies(),
+              recentLogs: this.adminAuditLogs,
+              activeCompanyId: this.activeCompany.id,
+              stats: this.adminOverviewStats,
+              activeTab: this.masterAdminTab,
+              selectedCompanyDetails: this.selectedCompanyDetails,
+              isLoadingCompanyDetails: this.isLoadingCompanyDetails,
+              showNewCompanyForm: this.showAdminNewCompanyModal,
+              usersList: this.platformUsersList,
+              isLoadingUsers: this.isLoadingPlatformUsers,
+              systemStatus: this.systemStatusData,
+              isLoadingSystemStatus: this.isLoadingSystemStatus,
+            })
+          : ''
+      }
 
       ${
         this.showPrivacyPolicyModal

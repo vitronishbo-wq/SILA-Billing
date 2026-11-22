@@ -115,6 +115,10 @@ export interface MobileOperationalProps {
   canViewMaster?: boolean;
   canManageRbac?: boolean;
   canViewSecurityAudit?: boolean;
+  companiesCount?: number;
+  syncPendingCount?: number;
+  syncMessage?: string | null;
+  isSyncing?: boolean;
 }
 
 function escapeHtml(raw: string): string {
@@ -280,6 +284,42 @@ function renderMobileHome(props: MobileOperationalProps): string {
             : ''
         }
       </section>
+
+      ${
+        !props.user
+          ? `<section class="bg-amber-950/50 border border-amber-800/70 rounded-2xl p-3.5 flex items-center justify-between gap-3">
+              <div class="min-w-0">
+                <span class="text-xs font-bold text-amber-300 block">Conta Google não vinculada</span>
+                <span class="text-[11px] text-amber-100/80 block mt-0.5">Esta empresa está guardada apenas neste telemóvel. Entre com Google para sincronizar na Cloud.</span>
+              </div>
+              <button
+                type="button"
+                data-action="signin-google"
+                ${!isOnline ? 'disabled' : ''}
+                class="h-9 px-3 rounded-xl bg-amber-500 hover:bg-amber-400 disabled:opacity-40 text-slate-950 text-xs font-bold whitespace-nowrap shrink-0"
+              >Entrar</button>
+            </section>`
+          : !activeCompany.synced || (props.syncPendingCount ?? 0) > 0 || props.syncMessage
+            ? `<section class="bg-blue-950/40 border border-blue-800/70 rounded-2xl p-3.5 flex items-center justify-between gap-3">
+                <div class="min-w-0">
+                  <span class="text-xs font-bold text-blue-300 block">${
+                    !activeCompany.synced
+                      ? 'Empresa aguarda registo na Cloud'
+                      : `${props.syncPendingCount ?? 0} registo(s) por sincronizar`
+                  }</span>
+                  <span class="text-[11px] text-blue-100/80 block mt-0.5 truncate">${escapeHtml(
+                    props.syncMessage || props.user.email || 'Sincronização pendente'
+                  )}</span>
+                </div>
+                <button
+                  type="button"
+                  data-action="sync-now"
+                  ${!isOnline || props.isSyncing ? 'disabled' : ''}
+                  class="h-9 px-3 rounded-xl bg-blue-600 hover:bg-blue-500 disabled:opacity-40 text-white text-xs font-bold whitespace-nowrap shrink-0"
+                >${props.isSyncing ? 'A enviar...' : 'Sincronizar'}</button>
+              </section>`
+            : ''
+      }
 
       <!-- Secção "O que pretende fazer?" -->
       <section class="flex flex-col gap-3">
@@ -1614,6 +1654,24 @@ function renderMobileMore(props: MobileOperationalProps): string {
             : ''
         }
 
+        <!-- Cadastrar Nova Empresa -->
+        <button
+          type="button"
+          data-action="open-new-company-modal"
+          class="bg-slate-900 hover:bg-slate-850 rounded-xl p-3.5 flex items-center justify-between border border-slate-800 text-left active:scale-[0.98]"
+        >
+          <div class="flex items-center gap-3">
+            <div class="h-8 w-8 rounded-lg bg-blue-900/60 text-blue-300 flex items-center justify-center shrink-0">
+              ${ICONS.plus}
+            </div>
+            <div>
+              <span class="text-sm font-bold text-white block">Cadastrar Nova Empresa</span>
+              <span class="text-xs text-slate-400 block">${props.companiesCount ? `${props.companiesCount} empresa(s) neste terminal` : 'Criar nova empresa com NIF único'}</span>
+            </div>
+          </div>
+          <span class="text-slate-500">${ICONS.chevronRight}</span>
+        </button>
+
         <!-- Sincronização Cloud -->
         <button
           type="button"
@@ -1626,7 +1684,11 @@ function renderMobileMore(props: MobileOperationalProps): string {
             </div>
             <div>
               <span class="text-sm font-bold text-white block">Sincronização Cloud</span>
-              <span class="text-xs text-slate-400 block">Backup e sincronização offline-first</span>
+              <span class="text-xs text-slate-400 block">${
+                props.user?.email
+                  ? `${escapeHtml(props.user.email)} · ${props.activeCompany.synced ? 'Empresa na Cloud' : 'Aguarda sincronização'}`
+                  : 'Iniciar sessão Google para sincronizar'
+              }</span>
             </div>
           </div>
           <span class="text-slate-500">${ICONS.chevronRight}</span>
