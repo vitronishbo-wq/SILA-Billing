@@ -51,7 +51,25 @@
   }
 }
 
+/* Escala ajustada ao ecrã em telemóveis para pré-visualização A4 sem colapsar colunas; impressão usa geometria A4 real */
+@media screen and (max-width: 640px) {
+  .a4-screen-frame {
+    overflow-x: auto;
+    -webkit-overflow-scrolling: touch;
+  }
+
+  .a4-invoice-sheet {
+    min-width: 580px;
+    zoom: 0.58;
+  }
+}
+
 /* Print rules for POS 80mm thermal receipt and A4 invoice */
+@page a4-sheet {
+  size: A4 portrait;
+  margin: 7mm 9mm;
+}
+
 @media print {
   body {
     background: #ffffff !important;
@@ -81,10 +99,36 @@
     padding: 2mm !important;
   }
 
-  body[data-print-mode="A4"] .print-target {
-    width: 210mm !important;
-    max-width: 210mm !important;
+  body[data-print-mode="A4"] .a4-screen-frame {
+    overflow: visible !important;
+  }
+
+  body[data-print-mode="A4"] .print-target,
+  body[data-print-mode="A4"] .a4-invoice-sheet {
+    page: a4-sheet;
+    width: 100% !important;
+    max-width: 192mm !important;
+    min-width: 0 !important;
+    zoom: 1 !important;
     margin: 0 auto !important;
-    padding: 8mm !important;
+    padding: 0 !important;
+    border: none !important;
+    box-shadow: none !important;
+    -webkit-print-color-adjust: exact;
+    print-color-adjust: exact;
+  }
+
+  body[data-print-mode="A4"] .a4-items-table thead {
+    display: table-header-group;
+  }
+
+  body[data-print-mode="A4"] .a4-items-table tfoot {
+    display: table-footer-group;
+  }
+
+  body[data-print-mode="A4"] .a4-items-table tr,
+  body[data-print-mode="A4"] .a4-keep-together {
+    break-inside: avoid;
+    page-break-inside: avoid;
   }
 }

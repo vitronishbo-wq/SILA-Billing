@@ -396,10 +396,10 @@ export function renderDocumentHtml(
         qrCaption
       );
   const qrA4ImgOrSvgHtml = qrDataUrl
-    ? `<img src="${qrDataUrl}" data-qr-key="${escapeHtml(qrKey)}" alt="${escapeHtml(qrCaption)}" referrerpolicy="no-referrer" class="h-16 w-16 border border-slate-200 p-0.5" />`
+    ? `<img src="${qrDataUrl}" data-qr-key="${escapeHtml(qrKey)}" alt="${escapeHtml(qrCaption)}" referrerpolicy="no-referrer" class="h-16 w-16 shrink-0 border border-slate-300 bg-white p-0.5 object-contain" />`
     : renderQrSvgSync(
         buildAgtQrCanonicalString(buildInvoiceQrPayloadInput(invoice, docCompany)),
-        'h-16 w-16 border border-slate-200 p-0.5',
+        'h-16 w-16 shrink-0 border border-slate-300 bg-white p-0.5',
         qrCaption
       );
 
@@ -687,21 +687,18 @@ export function renderDocumentHtml(
     `;
   }
 
-  // Formato Comercial A4 Unificado
+  // Formato Comercial A4 Unificado (Alta Densidade Informativa + Paginação Dinâmica)
   const rowsA4 = invoice.lines
     .map(
       (line) => `
         <tr>
-          <td class="py-2 px-2.5 font-mono text-slate-600">${escapeHtml(line.code)}</td>
-          <td class="py-2 px-2.5 font-medium text-slate-900">
-            <div>${escapeHtml(line.description)}</div>
-            <div class="text-[9.5px] text-slate-500">${escapeHtml(buildLineTaxBadge(line.ivaRate, line.exemptionCode, docCompany))}</div>
-          </td>
-          <td class="py-2 px-2.5 text-right">${formatKzNumber(line.qty)}</td>
-          <td class="py-2 px-2.5 text-right">${formatKzNumber(line.unitPrice)}</td>
-          <td class="py-2 px-2.5 text-right">${formatKzNumber(line.ivaRate)}</td>
-          <td class="py-2 px-2.5 text-right">${formatKzNumber(line.discountPct)}</td>
-          <td class="py-2 px-2.5 text-right font-semibold text-slate-900">${formatKzNumber(line.lineTotal)}</td>
+          <td class="py-1 px-1.5 font-mono text-slate-600 whitespace-nowrap">${escapeHtml(line.code)}</td>
+          <td class="py-1 px-1.5 font-medium text-slate-900">${escapeHtml(line.description)}</td>
+          <td class="py-1 px-1.5 text-right whitespace-nowrap">${formatKzNumber(line.qty)}</td>
+          <td class="py-1 px-1.5 text-right whitespace-nowrap">${formatKzNumber(line.unitPrice)}</td>
+          <td class="py-1 px-1.5 text-right whitespace-nowrap text-slate-700">${escapeHtml(buildLineTaxBadge(line.ivaRate, line.exemptionCode, docCompany))}</td>
+          <td class="py-1 px-1.5 text-right whitespace-nowrap text-slate-600">${(line.discountPct || 0) > 0 ? `${formatKzNumber(line.discountPct)}%` : '—'}</td>
+          <td class="py-1 px-1.5 text-right font-semibold text-slate-900 whitespace-nowrap">${formatKzNumber(line.lineTotal)}</td>
         </tr>
       `
     )
@@ -711,115 +708,140 @@ export function renderDocumentHtml(
     .map(
       (tr) => `
               <tr>
-                <td class="py-1.5">
-                  <div>${escapeHtml(tr.rateLabel)}</div>
-                  ${tr.exemptionNote ? `<div class="text-[9.5px] text-slate-500">${escapeHtml(tr.exemptionNote)}</div>` : ''}
+                <td class="py-0.5 pr-2">
+                  <span>${escapeHtml(tr.rateLabel)}</span>
+                  ${tr.exemptionNote ? `<div class="text-[8.5px] leading-tight text-slate-500">${escapeHtml(tr.exemptionNote)}</div>` : ''}
                 </td>
-                <td class="py-1.5 text-right">${formatKzNumber(tr.base)}</td>
-                <td class="py-1.5 text-right">${formatKzNumber(tr.amount)}</td>
+                <td class="py-0.5 text-right whitespace-nowrap">${formatKzNumber(tr.base)}</td>
+                <td class="py-0.5 text-right whitespace-nowrap pl-2">${formatKzNumber(tr.amount)}</td>
               </tr>`
     )
     .join('');
 
   const a4PaymentSplitsHtml =
     paymentSplits.length > 0
-      ? `<div class="mt-1 space-y-0.5 text-[10px] text-slate-600">${paymentSplits
+      ? `<div class="mt-0.5 flex flex-wrap gap-x-2.5 gap-y-0.5 text-[9px] text-slate-600">${paymentSplits
           .map(
             (sp) =>
-              `<div>· ${escapeHtml(sp.method)}: <strong>${formatKzNumber(sp.amount)} Kz</strong>${sp.reference ? ` (${escapeHtml(sp.reference)})` : ''}</div>`
+              `<span>· ${escapeHtml(sp.method)}: <strong>${formatKzNumber(sp.amount)} Kz</strong>${sp.reference ? ` (${escapeHtml(sp.reference)})` : ''}</span>`
           )
           .join('')}</div>`
       : invoice.paymentSummary
-        ? `<div class="text-[10px] text-slate-600 mt-0.5">${escapeHtml(invoice.paymentSummary)}</div>`
+        ? `<div class="text-[9px] text-slate-600 mt-0.5">${escapeHtml(invoice.paymentSummary)}</div>`
         : '';
 
-  return `
-    <div class="print-target mx-auto w-full max-w-[794px] bg-white p-6 sm:p-8 text-slate-900 border border-slate-200 text-xs">
-      <div class="flex flex-col sm:flex-row sm:items-start justify-between gap-4 pb-5 border-b border-slate-200">
-        <div class="flex items-center gap-3.5">
-          ${
-            showLogoA4 && docCompany.logoUrl
-              ? `<img src="${escapeHtml(docCompany.logoUrl)}" class="h-14 w-auto max-w-[130px] object-contain rounded" alt="Logótipo" />`
-              : `<div class="flex h-14 w-14 shrink-0 items-center justify-center rounded-full border-2 border-blue-600 bg-slate-900 text-white font-bold text-lg tracking-tight">${escapeHtml(deriveCompanyInitials(docCompany))}</div>`
-          }
-          <div>
-            <div class="text-base font-bold tracking-tight text-slate-900">${escapeHtml(docCompany.shortName)}</div>
-            <div class="text-[11px] font-medium text-slate-600">${escapeHtml(docCompany.legalName)}</div>
-            ${
-              showCustomTagline || normalizeCompanyNif(docCompany.nif) === '5003069940'
-                ? `<div class="text-[10px] text-blue-700 mt-0.5">${
-                    normalizeCompanyNif(docCompany.nif) === '5003069940'
-                      ? 'Qualidade · Confiança · Soluções'
-                      : escapeHtml(docCompany.tagline || '')
-                  }</div>`
-                : ''
-            }
-            ${
-              docCompany.taxRegime || docCompany.commercialRegistry || docCompany.cae || docCompany.taxOffice
-                ? `<div class="text-[9.5px] text-slate-500 mt-0.5">
-                    ${docCompany.taxRegime ? escapeHtml(formatTaxRegimeLabelPt(docCompany.taxRegime)) : ''}
-                    ${docCompany.taxOffice ? ` · ${escapeHtml(docCompany.taxOffice)}` : ''}
-                    ${docCompany.cae ? ` · CAE: ${escapeHtml(docCompany.cae)}` : ''}
-                    ${docCompany.commercialRegistry ? ` · CRC: ${escapeHtml(docCompany.commercialRegistry)}` : ''}
-                    ${docCompany.shareCapital ? ` · Cap. Social: ${escapeHtml(docCompany.shareCapital)}` : ''}
-                  </div>`
-                : ''
-            }
-          </div>
-        </div>
-        <div class="text-[11px] text-slate-600 space-y-0.5 sm:text-right tabular-nums">
-          ${estLabel ? `<div class="font-semibold text-slate-800">${escapeHtml(estLabel)}</div>` : ''}
-          <div>${escapeHtml(estAddress || docCompany.address)}${docCompany.postalCode ? ` · CP ${escapeHtml(docCompany.postalCode)}` : ''}</div>
-          <div>${escapeHtml(issuerLocalityLabel)}</div>
-          ${docCompany.phone ? `<div>Tel.: ${escapeHtml(docCompany.phone)}${docCompany.mobile ? ` / ${escapeHtml(docCompany.mobile)}` : ''}</div>` : ''}
-          ${docCompany.email ? `<div>${escapeHtml(docCompany.email)}</div>` : ''}
-          ${docCompany.website ? `<div>${escapeHtml(docCompany.website)}</div>` : ''}
-          <div class="font-semibold text-slate-900">Contribuinte / NIF: ${escapeHtml(docCompany.nif)}</div>
-        </div>
-      </div>
+  const customerContactsLine = [
+    custPhone ? `Tel.: ${escapeHtml(custPhone)}` : '',
+    custEmail ? escapeHtml(custEmail) : '',
+  ]
+    .filter(Boolean)
+    .join(' · ');
 
-      <div class="grid grid-cols-1 sm:grid-cols-12 gap-4 py-5">
-        <div class="sm:col-span-7 space-y-3">
-          <div>
-            <div class="flex items-center gap-2.5 flex-wrap">
-              <div class="text-lg font-bold ${isCreditNote ? 'text-amber-700' : 'text-blue-700'} tracking-tight">${titleLabel}</div>
+  const customerLocationLine = [
+    custAddr ? escapeHtml(custAddr) : '',
+    `Localidade: ${escapeHtml(custLoc)}`,
+  ]
+    .filter(Boolean)
+    .join(' · ');
+
+  const companyContactLine = [
+    docCompany.phone
+      ? `Tel.: ${escapeHtml(docCompany.phone)}${docCompany.mobile ? ` / ${escapeHtml(docCompany.mobile)}` : ''}`
+      : '',
+    docCompany.email ? escapeHtml(docCompany.email) : '',
+    docCompany.website ? escapeHtml(docCompany.website) : '',
+  ]
+    .filter(Boolean)
+    .join(' · ');
+
+  const companyFiscalMeta = [
+    docCompany.taxRegime ? escapeHtml(formatTaxRegimeLabelPt(docCompany.taxRegime)) : '',
+    docCompany.taxOffice ? escapeHtml(docCompany.taxOffice) : '',
+    docCompany.cae ? `CAE: ${escapeHtml(docCompany.cae)}` : '',
+    docCompany.commercialRegistry ? `CRC: ${escapeHtml(docCompany.commercialRegistry)}` : '',
+    docCompany.shareCapital ? `Cap. Social: ${escapeHtml(docCompany.shareCapital)}` : '',
+  ]
+    .filter(Boolean)
+    .join(' · ');
+
+  return `
+    <div class="a4-screen-frame">
+      <div class="print-target a4-invoice-sheet mx-auto w-full max-w-[794px] bg-white p-3.5 sm:p-4 text-slate-900 border border-slate-200 text-[10.5px] leading-tight">
+        <div class="flex items-start justify-between gap-3 pb-2 border-b border-slate-300">
+          <div class="flex items-center gap-2.5 min-w-0">
+            ${
+              showLogoA4 && docCompany.logoUrl
+                ? `<img src="${escapeHtml(docCompany.logoUrl)}" class="h-10 w-auto max-w-[100px] shrink-0 object-contain rounded" alt="Logótipo" />`
+                : `<div class="flex h-10 w-10 shrink-0 items-center justify-center rounded-full border-2 border-blue-600 bg-slate-900 text-white font-bold text-sm tracking-tight">${escapeHtml(deriveCompanyInitials(docCompany))}</div>`
+            }
+            <div class="min-w-0">
+              <div class="text-sm font-bold tracking-tight text-slate-900 leading-snug">${escapeHtml(docCompany.shortName)}</div>
+              <div class="text-[10px] font-medium text-slate-600 leading-snug">${escapeHtml(docCompany.legalName)}</div>
               ${
-                isSecondCopy
-                  ? `<span class="text-[10.5px] font-semibold text-slate-500 tabular-nums">· 2.ª VIA (Reimpressão${
-                      invoice.reprintCount && invoice.reprintCount > 1 ? ` #${invoice.reprintCount}` : ''
-                    })</span>`
+                showCustomTagline || normalizeCompanyNif(docCompany.nif) === '5003069940'
+                  ? `<div class="text-[9px] text-blue-700 leading-snug">${
+                      normalizeCompanyNif(docCompany.nif) === '5003069940'
+                        ? 'Qualidade · Confiança · Soluções'
+                        : escapeHtml(docCompany.tagline || '')
+                    }</div>`
+                  : ''
+              }
+              ${
+                companyFiscalMeta
+                  ? `<div class="text-[9px] text-slate-500 leading-snug">${companyFiscalMeta}</div>`
                   : ''
               }
             </div>
-            <div class="text-sm font-semibold text-slate-800 tabular-nums">N.º ${escapeHtml(invoice.number)}</div>
-            <div class="text-[10.5px] font-medium text-slate-600 tabular-nums">
+          </div>
+          <div class="text-[9.5px] text-slate-600 space-y-0.5 text-right tabular-nums shrink-0 max-w-[48%]">
+            ${estLabel ? `<div class="font-semibold text-slate-800">${escapeHtml(estLabel)}</div>` : ''}
+            <div>${escapeHtml(estAddress || docCompany.address)}${docCompany.postalCode ? ` · CP ${escapeHtml(docCompany.postalCode)}` : ''} · ${escapeHtml(issuerLocalityLabel)}</div>
+            ${companyContactLine ? `<div>${companyContactLine}</div>` : ''}
+            <div class="font-semibold text-slate-900 text-[10px]">Contribuinte / NIF: ${escapeHtml(docCompany.nif)}</div>
+          </div>
+        </div>
+
+        <div class="grid grid-cols-12 gap-2 py-2 border-b border-slate-200 items-stretch">
+          <div class="col-span-4 space-y-0.5 min-w-0">
+            <div class="flex items-baseline gap-1.5 flex-wrap">
+              <div class="text-sm font-bold ${isCreditNote ? 'text-amber-700' : 'text-blue-700'} tracking-tight">${titleLabel}</div>
+              ${
+                isSecondCopy
+                  ? `<span class="text-[9.5px] font-semibold text-slate-500 tabular-nums">· 2.ª VIA${
+                      invoice.reprintCount && invoice.reprintCount > 1 ? ` #${invoice.reprintCount}` : ''
+                    }</span>`
+                  : ''
+              }
+            </div>
+            <div class="text-xs font-bold text-slate-900 tabular-nums">N.º ${escapeHtml(invoice.number)}</div>
+            <div class="text-[9px] font-medium text-slate-600 tabular-nums leading-snug">
               Estado: ${escapeHtml(docStateLabel)} · ATCUD: ${escapeHtml(atcudDisplay)}
             </div>
             ${
               invoice.seriesCode
-                ? `<div class="text-[10.5px] text-slate-500 tabular-nums">Série: ${escapeHtml(invoice.seriesCode)} · Ambiente: ${isProductionDoc ? 'Produção AGT' : 'Simulação'}${
-                    invoice.agtAuthorizationCode ? ` · Aut. AGT: ${escapeHtml(invoice.agtAuthorizationCode)}` : ''
+                ? `<div class="text-[9px] text-slate-500 tabular-nums leading-snug">Série: ${escapeHtml(invoice.seriesCode)} · ${isProductionDoc ? 'Produção AGT' : 'Simulação'}${
+                    invoice.agtAuthorizationCode ? ` · Aut.: ${escapeHtml(invoice.agtAuthorizationCode)}` : ''
                   }</div>`
                 : ''
             }
             ${
               isCreditNote && invoice.returnOriginNumber
-                ? `<div class="mt-0.5 text-[11px] font-medium text-slate-600 tabular-nums">Documento Origem Retificado: <span class="font-mono font-semibold text-slate-900">${escapeHtml(invoice.returnOriginNumber)}</span></div>`
+                ? `<div class="text-[9.5px] font-medium text-slate-700 tabular-nums">Orig. Retificado: <span class="font-mono font-semibold text-slate-900">${escapeHtml(invoice.returnOriginNumber)}</span></div>`
                 : ''
             }
             ${
               invoice.status === 'cancelled'
-                ? `<div class="mt-1 space-y-0.5">
-                    <div class="text-xs font-bold text-red-600">DOCUMENTO ANULADO</div>
+                ? `<div class="pt-0.5 space-y-0.5">
+                    <div class="text-[10px] font-bold text-red-600">DOCUMENTO ANULADO</div>
                     ${
                       invoice.cancelReason
-                        ? `<div class="text-[11px] text-red-700">Motivo: ${escapeHtml(invoice.cancelReason)}</div>`
+                        ? `<div class="text-[9.5px] text-red-700">Motivo: ${escapeHtml(invoice.cancelReason)}</div>`
                         : ''
                     }
                     ${
                       invoice.cancelledBy
-                        ? `<div class="text-[10.5px] text-slate-500 tabular-nums">Anulado por ${escapeHtml(invoice.cancelledBy)}${
-                            cancelledDt ? ` em ${cancelledDt.slashDate} ${cancelledDt.time}` : ''
+                        ? `<div class="text-[9px] text-slate-500 tabular-nums">Anulado por ${escapeHtml(invoice.cancelledBy)}${
+                            cancelledDt ? ` (${cancelledDt.slashDate} ${cancelledDt.time})` : ''
                           }</div>`
                         : ''
                     }
@@ -827,209 +849,206 @@ export function renderDocumentHtml(
                 : ''
             }
           </div>
-          <div class="rounded-lg bg-slate-50 p-3.5 border border-slate-200/80 space-y-0.5">
-            <div class="flex items-center justify-between">
-              <div class="text-[10px] font-semibold text-blue-700">Adquirente / Cliente</div>
-              <div class="text-[10px] font-semibold text-slate-600">${escapeHtml(customerTypeLabel)}</div>
+
+          <div class="col-span-5 rounded bg-slate-50 px-2.5 py-1.5 border border-slate-200/80 space-y-0.5 min-w-0">
+            <div class="flex items-center justify-between gap-2">
+              <span class="text-[9px] font-semibold text-blue-700">Adquirente / Cliente</span>
+              <span class="text-[9px] font-semibold text-slate-500">${escapeHtml(customerTypeLabel)}</span>
             </div>
-            <div class="text-[11px] text-slate-500">Exmo.(s) Sr.(s)</div>
-            <div class="text-xs font-bold text-slate-900">${escapeHtml(invoice.customerName)}</div>
-            <div class="text-[11px] text-slate-600 tabular-nums">NIF: ${escapeHtml(custNifDisplay)}</div>
-            ${custPhone ? `<div class="text-[11px] text-slate-600 tabular-nums">Tel.: ${escapeHtml(custPhone)}</div>` : ''}
-            ${custEmail ? `<div class="text-[11px] text-slate-600">E-mail: ${escapeHtml(custEmail)}</div>` : ''}
-            ${custAddr ? `<div class="text-[11px] text-slate-600">Morada: ${escapeHtml(custAddr)}</div>` : ''}
-            <div class="text-[11px] text-slate-600">Localidade: ${escapeHtml(custLoc)}</div>
+            <div class="text-[10.5px] font-bold text-slate-900 leading-snug">${escapeHtml(invoice.customerName)}</div>
+            <div class="text-[9.5px] text-slate-700 tabular-nums">NIF: ${escapeHtml(custNifDisplay)}</div>
+            ${customerContactsLine ? `<div class="text-[9px] text-slate-600 tabular-nums">${customerContactsLine}</div>` : ''}
+            <div class="text-[9px] text-slate-600 leading-snug">${customerLocationLine}</div>
+          </div>
+
+          <div class="col-span-3 rounded bg-slate-50 px-2 py-1.5 border border-slate-200/80 flex flex-col justify-between space-y-1 tabular-nums text-[9.5px]">
+            <div>
+              <div class="text-[8.5px] text-slate-500">Data/Hora de emissão</div>
+              <div class="font-semibold text-slate-900">${dt.slashDate} ${dt.time}</div>
+            </div>
+            <div class="grid grid-cols-2 gap-1.5">
+              <div>
+                <div class="text-[8.5px] text-slate-500">Caixa</div>
+                <div class="font-semibold text-slate-900 truncate">${escapeHtml(invoice.cashier)}</div>
+              </div>
+              <div>
+                <div class="text-[8.5px] text-slate-500">Operador(a)</div>
+                <div class="font-semibold text-slate-900 truncate">${escapeHtml(invoice.operator)}</div>
+              </div>
+            </div>
+            <div>
+              <div class="text-[8.5px] text-slate-500">Local de emissão</div>
+              <div class="font-semibold text-slate-900 truncate">${escapeHtml(issuerLocalityLabel)}</div>
+            </div>
           </div>
         </div>
 
-        <div class="sm:col-span-5 rounded-lg bg-slate-50 p-3.5 border border-slate-200/80 flex flex-col justify-between space-y-2 tabular-nums">
-          <div>
-            <div class="text-[10px] text-slate-500">Data/Hora de emissão</div>
-            <div class="font-semibold text-slate-900">${dt.slashDate} ${dt.time}</div>
-          </div>
-          <div class="grid grid-cols-2 gap-3">
-            <div>
-              <div class="text-[10px] text-slate-500">Caixa</div>
-              <div class="font-semibold text-slate-900">${escapeHtml(invoice.cashier)}</div>
-            </div>
-            <div>
-              <div class="text-[10px] text-slate-500">Operador(a)</div>
-              <div class="font-semibold text-slate-900">${escapeHtml(invoice.operator)}</div>
-            </div>
-          </div>
-          <div>
-            <div class="text-[10px] text-slate-500">Local de emissão</div>
-            <div class="font-semibold text-slate-900">${escapeHtml(issuerLocalityLabel)}</div>
-          </div>
-        </div>
-      </div>
-
-      <div class="overflow-x-auto border border-slate-200 rounded-lg">
-        <table class="w-full text-left border-collapse">
-          <thead>
-            <tr class="bg-slate-900 text-white text-[10.5px]">
-              <th class="py-2 px-2.5 font-semibold">Código</th>
-              <th class="py-2 px-2.5 font-semibold">Descrição / Taxa</th>
-              <th class="py-2 px-2.5 font-semibold text-right">Qtd.</th>
-              <th class="py-2 px-2.5 font-semibold text-right">Preço Unit.</th>
-              <th class="py-2 px-2.5 font-semibold text-right">IVA %</th>
-              <th class="py-2 px-2.5 font-semibold text-right">Desc. %</th>
-              <th class="py-2 px-2.5 font-semibold text-right">Total</th>
-            </tr>
-          </thead>
-          <tbody class="divide-y divide-slate-200 text-[11px] tabular-nums">${rowsA4}</tbody>
-        </table>
-      </div>
-
-      <div class="grid grid-cols-1 sm:grid-cols-12 gap-4 mt-5">
-        <div class="sm:col-span-6 rounded-lg bg-slate-50 p-3.5 border border-slate-200/80">
-          <div class="text-[11px] font-bold text-slate-900 mb-2">Resumo de Impostos</div>
-          <table class="w-full text-[11px] tabular-nums">
+        <div class="mt-2 border border-slate-300 rounded overflow-hidden">
+          <table class="a4-items-table w-full text-left border-collapse">
             <thead>
-              <tr class="text-slate-500 border-b border-slate-200">
-                <th class="pb-1 text-left font-medium">IVA %</th>
-                <th class="pb-1 text-right font-medium">Base de Cálculo</th>
-                <th class="pb-1 text-right font-medium">Valor de IVA</th>
+              <tr class="bg-slate-900 text-white text-[9.5px]">
+                <th class="py-1 px-1.5 font-semibold">Código</th>
+                <th class="py-1 px-1.5 font-semibold">Descrição</th>
+                <th class="py-1 px-1.5 font-semibold text-right">Qtd.</th>
+                <th class="py-1 px-1.5 font-semibold text-right">Preço Unit.</th>
+                <th class="py-1 px-1.5 font-semibold text-right">IVA / Taxa</th>
+                <th class="py-1 px-1.5 font-semibold text-right">Desc.</th>
+                <th class="py-1 px-1.5 font-semibold text-right">Total</th>
               </tr>
             </thead>
-            <tbody class="divide-y divide-slate-200/70">
-              ${a4TaxRowsHtml}
-            </tbody>
+            <tbody class="divide-y divide-slate-200 text-[10px] leading-tight tabular-nums">${rowsA4}</tbody>
           </table>
         </div>
 
-        <div class="sm:col-span-6 flex flex-col justify-between rounded-lg bg-slate-50 border border-slate-200/80 overflow-hidden tabular-nums">
-          <div class="p-3.5 space-y-1.5 text-[11px]">
-            <div class="flex justify-between">
-              <span class="text-slate-600">Total de mercadorias</span>
-              <span class="font-semibold text-slate-900">${formatKzNumber(invoice.merchandiseTotal)}</span>
-            </div>
-            <div class="flex justify-between">
-              <span class="text-slate-600">Desconto comercial${invoice.globalDiscountPct ? ` (incl. global ${formatKzNumber(invoice.globalDiscountPct)}%)` : ''}</span>
-              <span class="font-semibold text-slate-900">${formatKzNumber(invoice.discountTotal)}</span>
-            </div>
-            <div class="flex justify-between">
-              <span class="text-slate-600">Total de impostos</span>
-              <span class="font-semibold text-slate-900">${formatKzNumber(invoice.taxTotal)}</span>
-            </div>
+        <div class="grid grid-cols-12 gap-2 mt-2 a4-keep-together">
+          <div class="col-span-7 rounded bg-slate-50 px-2.5 py-1.5 border border-slate-200/80">
+            <div class="text-[9.5px] font-bold text-slate-900 mb-0.5">Resumo de Impostos</div>
+            <table class="w-full text-[9.5px] tabular-nums">
+              <thead>
+                <tr class="text-slate-500 border-b border-slate-200">
+                  <th class="pb-0.5 text-left font-medium">IVA %</th>
+                  <th class="pb-0.5 text-right font-medium">Base</th>
+                  <th class="pb-0.5 text-right font-medium pl-2">Imposto</th>
+                </tr>
+              </thead>
+              <tbody class="divide-y divide-slate-200/70">
+                ${a4TaxRowsHtml}
+              </tbody>
+            </table>
           </div>
-          <div class="${isCreditNote ? 'bg-amber-700' : 'bg-blue-600'} px-4 py-3 text-white flex items-center justify-between">
-            <span class="font-bold text-xs">${isCreditNote ? 'TOTAL A CREDITAR' : 'TOTAL A PAGAR'}</span>
-            <span class="font-bold text-base">${formatKzNumber(invoice.grandTotal)} Kz</span>
-          </div>
-        </div>
-      </div>
 
-      <div class="mt-4 space-y-3">
-        <div class="text-[11px]">
-          <span class="font-semibold text-slate-700">Valor por extenso: </span>
-          <span class="text-slate-600">${escapeHtml(invoice.amountInWords)}</span>
-        </div>
-
-        <div class="grid grid-cols-3 gap-3 rounded-lg bg-slate-50 p-3 border border-slate-200/80 text-[11px] tabular-nums">
-          <div>
-            <div class="text-[10px] text-slate-500">${isCreditNote ? 'Modo de regularização' : 'Pagamentos'}</div>
-            <div class="font-bold text-slate-900">${escapeHtml(invoice.paymentMethod)}</div>
-            ${a4PaymentSplitsHtml}
-            ${
-              invoice.transferReference
-                ? `<div class="text-[10px] text-slate-600 mt-0.5">Ref.: ${escapeHtml(invoice.transferReference)}</div>`
-                : ''
-            }
-            ${
-              invoice.returnOriginNumber
-                ? `<div class="text-[10px] text-slate-600 mt-0.5">${isCreditNote ? 'Ref. Origem' : 'Troca/Dev.'}: ${escapeHtml(invoice.returnOriginNumber)}</div>`
-                : ''
-            }
-          </div>
-          <div>
-            <div class="text-[10px] text-slate-500">${isCreditNote ? 'Reembolsado no ato' : 'Valor recebido'}</div>
-            <div class="font-bold text-slate-900">${formatKzNumber(invoice.amountReceived)} Kz</div>
-          </div>
-          <div>
-            <div class="text-[10px] text-slate-500">${
-              isCreditNote
-                ? 'Abatimento / Crédito'
-                : invoice.amountDue && invoice.amountDue > 0
-                  ? 'Em dívida (Conta Corrente)'
-                  : invoice.changeAmount > 0
-                    ? 'Troco'
-                    : 'Situação financeira'
-            }</div>
-            <div class="font-bold ${!isCreditNote && invoice.amountDue && invoice.amountDue > 0 ? 'text-amber-700' : 'text-slate-900'}">${
-              isCreditNote
-                ? `${formatKzNumber(Math.max(0, invoice.grandTotal - (invoice.amountReceived || 0)))} Kz`
-                : invoice.amountDue && invoice.amountDue > 0
-                  ? `${formatKzNumber(invoice.amountDue)} Kz`
-                  : invoice.changeAmount > 0
-                    ? `${formatKzNumber(invoice.changeAmount)} Kz`
-                    : 'Liquidado'
-            }</div>
+          <div class="col-span-5 flex flex-col justify-between rounded bg-slate-50 border border-slate-200/80 overflow-hidden tabular-nums">
+            <div class="px-2.5 py-1.5 space-y-0.5 text-[10px]">
+              <div class="flex justify-between">
+                <span class="text-slate-600">Total de mercadorias</span>
+                <span class="font-semibold text-slate-900">${formatKzNumber(invoice.merchandiseTotal)}</span>
+              </div>
+              <div class="flex justify-between">
+                <span class="text-slate-600">Desconto${invoice.globalDiscountPct ? ` (${formatKzNumber(invoice.globalDiscountPct)}%)` : ''}</span>
+                <span class="font-semibold text-slate-900">${formatKzNumber(invoice.discountTotal)}</span>
+              </div>
+              <div class="flex justify-between">
+                <span class="text-slate-600">Total de impostos</span>
+                <span class="font-semibold text-slate-900">${formatKzNumber(invoice.taxTotal)}</span>
+              </div>
+            </div>
+            <div class="${isCreditNote ? 'bg-amber-700' : 'bg-blue-600'} px-2.5 py-1.5 text-white flex items-center justify-between">
+              <span class="font-bold text-[10.5px]">${isCreditNote ? 'TOTAL A CREDITAR' : 'TOTAL A PAGAR'}</span>
+              <span class="font-bold text-sm">${formatKzNumber(invoice.grandTotal)} Kz</span>
+            </div>
           </div>
         </div>
 
+        <div class="mt-1.5 space-y-1.5 a4-keep-together">
+          <div class="text-[9.5px] leading-tight">
+            <span class="font-semibold text-slate-700">Valor por extenso: </span>
+            <span class="text-slate-600">${escapeHtml(invoice.amountInWords)}</span>
+          </div>
+
+          <div class="grid grid-cols-3 gap-2 rounded bg-slate-50 px-2.5 py-1.5 border border-slate-200/80 text-[9.5px] tabular-nums">
+            <div>
+              <div class="text-[8.5px] text-slate-500">${isCreditNote ? 'Modo de regularização' : 'Pagamentos'}</div>
+              <div class="font-bold text-slate-900">${escapeHtml(invoice.paymentMethod)}</div>
+              ${a4PaymentSplitsHtml}
+              ${
+                invoice.transferReference
+                  ? `<div class="text-[9px] text-slate-600">Ref.: ${escapeHtml(invoice.transferReference)}</div>`
+                  : ''
+              }
+              ${
+                invoice.returnOriginNumber
+                  ? `<div class="text-[9px] text-slate-600">${isCreditNote ? 'Ref. Origem' : 'Troca/Dev.'}: ${escapeHtml(invoice.returnOriginNumber)}</div>`
+                  : ''
+              }
+            </div>
+            <div>
+              <div class="text-[8.5px] text-slate-500">${isCreditNote ? 'Reembolsado no ato' : 'Valor recebido'}</div>
+              <div class="font-bold text-slate-900">${formatKzNumber(invoice.amountReceived)} Kz</div>
+            </div>
+            <div>
+              <div class="text-[8.5px] text-slate-500">${
+                isCreditNote
+                  ? 'Abatimento / Crédito'
+                  : invoice.amountDue && invoice.amountDue > 0
+                    ? 'Em dívida (Conta Corrente)'
+                    : invoice.changeAmount > 0
+                      ? 'Troco'
+                      : 'Situação financeira'
+              }</div>
+              <div class="font-bold ${!isCreditNote && invoice.amountDue && invoice.amountDue > 0 ? 'text-amber-700' : 'text-slate-900'}">${
+                isCreditNote
+                  ? `${formatKzNumber(Math.max(0, invoice.grandTotal - (invoice.amountReceived || 0)))} Kz`
+                  : invoice.amountDue && invoice.amountDue > 0
+                    ? `${formatKzNumber(invoice.amountDue)} Kz`
+                    : invoice.changeAmount > 0
+                      ? `${formatKzNumber(invoice.changeAmount)} Kz`
+                      : 'Liquidado'
+              }</div>
+            </div>
+          </div>
+
+          ${
+            invoice.notes
+              ? `<div class="text-[9.5px] text-slate-600 leading-tight">
+                  <span class="font-semibold text-slate-800">Observações: </span>
+                  ${escapeHtml(invoice.notes)}
+                </div>`
+              : ''
+          }
+
+          ${
+            docCompany.iban1 || docCompany.multicaixaExpressPhone
+              ? `<div class="px-2 py-1 rounded bg-slate-50 border border-slate-200 text-[9px] text-slate-700 flex flex-wrap items-center justify-between gap-x-3 gap-y-0.5 tabular-nums">
+                  ${
+                    docCompany.iban1
+                      ? `<div>
+                          <span class="font-semibold text-slate-900">Coordenadas Bancárias:</span>
+                          <span>${escapeHtml(docCompany.bankName1 || 'Banco Principal')} · IBAN: <strong class="font-mono text-slate-900">${escapeHtml(docCompany.iban1)}</strong>${
+                            docCompany.accountHolder1 ? ` · Titular: ${escapeHtml(docCompany.accountHolder1)}` : ''
+                          }${docCompany.swift1 ? ` · SWIFT: ${escapeHtml(docCompany.swift1)}` : ''}</span>
+                        </div>`
+                      : ''
+                  }
+                  ${
+                    docCompany.iban2
+                      ? `<div>
+                          <span>${escapeHtml(docCompany.bankName2 || 'Banco Secundário')} · IBAN: <strong class="font-mono text-slate-900">${escapeHtml(docCompany.iban2)}</strong>${
+                            docCompany.swift2 ? ` · SWIFT: ${escapeHtml(docCompany.swift2)}` : ''
+                          }</span>
+                        </div>`
+                      : ''
+                  }
+                  ${
+                    docCompany.multicaixaExpressPhone
+                      ? `<div>Multicaixa Express: <strong class="font-mono text-slate-900">${escapeHtml(docCompany.multicaixaExpressPhone)}</strong></div>`
+                      : ''
+                  }
+                </div>`
+              : ''
+          }
+        </div>
+
+        <div class="mt-2 pt-1.5 border-t border-slate-300 flex items-center justify-between gap-3 a4-keep-together">
+          <div class="flex items-center gap-2.5 min-w-0">
+            ${qrA4ImgOrSvgHtml}
+            <div class="text-[9.5px] leading-snug text-slate-600 space-y-0.5 min-w-0">
+              <div class="font-bold text-slate-900">OBRIGADO PELA SUA PREFERÊNCIA! · <span class="font-semibold text-slate-700">${escapeHtml(docCompany.legalName)}</span></div>
+              ${
+                isProductionDoc
+                  ? `<div class="text-slate-700 font-medium tabular-nums">${escapeHtml(docHash4)}-Processado por programa validado SILA-Billing · Série ${escapeHtml(invoice.seriesCode || 'A')} (Assinatura RSA-SHA1 SAF-T)</div>`
+                  : `<div class="text-slate-500 tabular-nums">Modelo — Sem validade fiscal · Não substitui factura fiscal · Assinatura teste RSA-SHA1: ${escapeHtml(docHash4)}</div>`
+              }
+              <div class="text-[9px] text-slate-500 tabular-nums">Software SILA-Billing v${SILA_SOFTWARE_VERSION} · Produtor: ${escapeHtml(VITRONIS_INSTITUTIONAL.shortName)}, Lda · Ref. ${escapeHtml(DEFAULT_AGT_SOFTWARE_APPROVAL)} · NIF Produtor: ${escapeHtml(VITRONIS_INSTITUTIONAL.nif)}</div>
+            </div>
+          </div>
+          ${showCustomTagline ? `<div class="text-right text-[10px] font-semibold text-slate-700 shrink-0">${escapeHtml(docCompany.tagline)}</div>` : ''}
+        </div>
         ${
-          invoice.notes
-            ? `<div class="text-[11px] text-slate-600">
-                <span class="font-semibold text-slate-800">Observações: </span>
-                ${escapeHtml(invoice.notes)}
-              </div>`
+          showViralFooter
+            ? `<div class="mt-1.5 pt-1 border-t border-slate-100 text-center text-[9px] text-slate-400">${escapeHtml(VITRONIS_INSTITUTIONAL.website)}</div>`
             : ''
         }
-
-        ${
-          docCompany.iban1 || docCompany.multicaixaExpressPhone
-            ? `<div class="p-2.5 rounded-lg bg-slate-50 border border-slate-200 text-[10.5px] text-slate-700 flex flex-col sm:flex-row sm:items-center justify-between gap-1.5 tabular-nums">
-                ${
-                  docCompany.iban1
-                    ? `<div>
-                        <span class="font-semibold text-slate-900">Coordenadas Bancárias:</span>
-                        <span>${escapeHtml(docCompany.bankName1 || 'Banco Principal')} · IBAN: <strong class="font-mono text-slate-900">${escapeHtml(docCompany.iban1)}</strong>${
-                          docCompany.accountHolder1 ? ` · Titular: ${escapeHtml(docCompany.accountHolder1)}` : ''
-                        }${docCompany.swift1 ? ` · SWIFT: ${escapeHtml(docCompany.swift1)}` : ''}</span>
-                      </div>`
-                    : ''
-                }
-                ${
-                  docCompany.iban2
-                    ? `<div>
-                        <span>${escapeHtml(docCompany.bankName2 || 'Banco Secundário')} · IBAN: <strong class="font-mono text-slate-900">${escapeHtml(docCompany.iban2)}</strong>${
-                          docCompany.swift2 ? ` · SWIFT: ${escapeHtml(docCompany.swift2)}` : ''
-                        }</span>
-                      </div>`
-                    : ''
-                }
-                ${
-                  docCompany.multicaixaExpressPhone
-                    ? `<div>Multicaixa Express: <strong class="font-mono text-slate-900">${escapeHtml(docCompany.multicaixaExpressPhone)}</strong></div>`
-                    : ''
-                }
-              </div>`
-            : ''
-        }
       </div>
-
-      <div class="mt-6 pt-4 border-t border-slate-200 flex items-center justify-between gap-4">
-        <div class="flex items-center gap-3">
-          ${qrA4ImgOrSvgHtml}
-          <div class="text-[10.5px] text-slate-600 space-y-0.5">
-            <div class="font-bold text-slate-900">OBRIGADO PELA SUA PREFERÊNCIA!</div>
-            <div>${escapeHtml(docCompany.legalName)}</div>
-            ${
-              isProductionDoc
-                ? `<div class="text-slate-700 font-medium tabular-nums">${escapeHtml(docHash4)}-Processado por programa validado SILA-Billing · Série ${escapeHtml(invoice.seriesCode || 'A')} (Assinatura RSA-SHA1 SAF-T)</div>`
-                : `<div class="text-slate-500 tabular-nums">Modelo — Sem validade fiscal · Não substitui factura fiscal · Assinatura teste RSA-SHA1: ${escapeHtml(docHash4)}</div>`
-            }
-            <div class="text-[9.5px] text-slate-400 tabular-nums">Software SILA-Billing v${SILA_SOFTWARE_VERSION} · Produtor: ${escapeHtml(VITRONIS_INSTITUTIONAL.shortName)}, Lda · Ref. ${escapeHtml(DEFAULT_AGT_SOFTWARE_APPROVAL)} · NIF Produtor: ${escapeHtml(VITRONIS_INSTITUTIONAL.nif)}</div>
-          </div>
-        </div>
-        ${showCustomTagline ? `<div class="text-right text-xs font-semibold text-slate-700">${escapeHtml(docCompany.tagline)}</div>` : ''}
-      </div>
-      ${
-        showViralFooter
-          ? `<div class="mt-3 pt-2 border-t border-slate-100 text-center text-[10px] text-slate-400">${escapeHtml(VITRONIS_INSTITUTIONAL.website)}</div>`
-          : ''
-      }
     </div>
   `;
 }

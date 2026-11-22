@@ -1942,12 +1942,27 @@ export class SilaBillingApp {
     return { ok: true, closed: closedSession, summary };
   }
 
+  private syncPrintPageStyle(format: DocumentFormat): void {
+    if (typeof document === 'undefined' || !document.head) return;
+    let styleEl = document.getElementById('sila-print-page-style') as HTMLStyleElement | null;
+    if (!styleEl) {
+      styleEl = document.createElement('style');
+      styleEl.id = 'sila-print-page-style';
+      document.head.appendChild(styleEl);
+    }
+    styleEl.textContent =
+      format === 'A4'
+        ? '@media print { @page { size: A4 portrait; margin: 7mm 9mm; } }'
+        : '';
+  }
+
   private triggerCashReportPrint(
     session: CashSession,
     summary: CashSessionSummary,
     format: DocumentFormat
   ): void {
     this.isPrinting = true;
+    this.syncPrintPageStyle(format);
     document.body.setAttribute('data-print-mode', format);
     this.printJob = null;
     this.historyReportPrintJob = null;
@@ -12385,6 +12400,7 @@ export class SilaBillingApp {
   ): Promise<void> {
     this.isPrinting = true;
     const qr = await this.ensureQrForInvoice(invoice);
+    this.syncPrintPageStyle(format);
     document.body.setAttribute('data-print-mode', format);
     this.cashPrintJob = null;
     this.historyReportPrintJob = null;
@@ -12406,6 +12422,7 @@ export class SilaBillingApp {
     filterLabel: string
   ): void {
     this.isPrinting = true;
+    this.syncPrintPageStyle('A4');
     document.body.setAttribute('data-print-mode', 'A4');
     this.printJob = null;
     this.cashPrintJob = null;
