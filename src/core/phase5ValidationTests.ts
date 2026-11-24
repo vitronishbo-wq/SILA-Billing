@@ -2303,6 +2303,146 @@ export async function runPhase5ValidationTests(): Promise<{ passed: number; tota
     }
   });
 
+  await test('5.14 Recuperação de PIN do Proprietário no Ecrã de Bloqueio: opção visível só para Owner, fluxo Google + redefinição', () => {
+    const compRecord = {
+      id: 'comp_jaimona',
+      normalizedNif: '5003069940',
+      profile: JAIMONA_COMPANY,
+      status: 'active' as const,
+      plan: {
+        planTier: 'PROFISSIONAL' as const,
+        commercialActive: true,
+        maxUsers: null,
+        maxInvoicesPerMonth: null,
+        updatedAtIso: new Date().toISOString(),
+      },
+      baseSequence: 0,
+      allowManagerCancel: false,
+      ownerEmail: 'jaimonacomercioeservicos@gmail.com',
+      createdAtIso: new Date().toISOString(),
+      updatedAtIso: new Date().toISOString(),
+    };
+    const ownerMem = {
+      id: 'mem_owner_1',
+      companyId: 'comp_jaimona',
+      uid: 'uid_owner_1',
+      email: 'jaimonacomercioeservicos@gmail.com',
+      displayName: 'Proprietário',
+      role: 'owner' as const,
+      allowInvoiceCancel: true,
+      pinHash: 'pbkdf2_sha256$100000$salt$hash',
+      active: true,
+      status: 'active' as const,
+      createdAtIso: new Date().toISOString(),
+      updatedAtIso: new Date().toISOString(),
+    };
+    const cashierMem = {
+      ...ownerMem,
+      id: 'mem_cashier_1',
+      uid: 'uid_cashier_1',
+      email: 'caixa@jaimona.ao',
+      displayName: 'Caixa 1',
+      role: 'cashier' as const,
+      allowInvoiceCancel: false,
+    };
+
+    const ownerLockHtml = renderTerminalLockScreen({
+      company: compRecord,
+      companies: [compRecord],
+      members: [ownerMem, cashierMem],
+      roles: [],
+      selectedMemberId: 'mem_owner_1',
+      pinInput: '',
+      newPinConfirmInput: '',
+      isSubmitting: false,
+      errorMessage: null,
+      lockReasonMessage: null,
+      isOnline: true,
+      isSignedIn: false,
+      signedInEmail: '',
+      isPlatformAdmin: false,
+      ownerRecoveryStep: 'NONE',
+    });
+    assert(
+      ownerLockHtml.includes('data-action="lock-owner-recovery-open"') &&
+        ownerLockHtml.includes('Esqueceu o PIN do Proprietário?'),
+      'Proprietário com PIN configurado deve ver acesso discreto para recuperação por Google'
+    );
+
+    const cashierLockHtml = renderTerminalLockScreen({
+      company: compRecord,
+      companies: [compRecord],
+      members: [ownerMem, cashierMem],
+      roles: [],
+      selectedMemberId: 'mem_cashier_1',
+      pinInput: '',
+      newPinConfirmInput: '',
+      isSubmitting: false,
+      errorMessage: null,
+      lockReasonMessage: null,
+      isOnline: true,
+      isSignedIn: false,
+      signedInEmail: '',
+      isPlatformAdmin: false,
+      ownerRecoveryStep: 'VERIFY_GOOGLE',
+    });
+    assert(
+      !cashierLockHtml.includes('lock-owner-recovery-open') &&
+        !cashierLockHtml.includes('lock-owner-recovery-verify-google') &&
+        !cashierLockHtml.includes('recover-owner-pin-form'),
+      'Caixa nunca pode aceder ao fluxo de recuperação Google nem redefinição de PIN de Proprietário'
+    );
+
+    const verifyGoogleHtml = renderTerminalLockScreen({
+      company: compRecord,
+      companies: [compRecord],
+      members: [ownerMem, cashierMem],
+      roles: [],
+      selectedMemberId: 'mem_owner_1',
+      pinInput: '',
+      newPinConfirmInput: '',
+      isSubmitting: false,
+      errorMessage: null,
+      lockReasonMessage: null,
+      isOnline: true,
+      isSignedIn: false,
+      signedInEmail: '',
+      isPlatformAdmin: false,
+      ownerRecoveryStep: 'VERIFY_GOOGLE',
+    });
+    assert(
+      verifyGoogleHtml.includes('data-action="lock-owner-recovery-verify-google"') &&
+        verifyGoogleHtml.includes('Confirmar com Google') &&
+        verifyGoogleHtml.includes('data-action="lock-owner-recovery-cancel"'),
+      'Passo VERIFY_GOOGLE deve exigir confirmação interactiva da conta Google do Proprietário'
+    );
+
+    const setNewPinHtml = renderTerminalLockScreen({
+      company: compRecord,
+      companies: [compRecord],
+      members: [ownerMem, cashierMem],
+      roles: [],
+      selectedMemberId: 'mem_owner_1',
+      pinInput: '',
+      newPinConfirmInput: '',
+      isSubmitting: false,
+      errorMessage: null,
+      lockReasonMessage: null,
+      isOnline: true,
+      isSignedIn: true,
+      signedInEmail: 'jaimonacomercioeservicos@gmail.com',
+      isPlatformAdmin: false,
+      ownerRecoveryStep: 'SET_NEW_PIN',
+    });
+    assert(
+      setNewPinHtml.includes('data-form="recover-owner-pin-form"') &&
+        setNewPinHtml.includes('id="lock-recover-pin"') &&
+        setNewPinHtml.includes('id="lock-recover-pin-confirm"') &&
+        setNewPinHtml.includes('Redefinir PIN e Desbloquear'),
+      'Passo SET_NEW_PIN deve permitir redefinir o PIN do Proprietário após confirmação Google'
+    );
+  });
+
   console.log(`\n=== FASE 5 CONCLUÍDA: ${passed}/${total} TESTES PASSARAM COM SUCESSO ===\n`);
   return { passed, total };
 }

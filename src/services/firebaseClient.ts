@@ -3,6 +3,7 @@ import {
   GoogleAuthProvider,
   getAuth,
   getRedirectResult,
+  reauthenticateWithPopup,
   signInWithPopup,
   signInWithRedirect,
   signOut,
@@ -148,6 +149,21 @@ export async function signInWithGoogle() {
     ) {
       await signInWithRedirect(auth, googleProvider);
       return null;
+    }
+    throw err;
+  }
+}
+
+export async function reauthenticateWithGoogle() {
+  if (!auth.currentUser) {
+    return signInWithGoogle();
+  }
+  try {
+    return await reauthenticateWithPopup(auth.currentUser, googleProvider);
+  } catch (err) {
+    const code = extractFirebaseErrorCode(err);
+    if (code === 'auth/user-mismatch') {
+      return signInWithPopup(auth, googleProvider);
     }
     throw err;
   }

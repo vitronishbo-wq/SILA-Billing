@@ -1,7 +1,11 @@
-import type {
+import {
   CompanyMember,
+  CompanyRecord,
   CompanyRole,
   CompanyRoleDefinition,
+  isJaimonaOwnerEmail,
+  isPlatformAdminEmail,
+  JAIMONA_COMPANY_ID,
   MemberStatus,
   PermissionKey,
 } from './types.ts';
@@ -607,5 +611,132 @@ export function computeProgressiveLockout(
     ...(lockoutSeconds > 0
       ? { lockedUntilIso: new Date(nowMs + lockoutSeconds * 1000).toISOString() }
       : {}),
+  };
+}
+
+export interface OwnerRecoveryGoogleUser {
+  uid?: string | null;
+  email?: string | null;
+  emailVerified?: boolean | null;
+}
+
+export type OwnerRecoveryEligibility =
+  | {
+      canRecover: true;
+      reason: 'owner_uid' | 'owner_email' | 'jaimona_owner' | 'platform_admin';
+    }
+  | {
+      canRecover: false;
+      errorCode:
+        | 'NOT_OWNER_MEMBER'
+        | 'MEMBER_INACTIVE'
+        | 'NO_GOOGLE_SESSION'
+        | 'EMAIL_NOT_VERIFIED'
+        | 'NO_OWNER_ANCHOR'
+        | 'IDENTITY_MISMATCH';
+      message: string;
+    };
+
+/**
+ * Valida de forma estrita se uma conta Google autenticada e com e-mail verificado
+ * está autorizada a redefinir um PIN esquecido do Proprietário no ecrã de bloqueio.
+ * Nunca permite recuperação por Google para caixas/gerentes nem por contas não vinculadas.
+ */
+export function verifyOwnerPinRecoveryEligibility(params: {
+  company: Pick<CompanyRecord, 'id' | 'ownerUid' | 'ownerEmail'>;
+  targetMember: CompanyMember | null | undefined;
+  googleUser: OwnerRecoveryGoogleUser | null | undefined;
+}): OwnerRecoveryEligibility {
+  const { company, targetMember, googleUser } = params;
+  if (!targetMember || resolveMemberBaseRole(targetMember) !== 'owner') {
+    return {
+      canRecover: false,
+      errorCode: 'NOT_OWNER_MEMBER',
+      message:
+        'A recuperação por Google aplica-se apenas ao Proprietário. Outros operadores devem solicitar novo PIN ao Proprietário.',
+    };
+  }
+  if (resolveMemberStatus(targetMember) !== 'active') {
+    return {
+      canRecover: false,
+      errorCode: 'MEMBER_INACTIVE',
+      message: 'A conta do Proprietário está suspensa ou inactiva.',
+    };
+  }
+  const uUid = String(googleUser?.uid || '').trim();
+  const uEmail = String(googleUser?.email || '').trim().toLowerCase();
+  if (!googleUser || !uUid || !uEmail) {
+    return {
+      canRecover: false,
+      errorCode: 'NO_GOOGLE_SESSION',
+      message: 'Confirme a sessão com a conta Google do Proprietário para continuar.',
+    };
+  }
+  if (googleUser.emailVerified !== true) {
+    return {
+      canRecover: false,
+      errorCode: 'EMAIL_NOT_VERIFIED',
+      message: 'O e-mail da conta Google não se encontra verificado.',
+    };
+  }
+
+  const compOwnerUid = String(company.ownerUid || '').trim();
+  const compOwnerEmail = String(company.ownerEmail || '').trim().toLowerCase();
+  const memUid = String(targetMember.uid || '').trim();
+  const memEmailRaw = String(targetMember.emailLower || targetMember.email || '')
+    .trim()
+    .toLowerCase();
+  const memEmail =
+    memEmailRaw &&
+    memEmailRaw !== 'proprietario@local' &&
+    memEmailRaw !== 'proprietario@empresa.ao'
+      ? memEmailRaw
+      : '';
+  const hasRealMemberUid =
+    Boolean(memUid) &&
+    !memUid.startsWith('local_') &&
+    !memUid.startsWith('owner_') &&
+    !memUid.startsWith('mem_');
+
+  if (compOwnerUid && uUid === compOwnerUid) {
+    return { canRecover: true, reason: 'owner_uid' };
+  }
+  if (hasRealMemberUid && uUid === memUid) {
+    return { canRecover: true, reason: 'owner_uid' };
+  }
+  if (company.id === JAIMONA_COMPANY_ID && isJaimonaOwnerEmail(uEmail)) {
+    return { canRecover: true, reason: 'jaimona_owner' };
+  }
+  if (compOwnerEmail && uEmail === compOwnerEmail) {
+    return { canRecover: true, reason: 'owner_email' };
+  }
+  if (memEmail && uEmail === memEmail) {
+    return { canRecover: true, reason: 'owner_email' };
+  }
+  if (isPlatformAdminEmail(uEmail)) {
+    return { canRecover: true, reason: 'platform_admin' };
+  }
+
+  const hasAnchor = Boolean(
+    compOwnerUid ||
+      compOwnerEmail ||
+      hasRealMemberUid ||
+      memEmail ||
+      company.id === JAIMONA_COMPANY_ID
+  );
+  if (!hasAnchor) {
+    return {
+      canRecover: false,
+      errorCode: 'NO_OWNER_ANCHOR',
+      message:
+        'Esta empresa foi criada apenas localmente sem conta Google associada ao Proprietário.',
+    };
+  }
+
+  return {
+    canRecover: false,
+    errorCode: 'IDENTITY_MISMATCH',
+    message:
+      'A conta Google confirmada não corresponde ao Proprietário registado desta empresa.',
   };
 }

@@ -349,6 +349,18 @@ export async function upsertCompanyMemberCloud(
         createdAt: serverTimestamp(),
         updatedAt: serverTimestamp(),
       });
+    } else if (
+      resolvedRole === 'owner' &&
+      memberDocId === user.uid &&
+      member.pinHash
+    ) {
+      await updateDoc(ref, {
+        pinHash: member.pinHash.slice(0, 256),
+        ...(member.pinUpdatedAtIso
+          ? { pinUpdatedAtIso: member.pinUpdatedAtIso.slice(0, 40) }
+          : {}),
+        updatedAt: serverTimestamp(),
+      });
     } else {
       await updateDoc(ref, {
         displayName: (member.displayName || member.email || 'Operador').slice(0, 120),
@@ -365,6 +377,9 @@ export async function upsertCompanyMemberCloud(
         allowInvoiceCancel: Boolean(member.allowInvoiceCancel),
         active: resolvedStatus === 'active',
         ...(member.pinHash ? { pinHash: member.pinHash.slice(0, 256) } : {}),
+        ...(member.pinUpdatedAtIso
+          ? { pinUpdatedAtIso: member.pinUpdatedAtIso.slice(0, 40) }
+          : {}),
         updatedAt: serverTimestamp(),
       });
     }

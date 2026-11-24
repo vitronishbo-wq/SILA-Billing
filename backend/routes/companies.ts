@@ -896,9 +896,19 @@ companiesRouter.post(
     );
     const allRoles = [...buildDefaultCompanyRoles(companyId), ...customRoles];
 
-    const targetMemberId = sanitizeId(
+    let targetMemberId = sanitizeId(
       String(body.id || `mem_${email.replace(/[^a-zA-Z0-9_-]/g, '_').slice(0, 64)}`)
     );
+    if (
+      targetNewRole === 'owner' &&
+      membership.role === 'owner' &&
+      (String(body.uid || '') === user.uid || membership.companyData?.ownerUid === user.uid)
+    ) {
+      const canonicalOwnerSnap = await compRef.collection('members').doc(user.uid).get();
+      if (canonicalOwnerSnap.exists) {
+        targetMemberId = user.uid;
+      }
+    }
     const existingMemberSnap = await compRef.collection('members').doc(targetMemberId).get();
     const existingRole = existingMemberSnap.exists
       ? resolveMemberBaseRole({ role: existingMemberSnap.data()?.role as CompanyRole })
@@ -988,6 +998,9 @@ companiesRouter.post(
     }
     if (body.pinHash) {
       payload.pinHash = String(body.pinHash).slice(0, 256);
+    }
+    if (body.pinUpdatedAtIso) {
+      payload.pinUpdatedAtIso = String(body.pinUpdatedAtIso).slice(0, 40);
     }
 
     batch.set(memberRef, payload, { merge: true });

@@ -40,6 +40,7 @@ import {
   resolveMemberPermissions,
   validatePinFormat,
   verifyMemberPinHash,
+  verifyOwnerPinRecoveryEligibility,
 } from './rbac.ts';
 
 function assert(condition: boolean, msg: string): void {
@@ -633,6 +634,127 @@ export async function runIsolationTests(): Promise<{ passed: number; total: numb
     assert(!canMemberAccessEstablishment(scopedCashier, 'est_viana'), 'Caixa restrito não pode operar noutro estabelecimento');
     assert(canMemberOperateCashier(scopedCashier, '02'), 'Caixa autorizado no terminal 02');
     assert(!canMemberOperateCashier(scopedCashier, '01'), 'Caixa restrito não pode abrir terminal 01');
+  });
+
+  // Teste 15: Recuperação de PIN do Proprietário por conta Google verificada (anti-escalada)
+  await test('RBAC 6.7: Recuperação de PIN do Proprietário exige Google verificado do titular e bloqueia caixas/terceiros', () => {
+    const now = '2026-06-01T00:00:00.000Z';
+    const company: CompanyRecord = {
+      id: 'comp_loja_rec',
+      normalizedNif: '5009998887',
+      profile: JAIMONA_COMPANY,
+      status: 'active',
+      plan: {
+        planTier: 'PROFISSIONAL',
+        commercialActive: true,
+        maxUsers: null,
+        maxInvoicesPerMonth: null,
+        updatedAtIso: now,
+      },
+      baseSequence: 0,
+      allowManagerCancel: false,
+      ownerUid: 'uid_owner_real',
+      ownerEmail: 'dono@loja.ao',
+      createdAtIso: now,
+      updatedAtIso: now,
+    };
+
+    const ownerMember: CompanyMember = {
+      id: 'comp_loja_rec_uid_owner_real',
+      companyId: 'comp_loja_rec',
+      uid: 'uid_owner_real',
+      email: 'dono@loja.ao',
+      displayName: 'Proprietário',
+      role: 'owner',
+      allowInvoiceCancel: true,
+      active: true,
+      status: 'active',
+      pinHash: 'pbkdf2_sha256$100000$salt$hash',
+      createdAtIso: now,
+      updatedAtIso: now,
+    };
+
+    const cashierMember: CompanyMember = {
+      ...ownerMember,
+      id: 'comp_loja_rec_cashier',
+      uid: 'uid_cashier',
+      email: 'caixa@loja.ao',
+      displayName: 'Caixa 1',
+      role: 'cashier',
+      allowInvoiceCancel: false,
+    };
+
+    // 1. Caixa nunca pode usar fluxo de recuperação do Proprietário
+    const cashierAttempt = verifyOwnerPinRecoveryEligibility({
+      company,
+      targetMember: cashierMember,
+      googleUser: { uid: 'uid_owner_real', email: 'dono@loja.ao', emailVerified: true },
+    });
+    assert(!cashierAttempt.canRecover && cashierAttempt.errorCode === 'NOT_OWNER_MEMBER', 'Caixa não pode usar recuperação por Google');
+
+    // 2. E-mail não verificado é bloqueado
+    const unverifiedAttempt = verifyOwnerPinRecoveryEligibility({
+      company,
+      targetMember: ownerMember,
+      googleUser: { uid: 'uid_owner_real', email: 'dono@loja.ao', emailVerified: false },
+    });
+    assert(!unverifiedAttempt.canRecover && unverifiedAttempt.errorCode === 'EMAIL_NOT_VERIFIED', 'Google não verificado deve ser bloqueado');
+
+    // 3. Terceiro com outro Gmail é bloqueado
+    const strangerAttempt = verifyOwnerPinRecoveryEligibility({
+      company,
+      targetMember: ownerMember,
+      googleUser: { uid: 'uid_estranho', email: 'intruso@gmail.com', emailVerified: true },
+    });
+    assert(!strangerAttempt.canRecover && strangerAttempt.errorCode === 'IDENTITY_MISMATCH', 'Conta Google de terceiro não pode redefinir PIN do Proprietário');
+
+    // 4. Empresa exclusivamente local (sem âncora Google) não pode ser sequestrada por Gmail aleatório
+    const localOnlyCompany: CompanyRecord = {
+      ...company,
+      id: 'comp_local_sem_google',
+      ownerUid: undefined,
+      ownerEmail: undefined,
+    };
+    const localOnlyOwner: CompanyMember = {
+      ...ownerMember,
+      companyId: 'comp_local_sem_google',
+      uid: 'owner_local_comp_local_sem_google',
+      email: 'proprietario@empresa.ao',
+    };
+    const localHijack = verifyOwnerPinRecoveryEligibility({
+      company: localOnlyCompany,
+      targetMember: localOnlyOwner,
+      googleUser: { uid: 'uid_qualquer', email: 'caixa.pessoal@gmail.com', emailVerified: true },
+    });
+    assert(!localHijack.canRecover && localHijack.errorCode === 'NO_OWNER_ANCHOR', 'Empresa local sem Google vinculada não pode ser reivindicada no ecrã de bloqueio');
+
+    // 5. Titular legítimo verificado (ownerUid / ownerEmail / JAIMONA / Platform Admin) é autorizado
+    const validOwner = verifyOwnerPinRecoveryEligibility({
+      company,
+      targetMember: ownerMember,
+      googleUser: { uid: 'uid_owner_real', email: 'dono@loja.ao', emailVerified: true },
+    });
+    assert(validOwner.canRecover && validOwner.reason === 'owner_uid', 'Titular verificado deve poder redefinir o PIN do Proprietário');
+
+    const jaimonaCompany: CompanyRecord = {
+      ...company,
+      id: JAIMONA_COMPANY_ID,
+      ownerUid: undefined,
+      ownerEmail: 'jaimonacomercioeservicos@gmail.com',
+    };
+    const validJaimona = verifyOwnerPinRecoveryEligibility({
+      company: jaimonaCompany,
+      targetMember: { ...ownerMember, companyId: JAIMONA_COMPANY_ID, uid: 'owner_local' },
+      googleUser: { uid: 'uid_jaimona', email: 'jaimonacomercioeservicos@gmail.com', emailVerified: true },
+    });
+    assert(validJaimona.canRecover && validJaimona.reason === 'jaimona_owner', 'Titular da JAIMONA verificado deve poder recuperar PIN');
+
+    const validPlatformAdmin = verifyOwnerPinRecoveryEligibility({
+      company,
+      targetMember: ownerMember,
+      googleUser: { uid: 'uid_admin', email: PLATFORM_ADMIN_EMAIL, emailVerified: true },
+    });
+    assert(validPlatformAdmin.canRecover && validPlatformAdmin.reason === 'platform_admin', 'Administrador da plataforma verificado deve poder auxiliar na recuperação');
   });
 
   console.log(`\nTODOS OS ${passed}/${total} TESTES DE ISOLAMENTO PASSARAM COM SUCESSO!\n`);

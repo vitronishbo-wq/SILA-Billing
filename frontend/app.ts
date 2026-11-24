@@ -131,6 +131,7 @@ import {
   resolveMemberStatus,
   validatePinFormat,
   verifyMemberPinHash,
+  verifyOwnerPinRecoveryEligibility,
 } from '../src/core/rbac';
 import { PRIVACY_POLICY_VERSION } from '../src/core/privacyTerms';
 import {
@@ -177,6 +178,7 @@ import {
   consumeGoogleRedirectResult,
   formatFirebaseAuthErrorPt,
   isUnauthorizedDomainError,
+  reauthenticateWithGoogle,
   signInWithGoogle,
   signOutFirebase,
   validateFirestoreConnection,
@@ -273,6 +275,7 @@ import {
   renderTenantOnboardingView,
 } from './ui/multicompanyModals';
 import {
+  OwnerPinRecoveryStep,
   RbacPanelTab,
   renderPrivacyPolicyModal,
   renderRbacMobileModal,
@@ -727,6 +730,10 @@ export class SilaBillingApp {
   private lockErrorMessage: string | null = null;
   private lockReasonMessage: string | null = null;
   private isUnlockingTerminal = false;
+  private lockOwnerRecoveryStep: OwnerPinRecoveryStep = 'NONE';
+  private lockOwnerRecoveryVerifiedAtMs = 0;
+  private lockOwnerRecoveryVerifiedCompanyId: string | null = null;
+  private lockOwnerRecoveryPendingCompanyId: string | null = null;
   private showPrivacyPolicyModal = false;
   private showRbacMobileModal = false;
   private rbacActiveTab: RbacPanelTab = 'USERS';
@@ -897,6 +904,10 @@ export class SilaBillingApp {
         this.terminalUnlockedMemberId = null;
         this.lockPinInput = '';
         this.lockErrorMessage = null;
+        this.lockOwnerRecoveryStep = 'NONE';
+        this.lockOwnerRecoveryVerifiedAtMs = 0;
+        this.lockOwnerRecoveryVerifiedCompanyId = null;
+        this.lockOwnerRecoveryPendingCompanyId = null;
         if (authChanged) {
           this.lockReasonMessage = 'Sessão terminada — introduza o seu PIN de operador.';
           try {
@@ -961,12 +972,23 @@ export class SilaBillingApp {
       data.requiresCompanyOnboarding || !data.activeCompany.id
     );
     // Decisão 2: O terminal partilhado arranca SEMPRE bloqueado ao carregar qualquer empresa.
+    const keepOwnerRecovery =
+      Boolean(data.activeCompany.id) &&
+      (this.lockOwnerRecoveryPendingCompanyId === data.activeCompany.id ||
+        (this.lockOwnerRecoveryStep === 'SET_NEW_PIN' &&
+          this.lockOwnerRecoveryVerifiedCompanyId === data.activeCompany.id &&
+          Date.now() - this.lockOwnerRecoveryVerifiedAtMs < 5 * 60 * 1000));
     this.terminalUnlockedMemberId = null;
-    this.lockSelectedMemberId = null;
+    this.lockSelectedMemberId = keepOwnerRecovery ? this.lockSelectedMemberId : null;
     this.lockPinInput = '';
     this.lockPinConfirmInput = '';
     this.lockErrorMessage = null;
     this.isUnlockingTerminal = false;
+    if (!keepOwnerRecovery) {
+      this.lockOwnerRecoveryStep = 'NONE';
+      this.lockOwnerRecoveryVerifiedAtMs = 0;
+      this.lockOwnerRecoveryVerifiedCompanyId = null;
+    }
     this.showRbacMobileModal = false;
     this.rbacEditingMemberId = null;
     this.rbacEditingRoleId = null;
@@ -1397,6 +1419,10 @@ export class SilaBillingApp {
     this.lockPinConfirmInput = '';
     this.lockErrorMessage = null;
     this.lockReasonMessage = reason || null;
+    this.lockOwnerRecoveryStep = 'NONE';
+    this.lockOwnerRecoveryVerifiedAtMs = 0;
+    this.lockOwnerRecoveryVerifiedCompanyId = null;
+    this.lockOwnerRecoveryPendingCompanyId = null;
     this.showOperatorSwitchModal = false;
     this.showSupervisorAuthModal = false;
     this.showRbacMobileModal = false;
@@ -3974,6 +4000,9 @@ export class SilaBillingApp {
         action === 'lock-keypad-digit' ||
         action === 'lock-keypad-clear' ||
         action === 'lock-keypad-backspace' ||
+        action === 'lock-owner-recovery-open' ||
+        action === 'lock-owner-recovery-verify-google' ||
+        action === 'lock-owner-recovery-cancel' ||
         action === 'open-privacy-policy' ||
         action === 'close-privacy-policy' ||
         action === 'accept-privacy-policy' ||
@@ -4003,6 +4032,9 @@ export class SilaBillingApp {
         this.lockPinInput = '';
         this.lockPinConfirmInput = '';
         this.lockErrorMessage = null;
+        this.lockOwnerRecoveryStep = 'NONE';
+        this.lockOwnerRecoveryVerifiedAtMs = 0;
+        this.lockOwnerRecoveryVerifiedCompanyId = null;
         this.render();
         break;
       }
@@ -4025,6 +4057,113 @@ export class SilaBillingApp {
         this.lockPinInput = this.lockPinInput.slice(0, -1);
         this.lockErrorMessage = null;
         this.render();
+        break;
+      }
+      case 'lock-owner-recovery-open': {
+        const ownerMember = this.members.find(
+          (m) =>
+            resolveMemberStatus(m) === 'active' &&
+            resolveMemberBaseRole(m) === 'owner' &&
+            Boolean(m.pinHash)
+        );
+        if (!ownerMember) {
+          this.lockErrorMessage = 'Nenhum perfil de Proprietário com PIN activo encontrado.';
+          this.render();
+          break;
+        }
+        this.lockSelectedMemberId = ownerMember.id;
+        this.lockOwnerRecoveryStep = 'VERIFY_GOOGLE';
+        this.lockOwnerRecoveryVerifiedAtMs = 0;
+        this.lockOwnerRecoveryVerifiedCompanyId = null;
+        this.lockPinInput = '';
+        this.lockPinConfirmInput = '';
+        this.lockErrorMessage = null;
+        this.render();
+        break;
+      }
+      case 'lock-owner-recovery-cancel': {
+        this.lockOwnerRecoveryStep = 'NONE';
+        this.lockOwnerRecoveryVerifiedAtMs = 0;
+        this.lockOwnerRecoveryVerifiedCompanyId = null;
+        this.lockOwnerRecoveryPendingCompanyId = null;
+        this.lockPinInput = '';
+        this.lockPinConfirmInput = '';
+        this.lockErrorMessage = null;
+        this.render();
+        break;
+      }
+      case 'lock-owner-recovery-verify-google': {
+        if (!this.isOnline) {
+          this.lockErrorMessage =
+            'Terminal offline. Ligue à internet para confirmar a conta Google do Proprietário.';
+          this.render();
+          break;
+        }
+        if (this.isUnlockingTerminal) break;
+        const targetCompanyId = this.activeCompany.id;
+        this.isUnlockingTerminal = true;
+        this.lockErrorMessage = null;
+        this.lockOwnerRecoveryPendingCompanyId = targetCompanyId;
+        this.render();
+        try {
+          await reauthenticateWithGoogle();
+          const verifiedUser = auth.currentUser || this.user;
+          if (verifiedUser) {
+            this.user = verifiedUser;
+          }
+          const ownerMember =
+            this.members.find(
+              (m) =>
+                m.id === this.lockSelectedMemberId &&
+                resolveMemberStatus(m) === 'active' &&
+                resolveMemberBaseRole(m) === 'owner'
+            ) ||
+            this.members.find(
+              (m) =>
+                resolveMemberStatus(m) === 'active' &&
+                resolveMemberBaseRole(m) === 'owner'
+            ) ||
+            null;
+          const eligibility = verifyOwnerPinRecoveryEligibility({
+            company: this.activeCompany,
+            targetMember: ownerMember,
+            googleUser: verifiedUser,
+          });
+          if (!eligibility.canRecover) {
+            this.lockOwnerRecoveryVerifiedAtMs = 0;
+            this.lockOwnerRecoveryVerifiedCompanyId = null;
+            this.lockOwnerRecoveryStep = 'VERIFY_GOOGLE';
+            this.lockErrorMessage = eligibility.message;
+            void this.appendSecurityAuditEvent({
+              action: 'ACCESS_DENIED',
+              targetType: 'member',
+              targetId: ownerMember?.id,
+              summary: `Recuperação de PIN do Proprietário recusada (${eligibility.errorCode}).`,
+              outcome: 'denied',
+              actorOverride: ownerMember,
+            });
+          } else {
+            this.lockSelectedMemberId = ownerMember!.id;
+            this.lockOwnerRecoveryVerifiedAtMs = Date.now();
+            this.lockOwnerRecoveryVerifiedCompanyId = this.activeCompany.id;
+            this.lockOwnerRecoveryStep = 'SET_NEW_PIN';
+            this.lockPinInput = '';
+            this.lockPinConfirmInput = '';
+            this.lockErrorMessage = null;
+          }
+        } catch (err) {
+          let autoAuthorized = false;
+          if (isUnauthorizedDomainError(err)) {
+            const healRes = await requestEnsureAuthDomains();
+            autoAuthorized = healRes.ok && (healRes.added.length > 0 || healRes.alreadyPresent);
+          }
+          this.lockErrorMessage = formatFirebaseAuthErrorPt(err, autoAuthorized);
+          this.lockOwnerRecoveryStep = 'VERIFY_GOOGLE';
+        } finally {
+          this.lockOwnerRecoveryPendingCompanyId = null;
+          this.isUnlockingTerminal = false;
+          this.render();
+        }
         break;
       }
       case 'lock-terminal-now': {
@@ -7997,13 +8136,17 @@ export class SilaBillingApp {
     if (!el) return;
     this.touchActivity();
 
-    if (el.id === 'lock-setup-pin' || el.id === 'terminal-unlock-pin-input') {
+    if (
+      el.id === 'lock-setup-pin' ||
+      el.id === 'lock-recover-pin' ||
+      el.id === 'terminal-unlock-pin-input'
+    ) {
       this.lockPinInput = el.value.replace(/\D/g, '').slice(0, 6);
       el.value = this.lockPinInput;
       return;
     }
 
-    if (el.id === 'lock-setup-pin-confirm') {
+    if (el.id === 'lock-setup-pin-confirm' || el.id === 'lock-recover-pin-confirm') {
       this.lockPinConfirmInput = el.value.replace(/\D/g, '').slice(0, 6);
       el.value = this.lockPinConfirmInput;
       return;
@@ -8534,6 +8677,9 @@ export class SilaBillingApp {
         this.lockPinInput = '';
         this.lockPinConfirmInput = '';
         this.lockErrorMessage = null;
+        this.lockOwnerRecoveryStep = 'NONE';
+        this.lockOwnerRecoveryVerifiedAtMs = 0;
+        this.lockOwnerRecoveryVerifiedCompanyId = null;
         this.render();
       }
       return;
@@ -9012,7 +9158,11 @@ export class SilaBillingApp {
     const earlyFormName = form.dataset.form;
 
     if (this.isTerminalLocked()) {
-      if (earlyFormName !== 'setup-owner-pin-form' && earlyFormName !== 'terminal-unlock-form') {
+      if (
+        earlyFormName !== 'setup-owner-pin-form' &&
+        earlyFormName !== 'recover-owner-pin-form' &&
+        earlyFormName !== 'terminal-unlock-form'
+      ) {
         void this.appendSecurityAuditEvent({
           action: 'ACCESS_DENIED',
           targetType: 'form',
@@ -9106,6 +9256,122 @@ export class SilaBillingApp {
       } catch (err) {
         this.lockErrorMessage =
           err instanceof Error ? err.message : 'Não foi possível guardar o PIN inicial.';
+      } finally {
+        this.isUnlockingTerminal = false;
+        this.render();
+      }
+      return;
+    }
+
+    if (earlyFormName === 'recover-owner-pin-form') {
+      if (this.isUnlockingTerminal) return;
+      const memberId = String(fd.get('memberId') || this.lockSelectedMemberId || '').trim();
+      const pin = String(fd.get('pin') || this.lockPinInput || '').trim();
+      const pinConfirm = String(fd.get('pinConfirm') || this.lockPinConfirmInput || '').trim();
+      const targetOwner = this.members.find(
+        (m) =>
+          m.id === memberId &&
+          resolveMemberStatus(m) === 'active' &&
+          resolveMemberBaseRole(m) === 'owner'
+      );
+      const isFreshVerification =
+        this.lockOwnerRecoveryVerifiedCompanyId === this.activeCompany.id &&
+        Date.now() - this.lockOwnerRecoveryVerifiedAtMs < 5 * 60 * 1000;
+      const eligibility = verifyOwnerPinRecoveryEligibility({
+        company: this.activeCompany,
+        targetMember: targetOwner,
+        googleUser: auth.currentUser || this.user,
+      });
+
+      if (!targetOwner || !isFreshVerification || !eligibility.canRecover) {
+        this.lockOwnerRecoveryStep = 'VERIFY_GOOGLE';
+        this.lockOwnerRecoveryVerifiedAtMs = 0;
+        this.lockOwnerRecoveryVerifiedCompanyId = null;
+        this.lockErrorMessage = !eligibility.canRecover
+          ? eligibility.message
+          : 'A confirmação Google expirou. Confirme novamente a identidade do Proprietário.';
+        void this.appendSecurityAuditEvent({
+          action: 'ACCESS_DENIED',
+          targetType: 'member',
+          targetId: targetOwner?.id || memberId,
+          summary: 'Submissão de recuperação de PIN do Proprietário sem verificação Google activa.',
+          outcome: 'denied',
+          actorOverride: targetOwner || null,
+        });
+        this.render();
+        return;
+      }
+
+      const pinCheck = validatePinFormat(pin);
+      if (!pinCheck.valid) {
+        this.lockErrorMessage = pinCheck.error || 'O PIN deve ter entre 4 e 6 dígitos numéricos.';
+        this.render();
+        return;
+      }
+      if (pin !== pinConfirm) {
+        this.lockErrorMessage = 'Os dois PINs introduzidos não coincidem.';
+        this.render();
+        return;
+      }
+
+      this.isUnlockingTerminal = true;
+      this.lockErrorMessage = null;
+      this.render();
+      try {
+        const pinHash = await hashMemberPin(pin);
+        const nowIso = new Date().toISOString();
+        const updatedOwner: CompanyMember = {
+          ...targetOwner,
+          pinHash,
+          pinUpdatedAtIso: nowIso,
+          pinFailedAttempts: 0,
+          pinLockedUntilIso: undefined,
+          updatedAtIso: nowIso,
+        };
+        await localDb.saveMember(updatedOwner);
+        this.members = this.members.map((m) => (m.id === updatedOwner.id ? updatedOwner : m));
+        this.terminalUnlockedMemberId = updatedOwner.id;
+        this.lockPinInput = '';
+        this.lockPinConfirmInput = '';
+        this.lockReasonMessage = null;
+        this.lockOwnerRecoveryStep = 'NONE';
+        this.lockOwnerRecoveryVerifiedAtMs = 0;
+        this.lockOwnerRecoveryVerifiedCompanyId = null;
+        this.lockOwnerRecoveryPendingCompanyId = null;
+        this.operator = updatedOwner.displayName.slice(0, 32) || this.operator;
+        if (updatedOwner.authorizedCashiers && updatedOwner.authorizedCashiers.length > 0) {
+          this.cashier = updatedOwner.authorizedCashiers[0]!;
+        }
+        this.enforceModulePermission();
+        this.touchActivity();
+        const verifiedEmail = String((auth.currentUser || this.user)?.email || '').trim();
+        void this.appendSecurityAuditEvent({
+          action: 'PIN_SETUP',
+          targetType: 'member',
+          targetId: updatedOwner.id,
+          summary: `PIN do Proprietário (${updatedOwner.displayName}) redefinido após confirmação Google (${verifiedEmail || eligibility.reason}).`,
+          outcome: 'allowed',
+          actorOverride: updatedOwner,
+        });
+        void this.appendSecurityAuditEvent({
+          action: 'PIN_UNLOCK_OK',
+          targetType: 'terminal',
+          targetId: updatedOwner.id,
+          summary: `Terminal desbloqueado após recuperação de PIN por ${updatedOwner.displayName}.`,
+          outcome: 'allowed',
+          actorOverride: updatedOwner,
+        });
+        if (this.user && this.isOnline && canCompanySyncCloudData(this.activeCompany)) {
+          void ensureCompanyRegisteredCloud(this.activeCompany)
+            .then(() => upsertCompanyMemberCloud(this.activeCompany, updatedOwner))
+            .catch(() => null);
+          if (updatedOwner.email) {
+            void upsertCompanyMemberBackend(this.activeCompany.id, updatedOwner).catch(() => null);
+          }
+        }
+      } catch (err) {
+        this.lockErrorMessage =
+          err instanceof Error ? err.message : 'Não foi possível redefinir o PIN do Proprietário.';
       } finally {
         this.isUnlockingTerminal = false;
         this.render();
@@ -12561,6 +12827,7 @@ export class SilaBillingApp {
           isSignedIn: Boolean(this.user),
           signedInEmail: this.user?.email || '',
           isPlatformAdmin: Boolean(this.user && isPlatformAdminEmail(this.user.email)),
+          ownerRecoveryStep: this.lockOwnerRecoveryStep,
         })}
         ${
           this.showPrivacyPolicyModal

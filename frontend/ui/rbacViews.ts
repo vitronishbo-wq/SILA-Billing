@@ -80,6 +80,8 @@ function getMemberRoleDisplayName(
 
 // ==================== 1. ECRÃ DE BLOQUEIO DO TERMINAL PARTILHADO ====================
 
+export type OwnerPinRecoveryStep = 'NONE' | 'VERIFY_GOOGLE' | 'SET_NEW_PIN';
+
 export function renderTerminalLockScreen(params: {
   company: CompanyRecord;
   companies: CompanyRecord[];
@@ -95,6 +97,7 @@ export function renderTerminalLockScreen(params: {
   isSignedIn: boolean;
   signedInEmail: string;
   isPlatformAdmin: boolean;
+  ownerRecoveryStep?: OwnerPinRecoveryStep;
 }): string {
   const {
     company,
@@ -111,6 +114,7 @@ export function renderTerminalLockScreen(params: {
     isSignedIn,
     signedInEmail,
     isPlatformAdmin,
+    ownerRecoveryStep = 'NONE',
   } = params;
 
   const activeMembers = members.filter((m) => resolveMemberStatus(m) === 'active');
@@ -119,11 +123,14 @@ export function renderTerminalLockScreen(params: {
     activeMembers[0] ||
     null;
 
-  const isOwnerInitialSetup = Boolean(
-    selectedMember &&
-      resolveMemberBaseRole(selectedMember) === 'owner' &&
-      !selectedMember.pinHash
+  const isSelectedOwner = Boolean(
+    selectedMember && resolveMemberBaseRole(selectedMember) === 'owner'
   );
+  const isOwnerInitialSetup = Boolean(
+    isSelectedOwner && selectedMember && !selectedMember.pinHash
+  );
+  const activeRecoveryStep: OwnerPinRecoveryStep =
+    isSelectedOwner && selectedMember?.pinHash ? ownerRecoveryStep : 'NONE';
   const lockStatus = selectedMember
     ? isPinCurrentlyLocked(selectedMember)
     : { locked: false, remainingSeconds: 0 };
@@ -272,7 +279,102 @@ export function renderTerminalLockScreen(params: {
                   ? `<div class="p-3 rounded-xl bg-amber-950/50 border border-amber-800/80 text-xs text-amber-200 leading-relaxed">
                       Operador sem PIN configurado. Solicite definição ao Proprietário ou Administrador.
                     </div>`
-                  : `
+                  : activeRecoveryStep === 'VERIFY_GOOGLE'
+                    ? `
+                      ${
+                        errorMessage
+                          ? `<div class="p-2.5 rounded-xl bg-red-950/70 border border-red-800 text-xs text-red-200">${escapeHtml(errorMessage)}</div>`
+                          : ''
+                      }
+                      <div class="space-y-3">
+                        <p class="text-xs text-slate-300 leading-relaxed">
+                          Confirme a sua conta Google de Proprietário para redefinir o PIN deste terminal.
+                        </p>
+                        ${
+                          !isOnline
+                            ? `<div class="p-2.5 rounded-xl bg-amber-950/50 border border-amber-800/80 text-xs text-amber-200">
+                                Ligação à internet necessária para confirmar a conta Google.
+                              </div>`
+                            : ''
+                        }
+                        <button
+                          type="button"
+                          data-action="lock-owner-recovery-verify-google"
+                          ${!isOnline || isSubmitting ? 'disabled' : ''}
+                          class="w-full h-11 rounded-xl bg-blue-600 hover:bg-blue-500 disabled:opacity-40 text-white font-bold text-sm flex items-center justify-center gap-2 transition-colors"
+                        >
+                          ${ICONS.shieldCheck}
+                          <span>${isSubmitting ? 'A confirmar...' : 'Confirmar com Google'}</span>
+                        </button>
+                        <button
+                          type="button"
+                          data-action="lock-owner-recovery-cancel"
+                          ${isSubmitting ? 'disabled' : ''}
+                          class="w-full h-9 rounded-xl border border-slate-700 bg-slate-950 hover:bg-slate-800 text-xs font-medium text-slate-300 transition-colors"
+                        >Voltar ao PIN</button>
+                      </div>
+                    `
+                    : activeRecoveryStep === 'SET_NEW_PIN'
+                      ? `
+                        ${
+                          errorMessage
+                            ? `<div class="p-2.5 rounded-xl bg-red-950/70 border border-red-800 text-xs text-red-200">${escapeHtml(errorMessage)}</div>`
+                            : ''
+                        }
+                        <div class="px-3 py-2 rounded-lg bg-emerald-950/40 border border-emerald-800/70 text-[11px] text-emerald-200 truncate">
+                          Identidade confirmada: ${escapeHtml(signedInEmail || 'Google')}
+                        </div>
+                        <form data-form="recover-owner-pin-form" class="space-y-3">
+                          <input type="hidden" name="memberId" value="${escapeHtml(selectedMember.id)}" />
+                          <div>
+                            <label for="lock-recover-pin" class="block text-xs font-medium text-slate-300 mb-1">Novo PIN (4 a 6 dígitos)</label>
+                            <input
+                              type="password"
+                              name="pin"
+                              id="lock-recover-pin"
+                              inputmode="numeric"
+                              pattern="\\d{4,6}"
+                              maxlength="6"
+                              required
+                              autocomplete="new-password"
+                              value="${escapeHtml(pinInput)}"
+                              placeholder="••••"
+                              class="w-full h-11 px-4 rounded-xl bg-slate-950 border border-slate-700 text-center text-xl font-mono tracking-[0.4em] text-white focus:outline-none focus:border-blue-500"
+                            />
+                          </div>
+                          <div>
+                            <label for="lock-recover-pin-confirm" class="block text-xs font-medium text-slate-300 mb-1">Confirmar novo PIN</label>
+                            <input
+                              type="password"
+                              name="pinConfirm"
+                              id="lock-recover-pin-confirm"
+                              inputmode="numeric"
+                              pattern="\\d{4,6}"
+                              maxlength="6"
+                              required
+                              autocomplete="new-password"
+                              value="${escapeHtml(newPinConfirmInput)}"
+                              placeholder="••••"
+                              class="w-full h-11 px-4 rounded-xl bg-slate-950 border border-slate-700 text-center text-xl font-mono tracking-[0.4em] text-white focus:outline-none focus:border-blue-500"
+                            />
+                          </div>
+                          <button
+                            type="submit"
+                            ${isSubmitting ? 'disabled' : ''}
+                            class="w-full h-11 rounded-xl bg-blue-600 hover:bg-blue-500 disabled:opacity-40 text-white font-bold text-sm flex items-center justify-center gap-2 transition-colors"
+                          >
+                            ${ICONS.shieldCheck}
+                            <span>${isSubmitting ? 'A redefinir...' : 'Redefinir PIN e Desbloquear'}</span>
+                          </button>
+                          <button
+                            type="button"
+                            data-action="lock-owner-recovery-cancel"
+                            ${isSubmitting ? 'disabled' : ''}
+                            class="w-full h-9 rounded-xl border border-slate-700 bg-slate-950 hover:bg-slate-800 text-xs font-medium text-slate-300 transition-colors"
+                          >Cancelar</button>
+                        </form>
+                      `
+                      : `
                     ${
                       errorMessage
                         ? `<div class="p-2.5 rounded-xl bg-red-950/70 border border-red-800 text-xs text-red-200">${escapeHtml(errorMessage)}</div>`
@@ -344,6 +446,15 @@ export function renderTerminalLockScreen(params: {
                         ${ICONS.unlock}
                         <span>${isSubmitting ? 'A verificar...' : 'Desbloquear Terminal'}</span>
                       </button>
+                      ${
+                        isSelectedOwner
+                          ? `<button
+                              type="button"
+                              data-action="lock-owner-recovery-open"
+                              class="w-full pt-1 text-center text-[11px] text-slate-400 hover:text-blue-300 transition-colors"
+                            >Esqueceu o PIN do Proprietário?</button>`
+                          : ''
+                      }
                     </form>
                   `
           }
