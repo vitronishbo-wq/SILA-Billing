@@ -1,13 +1,15 @@
-import {
+import type {
   CompanyMember,
   CompanyRecord,
   CompanyRole,
   CompanyRoleDefinition,
+  MemberStatus,
+  PermissionKey,
+} from './types.ts';
+import {
   isJaimonaOwnerEmail,
   isPlatformAdminEmail,
   JAIMONA_COMPANY_ID,
-  MemberStatus,
-  PermissionKey,
 } from './types.ts';
 
 export const ALL_PERMISSION_KEYS: readonly PermissionKey[] = [
