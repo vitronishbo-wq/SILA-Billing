@@ -451,15 +451,26 @@ function renderMobileHome(props: MobileOperationalProps): string {
 
       ${
         canViewFinancialTotals
-          ? `<!-- Resumo Rápido de Vendas do Dia -->
-            <section class="bg-slate-900/60 border border-slate-800/80 rounded-2xl p-3.5 flex items-center justify-between text-xs">
+          ? `<!-- Resumo Rápido de Vendas do Dia + Envio WhatsApp ao Proprietário -->
+            <section class="bg-slate-900/60 border border-slate-800/80 rounded-2xl p-3.5 flex items-center justify-between gap-2 text-xs">
               <div>
                 <span class="text-slate-400 block">Vendas hoje:</span>
                 <span class="text-sm font-semibold text-white tabular-nums">${todayInvoices.length} ${todayInvoices.length === 1 ? 'documento' : 'documentos'}</span>
               </div>
-              <div class="text-right">
-                <span class="text-slate-400 block">Total faturado:</span>
-                <span class="text-sm font-bold text-emerald-400 tabular-nums">${formatKzNumber(todayTotal)} Kz</span>
+              <div class="flex items-center gap-2.5">
+                <div class="text-right">
+                  <span class="text-slate-400 block">Total faturado:</span>
+                  <span class="text-sm font-bold text-emerald-400 tabular-nums">${formatKzNumber(todayTotal)} Kz</span>
+                </div>
+                <button
+                  type="button"
+                  data-action="whatsapp-daily-summary"
+                  title="Enviar resumo diário ao proprietário via WhatsApp"
+                  class="h-10 px-3 rounded-xl bg-emerald-600/20 hover:bg-emerald-600 border border-emerald-700/60 text-emerald-300 hover:text-white text-xs font-semibold flex items-center gap-1.5 active:scale-95 transition-colors shrink-0"
+                >
+                  ${ICONS.whatsapp}
+                  <span>Resumo</span>
+                </button>
               </div>
             </section>`
           : ''
@@ -506,18 +517,29 @@ function renderMobileProducts(props: MobileOperationalProps): string {
           </div>
         </div>
 
-        ${
-          canManageProducts
-            ? `<button
-                type="button"
-                data-action="mobile-open-quick-product"
-                class="h-9 px-3 rounded-xl bg-blue-600 hover:bg-blue-500 text-white text-xs font-bold flex items-center gap-1.5 shadow-md shadow-blue-600/30 active:scale-95"
-              >
-                ${ICONS.plus}
-                <span>Novo Artigo</span>
-              </button>`
-            : ''
-        }
+        <div class="flex items-center gap-1.5 shrink-0">
+          <button
+            type="button"
+            data-action="whatsapp-catalog"
+            title="Enviar catálogo em PDF pelo WhatsApp"
+            class="h-9 px-2.5 rounded-xl bg-emerald-600/20 hover:bg-emerald-600 border border-emerald-700/60 text-emerald-300 hover:text-white text-xs font-semibold flex items-center gap-1 active:scale-95 transition-colors"
+          >
+            ${ICONS.whatsapp}
+            <span>Catálogo</span>
+          </button>
+          ${
+            canManageProducts
+              ? `<button
+                  type="button"
+                  data-action="mobile-open-quick-product"
+                  class="h-9 px-3 rounded-xl bg-blue-600 hover:bg-blue-500 text-white text-xs font-bold flex items-center gap-1.5 shadow-md shadow-blue-600/30 active:scale-95"
+                >
+                  ${ICONS.plus}
+                  <span>Novo</span>
+                </button>`
+              : ''
+          }
+        </div>
       </div>
 
       <!-- Barra de Pesquisa de Artigos -->
@@ -760,10 +782,19 @@ function renderMobileCartStep(props: MobileOperationalProps): string {
           </div>
         </div>
 
-        <div class="flex items-center gap-2">
+        <div class="flex items-center gap-1.5">
           ${
             cart.length > 0
               ? `<button
+                  type="button"
+                  data-action="whatsapp-quote"
+                  class="h-8 px-2.5 rounded-lg bg-emerald-600/20 border border-emerald-700/60 text-emerald-300 text-xs font-semibold flex items-center gap-1 active:scale-95"
+                  title="Enviar orçamento em PDF pelo WhatsApp"
+                >
+                  ${ICONS.whatsapp}
+                  <span>Orçamento</span>
+                </button>
+                <button
                   type="button"
                   data-action="mobile-cart-clear"
                   class="h-8 px-2.5 rounded-lg bg-red-950/40 border border-red-900/60 text-red-300 text-xs font-medium flex items-center gap-1 active:scale-95"
@@ -1295,9 +1326,19 @@ function renderMobileSuccessStep(props: MobileOperationalProps): string {
       <div class="flex flex-col gap-2.5 pt-2">
         <button
           type="button"
+          data-action="whatsapp-invoice"
+          data-invoice-id="${escapeHtml(invoice.id)}"
+          class="w-full h-[50px] rounded-xl bg-emerald-600 hover:bg-emerald-500 active:scale-[0.98] text-white font-bold text-sm flex items-center justify-center gap-2 shadow-md shadow-emerald-600/25"
+        >
+          ${ICONS.whatsapp}
+          <span>Enviar PDF pelo WhatsApp</span>
+        </button>
+
+        <button
+          type="button"
           data-action="mobile-print-receipt"
           data-invoice-id="${escapeHtml(invoice.id)}"
-          class="w-full h-[50px] rounded-xl bg-blue-600 hover:bg-blue-500 active:scale-[0.98] text-white font-bold text-sm flex items-center justify-center gap-2 shadow-md shadow-blue-600/25"
+          class="w-full h-[48px] rounded-xl bg-blue-600 hover:bg-blue-500 active:scale-[0.98] text-white font-bold text-sm flex items-center justify-center gap-2 shadow-md shadow-blue-600/25"
         >
           ${ICONS.printer}
           <span>Imprimir Talão Térmico (80mm)</span>
@@ -1307,16 +1348,16 @@ function renderMobileSuccessStep(props: MobileOperationalProps): string {
           type="button"
           data-action="mobile-print-a4"
           data-invoice-id="${escapeHtml(invoice.id)}"
-          class="w-full h-[46px] rounded-xl bg-slate-800 hover:bg-slate-700 active:scale-[0.98] text-slate-200 font-semibold text-xs flex items-center justify-center gap-2 border border-slate-700"
+          class="w-full h-[44px] rounded-xl bg-slate-800 hover:bg-slate-700 active:scale-[0.98] text-slate-200 font-semibold text-xs flex items-center justify-center gap-2 border border-slate-700"
         >
           ${ICONS.fileA4}
-          <span>Ver / Partilhar Factura A4</span>
+          <span>Ver / Imprimir Factura A4</span>
         </button>
 
         <button
           type="button"
           data-action="mobile-start-new-sale"
-          class="w-full h-[50px] rounded-xl bg-emerald-700 hover:bg-emerald-600 active:scale-[0.98] text-white font-bold text-sm flex items-center justify-center gap-2 mt-2 shadow-md"
+          class="w-full h-[48px] rounded-xl bg-slate-900 hover:bg-slate-800 border border-slate-700 active:scale-[0.98] text-white font-bold text-sm flex items-center justify-center gap-2 mt-1"
         >
           ${ICONS.plus}
           <span>Iniciar Nova Venda</span>
@@ -1397,6 +1438,16 @@ function renderMobileDocs(props: MobileOperationalProps): string {
                   <div class="flex items-center gap-2">
                     <button
                       type="button"
+                      data-action="whatsapp-invoice"
+                      data-invoice-id="${escapeHtml(inv.id)}"
+                      class="text-emerald-400 hover:text-emerald-300 text-xs font-semibold flex items-center gap-1"
+                    >
+                      ${ICONS.whatsapp}
+                      <span>WhatsApp</span>
+                    </button>
+                    <span>·</span>
+                    <button
+                      type="button"
                       data-action="mobile-print-receipt"
                       data-invoice-id="${escapeHtml(inv.id)}"
                       class="text-blue-400 hover:text-blue-300 text-xs font-medium"
@@ -1459,6 +1510,17 @@ function renderMobileCustomers(props: MobileOperationalProps): string {
             const isDirect = c.id === directCustId;
             const cType = inferCustomerType(c, directCustId);
             const isInactive = c.active === false;
+            const custOpenDebt = isDirect
+              ? 0
+              : props.invoices
+                  .filter(
+                    (i) =>
+                      i.status === 'issued' &&
+                      i.customerId === c.id &&
+                      typeof i.amountDue === 'number' &&
+                      i.amountDue > 0
+                  )
+                  .reduce((acc, i) => acc + (i.amountDue || 0), 0);
             return `
           <div class="bg-slate-900 border ${isInactive ? 'border-slate-800/60 opacity-75' : 'border-slate-800'} rounded-xl p-3 flex items-center justify-between gap-2 shadow-sm">
             <div class="min-w-0 flex-1">
@@ -1475,11 +1537,22 @@ function renderMobileCustomers(props: MobileOperationalProps): string {
                   cType === 'ESTRANGEIRO'
                     ? `${escapeHtml(c.countryCode || 'OUT')} ${escapeHtml(c.foreignTaxId || c.nif)}`
                     : `NIF: ${escapeHtml(c.nif || 'Consumidor Final')}`
-                }${isInactive ? ' · Inactivo' : ''}
+                }${custOpenDebt > 0 ? ` · Dívida: ${formatKzNumber(custOpenDebt)} Kz` : ''}${isInactive ? ' · Inactivo' : ''}
               </p>
               ${c.phone ? `<p class="text-[11px] text-slate-500 font-mono">${escapeHtml(c.phone)}</p>` : ''}
             </div>
             <div class="flex items-center gap-1.5 shrink-0">
+              ${
+                custOpenDebt > 0
+                  ? `<button
+                      type="button"
+                      data-action="whatsapp-collection"
+                      data-customer-id="${escapeHtml(c.id)}"
+                      title="Enviar cobrança / aviso de vencimento por WhatsApp"
+                      class="h-10 px-2.5 rounded-lg bg-emerald-600/20 hover:bg-emerald-600 border border-emerald-700/60 text-emerald-300 hover:text-white text-xs font-semibold flex items-center gap-1 active:scale-95"
+                    >${ICONS.whatsapp}<span>Cobrar</span></button>`
+                  : ''
+              }
               ${
                 canEditExistingCustomers && !isDirect
                   ? `<button

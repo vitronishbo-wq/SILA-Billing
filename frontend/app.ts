@@ -282,6 +282,28 @@ import {
   renderRbacTeamSection,
   renderTerminalLockScreen,
 } from './ui/rbacViews';
+import {
+  generateCatalogOrQuotePdfBytes,
+  generateDailySummaryPdfBytes,
+  generateInvoicePdfBytes,
+  generatePaymentReceiptPdfBytes,
+  type DailyOwnerSummaryPayload,
+  type PaymentReceiptPdfPayload,
+} from '../src/core/pdfGenerator';
+import {
+  buildCatalogOrQuoteWhatsAppMessage,
+  buildCollectionReminderWhatsAppMessage,
+  buildDailyOwnerSummaryWhatsAppMessage,
+  buildDocumentWhatsAppMessage,
+  buildPaymentReceiptWhatsAppMessage,
+  buildWhatsAppUrl,
+  normalizeWhatsAppPhone,
+  resolveOwnerWhatsAppPhone,
+} from '../src/core/whatsappChannel';
+import {
+  renderWhatsAppShareModal,
+  type WhatsAppShareDraftState,
+} from './ui/whatsappShareModal';
 
 type ActiveModule =
   | 'NEW_POS'
@@ -670,6 +692,8 @@ export class SilaBillingApp {
   private settleMethod: DirectPaymentMethod = 'Dinheiro';
   private settleReference = '';
   private settleError: string | null = null;
+  private whatsappShareDraft: WhatsAppShareDraftState | null = null;
+  private lastPaymentReceiptProof: PaymentReceiptPdfPayload | null = null;
 
   // Estado Caixa e Pagamentos (Turnos, Fundo Inicial, Sangria, Reforço, Entradas/Saídas e Fecho)
   private cashSessions: CashSession[] = [];
@@ -1093,6 +1117,8 @@ export class SilaBillingApp {
     this.settlingInvoiceId = null;
     this.settlingCustomerAccountId = null;
     this.settleError = null;
+    this.whatsappShareDraft = null;
+    this.lastPaymentReceiptProof = null;
     this.historyStatusFilter = 'ALL';
     this.historyDebtOnly = false;
     this.historyPeriod = 'ALL';
@@ -1427,6 +1453,7 @@ export class SilaBillingApp {
     this.showSupervisorAuthModal = false;
     this.showRbacMobileModal = false;
     this.showCompanyDropdown = false;
+    this.whatsappShareDraft = null;
     this.render();
   }
 
@@ -3972,6 +3999,441 @@ export class SilaBillingApp {
       createdAtIso: now,
       updatedAtIso: now,
     };
+  }
+
+  // ==================== CANAL COMERCIAL WHATSAPP NATIVO (PDF + MENSAGEM) ====================
+
+  private sanitizePdfFilename(raw: string): string {
+    const clean = String(raw || 'documento')
+      .normalize('NFD')
+      .replace(/[\u0300-\u036f]/g, '')
+      .replace(/[^a-zA-Z0-9_-]+/g, '_')
+      .replace(/^_+|_+$/g, '')
+      .slice(0, 64);
+    return clean || 'documento';
+  }
+
+  private triggerPdfFileDownload(bytes: Uint8Array, filename: string): void {
+    const safeBytes = new Uint8Array(bytes);
+    const blob = new Blob([safeBytes], { type: 'application/pdf' });
+    const url = URL.createObjectURL(blob);
+    const a = document.createElement('a');
+    a.href = url;
+    a.download = filename.endsWith('.pdf') ? filename : `${filename}.pdf`;
+    a.style.display = 'none';
+    document.body.appendChild(a);
+    a.click();
+    document.body.removeChild(a);
+    window.setTimeout(() => URL.revokeObjectURL(url), 1500);
+  }
+
+  private checkCanNativeSharePdf(pdfBytes: Uint8Array, pdfFileName: string): boolean {
+    try {
+      if (
+        typeof navigator === 'undefined' ||
+        typeof navigator.canShare !== 'function' ||
+        typeof navigator.share !== 'function'
+      ) {
+        return false;
+      }
+      const file = new File([new Uint8Array(pdfBytes)], pdfFileName, {
+        type: 'application/pdf',
+      });
+      return navigator.canShare({ files: [file] });
+    } catch {
+      return false;
+    }
+  }
+
+  private syncWhatsAppShareModalDom(): void {
+    if (!this.whatsappShareDraft) return;
+    const norm = normalizeWhatsAppPhone(this.whatsappShareDraft.phoneInput);
+    const href = buildWhatsAppUrl(norm.digits, this.whatsappShareDraft.messageText);
+    const linkEl = document.getElementById('whatsapp-open-link') as HTMLAnchorElement | null;
+    if (linkEl) {
+      linkEl.href = href;
+    }
+    const phoneInputEl = document.getElementById('whatsapp-phone-input');
+    const statusBadge = phoneInputEl?.previousElementSibling?.querySelector('span');
+    if (statusBadge) {
+      if (!this.whatsappShareDraft.phoneInput.trim()) {
+        statusBadge.className = 'text-[11px] font-mono tabular-nums text-slate-400';
+        statusBadge.textContent = 'Opcional (pode escolher no WhatsApp)';
+      } else if (norm.valid) {
+        statusBadge.className = 'text-[11px] font-mono tabular-nums text-emerald-700';
+        statusBadge.textContent = `Destino: ${norm.display}`;
+      } else {
+        statusBadge.className = 'text-[11px] font-mono tabular-nums text-amber-700';
+        statusBadge.textContent = 'Formato inválido (ex: 943671515 ou +244...)';
+      }
+    }
+  }
+
+  private openWhatsAppForInvoice(invoiceId?: string): void {
+    const inv =
+      (invoiceId ? this.invoices.find((i) => i.id === invoiceId) : null) ||
+      (this.lastEmitted && (!invoiceId || this.lastEmitted.id === invoiceId)
+        ? this.lastEmitted
+        : null);
+    if (!inv) return;
+
+    const cust = inv.customerId
+      ? this.customers.find((c) => c.id === inv.customerId) || null
+      : null;
+    const customerPhone = inv.customerPhone || cust?.phone || '';
+    const customerAddress = inv.customerAddress || cust?.address || '';
+    const customerEmail = inv.customerEmail || cust?.email || '';
+
+    const pdfBytes = generateInvoicePdfBytes(inv, this.settings.company, {
+      customerAddress,
+      customerPhone,
+      customerEmail,
+    });
+    const messageText = buildDocumentWhatsAppMessage(inv, this.settings.company);
+    const pdfFileName = `${this.sanitizePdfFilename(inv.number)}.pdf`;
+
+    this.whatsappShareDraft = {
+      kind: 'DOCUMENT',
+      title: `Enviar ${inv.number} no WhatsApp`,
+      subtitle: `${inv.customerName || 'Cliente'} · ${formatKzNumber(inv.grandTotal)} Kz`,
+      recipientLabel: inv.customerName || 'Cliente',
+      phoneInput: customerPhone,
+      messageText,
+      pdfFileName,
+      pdfBytes,
+      pdfDownloaded: false,
+      copiedFeedback: false,
+      shareError: null,
+      canNativeShareFiles: this.checkCanNativeSharePdf(pdfBytes, pdfFileName),
+    };
+    this.render();
+  }
+
+  private openWhatsAppForPaymentProof(proof: PaymentReceiptPdfPayload): void {
+    const pdfBytes = generatePaymentReceiptPdfBytes(proof, this.settings.company);
+    const messageText = buildPaymentReceiptWhatsAppMessage(proof, this.settings.company);
+    const pdfFileName = `${this.sanitizePdfFilename(proof.receiptNumber)}.pdf`;
+
+    this.whatsappShareDraft = {
+      kind: 'PAYMENT_RECEIPT',
+      title: `Comprovativo ${proof.receiptNumber}`,
+      subtitle: `${proof.customerName} · ${formatKzNumber(proof.paidAmount)} Kz recebidos`,
+      recipientLabel: proof.customerName,
+      phoneInput: proof.customerPhone || '',
+      messageText,
+      pdfFileName,
+      pdfBytes,
+      pdfDownloaded: false,
+      copiedFeedback: false,
+      shareError: null,
+      canNativeShareFiles: this.checkCanNativeSharePdf(pdfBytes, pdfFileName),
+    };
+    this.render();
+  }
+
+  private openWhatsAppPaymentProofForInvoice(invoiceId: string): void {
+    const inv = this.invoices.find((i) => i.id === invoiceId);
+    if (!inv || inv.status === 'cancelled' || inv.amountReceived <= 0) return;
+    const cust = inv.customerId
+      ? this.customers.find((c) => c.id === inv.customerId) || null
+      : null;
+    const paid = roundKz(Math.min(inv.grandTotal, inv.amountReceived));
+    const rem = roundKz(inv.amountDue || 0);
+    const proof: PaymentReceiptPdfPayload = {
+      receiptNumber: `CMP-${this.sanitizePdfFilename(inv.number)}`,
+      issuedAtIso: inv.updatedAtIso || inv.issuedAtIso,
+      customerName: inv.customerName,
+      customerNif: inv.customerNif,
+      customerPhone: inv.customerPhone || cust?.phone || '',
+      paymentMethod:
+        inv.paymentMethod === 'Multicaixa' || inv.paymentMethod === 'Transferência'
+          ? inv.paymentMethod
+          : 'Dinheiro',
+      ...(inv.transferReference ? { reference: inv.transferReference } : {}),
+      paidAmount: paid,
+      remainingDebtAfter: rem,
+      operator: inv.operator || this.operator || '001',
+      cashier: inv.cashier || this.cashier || '01',
+      settledInvoices: [
+        {
+          invoiceNumber: inv.number,
+          invoiceTotal: inv.grandTotal,
+          appliedAmount: paid,
+          remainingDue: rem,
+        },
+      ],
+    };
+    this.openWhatsAppForPaymentProof(proof);
+  }
+
+  private openWhatsAppCollectionForCustomer(customerId: string): void {
+    const cust = this.customers.find((c) => c.id === customerId);
+    if (!cust) return;
+    const openInvoices = this.invoices
+      .filter(
+        (i) =>
+          i.status === 'issued' &&
+          i.docType === 'FR' &&
+          i.customerId === cust.id &&
+          typeof i.amountDue === 'number' &&
+          i.amountDue > 0
+      )
+      .sort((a, b) => a.issuedAtIso.localeCompare(b.issuedAtIso));
+    if (openInvoices.length === 0) return;
+
+    const totalDue = roundKz(openInvoices.reduce((acc, i) => acc + (i.amountDue || 0), 0));
+    const leadInvoice = openInvoices[0]!;
+    const pdfBytes = generateInvoicePdfBytes(leadInvoice, this.settings.company, {
+      customerAddress: cust.address,
+      customerPhone: cust.phone,
+      customerEmail: cust.email,
+    });
+    const messageText = buildCollectionReminderWhatsAppMessage(
+      { customer: cust, openInvoices },
+      this.settings.company
+    );
+    const pdfFileName =
+      openInvoices.length === 1
+        ? `${this.sanitizePdfFilename(leadInvoice.number)}.pdf`
+        : `${this.sanitizePdfFilename(`Cobranca_${cust.name}`)}.pdf`;
+
+    this.whatsappShareDraft = {
+      kind: 'COLLECTION',
+      title: `Cobrança / Vencimento · ${cust.name}`,
+      subtitle: `${openInvoices.length} documento(s) · ${formatKzNumber(totalDue)} Kz em aberto`,
+      recipientLabel: cust.name,
+      phoneInput: cust.phone || '',
+      messageText,
+      pdfFileName,
+      pdfBytes,
+      pdfDownloaded: false,
+      copiedFeedback: false,
+      shareError: null,
+      canNativeShareFiles: this.checkCanNativeSharePdf(pdfBytes, pdfFileName),
+    };
+    this.render();
+  }
+
+  private openWhatsAppForQuote(): void {
+    if (this.cart.length === 0) return;
+    const directCustId = getDirectCustomerIdForCompany(this.activeCompany.id);
+    const cust =
+      this.selectedCustomerId && this.selectedCustomerId !== directCustId
+        ? this.customers.find((c) => c.id === this.selectedCustomerId) || null
+        : null;
+    const now = new Date().toISOString();
+    const referenceCode = `ORC-${now.slice(0, 10).replace(/-/g, '')}-${String(Math.floor(100 + Math.random() * 900))}`;
+    const totals = calculateInvoiceTotals(this.cart, this.globalDiscountPct);
+
+    const pdfBytes = generateCatalogOrQuotePdfBytes(
+      {
+        mode: 'QUOTE',
+        referenceCode,
+        issuedAtIso: now,
+        customer: cust,
+        cartItems: this.cart,
+        globalDiscountPct: this.globalDiscountPct,
+        notes: this.notes,
+        validityDays: 15,
+      },
+      this.settings.company
+    );
+    const messageText = buildCatalogOrQuoteWhatsAppMessage(
+      {
+        mode: 'QUOTE',
+        referenceCode,
+        customerName: cust?.name || 'Cliente',
+        cartItems: this.cart,
+        globalDiscountPct: this.globalDiscountPct,
+        validityDays: 15,
+      },
+      this.settings.company
+    );
+    const pdfFileName = `${this.sanitizePdfFilename(referenceCode)}.pdf`;
+
+    this.whatsappShareDraft = {
+      kind: 'QUOTE',
+      title: `Enviar Orçamento ${referenceCode}`,
+      subtitle: `${cust?.name || 'Cliente'} · ${this.cart.length} artigo(s) · ${formatKzNumber(totals.grandTotal)} Kz`,
+      recipientLabel: cust?.name || 'Cliente',
+      phoneInput: cust?.phone || '',
+      messageText,
+      pdfFileName,
+      pdfBytes,
+      pdfDownloaded: false,
+      copiedFeedback: false,
+      shareError: null,
+      canNativeShareFiles: this.checkCanNativeSharePdf(pdfBytes, pdfFileName),
+    };
+    this.render();
+  }
+
+  private openWhatsAppForCatalog(): void {
+    let catalogProducts = this.products.filter((p) => p.active !== false);
+    let filterLabel = '';
+    if (this.activeModule === 'PRODUCTS') {
+      const smart = searchProductsSmart(catalogProducts, this.productSearch);
+      const base = smart.matches.length > 0 ? smart.matches : catalogProducts;
+      catalogProducts = base.filter((p) => {
+        if (this.productCategoryFilter !== 'ALL') {
+          return (p.category || 'Geral').trim() === this.productCategoryFilter;
+        }
+        return true;
+      });
+      if (this.productCategoryFilter !== 'ALL') {
+        filterLabel = `Categoria: ${this.productCategoryFilter}`;
+      } else if (this.productSearch.trim()) {
+        filterLabel = `Filtro: ${this.productSearch.trim()}`;
+      }
+    }
+
+    const now = new Date().toISOString();
+    const referenceCode = `CAT-${now.slice(0, 10).replace(/-/g, '')}`;
+    const pdfBytes = generateCatalogOrQuotePdfBytes(
+      {
+        mode: 'CATALOG',
+        referenceCode,
+        issuedAtIso: now,
+        products: catalogProducts,
+        ...(filterLabel ? { catalogFilterLabel: filterLabel } : {}),
+      },
+      this.settings.company
+    );
+    const messageText = buildCatalogOrQuoteWhatsAppMessage(
+      {
+        mode: 'CATALOG',
+        referenceCode,
+        products: catalogProducts,
+      },
+      this.settings.company
+    );
+    const pdfFileName = `${this.sanitizePdfFilename(referenceCode)}.pdf`;
+
+    this.whatsappShareDraft = {
+      kind: 'CATALOG',
+      title: 'Enviar Catálogo Comercial em PDF',
+      subtitle: `${catalogProducts.length} artigo(s) activos${filterLabel ? ` · ${filterLabel}` : ''}`,
+      recipientLabel: 'Cliente / Interessado',
+      phoneInput: '',
+      messageText,
+      pdfFileName,
+      pdfBytes,
+      pdfDownloaded: false,
+      copiedFeedback: false,
+      shareError: null,
+      canNativeShareFiles: this.checkCanNativeSharePdf(pdfBytes, pdfFileName),
+    };
+    this.render();
+  }
+
+  private openWhatsAppForDailySummary(): void {
+    const now = new Date().toISOString();
+    const todayIso = now.slice(0, 10);
+    const todaySalesAll = this.invoices.filter(
+      (i) =>
+        (i.docType === 'FR' || i.docType === 'FA' || i.docType === 'FT') &&
+        i.issuedAtIso.slice(0, 10) === todayIso
+    );
+    const validSales = todaySalesAll.filter((i) => i.status === 'issued');
+    const cancelledCount = todaySalesAll.length - validSales.length;
+
+    let totalSalesGross = 0;
+    let cashTotal = 0;
+    let multicaixaTotal = 0;
+    let transferTotal = 0;
+    let creditTotal = 0;
+    const productStats = new Map<string, { name: string; qty: number; revenue: number }>();
+
+    for (const inv of validSales) {
+      totalSalesGross = roundKz(totalSalesGross + inv.grandTotal);
+      const receipts = extractInvoiceSaleReceipts(inv);
+      cashTotal = roundKz(cashTotal + receipts.cash);
+      multicaixaTotal = roundKz(multicaixaTotal + receipts.multicaixa);
+      transferTotal = roundKz(transferTotal + receipts.transfer);
+      if ((inv.amountDue || 0) > 0) {
+        creditTotal = roundKz(creditTotal + (inv.amountDue || 0));
+      }
+      for (const ln of inv.lines) {
+        const key = ln.productId || ln.description;
+        const prev = productStats.get(key) || { name: ln.description, qty: 0, revenue: 0 };
+        prev.qty = roundKz(prev.qty + ln.qty);
+        prev.revenue = roundKz(prev.revenue + ln.lineTotal);
+        productStats.set(key, prev);
+      }
+    }
+
+    const debtCollectionsTotal = roundKz(
+      this.cashMovements
+        .filter((m) => m.type === 'LIQUIDACAO_DIVIDA' && m.createdAtIso.slice(0, 10) === todayIso)
+        .reduce((acc, m) => acc + (m.amount || 0), 0)
+    );
+
+    const openReceivablesTotal = roundKz(
+      this.invoices
+        .filter((i) => i.status === 'issued' && i.docType === 'FR' && (i.amountDue || 0) > 0)
+        .reduce((acc, i) => acc + (i.amountDue || 0), 0)
+    );
+
+    const targetSess =
+      this.getActiveOpenCashSession() ||
+      this.cashSessions
+        .filter((s) => s.openedAtIso.slice(0, 10) === todayIso)
+        .sort((a, b) => b.openedAtIso.localeCompare(a.openedAtIso))[0] ||
+      null;
+    const sessSummary = targetSess
+      ? calculateCashSessionSummary(targetSess, this.invoices, this.cashMovements)
+      : null;
+
+    const topProducts = Array.from(productStats.values())
+      .sort((a, b) => b.revenue - a.revenue)
+      .slice(0, 8);
+
+    const summary: DailyOwnerSummaryPayload = {
+      dateIso: todayIso,
+      generatedAtIso: now,
+      totalSalesGross,
+      validDocCount: validSales.length,
+      cancelledCount,
+      averageTicket: validSales.length > 0 ? roundKz(totalSalesGross / validSales.length) : 0,
+      cashTotal,
+      multicaixaTotal,
+      transferTotal,
+      creditTotal,
+      debtCollectionsTotal,
+      openReceivablesTotal,
+      activeCashSessionSummary: targetSess && sessSummary
+        ? {
+            cashier: targetSess.cashier,
+            operator: targetSess.operator,
+            status: targetSess.status,
+            openingFloat: targetSess.openingFloat,
+            expectedCash: sessSummary.expectedCash,
+            countedCash: targetSess.countedCash ?? null,
+            differenceAmount: targetSess.differenceAmount ?? null,
+          }
+        : null,
+      topProducts,
+    };
+
+    const pdfBytes = generateDailySummaryPdfBytes(summary, this.settings.company);
+    const messageText = buildDailyOwnerSummaryWhatsAppMessage(summary, this.settings.company);
+    const pdfFileName = `Resumo_Diario_${todayIso}.pdf`;
+
+    this.whatsappShareDraft = {
+      kind: 'DAILY_SUMMARY',
+      title: `Resumo Diário para Proprietário (${todayIso.split('-').reverse().join('/')})`,
+      subtitle: `Faturado: ${formatKzNumber(totalSalesGross)} Kz · ${validSales.length} documento(s)`,
+      recipientLabel: 'Proprietário / Gerência',
+      phoneInput: resolveOwnerWhatsAppPhone(this.settings.company),
+      messageText,
+      pdfFileName,
+      pdfBytes,
+      pdfDownloaded: false,
+      copiedFeedback: false,
+      shareError: null,
+      canNativeShareFiles: this.checkCanNativeSharePdf(pdfBytes, pdfFileName),
+    };
+    this.render();
   }
 
   // ==================== HANDLERS DE INTERAÇÃO ====================
@@ -7747,6 +8209,140 @@ export class SilaBillingApp {
         }
         break;
       }
+      case 'whatsapp-invoice': {
+        const targetId = id || target.dataset.invoiceId || '';
+        this.openWhatsAppForInvoice(targetId || undefined);
+        break;
+      }
+      case 'whatsapp-payment-proof': {
+        const targetId = id || target.dataset.invoiceId || '';
+        if (targetId) {
+          this.openWhatsAppPaymentProofForInvoice(targetId);
+        }
+        break;
+      }
+      case 'whatsapp-last-payment-proof': {
+        if (this.lastPaymentReceiptProof) {
+          this.openWhatsAppForPaymentProof(this.lastPaymentReceiptProof);
+        }
+        break;
+      }
+      case 'whatsapp-collection': {
+        const custId = id || target.dataset.customerId || '';
+        if (custId) {
+          this.openWhatsAppCollectionForCustomer(custId);
+        }
+        break;
+      }
+      case 'whatsapp-quote': {
+        this.openWhatsAppForQuote();
+        break;
+      }
+      case 'whatsapp-catalog': {
+        this.openWhatsAppForCatalog();
+        break;
+      }
+      case 'whatsapp-daily-summary': {
+        if (
+          !this.hasPerm('reports_operational') &&
+          !this.hasPerm('reports_own_sales') &&
+          !this.hasPerm('cash_own_shift') &&
+          !this.hasPerm('cash_all_shifts') &&
+          !this.hasPerm('finance_view')
+        ) {
+          return;
+        }
+        this.openWhatsAppForDailySummary();
+        break;
+      }
+      case 'close-whatsapp-share-modal': {
+        this.whatsappShareDraft = null;
+        this.render();
+        break;
+      }
+      case 'whatsapp-download-pdf': {
+        if (this.whatsappShareDraft) {
+          this.triggerPdfFileDownload(
+            this.whatsappShareDraft.pdfBytes,
+            this.whatsappShareDraft.pdfFileName
+          );
+          this.whatsappShareDraft = {
+            ...this.whatsappShareDraft,
+            pdfDownloaded: true,
+            shareError: null,
+          };
+          this.render();
+        }
+        break;
+      }
+      case 'whatsapp-copy-text': {
+        if (this.whatsappShareDraft) {
+          try {
+            await navigator.clipboard.writeText(this.whatsappShareDraft.messageText);
+            this.whatsappShareDraft = {
+              ...this.whatsappShareDraft,
+              copiedFeedback: true,
+              shareError: null,
+            };
+          } catch {
+            this.whatsappShareDraft = {
+              ...this.whatsappShareDraft,
+              shareError: 'Não foi possível copiar automaticamente. Seleccione o texto acima.',
+            };
+          }
+          this.render();
+        }
+        break;
+      }
+      case 'whatsapp-native-share': {
+        if (this.whatsappShareDraft) {
+          try {
+            const file = new File(
+              [new Uint8Array(this.whatsappShareDraft.pdfBytes)],
+              this.whatsappShareDraft.pdfFileName,
+              { type: 'application/pdf' }
+            );
+            await navigator.share({
+              title: this.whatsappShareDraft.title,
+              text: this.whatsappShareDraft.messageText,
+              files: [file],
+            });
+            this.whatsappShareDraft = {
+              ...this.whatsappShareDraft,
+              pdfDownloaded: true,
+              shareError: null,
+            };
+            this.render();
+          } catch (err) {
+            const msg = err instanceof Error ? err.message : '';
+            if (msg && !/abort|cancel/i.test(msg)) {
+              this.whatsappShareDraft = {
+                ...this.whatsappShareDraft,
+                shareError:
+                  'A partilha directa não foi concluída neste navegador. Pode descarregar o PDF e abrir o WhatsApp.',
+              };
+              this.render();
+            }
+          }
+        }
+        break;
+      }
+      case 'whatsapp-open-link': {
+        if (this.whatsappShareDraft && !this.whatsappShareDraft.pdfDownloaded) {
+          this.triggerPdfFileDownload(
+            this.whatsappShareDraft.pdfBytes,
+            this.whatsappShareDraft.pdfFileName
+          );
+          this.whatsappShareDraft = {
+            ...this.whatsappShareDraft,
+            pdfDownloaded: true,
+            shareError: null,
+          };
+          const dlBtnLabel = document.querySelector('[data-action="whatsapp-download-pdf"] span');
+          if (dlBtnLabel) dlBtnLabel.textContent = 'PDF guardado';
+        }
+        break;
+      }
     }
   }
 
@@ -7868,12 +8464,18 @@ export class SilaBillingApp {
       this.showIOSGuide ||
       Boolean(this.growthModalReason) ||
       Boolean(this.cancellingInvoiceId) ||
+      Boolean(this.whatsappShareDraft) ||
       this.showNewCompanyModal ||
       this.showMasterAdminModal;
 
     // 2. Escape inteligente em cascata (Modais -> Painéis -> Limpeza de Pesquisa)
     if (e.key === 'Escape') {
       this.barcodeBuffer = '';
+      if (this.whatsappShareDraft) {
+        this.whatsappShareDraft = null;
+        this.render();
+        return;
+      }
       if (this.showIOSGuide) {
         this.showIOSGuide = false;
         this.render();
@@ -8655,6 +9257,26 @@ export class SilaBillingApp {
       case 'operational-audit-search':
         this.operationalAuditSearch = rawVal;
         this.renderPreservingFocus(activeId, selStart);
+        break;
+      case 'whatsapp-phone-input':
+        if (this.whatsappShareDraft) {
+          this.whatsappShareDraft = {
+            ...this.whatsappShareDraft,
+            phoneInput: rawVal,
+            shareError: null,
+          };
+          this.syncWhatsAppShareModalDom();
+        }
+        break;
+      case 'whatsapp-message-input':
+        if (this.whatsappShareDraft) {
+          this.whatsappShareDraft = {
+            ...this.whatsappShareDraft,
+            messageText: rawVal,
+            copiedFeedback: false,
+          };
+          this.syncWhatsAppShareModalDom();
+        }
         break;
     }
   }
@@ -9979,8 +10601,8 @@ export class SilaBillingApp {
       await localDb.saveInvoice(updatedInv, this.activeCompany.id);
       this.invoices = this.invoices.map((x) => (x.id === updatedInv.id ? updatedInv : x));
 
+      const openSess = this.getActiveOpenCashSession();
       if (applied > 0) {
-        const openSess = this.getActiveOpenCashSession();
         const nowMov = new Date().toISOString();
         const debtMov: CashMovement = {
           id: `cm_liq_${Date.now()}_${Math.random().toString(36).slice(2, 6)}`,
@@ -10007,6 +10629,34 @@ export class SilaBillingApp {
       this.settlingInvoiceId = null;
       this.settleError = null;
       const remDue = roundKz(updatedInv.amountDue || 0);
+      const settleCust = inv.customerId
+        ? this.customers.find((c) => c.id === inv.customerId) || null
+        : null;
+      this.lastPaymentReceiptProof =
+        applied > 0
+          ? {
+              receiptNumber: `CMP-${Date.now().toString().slice(-6)}`,
+              issuedAtIso: new Date().toISOString(),
+              customerName: inv.customerName,
+              customerNif: inv.customerNif,
+              customerPhone: inv.customerPhone || settleCust?.phone || '',
+              paymentMethod: method,
+              ...(refText ? { reference: refText } : {}),
+              paidAmount: applied,
+              remainingDebtAfter: remDue,
+              operator: openSess?.operator || this.operator || '001',
+              cashier: openSess?.cashier || this.cashier || '01',
+              settledInvoices: [
+                {
+                  invoiceNumber: inv.number,
+                  invoiceTotal: inv.grandTotal,
+                  appliedAmount: applied,
+                  remainingDue: remDue,
+                },
+              ],
+            }
+          : null;
+
       const noticeMsg =
         remDue > 0
           ? `Recebimento parcial de ${formatKzNumber(applied)} Kz registado na fatura ${inv.number}. Saldo pendente: ${formatKzNumber(remDue)} Kz.`
@@ -10014,11 +10664,11 @@ export class SilaBillingApp {
       if (this.activeModule === 'CUSTOMERS') {
         this.customerSavedNotice = noticeMsg;
         window.setTimeout(() => {
-          if (this.customerSavedNotice) {
+          if (this.customerSavedNotice === noticeMsg) {
             this.customerSavedNotice = null;
             if (this.activeModule === 'CUSTOMERS') this.render();
           }
-        }, 2800);
+        }, 6500);
       } else if (this.activeModule === 'FINANCE') {
         this.financeWorkspaceNotice = noticeMsg;
       } else if (this.activeModule === 'HISTORY') {
@@ -10125,6 +10775,46 @@ export class SilaBillingApp {
       this.invoices = this.invoices.map((x) => updatedMap.get(x.id) || x);
       this.settlingCustomerAccountId = null;
       this.settleError = null;
+      const settleCust = this.customers.find((c) => c.id === custId) || null;
+      const remainingDebtAfter = roundKz(
+        this.invoices
+          .filter(
+            (i) =>
+              i.status === 'issued' &&
+              i.docType === 'FR' &&
+              i.customerId === custId &&
+              (i.amountDue || 0) > 0
+          )
+          .reduce((acc, i) => acc + (i.amountDue || 0), 0)
+      );
+      this.lastPaymentReceiptProof =
+        totalApplied > 0 && updatedMap.size > 0
+          ? {
+              receiptNumber: `CMP-${Date.now().toString().slice(-6)}`,
+              issuedAtIso: new Date().toISOString(),
+              customerName: settleCust?.name || openInvoices[0]!.customerName,
+              customerNif: settleCust?.nif || openInvoices[0]!.customerNif,
+              customerPhone: settleCust?.phone || openInvoices[0]!.customerPhone || '',
+              paymentMethod: method,
+              ...(refText ? { reference: refText } : {}),
+              paidAmount: totalApplied,
+              remainingDebtAfter,
+              operator: openSess?.operator || this.operator || '001',
+              cashier: openSess?.cashier || this.cashier || '01',
+              settledInvoices: Array.from(updatedMap.values()).map((uInv) => {
+                const orig = openInvoices.find((o) => o.id === uInv.id);
+                const prevDue = roundKz(orig?.amountDue || 0);
+                const nextDue = roundKz(uInv.amountDue || 0);
+                return {
+                  invoiceNumber: uInv.number,
+                  invoiceTotal: uInv.grandTotal,
+                  appliedAmount: Math.max(0, roundKz(prevDue - nextDue)),
+                  remainingDue: nextDue,
+                };
+              }),
+            }
+          : null;
+
       const acctNotice = `Recebimento de ${formatKzNumber(totalApplied)} Kz registado (${updatedMap.size} ${updatedMap.size === 1 ? 'fatura amortizada' : 'faturas amortizadas'}).`;
       this.customerSavedNotice = acctNotice;
       if (this.activeModule === 'FINANCE') {
@@ -10133,11 +10823,11 @@ export class SilaBillingApp {
       this.render();
 
       window.setTimeout(() => {
-        if (this.customerSavedNotice) {
+        if (this.customerSavedNotice === acctNotice) {
           this.customerSavedNotice = null;
           if (this.activeModule === 'CUSTOMERS') this.render();
         }
-      }, 3000);
+      }, 6500);
 
       if (this.user && this.isOnline && canCompanySyncCloudData(this.activeCompany)) {
         try {
@@ -13304,6 +13994,7 @@ export class SilaBillingApp {
             })
           : ''
       }
+      ${this.whatsappShareDraft ? renderWhatsAppShareModal(this.whatsappShareDraft) : ''}
 
       ${
         this.printJob
@@ -14450,13 +15141,22 @@ export class SilaBillingApp {
                     <p class="text-xs text-slate-500">Adicione artigos do catálogo para iniciar a fatura.</p>
                     ${
                       this.lastEmitted
-                        ? `<div class="mt-3 text-xs text-emerald-700 font-medium flex flex-col items-center gap-1">
+                        ? `<div class="mt-3 text-xs text-emerald-700 font-medium flex flex-col items-center gap-1.5">
                             <span class="flex items-center gap-1.5">${ICONS.check} Emitida ${escapeHtml(this.lastEmitted.number)} (${formatKzNumber(this.lastEmitted.grandTotal)} Kz)</span>
                             ${
                               this.lastAuditHash
                                 ? `<span class="text-[10px] font-mono text-slate-500">SHA256: ${escapeHtml(this.lastAuditHash)}</span>`
                                 : ''
                             }
+                            <button
+                              type="button"
+                              data-action="whatsapp-invoice"
+                              data-id="${escapeHtml(this.lastEmitted.id)}"
+                              class="mt-1 h-8 px-3 rounded-lg border border-emerald-300 bg-emerald-50 text-emerald-800 hover:bg-emerald-100 text-[11.5px] font-semibold inline-flex items-center gap-1.5 whitespace-nowrap"
+                            >
+                              ${ICONS.whatsapp}
+                              <span>Enviar PDF no WhatsApp</span>
+                            </button>
                           </div>`
                         : ''
                     }
@@ -15024,15 +15724,41 @@ export class SilaBillingApp {
                 >A4</button>
               </div>
 
-              <button
-                type="button"
-                data-action="print-live"
-                ${liveInvoice.lines.length === 0 ? 'disabled' : ''}
-                class="h-8 px-3 rounded-lg border border-slate-200 text-xs font-medium text-slate-700 hover:bg-slate-50 disabled:opacity-40 flex items-center gap-1.5 whitespace-nowrap"
-              >
-                ${ICONS.printer}
-                <span>Imprimir</span>
-              </button>
+              <div class="flex items-center gap-1.5 shrink-0">
+                ${
+                  this.cart.length > 0
+                    ? `<button
+                        type="button"
+                        data-action="whatsapp-quote"
+                        title="Gerar orçamento em PDF do carrinho e partilhar no WhatsApp"
+                        class="h-8 px-2.5 rounded-lg border border-emerald-300 bg-emerald-50 text-xs font-semibold text-emerald-800 hover:bg-emerald-100 flex items-center gap-1 whitespace-nowrap"
+                      >
+                        ${ICONS.whatsapp}
+                        <span>Orçamento</span>
+                      </button>`
+                    : this.lastEmitted
+                      ? `<button
+                          type="button"
+                          data-action="whatsapp-invoice"
+                          data-id="${escapeHtml(this.lastEmitted.id)}"
+                          title="Enviar último documento emitido em PDF pelo WhatsApp"
+                          class="h-8 px-2.5 rounded-lg border border-emerald-300 bg-emerald-50 text-xs font-semibold text-emerald-800 hover:bg-emerald-100 flex items-center gap-1 whitespace-nowrap"
+                        >
+                          ${ICONS.whatsapp}
+                          <span>WhatsApp PDF</span>
+                        </button>`
+                      : ''
+                }
+                <button
+                  type="button"
+                  data-action="print-live"
+                  ${liveInvoice.lines.length === 0 ? 'disabled' : ''}
+                  class="h-8 px-3 rounded-lg border border-slate-200 text-xs font-medium text-slate-700 hover:bg-slate-50 disabled:opacity-40 flex items-center gap-1.5 whitespace-nowrap"
+                >
+                  ${ICONS.printer}
+                  <span>Imprimir</span>
+                </button>
+              </div>
             </div>
 
             <div class="relative z-10 flex-1 overflow-y-auto p-3">
@@ -15180,9 +15906,20 @@ export class SilaBillingApp {
 
         ${
           this.customerSavedNotice
-            ? `<div class="px-3.5 py-2 bg-emerald-50 border-b border-emerald-200 text-xs text-emerald-800 flex items-center gap-1.5 shrink-0">${ICONS.check}<span>${escapeHtml(
-                this.customerSavedNotice
-              )}</span></div>`
+            ? `<div class="px-3.5 py-2 bg-emerald-50 border-b border-emerald-200 text-xs text-emerald-800 flex flex-wrap items-center justify-between gap-2 shrink-0">
+                <div class="flex items-center gap-1.5">${ICONS.check}<span>${escapeHtml(
+                  this.customerSavedNotice
+                )}</span></div>
+                ${
+                  this.lastPaymentReceiptProof
+                    ? `<button
+                        type="button"
+                        data-action="whatsapp-last-payment-proof"
+                        class="h-7 px-2.5 rounded-md border border-emerald-300 bg-white text-emerald-800 hover:bg-emerald-100 text-[11px] font-semibold inline-flex items-center gap-1 whitespace-nowrap"
+                      >${ICONS.whatsapp}<span>Enviar Comprovativo (WhatsApp / PDF)</span></button>`
+                    : ''
+                }
+              </div>`
             : ''
         }
 
@@ -15400,10 +16137,17 @@ export class SilaBillingApp {
                             }
                           </div>
 
-                          <div class="flex items-center gap-1.5 shrink-0">
+                          <div class="flex flex-wrap items-center justify-end gap-1.5 shrink-0">
                             ${
                               !isDirect && activeDetailStats.openDebt > 0
                                 ? `<button
+                                    type="button"
+                                    data-action="whatsapp-collection"
+                                    data-id="${escapeHtml(activeDetailCust.id)}"
+                                    title="Enviar cobrança / aviso de vencimento pelo WhatsApp com PDF"
+                                    class="h-8 px-2.5 rounded-lg border border-emerald-300 bg-emerald-50 text-emerald-800 text-xs font-semibold hover:bg-emerald-100 inline-flex items-center gap-1 whitespace-nowrap"
+                                  >${ICONS.whatsapp}<span>Cobrar WA</span></button>
+                                  <button
                                     type="button"
                                     data-action="open-settle-customer-account"
                                     data-id="${escapeHtml(activeDetailCust.id)}"
@@ -15656,7 +16400,7 @@ export class SilaBillingApp {
                                           : ''
                                       }
 
-                                      <div class="flex items-center justify-end gap-1.5 pt-0.5">
+                                      <div class="flex flex-wrap items-center justify-end gap-1.5 pt-0.5">
                                         ${
                                           inv.status !== 'cancelled' && due > 0
                                             ? `<button
@@ -15668,6 +16412,26 @@ export class SilaBillingApp {
                                               >Liquidar</button>`
                                             : ''
                                         }
+                                        ${
+                                          inv.status !== 'cancelled' &&
+                                          inv.docType === 'FR' &&
+                                          inv.amountReceived > 0
+                                            ? `<button
+                                                type="button"
+                                                data-action="whatsapp-payment-proof"
+                                                data-id="${escapeHtml(inv.id)}"
+                                                title="Partilhar comprovativo de pagamento em PDF no WhatsApp"
+                                                class="h-7 px-2 rounded border border-slate-200 text-[11px] font-medium text-emerald-700 hover:bg-emerald-50 whitespace-nowrap"
+                                              >Comprovativo</button>`
+                                            : ''
+                                        }
+                                        <button
+                                          type="button"
+                                          data-action="whatsapp-invoice"
+                                          data-id="${escapeHtml(inv.id)}"
+                                          title="Enviar documento em PDF pelo WhatsApp"
+                                          class="h-7 px-2 rounded border border-emerald-300 bg-emerald-50 text-[11px] font-semibold text-emerald-800 hover:bg-emerald-100 inline-flex items-center gap-1 whitespace-nowrap"
+                                        >${ICONS.whatsapp}<span>WA / PDF</span></button>
                                         <button
                                           type="button"
                                           data-action="open-invoice-in-history"
@@ -16620,6 +17384,19 @@ export class SilaBillingApp {
         </div>
 
         <div class="flex items-center gap-2 shrink-0">
+          ${
+            this.productsSubView === 'CATALOG'
+              ? `<button
+                  type="button"
+                  data-action="whatsapp-catalog"
+                  title="Enviar catálogo comercial em PDF para o cliente no WhatsApp"
+                  class="h-8 px-3 rounded-lg border border-emerald-300 bg-emerald-50 text-emerald-800 text-xs font-semibold hover:bg-emerald-100 flex items-center gap-1.5 whitespace-nowrap"
+                >
+                  ${ICONS.whatsapp}
+                  <span>Catálogo WhatsApp / PDF</span>
+                </button>`
+              : ''
+          }
           ${
             canManageCat
               ? `<button
@@ -18760,9 +19537,18 @@ export class SilaBillingApp {
                 <div class="p-3 border-b border-slate-200 space-y-2.5 shrink-0 bg-white">
             ${
               this.historyWorkspaceNotice
-                ? `<div class="px-3 py-2 rounded-md border border-emerald-200 bg-emerald-50 text-xs text-emerald-800 font-medium">${escapeHtml(
-                    this.historyWorkspaceNotice
-                  )}</div>`
+                ? `<div class="px-3 py-2 rounded-md border border-emerald-200 bg-emerald-50 text-xs text-emerald-800 font-medium flex flex-wrap items-center justify-between gap-2">
+                    <span>${escapeHtml(this.historyWorkspaceNotice)}</span>
+                    ${
+                      this.lastPaymentReceiptProof
+                        ? `<button
+                            type="button"
+                            data-action="whatsapp-last-payment-proof"
+                            class="h-7 px-2.5 rounded-md border border-emerald-300 bg-white text-emerald-800 hover:bg-emerald-100 text-[11px] font-semibold inline-flex items-center gap-1 whitespace-nowrap"
+                          >${ICONS.whatsapp}<span>Enviar Comprovativo (WhatsApp)</span></button>`
+                        : ''
+                    }
+                  </div>`
                 : ''
             }
 
@@ -19098,6 +19884,26 @@ export class SilaBillingApp {
                           data-id="${escapeHtml(active.id)}"
                           class="h-8 px-2.5 rounded-md border border-slate-200 text-xs font-medium text-red-600 hover:bg-red-50 flex items-center gap-1 whitespace-nowrap"
                         >${ICONS.ban}<span>Anular</span></button>`
+                      : ''
+                  }
+                  <button
+                    type="button"
+                    data-action="whatsapp-invoice"
+                    data-id="${escapeHtml(active.id)}"
+                    title="Enviar documento em PDF pelo WhatsApp"
+                    class="h-8 px-2.5 rounded-md border border-emerald-300 bg-emerald-50 text-xs font-semibold text-emerald-800 hover:bg-emerald-100 flex items-center gap-1 whitespace-nowrap"
+                  >${ICONS.whatsapp}<span>WhatsApp</span></button>
+                  ${
+                    active.status !== 'cancelled' &&
+                    active.docType === 'FR' &&
+                    active.amountReceived > 0
+                      ? `<button
+                          type="button"
+                          data-action="whatsapp-payment-proof"
+                          data-id="${escapeHtml(active.id)}"
+                          title="Partilhar comprovativo de pagamento em PDF no WhatsApp"
+                          class="h-8 px-2.5 rounded-md border border-slate-200 bg-white text-xs font-medium text-emerald-700 hover:bg-emerald-50 whitespace-nowrap"
+                        >Comprovativo</button>`
                       : ''
                   }
                   <button
@@ -20067,6 +20873,15 @@ export class SilaBillingApp {
                   </div>
 
                   <div class="flex flex-wrap items-center gap-1.5 shrink-0">
+                    <button
+                      type="button"
+                      data-action="whatsapp-daily-summary"
+                      title="Enviar resumo diário em PDF para o WhatsApp do proprietário"
+                      class="h-9 px-3 rounded-lg border border-emerald-300 bg-emerald-50 text-xs font-semibold text-emerald-800 hover:bg-emerald-100 flex items-center gap-1.5 whitespace-nowrap"
+                    >
+                      ${ICONS.whatsapp}
+                      <span>Resumo Proprietário</span>
+                    </button>
                     <button
                       type="button"
                       data-action="print-cash-report"
@@ -25034,14 +25849,25 @@ export class SilaBillingApp {
         ${
           this.financeWorkspaceNotice
             ? `
-              <div class="px-4 py-2 border-b border-emerald-200 bg-emerald-50 text-xs text-emerald-800 flex items-center justify-between gap-2 shrink-0">
+              <div class="px-4 py-2 border-b border-emerald-200 bg-emerald-50 text-xs text-emerald-800 flex flex-wrap items-center justify-between gap-2 shrink-0">
                 <span>${escapeHtml(this.financeWorkspaceNotice)}</span>
-                <button
-                  type="button"
-                  data-action="set-finance-subview"
-                  data-value="${this.financeSubView}"
-                  class="text-[11px] font-medium text-emerald-900 hover:underline whitespace-nowrap shrink-0"
-                >Fechar aviso</button>
+                <div class="flex items-center gap-2 shrink-0">
+                  ${
+                    this.lastPaymentReceiptProof
+                      ? `<button
+                          type="button"
+                          data-action="whatsapp-last-payment-proof"
+                          class="h-7 px-2.5 rounded-md border border-emerald-300 bg-white text-emerald-800 hover:bg-emerald-100 text-[11px] font-semibold inline-flex items-center gap-1 whitespace-nowrap"
+                        >${ICONS.whatsapp}<span>Enviar Comprovativo (WhatsApp)</span></button>`
+                      : ''
+                  }
+                  <button
+                    type="button"
+                    data-action="set-finance-subview"
+                    data-value="${this.financeSubView}"
+                    class="text-[11px] font-medium text-emerald-900 hover:underline whitespace-nowrap shrink-0"
+                  >Fechar aviso</button>
+                </div>
               </div>
             `
             : ''
@@ -25560,6 +26386,13 @@ export class SilaBillingApp {
                               ${
                                 cust.customerId
                                   ? `
+                                    <button
+                                      type="button"
+                                      data-action="whatsapp-collection"
+                                      data-id="${escapeHtml(cust.customerId)}"
+                                      title="Enviar cobrança / aviso de vencimento pelo WhatsApp"
+                                      class="h-8 px-2.5 rounded-md border border-emerald-300 bg-emerald-50 hover:bg-emerald-100 text-xs font-semibold text-emerald-800 inline-flex items-center gap-1 whitespace-nowrap shrink-0"
+                                    >${ICONS.whatsapp}<span>Cobrar WA</span></button>
                                     <button
                                       type="button"
                                       data-action="finance-open-customer-detail"
@@ -26818,6 +27651,15 @@ export class SilaBillingApp {
           </div>
 
           <div class="flex items-center gap-2 shrink-0">
+            <button
+              type="button"
+              data-action="whatsapp-daily-summary"
+              title="Enviar resumo diário em PDF para o WhatsApp do proprietário"
+              class="h-8 px-3 rounded-md border border-emerald-300 bg-emerald-50 hover:bg-emerald-100 text-xs font-semibold text-emerald-800 flex items-center gap-1.5 whitespace-nowrap shrink-0"
+            >
+              ${ICONS.whatsapp}
+              <span>Resumo Diário (WA)</span>
+            </button>
             ${
               canSeeFinance
                 ? `<button

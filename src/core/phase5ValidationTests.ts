@@ -18,6 +18,7 @@ import {
 } from './cloudMasterMapper.ts';
 import {
   calculateInvoiceTotals,
+  formatKzNumber,
   roundKz,
 } from './billingEngine.ts';
 import {
@@ -86,6 +87,25 @@ import {
   resolveInitialCatalogViewMode,
   writeCatalogViewModePreference,
 } from '../../frontend/ui/posCatalogView.ts';
+import {
+  generateCatalogOrQuotePdfBytes,
+  generateDailySummaryPdfBytes,
+  generateInvoicePdfBytes,
+  generatePaymentReceiptPdfBytes,
+  SILA_PDF_SIGNATURE,
+} from './pdfGenerator.ts';
+import {
+  buildCatalogOrQuoteWhatsAppMessage,
+  buildCollectionReminderWhatsAppMessage,
+  buildDailyOwnerSummaryWhatsAppMessage,
+  buildDocumentWhatsAppMessage,
+  buildPaymentReceiptWhatsAppMessage,
+  buildWhatsAppUrl,
+  normalizeWhatsAppPhone,
+  resolveOwnerWhatsAppPhone,
+  WHATSAPP_DISCREET_SIGNATURE,
+} from './whatsappChannel.ts';
+import { renderWhatsAppShareModal } from '../../frontend/ui/whatsappShareModal.ts';
 
 function assert(condition: boolean, message: string): void {
   if (!condition) {
@@ -2440,6 +2460,430 @@ export async function runPhase5ValidationTests(): Promise<{ passed: number; tota
         setNewPinHtml.includes('id="lock-recover-pin-confirm"') &&
         setNewPinHtml.includes('Redefinir PIN e Desbloquear'),
       'Passo SET_NEW_PIN deve permitir redefinir o PIN do Proprietário após confirmação Google'
+    );
+  });
+
+  await test('5.15 Canal Comercial WhatsApp Nativo: PDF 1.4 real (FR/RC/FP, Comprovativo, Catálogo/Orçamento, Resumo Diário), assinatura discreta e UI', () => {
+    // 1. Normalização telefónica angolana e internacional + URL wa.me
+    const p1 = normalizeWhatsAppPhone('943 671 515');
+    assert(p1.valid && p1.digits === '244943671515' && p1.display === '+244943671515', 'Número local de 9 dígitos deve normalizar para 244...');
+    const p2 = normalizeWhatsAppPhone('00244 923-100-200');
+    assert(p2.valid && p2.digits === '244923100200', 'Prefixo 00244 deve normalizar sem 00');
+    const p3 = normalizeWhatsAppPhone('+351 912 345 678');
+    assert(p3.valid && p3.digits === '351912345678', 'Número internacional deve preservar indicativo');
+    const waUrl = buildWhatsAppUrl(p1.digits, 'Olá Teste');
+    assert(waUrl.startsWith('https://wa.me/244943671515?text='), 'URL wa.me deve incluir dígitos E.164 e texto codificado');
+
+    const companyProf: CompanyProfile = {
+      ...JAIMONA_COMPANY,
+      shortName: 'JAIMONA',
+      legalName: 'JAIMONA COMÉRCIO E SERVIÇOS, LDA',
+      nif: '5003069940',
+      phone: '+244 943 671 515',
+      whatsapp: '943671515',
+      bankName1: 'BAI',
+      iban1: 'AO06.0040.0000.1234.5678.1019.9',
+    };
+    assert(resolveOwnerWhatsAppPhone(companyProf) === '943671515', 'Deve resolver telefone WhatsApp do proprietário');
+
+    // 2. PDF real para Factura (FR), Recibo (RC) e Proforma (FP) com acentuação PT e QR Code
+    const totals = calculateInvoiceTotals([
+      {
+        productId: 'p_1',
+        code: 'SERV01',
+        description: 'Configuração de Gestão & Faturação',
+        unit: 'un',
+        qty: 1,
+        unitPrice: 25000,
+        discountPct: 0,
+        ivaRate: 14,
+      },
+    ]);
+    const baseInvoice: InvoiceRecord = {
+      id: 'inv_wa_1',
+      companyId: 'comp_jaimona',
+      number: 'FR S12026/000099',
+      docType: 'FR',
+      issuedAtIso: '2026-08-10T11:20:00.000Z',
+      createdAtIso: '2026-08-10T11:20:00.000Z',
+      updatedAtIso: '2026-08-10T11:20:00.000Z',
+      cashier: '01',
+      operator: '001',
+      paymentMethod: 'Multicaixa',
+      customerId: 'cust_wa_1',
+      customerName: 'Kwanza Comércio, Lda',
+      customerNif: '5001122334',
+      customerPhone: '923000111',
+      customerLocality: 'Luanda',
+      merchandiseTotal: totals.merchandiseTotal,
+      discountTotal: 0,
+      taxBase14: totals.taxBase14,
+      taxAmount14: totals.taxAmount14,
+      taxBase0: 0,
+      taxAmount0: 0,
+      taxTotal: totals.taxTotal,
+      grandTotal: totals.grandTotal,
+      amountInWords: totals.amountInWords,
+      amountReceived: totals.grandTotal,
+      changeAmount: 0,
+      notes: 'Entrega imediata',
+      status: 'issued',
+      lines: totals.lines,
+      saftHash4: 'abCD',
+    };
+
+    const latin1Decoder = new TextDecoder('latin1');
+    for (const dt of ['FR', 'RC', 'FP'] as const) {
+      const docRec: InvoiceRecord = {
+        ...baseInvoice,
+        docType: dt,
+        number: `${dt} S12026/000099`,
+      };
+      const pdfBytes = generateInvoicePdfBytes(docRec, companyProf);
+      const pdfText = latin1Decoder.decode(pdfBytes);
+      assert(
+        pdfText.startsWith('%PDF-1.4') &&
+          pdfText.includes('%%EOF') &&
+          pdfText.includes('/WinAnsiEncoding') &&
+          pdfText.includes('xref'),
+        `PDF ${dt} deve respeitar formato binário PDF 1.4 válido com tabela xref`
+      );
+      assert(
+        pdfText.includes(SILA_PDF_SIGNATURE) &&
+          pdfText.includes('Kwanza Com') &&
+          pdfText.includes('5003069940'),
+        `PDF ${dt} deve conter assinatura discreta '${SILA_PDF_SIGNATURE}', dados da empresa e cliente`
+      );
+
+      const waMsg = buildDocumentWhatsAppMessage(docRec, companyProf);
+      assert(
+        waMsg.includes(WHATSAPP_DISCREET_SIGNATURE) &&
+          waMsg.includes(docRec.number) &&
+          waMsg.includes(`${formatKzNumber(docRec.grandTotal)} Kz`),
+        `Mensagem WhatsApp de ${dt} deve incluir número, valor em Kz e assinatura ${WHATSAPP_DISCREET_SIGNATURE}`
+      );
+    }
+
+    // 3. Cobrança & Aviso de Vencimento
+    const overdueInv: InvoiceRecord = {
+      ...baseInvoice,
+      id: 'inv_wa_due',
+      number: 'FR S12026/000045',
+      issuedAtIso: '2026-07-01T10:00:00.000Z',
+      paymentMethod: 'Crédito',
+      amountReceived: 5000,
+      amountDue: 23500,
+    };
+    const collectionMsg = buildCollectionReminderWhatsAppMessage(
+      {
+        customer: {
+          name: 'Kwanza Comércio, Lda',
+          nif: '5001122334',
+          phone: '923000111',
+          paymentTerms: '15_DIAS',
+        },
+        openInvoices: [overdueInv],
+        referenceNowIso: '2026-08-10T10:00:00.000Z',
+      },
+      companyProf
+    );
+    assert(
+      collectionMsg.includes('Aviso de Vencimento') &&
+        collectionMsg.includes('23.500,00 Kz') &&
+        collectionMsg.includes(WHATSAPP_DISCREET_SIGNATURE) &&
+        collectionMsg.includes('IBAN'),
+      'Cobrança deve destacar vencimento, total em dívida, IBAN e assinatura SILA-Billing'
+    );
+
+    // 4. Comprovativo de Pagamento (PDF + Mensagem)
+    const proofPayload = {
+      receiptNumber: 'CMP-884411',
+      issuedAtIso: '2026-08-10T15:00:00.000Z',
+      customerName: 'Kwanza Comércio, Lda',
+      customerNif: '5001122334',
+      customerPhone: '923000111',
+      paymentMethod: 'Transferência' as const,
+      reference: 'TRF-2026-99',
+      paidAmount: 23500,
+      remainingDebtAfter: 0,
+      operator: '001',
+      cashier: '01',
+      settledInvoices: [
+        {
+          invoiceNumber: overdueInv.number,
+          invoiceTotal: overdueInv.grandTotal,
+          appliedAmount: 23500,
+          remainingDue: 0,
+        },
+      ],
+    };
+    const proofPdfText = latin1Decoder.decode(generatePaymentReceiptPdfBytes(proofPayload, companyProf));
+    const proofMsg = buildPaymentReceiptWhatsAppMessage(proofPayload, companyProf);
+    assert(
+      proofPdfText.startsWith('%PDF-1.4') &&
+        proofPdfText.includes('COMPROVATIVO DE PAGAMENTO') &&
+        proofPdfText.includes('CMP-884411') &&
+        proofPdfText.includes(SILA_PDF_SIGNATURE),
+      'PDF do comprovativo de pagamento deve ser válido e incluir número CMP e assinatura'
+    );
+    assert(
+      proofMsg.includes('CMP-884411') &&
+        proofMsg.includes('23.500,00 Kz') &&
+        proofMsg.includes('Liquidado na totalidade') &&
+        proofMsg.includes(WHATSAPP_DISCREET_SIGNATURE),
+      'Mensagem do comprovativo deve confirmar quitação total e assinatura'
+    );
+
+    // 5. Catálogo Comercial & Orçamento (garantindo zero exposição do preço de custo)
+    const catalogProducts: Product[] = [
+      {
+        id: 'cat_p1',
+        code: 'ART-01',
+        name: 'Impressora Térmica 80mm',
+        category: 'Hardware',
+        unit: 'un',
+        price: 85000,
+        costPrice: 41234, // nunca deve aparecer no catálogo do cliente
+        ivaRate: 14,
+        exemptionReason: '',
+        active: true,
+        createdAtIso: '2026-01-01T00:00:00.000Z',
+        updatedAtIso: '2026-01-01T00:00:00.000Z',
+      },
+    ];
+    const catalogPdfText = latin1Decoder.decode(
+      generateCatalogOrQuotePdfBytes(
+        {
+          mode: 'CATALOG',
+          referenceCode: 'CAT-20260810',
+          issuedAtIso: '2026-08-10T12:00:00.000Z',
+          products: catalogProducts,
+        },
+        companyProf
+      )
+    );
+    assert(
+      catalogPdfText.startsWith('%PDF-1.4') &&
+        catalogPdfText.includes('Impressora T') &&
+        catalogPdfText.includes('85.000,00') &&
+        !catalogPdfText.includes('41.234') &&
+        !catalogPdfText.includes('41234') &&
+        catalogPdfText.includes(SILA_PDF_SIGNATURE),
+      'Catálogo comercial PDF nunca pode expor preço de custo interno'
+    );
+    const quotePdfText = latin1Decoder.decode(
+      generateCatalogOrQuotePdfBytes(
+        {
+          mode: 'QUOTE',
+          referenceCode: 'ORC-20260810-101',
+          issuedAtIso: '2026-08-10T12:00:00.000Z',
+          cartItems: [
+            {
+              productId: 'cat_p1',
+              code: 'ART-01',
+              description: 'Impressora Térmica 80mm',
+              unit: 'un',
+              qty: 2,
+              unitPrice: 85000,
+              discountPct: 0,
+              ivaRate: 14,
+            },
+          ],
+          validityDays: 15,
+        },
+        companyProf
+      )
+    );
+    const quoteMsg = buildCatalogOrQuoteWhatsAppMessage(
+      {
+        mode: 'QUOTE',
+        referenceCode: 'ORC-20260810-101',
+        customerName: 'Kwanza Comércio, Lda',
+        cartItems: [
+          {
+            productId: 'cat_p1',
+            code: 'ART-01',
+            description: 'Impressora Térmica 80mm',
+            unit: 'un',
+            qty: 2,
+            unitPrice: 85000,
+            discountPct: 0,
+            ivaRate: 14,
+          },
+        ],
+        validityDays: 15,
+      },
+      companyProf
+    );
+    assert(
+      quotePdfText.includes('ORC-20260810-101') &&
+        quoteMsg.includes('ORC-20260810-101') &&
+        quoteMsg.includes(WHATSAPP_DISCREET_SIGNATURE),
+      'Orçamento PDF e mensagem WhatsApp devem estar consistentes e com assinatura discreta'
+    );
+
+    // 6. Resumo Diário ao Proprietário
+    const dailySummaryPayload = {
+      dateIso: '2026-08-10',
+      generatedAtIso: '2026-08-10T19:00:00.000Z',
+      totalSalesGross: 120000,
+      validDocCount: 4,
+      cancelledCount: 0,
+      averageTicket: 30000,
+      cashTotal: 70000,
+      multicaixaTotal: 35000,
+      transferTotal: 15000,
+      creditTotal: 0,
+      debtCollectionsTotal: 23500,
+      openReceivablesTotal: 45000,
+      activeCashSessionSummary: {
+        cashier: '01',
+        operator: '001',
+        status: 'open' as const,
+        openingFloat: 10000,
+        expectedCash: 103500,
+        countedCash: null,
+        differenceAmount: null,
+      },
+      topProducts: [{ name: 'Impressora Térmica 80mm', qty: 1, revenue: 85000 }],
+    };
+    const dailyPdfText = latin1Decoder.decode(
+      generateDailySummaryPdfBytes(dailySummaryPayload, companyProf)
+    );
+    const dailyMsg = buildDailyOwnerSummaryWhatsAppMessage(dailySummaryPayload, companyProf);
+    assert(
+      dailyPdfText.includes('RESUMO DI') &&
+        dailyPdfText.includes('120.000,00 Kz') &&
+        dailyPdfText.includes(SILA_PDF_SIGNATURE) &&
+        dailyMsg.includes('120.000,00 Kz') &&
+        dailyMsg.includes(WHATSAPP_DISCREET_SIGNATURE),
+      'Resumo diário PDF e WhatsApp ao proprietário devem incluir vendas, caixa e assinatura discreta'
+    );
+
+    // 7. Modal de Partilha WhatsApp + UI Mobile
+    const modalHtml = renderWhatsAppShareModal({
+      kind: 'DOCUMENT',
+      title: 'Enviar FR S12026/000099 no WhatsApp',
+      subtitle: 'Kwanza Comércio, Lda · 28.500,00 Kz',
+      recipientLabel: 'Kwanza Comércio, Lda',
+      phoneInput: '923000111',
+      messageText: 'Teste\n' + WHATSAPP_DISCREET_SIGNATURE,
+      pdfFileName: 'FR_S12026_000099.pdf',
+      pdfBytes: new Uint8Array([1, 2, 3, 4]),
+      pdfDownloaded: false,
+      copiedFeedback: false,
+      shareError: null,
+      canNativeShareFiles: false,
+    });
+    assert(
+      modalHtml.includes('id="whatsapp-open-link"') &&
+        modalHtml.includes('href="https://wa.me/244923000111?text=') &&
+        modalHtml.includes('data-action="whatsapp-download-pdf"') &&
+        modalHtml.includes('sem instala'),
+      'Modal WhatsApp deve apresentar download de PDF, link wa.me seguro e aviso de consulta sem instalação'
+    );
+
+    const mobileHomeHtml = renderMobileOperationalView({
+      activeCompany: {
+        id: 'comp_jaimona',
+        normalizedNif: '5003069940',
+        profile: companyProf,
+        status: 'active',
+        plan: {
+          planTier: 'PROFISSIONAL',
+          commercialActive: true,
+          maxUsers: null,
+          maxInvoicesPerMonth: null,
+          updatedAtIso: new Date().toISOString(),
+        },
+        baseSequence: 0,
+        allowManagerCancel: false,
+        ownerEmail: 'jaimona@ao.com',
+        createdAtIso: new Date().toISOString(),
+        updatedAtIso: new Date().toISOString(),
+      },
+      settings: {
+        companyId: 'comp_jaimona',
+        company: companyProf,
+        defaultDocType: 'FR',
+        defaultFormat: 'POS',
+        defaultCashier: '01',
+        defaultOperator: '001',
+        defaultNotes: '',
+        autoPrintOnEmit: false,
+        hidePromotionalFooter: false,
+        allowCashierPriceEdit: false,
+        maxCashierDiscountPct: 5,
+        inactivityLockMinutes: 10,
+        updatedAtIso: new Date().toISOString(),
+      },
+      companyMasterDraftProfile: null,
+      companyMasterDraftSettings: null,
+      companyMasterSection: 'ALL',
+      companySeries: [],
+      canManageCompanySettings: true,
+      companyFormError: null,
+      companyFormSavedNotice: false,
+      showRequestAgtSeriesForm: false,
+      confirmFinalizeSeriesId: null,
+      agtSeriesErrorMessage: null,
+      agtSeriesSuccessMessage: null,
+      showEstablishmentForm: false,
+      editingEstablishment: null,
+      establishmentError: null,
+      showWarehouseForm: false,
+      editingWarehouse: null,
+      warehouseError: null,
+      isOnline: true,
+      user: { email: 'jaimona@ao.com' },
+      mobileTab: 'HOME',
+      mobileCheckoutStep: 'CART',
+      cart: [],
+      products: catalogProducts,
+      customers: [],
+      invoices: [overdueInv],
+      selectedCustomerId: '999999999',
+      docType: 'FR',
+      paymentMethod: 'Dinheiro',
+      amountReceivedInput: '',
+      mobileSearchQuery: '',
+      mobileProductSearchInput: '',
+      lastEmittedInvoice: baseInvoice,
+      showQuickProductModal: false,
+      showQuickCustomerModal: false,
+      showQuickCompanyModal: false,
+      showCustomerPickerModal: false,
+      editingMobileProduct: null,
+      editingCustomer: null,
+      editingCustomerCreditLimitInput: '',
+      showCustomerAdvancedFields: false,
+      mobileCustomerModalMode: 'QUICK',
+      canEditExistingCustomers: true,
+      quickCustomerDraft: {
+        name: '',
+        nif: '',
+        phone: '',
+        address: '',
+        locality: 'Luanda',
+        customerType: 'PARTICULAR',
+      },
+      quickProductError: null,
+      quickCustomerError: null,
+      operator: '001',
+      unlockedOperatorName: 'Proprietário',
+      unlockedRoleLabel: 'Proprietário',
+      canSellPos: true,
+      canViewProducts: true,
+      canManageProducts: true,
+      canViewCustomers: true,
+      canCreateCustomers: true,
+      canViewDocs: true,
+      canOperateCash: true,
+      canExportSaft: true,
+    });
+    assert(
+      mobileHomeHtml.includes('data-action="whatsapp-daily-summary"'),
+      'Ecrã inicial Mobile deve expor botão rápido para envio de resumo diário ao proprietário via WhatsApp'
     );
   });
 
