@@ -238,6 +238,7 @@ import {
   renderDocumentHtml,
   renderHistoryControlReportHtml,
 } from './ui/documentRenderer';
+import { renderGeometricWatermarkLayer, renderSilaGeometricMark } from './ui/brandIdentity';
 import { ICONS } from './ui/icons';
 import {
   renderMobileOperationalView,
@@ -8527,6 +8528,17 @@ export class SilaBillingApp {
       return;
     }
 
+    if (el.id === 'lock-screen-member-select') {
+      if (el.value) {
+        this.lockSelectedMemberId = el.value;
+        this.lockPinInput = '';
+        this.lockPinConfirmInput = '';
+        this.lockErrorMessage = null;
+        this.render();
+      }
+      return;
+    }
+
     if (this.isTerminalLocked()) {
       return;
     }
@@ -12624,9 +12636,10 @@ export class SilaBillingApp {
       ${
         !this.forceDesktopView
           ? isUnassigned && this.activeModule !== 'SYNC'
-            ? `<div class="no-print flex md:hidden h-dvh w-screen flex-col overflow-hidden bg-slate-50 text-slate-900">
-                <header class="min-h-12 py-1.5 px-3 safe-area-top bg-slate-900 text-white border-b border-slate-800 flex items-center justify-between gap-2 shrink-0">
+            ? `<div class="no-print flex md:hidden h-dvh w-screen flex-col overflow-hidden sila-bg-grid-light text-slate-900">
+                <header class="min-h-12 py-1.5 px-3 safe-area-top sila-shell-bar text-white border-b border-slate-800 flex items-center justify-between gap-2 shrink-0">
                   <div class="flex items-center gap-2 min-w-0">
+                    ${renderSilaGeometricMark('w-4 h-4 text-blue-400')}
                     <span class="text-sm font-bold tracking-tight whitespace-nowrap">SILA-Billing</span>
                     <button
                       type="button"
@@ -12757,9 +12770,9 @@ export class SilaBillingApp {
             </div>`
       }
 
-      <div class="no-print h-dvh w-screen ${this.forceDesktopView ? 'flex' : 'hidden md:flex'} flex-col overflow-hidden bg-slate-50 text-slate-900">
+      <div class="no-print h-dvh w-screen ${this.forceDesktopView ? 'flex' : 'hidden md:flex'} flex-col overflow-hidden sila-bg-grid-light text-slate-900">
         <!-- Top Bar Limpa (3 Zonas) com suporte a Safe Area em iPhone / iPad Standalone -->
-        <header class="min-h-12 py-1.5 px-3 safe-area-top bg-slate-900 text-white border-b border-slate-800 flex items-center justify-between gap-4 shrink-0">
+        <header class="min-h-12 py-1.5 px-3 safe-area-top sila-shell-bar text-white border-b border-slate-800 flex items-center justify-between gap-4 shrink-0">
           <div class="flex items-center gap-2 shrink-0">
             <button
               type="button"
@@ -12769,6 +12782,7 @@ export class SilaBillingApp {
             >
               ${this.sidebarState === 'HIDDEN' ? ICONS.panelOpen : ICONS.panelClose}
             </button>
+            ${renderSilaGeometricMark('w-4 h-4 text-blue-400')}
             <span class="text-sm font-bold tracking-tight whitespace-nowrap">SILA-Billing</span>
             <button
               type="button"
@@ -12833,15 +12847,6 @@ export class SilaBillingApp {
             }
             <button
               type="button"
-              data-action="open-privacy-policy"
-              title="Política de Privacidade e Segurança"
-              class="h-8 px-2 rounded-md bg-slate-800 hover:bg-slate-700 text-[11px] text-slate-300 hover:text-white hidden lg:flex items-center gap-1 transition-colors whitespace-nowrap"
-            >
-              ${ICONS.shieldCheck}
-              <span>Privacidade</span>
-            </button>
-            <button
-              type="button"
               data-action="open-operator-switch-modal"
               title="Trocar operador ativo / identificar caixa"
               class="h-8 px-2.5 rounded-md bg-slate-800 hover:bg-slate-700 text-xs text-slate-200 flex items-center gap-1.5 transition-colors whitespace-nowrap"
@@ -12889,10 +12894,11 @@ export class SilaBillingApp {
         <div class="flex-1 flex overflow-hidden">
           ${this.renderSidebar(pendingCount)}
 
-          <main class="flex-1 overflow-hidden flex flex-col">
+          <main class="relative flex-1 overflow-hidden flex flex-col sila-bg-grid-light">
+            ${renderGeometricWatermarkLayer('light', 'corner')}
             ${
               this.dbBootError
-                ? `<div class="px-3 py-2 bg-red-50 border-b border-red-200 text-xs text-red-700 flex items-center justify-between gap-2 shrink-0">
+                ? `<div class="relative z-10 px-3 py-2 bg-red-50 border-b border-red-200 text-xs text-red-700 flex items-center justify-between gap-2 shrink-0">
                     <span>${escapeHtml(this.dbBootError)}</span>
                     <button
                       type="button"
@@ -12909,7 +12915,7 @@ export class SilaBillingApp {
               canViewMaster &&
               masterCheck &&
               !masterCheck.readyForProductionEmission
-                ? `<div class="px-4 py-1.5 bg-slate-50 border-b border-slate-200 flex items-center justify-between gap-3 text-xs shrink-0">
+                ? `<div class="relative z-10 px-4 py-1.5 bg-white/90 border-b border-slate-200 flex items-center justify-between gap-3 text-xs shrink-0">
                     <span class="text-slate-600 truncate tabular-nums">
                       <strong class="font-semibold text-slate-900">Modo Simulação</strong> · Ficha Mestre a ${masterCheck.completionPct}% — complete os dados fiscais para activar Produção AGT.
                     </span>
@@ -12921,7 +12927,7 @@ export class SilaBillingApp {
                   </div>`
                 : ''
             }
-            <div class="flex-1 overflow-hidden">
+            <div class="relative z-10 flex-1 overflow-hidden">
               ${this.isBooting ? this.renderBooting() : this.renderActiveWorkspace()}
             </div>
           </main>
@@ -13110,7 +13116,7 @@ export class SilaBillingApp {
     return `
       <aside
         aria-label="Navegação principal"
-        class="bg-slate-900 text-slate-300 border-r border-slate-800 flex flex-col justify-between shrink-0 select-none ${
+        class="bg-[#0B1220] text-slate-300 border-r border-slate-800/90 flex flex-col justify-between shrink-0 select-none ${
           expanded ? 'w-56' : 'w-14'
         }"
       >
@@ -13329,7 +13335,7 @@ export class SilaBillingApp {
 
         <div class="flex-1 grid grid-cols-1 lg:grid-cols-12 overflow-hidden">
           <!-- COLUNA 1: Pesquisa Rápida, Stock & Cadastro Rápido de Artigo -->
-          <section class="${isA4 ? 'lg:col-span-4' : 'lg:col-span-5'} flex flex-col border-r border-slate-200 bg-slate-50/60 overflow-hidden ${
+          <section class="${isA4 ? 'lg:col-span-4' : 'lg:col-span-5'} flex flex-col border-r border-slate-200 bg-transparent overflow-hidden ${
             this.mobilePane === 'CATALOG' ? 'flex' : 'hidden lg:flex'
           }">
             <div class="p-3 border-b border-slate-200 bg-white space-y-2 shrink-0">
@@ -14727,10 +14733,11 @@ export class SilaBillingApp {
           </section>
 
           <!-- COLUNA 3: Pré-visualização Térmica 80mm / A4 -->
-          <section class="${isA4 ? 'lg:col-span-4' : 'lg:col-span-3'} flex flex-col bg-slate-100 overflow-hidden ${
+          <section class="${isA4 ? 'lg:col-span-4' : 'lg:col-span-3'} relative flex flex-col sila-bg-grid-light overflow-hidden ${
             this.mobilePane === 'PREVIEW' ? 'flex' : 'hidden lg:flex'
           }">
-            <div class="p-2.5 border-b border-slate-200 bg-white flex items-center justify-between gap-2 shrink-0">
+            ${renderGeometricWatermarkLayer('light', 'corner')}
+            <div class="relative z-10 p-2.5 border-b border-slate-200 bg-white flex items-center justify-between gap-2 shrink-0">
               <div class="flex items-center bg-slate-100 p-0.5 rounded-lg">
                 <button
                   type="button"
@@ -14761,10 +14768,10 @@ export class SilaBillingApp {
               </button>
             </div>
 
-            <div class="flex-1 overflow-y-auto p-3">
+            <div class="relative z-10 flex-1 overflow-y-auto p-3">
               ${
                 liveInvoice.lines.length === 0
-                  ? `<div class="h-full flex items-center justify-center text-xs text-slate-400 text-center px-4">
+                  ? `<div class="h-full flex items-center justify-center text-xs text-slate-500 text-center px-4">
                       ${isA4 ? 'A fatura A4 aparecerá aqui em tempo real ao adicionar artigos.' : 'O talão térmico aparecerá aqui em tempo real ao adicionar artigos.'}
                     </div>`
                   : renderDocumentHtml(
@@ -19005,8 +19012,8 @@ export class SilaBillingApp {
     const companySeries = listarSeries({ companyId: this.activeCompany.id });
 
     return `
-      <div class="h-full overflow-y-auto bg-white p-4 sm:p-6">
-        <div class="max-w-5xl space-y-6">
+      <div class="h-full overflow-y-auto bg-transparent p-4 sm:p-6">
+        <div class="max-w-5xl bg-white border border-slate-200/90 rounded-xl p-4 sm:p-6 sila-card-elevated space-y-6">
           <div class="flex flex-col sm:flex-row sm:items-center justify-between gap-3 pb-3 border-b border-slate-200">
             <div>
               <h1 class="text-sm font-bold text-slate-900">Configurações, Ficha Mestre &amp; Segurança</h1>
@@ -19018,14 +19025,6 @@ export class SilaBillingApp {
               </p>
             </div>
             <div class="flex items-center gap-2 shrink-0 flex-wrap">
-              <button
-                type="button"
-                data-action="open-privacy-policy"
-                class="h-9 px-3 rounded-lg border border-slate-200 text-xs font-medium text-slate-700 hover:bg-slate-50 flex items-center gap-1.5 whitespace-nowrap"
-              >
-                ${ICONS.shieldCheck}
-                <span>Privacidade</span>
-              </button>
               ${
                 canViewMaster
                   ? `<button
@@ -20440,8 +20439,8 @@ export class SilaBillingApp {
     const bh = this.backendHealth;
 
     return `
-      <div class="h-full overflow-y-auto bg-white p-4 sm:p-6">
-        <div class="max-w-3xl space-y-6">
+      <div class="h-full overflow-y-auto bg-transparent p-4 sm:p-6">
+        <div class="max-w-3xl bg-white border border-slate-200/90 rounded-xl p-4 sm:p-6 sila-card-elevated space-y-6">
           <div class="flex flex-col sm:flex-row sm:items-center justify-between gap-3 pb-3 border-b border-slate-200">
             <div>
               <h1 class="text-sm font-bold text-slate-900">Sincronização, Backend e Backup</h1>

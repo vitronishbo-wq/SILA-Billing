@@ -36,6 +36,7 @@ import {
   CompanyMasterSectionTab,
   renderCompanyMasterSection,
 } from './companyMasterForm';
+import { renderGeometricWatermarkLayer, renderSilaGeometricMark } from './brandIdentity';
 import { renderCustomerMasterForm } from './customerForm';
 import { ICONS } from './icons';
 
@@ -162,9 +163,10 @@ export function renderMobileOperationalView(props: MobileOperationalProps): stri
   const nextSku = `ART${String(props.products.length + 1).padStart(4, '0')}`;
 
   return `
-    <div class="h-dvh w-screen flex flex-col bg-slate-950 text-slate-100 overflow-hidden select-none">
+    <div class="relative h-dvh w-screen flex flex-col sila-bg-grid-dark text-slate-100 overflow-hidden select-none">
+      ${renderGeometricWatermarkLayer('dark', 'corner')}
       <!-- Conteúdo com scroll independente -->
-      <div class="flex-1 overflow-y-auto overscroll-contain pb-20">
+      <div class="relative z-10 flex-1 overflow-y-auto overscroll-contain pb-20">
         ${mainContent}
       </div>
 
@@ -234,6 +236,7 @@ function renderMobileHome(props: MobileOperationalProps): string {
       <header class="flex items-center justify-between gap-2 pt-1">
         <div class="min-w-0">
           <h1 class="text-xl font-bold tracking-tight text-white flex items-center gap-2">
+            ${renderSilaGeometricMark('w-4 h-4 text-blue-400')}
             <span>SILA-Billing</span>
             <span class="text-[10px] font-mono px-1.5 py-0.5 rounded bg-blue-900/60 text-blue-300 font-normal">POS</span>
           </h1>
@@ -267,7 +270,8 @@ function renderMobileHome(props: MobileOperationalProps): string {
       </header>
 
       <!-- Cartão da Empresa Activa -->
-      <section class="bg-slate-900/90 border border-slate-800 rounded-2xl p-4 shadow-sm flex items-center justify-between gap-2">
+      <section class="relative overflow-hidden bg-slate-900/95 border border-slate-800/90 rounded-2xl p-4 shadow-sm flex items-center justify-between gap-2">
+        <div class="pointer-events-none absolute inset-x-0 top-0 h-[1.5px] bg-gradient-to-r from-transparent via-blue-600/75 to-transparent" aria-hidden="true"></div>
         <div class="min-w-0">
           <span class="text-xs text-slate-400 font-medium block">Empresa activa · ${escapeHtml(envLabel)}</span>
           <h2 class="text-lg font-bold text-white tracking-tight mt-0.5 truncate">${escapeHtml(companyName)}</h2>
@@ -1712,24 +1716,6 @@ function renderMobileMore(props: MobileOperationalProps): string {
           <span class="text-slate-500">${ICONS.chevronRight}</span>
         </button>
 
-        <!-- Política de Privacidade -->
-        <button
-          type="button"
-          data-action="open-privacy-policy"
-          class="bg-slate-900 hover:bg-slate-850 rounded-xl p-3.5 flex items-center justify-between border border-slate-800 text-left active:scale-[0.98]"
-        >
-          <div class="flex items-center gap-3">
-            <div class="h-8 w-8 rounded-lg bg-slate-800 text-blue-300 flex items-center justify-center shrink-0">
-              ${ICONS.shield}
-            </div>
-            <div>
-              <span class="text-sm font-bold text-white block">Política de Privacidade</span>
-              <span class="text-xs text-slate-400 block">Isolamento de dados e protecção de acesso</span>
-            </div>
-          </div>
-          <span class="text-slate-500">${ICONS.chevronRight}</span>
-        </button>
-
         <!-- Alternar para Modo Desktop / Gestão Completa -->
         <button
           type="button"
@@ -1767,7 +1753,7 @@ function renderMobileBottomNav(
   ];
 
   return `
-    <nav class="fixed bottom-0 left-0 right-0 z-40 bg-slate-900/95 backdrop-blur-md border-t border-slate-800 flex items-center justify-around h-16 safe-area-bottom">
+    <nav class="fixed bottom-0 left-0 right-0 z-40 bg-[#0B1220] border-t border-slate-800/90 flex items-center justify-around h-16 safe-area-bottom">
       ${tabs
         .filter((t) => t.visible)
         .map((t) => {

@@ -10,6 +10,7 @@ import {
   VITRONIS_INSTITUTIONAL,
 } from '../../src/core/types';
 import type { AdminAuditEntry, AdminCompanySummary, AdminOverviewStats } from '../services/backendApi';
+import { renderGeometricWatermarkLayer, renderSilaGeometricMark } from './brandIdentity';
 import { ICONS } from './icons';
 
 function escapeHtml(raw: string): string {
@@ -252,7 +253,9 @@ export function renderNewCompanyModal(params: {
               class="h-4 w-4 mt-0.5 rounded border-slate-300 text-blue-600 shrink-0"
             />
             <span>
-              Declaro aceitar as condições operacionais do <strong>SILA-Billing</strong>, dependência institucional de <strong>${escapeHtml(VITRONIS_INSTITUTIONAL.legalName)}</strong> (NIF ${escapeHtml(VITRONIS_INSTITUTIONAL.nif)}), assumindo responsabilidade pelos dados emitidos.
+              Declaro aceitar as condições operacionais e a
+              <button type="button" data-action="open-privacy-policy" class="text-blue-600 hover:underline font-medium">Política de Privacidade</button>
+              do <strong>SILA-Billing</strong>, dependência institucional de <strong>${escapeHtml(VITRONIS_INSTITUTIONAL.legalName)}</strong> (NIF ${escapeHtml(VITRONIS_INSTITUTIONAL.nif)}), assumindo responsabilidade pelos dados emitidos.
             </span>
           </label>
 
@@ -363,10 +366,15 @@ export function renderTenantOnboardingView(params: {
   const { userEmail, isSignedIn, isOnline, isSyncing, syncMessage } = params;
 
   return `
-    <div class="h-full overflow-y-auto bg-slate-50 p-4 sm:p-8 flex items-center justify-center">
-      <div class="w-full max-w-xl bg-white border border-slate-200 rounded-xl p-6 sm:p-8 space-y-6">
+    <div class="relative h-full overflow-y-auto sila-bg-grid-light p-4 sm:p-8 flex items-center justify-center">
+      ${renderGeometricWatermarkLayer('light', 'center')}
+      <div class="relative z-10 w-full max-w-xl bg-white border border-slate-200/90 rounded-xl p-6 sm:p-8 space-y-6 sila-card-elevated overflow-hidden">
+        <div class="pointer-events-none absolute inset-x-0 top-0 h-[2px] bg-gradient-to-r from-transparent via-blue-600/80 to-transparent" aria-hidden="true"></div>
         <div class="space-y-2">
-          <div class="text-[11px] font-bold tracking-wide text-blue-600 uppercase">SILA-Billing · Plataforma Multiempresa</div>
+          <div class="flex items-center gap-2 text-[11px] font-bold tracking-wide text-blue-600 uppercase">
+            ${renderSilaGeometricMark('w-4 h-4 text-slate-900')}
+            <span>SILA-Billing · Plataforma Multiempresa</span>
+          </div>
           <h1 class="text-lg font-bold text-slate-900 tracking-tight">Cadastre ou sincronize a sua empresa</h1>
           <p class="text-xs text-slate-600 leading-relaxed">
             ${

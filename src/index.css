@@ -23,6 +23,36 @@
     -ms-overflow-style: none;
     scrollbar-width: none;
   }
+
+  /* Identidade geométrica/técnica minimalista — 100% CSS, offline e zero peso de GPU */
+  .sila-bg-grid-light {
+    background-color: #f3f6fa;
+    background-image:
+      radial-gradient(ellipse 80% 42% at 50% 0%, rgba(37, 99, 235, 0.045), transparent 70%),
+      linear-gradient(to right, rgba(15, 23, 42, 0.032) 1px, transparent 1px),
+      linear-gradient(to bottom, rgba(15, 23, 42, 0.032) 1px, transparent 1px);
+    background-size: 100% 100%, 28px 28px, 28px 28px;
+  }
+
+  .sila-bg-grid-dark {
+    background-color: #070d19;
+    background-image:
+      radial-gradient(ellipse 75% 45% at 50% 0%, rgba(37, 99, 235, 0.09), transparent 72%),
+      linear-gradient(to right, rgba(148, 163, 184, 0.045) 1px, transparent 1px),
+      linear-gradient(to bottom, rgba(148, 163, 184, 0.045) 1px, transparent 1px);
+    background-size: 100% 100%, 28px 28px, 28px 28px;
+  }
+
+  .sila-shell-bar {
+    background-color: #0b1220;
+    box-shadow: inset 0 -1px 0 rgba(37, 99, 235, 0.28);
+  }
+
+  .sila-card-elevated {
+    box-shadow:
+      0 1px 2px rgba(15, 23, 42, 0.05),
+      0 10px 26px -16px rgba(15, 23, 42, 0.14);
+  }
 }
 
 /* Fallbacks à prova de minificação para browsers Windows 7 (Chrome 79–107 / Firefox ESR) */
@@ -78,8 +108,18 @@
     padding: 0 !important;
   }
 
-  .no-print {
+  .no-print,
+  .sila-watermark-layer {
     display: none !important;
+  }
+
+  .sila-bg-grid-light,
+  .sila-bg-grid-dark,
+  .sila-shell-bar,
+  .sila-card-elevated {
+    background: #ffffff !important;
+    background-image: none !important;
+    box-shadow: none !important;
   }
 
   .print-only-container {

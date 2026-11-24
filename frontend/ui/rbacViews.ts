@@ -26,6 +26,7 @@ import {
   SecurityAuditEntry,
   VITRONIS_INSTITUTIONAL,
 } from '../../src/core/types';
+import { renderGeometricWatermarkLayer, renderSilaGeometricMark } from './brandIdentity';
 import { ICONS } from './icons';
 
 export type RbacPanelTab = 'USERS' | 'ROLES' | 'AUDIT';
@@ -113,51 +114,41 @@ export function renderTerminalLockScreen(params: {
   } = params;
 
   const activeMembers = members.filter((m) => resolveMemberStatus(m) === 'active');
-  const pendingMembers = members.filter((m) => resolveMemberStatus(m) === 'pending_invite');
   const selectedMember =
     activeMembers.find((m) => m.id === selectedMemberId) ||
-    (activeMembers.length === 1 && !activeMembers[0]!.pinHash ? activeMembers[0]! : null);
+    activeMembers[0] ||
+    null;
 
-  const anyPinConfigured = activeMembers.some((m) => Boolean(m.pinHash));
   const isOwnerInitialSetup = Boolean(
     selectedMember &&
       resolveMemberBaseRole(selectedMember) === 'owner' &&
       !selectedMember.pinHash
   );
-  const lockStatus = selectedMember ? isPinCurrentlyLocked(selectedMember) : { locked: false, remainingSeconds: 0 };
+  const lockStatus = selectedMember
+    ? isPinCurrentlyLocked(selectedMember)
+    : { locked: false, remainingSeconds: 0 };
 
   return `
-    <div class="min-h-dvh w-screen bg-slate-950 text-slate-100 flex flex-col justify-between p-4 sm:p-6 overflow-y-auto">
-      <!-- Barra Superior Institucional -->
-      <header class="max-w-4xl w-full mx-auto flex flex-wrap items-center justify-between gap-3 pb-4 border-b border-slate-800/90">
-        <div class="flex items-center gap-3 min-w-0">
-          <div class="h-10 w-10 rounded-xl bg-blue-600/20 border border-blue-500/40 text-blue-400 flex items-center justify-center shrink-0">
-            ${ICONS.lock}
-          </div>
-          <div class="min-w-0">
-            <div class="flex items-center gap-2 flex-wrap">
-              <span class="text-xs font-bold uppercase tracking-wider text-blue-400">Terminal Protegido · SILA-Billing</span>
-              <span class="px-2 py-0.5 rounded text-[10px] font-medium border ${
-                isOnline
-                  ? 'bg-emerald-950/60 border-emerald-800 text-emerald-300'
-                  : 'bg-amber-950/60 border-amber-800 text-amber-300'
-              }">
-                ${isOnline ? 'Online · RBAC Activo' : 'Offline · RBAC Local Activo'}
-              </span>
-            </div>
-            <h1 class="text-base sm:text-lg font-bold text-white truncate">
+    <div class="no-print relative min-h-dvh w-screen sila-bg-grid-dark text-slate-100 flex flex-col justify-between p-4 sm:p-6 overflow-x-hidden overflow-y-auto">
+      ${renderGeometricWatermarkLayer('dark', 'center')}
+      <!-- Topo limpo: apenas empresa activa e controlos operacionais essenciais -->
+      <header class="relative z-10 max-w-md w-full mx-auto flex flex-wrap items-center justify-between gap-2 pb-3 border-b border-slate-800/80">
+        <div class="flex items-center gap-2 min-w-0">
+          ${renderSilaGeometricMark('w-4 h-4 text-slate-300 shrink-0')}
+          <div class="flex items-baseline gap-2 min-w-0">
+            <h1 class="text-sm sm:text-base font-bold text-white truncate">
               ${escapeHtml(company.profile.shortName || company.profile.legalName)}
-              <span class="text-xs font-mono font-normal text-slate-400 ml-1">NIF ${escapeHtml(company.profile.nif)}</span>
             </h1>
+            <span class="text-xs font-mono text-slate-400 shrink-0 tabular-nums">NIF ${escapeHtml(company.profile.nif)}</span>
           </div>
         </div>
 
-        <div class="flex items-center gap-2 flex-wrap">
+        <div class="flex items-center gap-2 shrink-0">
           ${
             companies.length > 1
               ? `<select
                   id="lock-screen-company-select"
-                  class="h-9 px-2.5 rounded-lg bg-slate-900 border border-slate-700 text-xs text-slate-200 focus:outline-none focus:border-blue-500"
+                  class="h-8 px-2 rounded-lg bg-slate-900 border border-slate-700 text-xs text-slate-200 focus:outline-none focus:border-blue-500"
                   aria-label="Seleccionar empresa"
                 >
                   ${companies
@@ -176,140 +167,67 @@ export function renderTerminalLockScreen(params: {
               ? `<button
                   type="button"
                   data-action="open-master-admin"
-                  class="h-9 px-3 rounded-lg border border-slate-700 bg-slate-900 hover:bg-slate-800 text-xs font-medium text-slate-200 flex items-center gap-1.5"
+                  class="h-8 px-2.5 rounded-lg border border-slate-700 bg-slate-900 hover:bg-slate-800 text-xs font-medium text-slate-200 flex items-center gap-1.5"
                 >
                   ${ICONS.shield}
-                  <span>Plataforma VITRONIS</span>
+                  <span>VITRONIS</span>
                 </button>`
               : ''
           }
         </div>
       </header>
 
-      <!-- Conteúdo Central: Seleção de Operador + Autenticação por PIN -->
-      <main class="max-w-4xl w-full mx-auto my-6 grid grid-cols-1 md:grid-cols-12 gap-5 items-start">
-        <!-- Coluna Esquerda: Lista de Operadores -->
-        <section class="md:col-span-6 bg-slate-900/80 border border-slate-800 rounded-2xl p-4 sm:p-5 space-y-3">
-          <div class="flex items-center justify-between gap-2">
-            <div>
-              <h2 class="text-sm font-bold text-white">1. Identificação do Operador</h2>
-              <p class="text-[11px] text-slate-400">Seleccione o seu perfil individual para iniciar turno.</p>
-            </div>
-            <span class="text-[11px] font-mono text-slate-400">${activeMembers.length} activo(s)</span>
-          </div>
+      <!-- Cartão Único Central: Selector Ultra-Minimalista de Operador + PIN -->
+      <main class="relative z-10 max-w-md w-full mx-auto my-auto py-4">
+        <section class="relative overflow-hidden bg-slate-900/95 border border-slate-800/90 rounded-2xl p-4 sm:p-5 space-y-4 shadow-2xl">
+          <div class="pointer-events-none absolute inset-x-0 top-0 h-[2px] bg-gradient-to-r from-transparent via-blue-600/80 to-transparent" aria-hidden="true"></div>
+          ${
+            activeMembers.length === 0
+              ? `<div class="p-3 rounded-xl border border-red-900/60 bg-red-950/40 text-xs text-red-200">
+                  Nenhum operador activo neste terminal. Contacte o Proprietário ou entre com a conta Google autorizada.
+                </div>`
+              : `<div>
+                  <select
+                    id="lock-screen-member-select"
+                    aria-label="Operador"
+                    class="w-full h-10 px-3 rounded-xl bg-slate-950 border border-slate-700 text-xs font-medium text-white focus:outline-none focus:border-blue-500"
+                  >
+                    ${activeMembers
+                      .map((m) => {
+                        const mLock = isPinCurrentlyLocked(m);
+                        const roleLabel = getMemberRoleDisplayName(m, roles);
+                        const suffix = mLock.locked ? ` · Bloqueado (${mLock.remainingSeconds}s)` : '';
+                        return `<option value="${escapeHtml(m.id)}" ${
+                          selectedMember?.id === m.id ? 'selected' : ''
+                        }>${escapeHtml(m.displayName)} (${escapeHtml(roleLabel)})${suffix}</option>`;
+                      })
+                      .join('')}
+                  </select>
+                </div>`
+          }
 
           ${
             lockReasonMessage
-              ? `<div class="p-2.5 rounded-xl bg-amber-950/60 border border-amber-800/80 text-xs text-amber-200 leading-snug">
+              ? `<div class="px-3 py-2 rounded-lg bg-amber-950/50 border border-amber-800/70 text-[11px] text-amber-200">
                   ${escapeHtml(lockReasonMessage)}
                 </div>`
               : ''
           }
 
-          <div class="space-y-2 max-h-[340px] overflow-y-auto pr-1">
-            ${
-              activeMembers.length === 0
-                ? `<div class="p-4 rounded-xl border border-red-900/60 bg-red-950/40 text-xs text-red-200">
-                    Nenhum operador activo neste terminal. Contacte o Proprietário da empresa ou autentique a conta Google autorizada.
-                  </div>`
-                : activeMembers
-                    .map((m) => {
-                      const isSelected = selectedMember?.id === m.id;
-                      const mLock = isPinCurrentlyLocked(m);
-                      const roleLabel = getMemberRoleDisplayName(m, roles);
-                      const isPriv = m.role === 'owner' || m.role === 'admin' || m.role === 'manager';
-                      return `
-                        <button
-                          type="button"
-                          data-action="select-lock-member"
-                          data-id="${escapeHtml(m.id)}"
-                          class="w-full p-3 rounded-xl border text-left transition-all flex items-center justify-between gap-3 ${
-                            isSelected
-                              ? 'bg-blue-600/20 border-blue-500 shadow-sm shadow-blue-500/20'
-                              : 'bg-slate-950/70 border-slate-800 hover:border-slate-700 hover:bg-slate-900'
-                          }"
-                        >
-                          <div class="min-w-0">
-                            <div class="flex items-center gap-2 flex-wrap">
-                              <span class="text-sm font-bold text-white truncate">${escapeHtml(m.displayName)}</span>
-                              <span class="px-1.5 py-0.5 rounded text-[10px] font-semibold ${
-                                isPriv
-                                  ? 'bg-indigo-950/80 border border-indigo-700/60 text-indigo-300'
-                                  : 'bg-slate-800 text-slate-300'
-                              }">
-                                ${escapeHtml(roleLabel)}
-                              </span>
-                            </div>
-                            <div class="text-[11px] text-slate-400 mt-0.5 truncate font-mono">
-                              ${
-                                mLock.locked
-                                  ? `<span class="text-red-400 font-semibold">Bloqueado temporariamente (${mLock.remainingSeconds}s)</span>`
-                                  : m.pinHash
-                                    ? 'PIN individual configurado · Requer autenticação'
-                                    : m.role === 'owner'
-                                      ? 'Primeiro acesso · Configurar PIN do Proprietário'
-                                      : 'PIN pendente · Solicitar definição ao Proprietário'
-                              }
-                            </div>
-                          </div>
-                          <div class="h-8 w-8 rounded-lg flex items-center justify-center shrink-0 ${
-                            isSelected ? 'bg-blue-600 text-white' : 'bg-slate-800 text-slate-400'
-                          }">
-                            ${mLock.locked ? ICONS.lock : ICONS.user}
-                          </div>
-                        </button>
-                      `;
-                    })
-                    .join('')
-            }
-          </div>
-
-          ${
-            pendingMembers.length > 0
-              ? `<div class="pt-2 border-t border-slate-800/80 text-[11px] text-slate-400">
-                  ${pendingMembers.length} convite(s) Cloud pendente(s) de aceitação via conta Google verificada.
-                </div>`
-              : ''
-          }
-        </section>
-
-        <!-- Coluna Direita: Autenticação PIN / Configuração Inicial -->
-        <section class="md:col-span-6 bg-slate-900/80 border border-slate-800 rounded-2xl p-4 sm:p-5 space-y-4">
           ${
             !selectedMember
-              ? `<div class="py-10 text-center space-y-2.5">
-                  <div class="h-12 w-12 rounded-2xl bg-slate-800 text-slate-400 flex items-center justify-center mx-auto">
-                    ${ICONS.shieldCheck}
-                  </div>
-                  <h2 class="text-sm font-bold text-white">Seleccione um Operador</h2>
-                  <p class="text-xs text-slate-400 max-w-xs mx-auto leading-relaxed">
-                    ${
-                      anyPinConfigured
-                        ? 'Por segurança em terminal partilhado, nenhum perfil privilegiado é aberto automaticamente. Escolha o seu nome à esquerda e introduza o seu PIN.'
-                        : 'Seleccione o Proprietário à esquerda para definir o PIN inicial de protecção do terminal.'
-                    }
-                  </p>
-                </div>`
+              ? ''
               : isOwnerInitialSetup
                 ? `
-                  <div>
-                    <div class="text-[11px] font-bold uppercase tracking-wider text-amber-400">Segurança Obrigatória</div>
-                    <h2 class="text-base font-bold text-white mt-0.5">Definir PIN Inicial do Proprietário</h2>
-                    <p class="text-xs text-slate-400 mt-1 leading-relaxed">
-                      Para proteger dados fiscais, custos e equipa de <strong>${escapeHtml(company.profile.shortName)}</strong>, defina um PIN individual de 4 a 6 dígitos para <strong>${escapeHtml(selectedMember.displayName)}</strong>.
-                    </p>
-                  </div>
-
                   ${
                     errorMessage
-                      ? `<div class="p-3 rounded-xl bg-red-950/70 border border-red-800 text-xs text-red-200">${escapeHtml(errorMessage)}</div>`
+                      ? `<div class="p-2.5 rounded-xl bg-red-950/70 border border-red-800 text-xs text-red-200">${escapeHtml(errorMessage)}</div>`
                       : ''
                   }
-
                   <form data-form="setup-owner-pin-form" class="space-y-3">
                     <input type="hidden" name="memberId" value="${escapeHtml(selectedMember.id)}" />
                     <div>
-                      <label class="block text-xs font-medium text-slate-300 mb-1">Novo PIN (4 a 6 dígitos) *</label>
+                      <label class="block text-xs font-medium text-slate-300 mb-1">Definir PIN inicial (4 a 6 dígitos)</label>
                       <input
                         type="password"
                         name="pin"
@@ -321,11 +239,11 @@ export function renderTerminalLockScreen(params: {
                         autocomplete="new-password"
                         value="${escapeHtml(pinInput)}"
                         placeholder="••••"
-                        class="w-full h-12 px-4 rounded-xl bg-slate-950 border border-slate-700 text-center text-xl font-mono tracking-[0.4em] text-white focus:outline-none focus:border-blue-500"
+                        class="w-full h-11 px-4 rounded-xl bg-slate-950 border border-slate-700 text-center text-xl font-mono tracking-[0.4em] text-white focus:outline-none focus:border-blue-500"
                       />
                     </div>
                     <div>
-                      <label class="block text-xs font-medium text-slate-300 mb-1">Confirmar PIN *</label>
+                      <label class="block text-xs font-medium text-slate-300 mb-1">Confirmar PIN</label>
                       <input
                         type="password"
                         name="pinConfirm"
@@ -337,50 +255,34 @@ export function renderTerminalLockScreen(params: {
                         autocomplete="new-password"
                         value="${escapeHtml(newPinConfirmInput)}"
                         placeholder="••••"
-                        class="w-full h-12 px-4 rounded-xl bg-slate-950 border border-slate-700 text-center text-xl font-mono tracking-[0.4em] text-white focus:outline-none focus:border-blue-500"
+                        class="w-full h-11 px-4 rounded-xl bg-slate-950 border border-slate-700 text-center text-xl font-mono tracking-[0.4em] text-white focus:outline-none focus:border-blue-500"
                       />
                     </div>
                     <button
                       type="submit"
                       ${isSubmitting ? 'disabled' : ''}
-                      class="w-full h-12 rounded-xl bg-blue-600 hover:bg-blue-500 disabled:opacity-40 text-white font-bold text-sm flex items-center justify-center gap-2 transition-colors"
+                      class="w-full h-11 rounded-xl bg-blue-600 hover:bg-blue-500 disabled:opacity-40 text-white font-bold text-sm flex items-center justify-center gap-2 transition-colors"
                     >
                       ${ICONS.shieldCheck}
-                      <span>${isSubmitting ? 'A encriptar PIN...' : 'Guardar PIN e Desbloquear Terminal'}</span>
+                      <span>${isSubmitting ? 'A guardar...' : 'Guardar PIN e Desbloquear'}</span>
                     </button>
                   </form>
                 `
                 : !selectedMember.pinHash
-                  ? `<div class="py-6 space-y-3">
-                      <h2 class="text-sm font-bold text-white">${escapeHtml(selectedMember.displayName)} — Sem PIN</h2>
-                      <div class="p-3.5 rounded-xl bg-amber-950/50 border border-amber-800/80 text-xs text-amber-200 leading-relaxed">
-                        Este utilizador ainda não possui PIN individual configurado. Peça ao <strong>Proprietário</strong> ou <strong>Administrador</strong> para desbloquear o terminal e definir um PIN na secção <em>Configurações → Equipa &amp; Segurança</em>.
-                      </div>
+                  ? `<div class="p-3 rounded-xl bg-amber-950/50 border border-amber-800/80 text-xs text-amber-200 leading-relaxed">
+                      Operador sem PIN configurado. Solicite definição ao Proprietário ou Administrador.
                     </div>`
                   : `
-                    <div class="flex items-center justify-between gap-2">
-                      <div>
-                        <span class="text-[11px] font-bold uppercase tracking-wider text-blue-400">2. Autenticação Individual</span>
-                        <h2 class="text-base font-bold text-white">${escapeHtml(selectedMember.displayName)}</h2>
-                        <p class="text-xs text-slate-400">${escapeHtml(getMemberRoleDisplayName(selectedMember, roles))}</p>
-                      </div>
-                      <button
-                        type="button"
-                        data-action="lock-keypad-clear"
-                        class="h-8 px-2.5 rounded-lg bg-slate-800 hover:bg-slate-700 text-[11px] text-slate-300"
-                      >Limpar</button>
-                    </div>
-
                     ${
                       errorMessage
-                        ? `<div class="p-3 rounded-xl bg-red-950/70 border border-red-800 text-xs text-red-200">${escapeHtml(errorMessage)}</div>`
+                        ? `<div class="p-2.5 rounded-xl bg-red-950/70 border border-red-800 text-xs text-red-200">${escapeHtml(errorMessage)}</div>`
                         : ''
                     }
 
                     ${
                       lockStatus.locked
-                        ? `<div class="p-3.5 rounded-xl bg-red-950/60 border border-red-800 text-xs text-red-200 leading-relaxed">
-                            Demasiadas tentativas falhadas. Terminal bloqueado por <strong>${lockStatus.remainingSeconds} segundo(s)</strong> para este operador.
+                        ? `<div class="p-2.5 rounded-xl bg-red-950/60 border border-red-800 text-xs text-red-200">
+                            Bloqueado temporariamente (${lockStatus.remainingSeconds}s).
                           </div>`
                         : ''
                     }
@@ -388,7 +290,7 @@ export function renderTerminalLockScreen(params: {
                     <form data-form="terminal-unlock-form" class="space-y-3">
                       <input type="hidden" name="memberId" value="${escapeHtml(selectedMember.id)}" />
                       <div>
-                        <label class="block text-xs font-medium text-slate-300 mb-1">Introduza o seu PIN (4 a 6 dígitos)</label>
+                        <label for="terminal-unlock-pin-input" class="block text-xs font-medium text-slate-300 mb-1.5">Introduza o seu PIN (4 a 6 dígitos)</label>
                         <input
                           type="password"
                           name="pin"
@@ -404,7 +306,7 @@ export function renderTerminalLockScreen(params: {
                         />
                       </div>
 
-                      <!-- Teclado Numérico Táctil -->
+                      <!-- Teclado Numérico Táctil Compacto (apagamento tradicional via teclado ou ⌫) -->
                       <div class="grid grid-cols-3 gap-2">
                         ${['1', '2', '3', '4', '5', '6', '7', '8', '9']
                           .map(
@@ -413,33 +315,31 @@ export function renderTerminalLockScreen(params: {
                               data-action="lock-keypad-digit"
                               data-value="${d}"
                               ${lockStatus.locked ? 'disabled' : ''}
-                              class="h-11 rounded-xl bg-slate-800 hover:bg-slate-700 active:scale-95 disabled:opacity-40 text-base font-mono font-bold text-white transition-all"
+                              class="h-10 rounded-xl bg-slate-800 hover:bg-slate-700 active:scale-95 disabled:opacity-40 text-base font-mono font-bold text-white transition-all"
                             >${d}</button>`
                           )
                           .join('')}
                         <button
                           type="button"
-                          data-action="lock-keypad-clear"
-                          class="h-11 rounded-xl bg-slate-950 border border-slate-800 hover:bg-slate-800 text-xs font-medium text-slate-300"
-                        >Limpar</button>
-                        <button
-                          type="button"
                           data-action="lock-keypad-digit"
                           data-value="0"
                           ${lockStatus.locked ? 'disabled' : ''}
-                          class="h-11 rounded-xl bg-slate-800 hover:bg-slate-700 active:scale-95 disabled:opacity-40 text-base font-mono font-bold text-white transition-all"
+                          class="col-span-2 h-10 rounded-xl bg-slate-800 hover:bg-slate-700 active:scale-95 disabled:opacity-40 text-base font-mono font-bold text-white transition-all"
                         >0</button>
                         <button
                           type="button"
                           data-action="lock-keypad-backspace"
-                          class="h-11 rounded-xl bg-slate-950 border border-slate-800 hover:bg-slate-800 text-xs font-medium text-slate-300"
-                        >Apagar</button>
+                          ${lockStatus.locked ? 'disabled' : ''}
+                          aria-label="Apagar último dígito"
+                          title="Apagar dígito"
+                          class="h-10 rounded-xl bg-slate-950 border border-slate-800 hover:bg-slate-800 disabled:opacity-40 text-xs font-medium text-slate-300"
+                        >⌫</button>
                       </div>
 
                       <button
                         type="submit"
                         ${isSubmitting || lockStatus.locked ? 'disabled' : ''}
-                        class="w-full h-12 rounded-xl bg-blue-600 hover:bg-blue-500 disabled:opacity-40 text-white font-bold text-sm flex items-center justify-center gap-2 transition-colors"
+                        class="w-full h-11 rounded-xl bg-blue-600 hover:bg-blue-500 disabled:opacity-40 text-white font-bold text-sm flex items-center justify-center gap-2 transition-colors"
                       >
                         ${ICONS.unlock}
                         <span>${isSubmitting ? 'A verificar...' : 'Desbloquear Terminal'}</span>
@@ -450,26 +350,16 @@ export function renderTerminalLockScreen(params: {
         </section>
       </main>
 
-      <!-- Rodapé com Conta Cloud e Política de Privacidade -->
-      <footer class="max-w-4xl w-full mx-auto pt-4 border-t border-slate-800/90 flex flex-wrap items-center justify-between gap-3 text-xs text-slate-400">
-        <div class="flex flex-wrap items-center gap-2">
-          ${
-            isSignedIn
-              ? `<span class="text-slate-300">Conta Cloud: <strong class="font-mono">${escapeHtml(signedInEmail)}</strong></span>
-                 <button type="button" data-action="signout-google" class="px-2.5 py-1 rounded-md border border-slate-700 hover:bg-slate-800 text-[11px] text-slate-200">Terminar Sessão Google</button>`
-              : `<button type="button" data-action="signin-google" ${!isOnline ? 'disabled' : ''} class="px-3 py-1.5 rounded-lg border border-slate-700 bg-slate-900 hover:bg-slate-800 disabled:opacity-40 text-xs text-slate-200">
-                   Entrar com Google (Sincronizar / Convite)
-                 </button>`
-          }
-        </div>
-        <div class="flex items-center gap-3">
-          <button
-            type="button"
-            data-action="open-privacy-policy"
-            class="text-blue-400 hover:text-blue-300 underline text-xs"
-          >Política de Privacidade &amp; Segurança</button>
-          <span class="text-[11px] text-slate-500">${escapeHtml(VITRONIS_INSTITUTIONAL.shortName || 'VITRONIS')}</span>
-        </div>
+      <!-- Rodapé minimalista: apenas sessão Google -->
+      <footer class="relative z-10 max-w-md w-full mx-auto pt-3 border-t border-slate-800/80 flex items-center justify-between gap-2 text-xs text-slate-400">
+        ${
+          isSignedIn
+            ? `<span class="font-mono text-[11px] text-slate-400 truncate">${escapeHtml(signedInEmail)}</span>
+               <button type="button" data-action="signout-google" class="h-7 px-2.5 rounded-md border border-slate-700 hover:bg-slate-800 text-[11px] text-slate-200 shrink-0">Terminar Sessão</button>`
+            : `<button type="button" data-action="signin-google" ${!isOnline ? 'disabled' : ''} class="h-8 px-3 rounded-lg border border-slate-700 bg-slate-900 hover:bg-slate-800 disabled:opacity-40 text-xs text-slate-200">
+                 Entrar com Google
+               </button>`
+        }
       </footer>
     </div>
   `;
@@ -486,7 +376,7 @@ export function renderPrivacyPolicyModal(params: {
   const isCurrentAccepted = acceptedVersion === PRIVACY_POLICY_VERSION;
 
   return `
-    <div class="fixed inset-0 z-50 bg-slate-950/75 backdrop-blur-sm flex items-center justify-center p-3 sm:p-5">
+    <div class="fixed inset-0 z-60 bg-slate-950/75 backdrop-blur-sm flex items-center justify-center p-3 sm:p-5">
       <div class="bg-white text-slate-900 rounded-2xl border border-slate-200 w-full max-w-3xl max-h-[90vh] flex flex-col overflow-hidden shadow-2xl">
         <div class="px-5 py-4 border-b border-slate-200 flex items-start justify-between gap-3 bg-slate-50 shrink-0">
           <div>
@@ -626,11 +516,6 @@ export function renderRbacTeamSection(params: {
         </div>
 
         <div class="flex items-center gap-2 flex-wrap">
-          <button
-            type="button"
-            data-action="open-privacy-policy"
-            class="h-8 px-3 rounded-lg border border-slate-200 bg-white hover:bg-slate-100 text-xs font-medium text-slate-700"
-          >Privacidade</button>
           <button
             type="button"
             data-action="lock-terminal-now"

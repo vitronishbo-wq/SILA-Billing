@@ -69,7 +69,15 @@ import { renderCustomerMasterForm } from '../../frontend/ui/customerForm.ts';
 import { renderDocumentHtml } from '../../frontend/ui/documentRenderer.ts';
 import { renderMasterGovernanceModal } from '../../frontend/ui/masterGovernanceModal.ts';
 import { renderMobileOperationalView } from '../../frontend/ui/mobileOperationalView.ts';
-import { renderNewCompanyModal } from '../../frontend/ui/multicompanyModals.ts';
+import {
+  renderGeometricWatermarkLayer,
+  renderSilaGeometricMark,
+} from '../../frontend/ui/brandIdentity.ts';
+import {
+  renderNewCompanyModal,
+  renderTenantOnboardingView,
+} from '../../frontend/ui/multicompanyModals.ts';
+import { renderTerminalLockScreen } from '../../frontend/ui/rbacViews.ts';
 import {
   CATALOG_VIEW_MODE_STORAGE_KEY,
   readCatalogViewModePreference,
@@ -1950,6 +1958,349 @@ export async function runPhase5ValidationTests(): Promise<{ passed: number; tota
         touchHtml.includes('×2'),
       'Modo Touch deve preservar integralmente a grelha e dimensão min-h-[92px] dos cartões táteis'
     );
+  });
+
+  await test('5.12 Ecrã de Bloqueio Minimalista: selector único de operador, zero jornais/Limpar e Privacidade reservada ao cadastro inicial', () => {
+    const compRecord = {
+      id: 'comp_jaimona',
+      normalizedNif: '5003069940',
+      profile: JAIMONA_COMPANY,
+      status: 'active' as const,
+      plan: {
+        planTier: 'PROFISSIONAL' as const,
+        commercialActive: true,
+        maxUsers: null,
+        maxInvoicesPerMonth: null,
+        updatedAtIso: new Date().toISOString(),
+      },
+      baseSequence: 0,
+      allowManagerCancel: false,
+      createdAtIso: new Date().toISOString(),
+      updatedAtIso: new Date().toISOString(),
+    };
+    const lockHtml = renderTerminalLockScreen({
+      company: compRecord,
+      companies: [compRecord],
+      members: [
+        {
+          id: 'mem_owner_1',
+          companyId: 'comp_jaimona',
+          uid: 'uid_owner_1',
+          email: 'owner@jaimona.ao',
+          displayName: 'Proprietário',
+          role: 'owner',
+          allowInvoiceCancel: true,
+          pinHash: 'pbkdf2$100000$salt$hash',
+          active: true,
+          status: 'active',
+          createdAtIso: new Date().toISOString(),
+          updatedAtIso: new Date().toISOString(),
+        },
+        {
+          id: 'mem_cashier_1',
+          companyId: 'comp_jaimona',
+          uid: 'uid_cashier_1',
+          email: 'maria@jaimona.ao',
+          displayName: 'Maria Caixa',
+          role: 'cashier',
+          allowInvoiceCancel: false,
+          pinHash: 'pbkdf2$100000$salt$hash2',
+          active: true,
+          status: 'active',
+          createdAtIso: new Date().toISOString(),
+          updatedAtIso: new Date().toISOString(),
+        },
+      ],
+      roles: [],
+      selectedMemberId: 'mem_owner_1',
+      pinInput: '',
+      newPinConfirmInput: '',
+      isSubmitting: false,
+      errorMessage: null,
+      lockReasonMessage: null,
+      isOnline: true,
+      isSignedIn: false,
+      signedInEmail: '',
+      isPlatformAdmin: false,
+    });
+
+    assert(
+      lockHtml.includes('JAIMONA') && lockHtml.includes('NIF 5003069940'),
+      'Ecrã de bloqueio deve manter identificação da empresa e NIF no topo'
+    );
+    for (const forbidden of [
+      'Terminal Protegido',
+      'RBAC Activo',
+      '1. Identificação do Operador',
+      '2. Autenticação Individual',
+      'Limpar',
+      'Política de Privacidade',
+      'open-privacy-policy',
+    ]) {
+      assert(
+        !lockHtml.includes(forbidden),
+        `Ecrã de bloqueio não deve conter texto ou controlo eliminado: '${forbidden}'`
+      );
+    }
+    assert(
+      lockHtml.includes('id="lock-screen-member-select"') &&
+        lockHtml.includes('Introduza o seu PIN (4 a 6 dígitos)') &&
+        lockHtml.includes('id="terminal-unlock-pin-input"') &&
+        lockHtml.includes('data-action="lock-keypad-backspace"') &&
+        lockHtml.includes('Desbloquear Terminal'),
+      'Ecrã de bloqueio deve conter selector único de operador, campo PIN, apagamento tradicional e botão de desbloqueio'
+    );
+
+    const regModalHtml = renderNewCompanyModal({
+      errorMessage: null,
+      isSubmitting: false,
+      isSignedIn: false,
+    });
+    assert(
+      regModalHtml.includes('data-action="open-privacy-policy"') &&
+        regModalHtml.includes('Política de Privacidade'),
+      'Política de Privacidade deve estar acessível na janela de cadastro inicial'
+    );
+  });
+
+  await test('5.13 Identidade Geométrica Minimalista: SVG inline puro, zero URLs externos, bloqueio/onboarding/mobile/desktop e isolamento de impressão', async () => {
+    const fs = await import('node:fs');
+    const path = await import('node:path');
+
+    // 1. Marca e camada geométrica puramente inline (zero dependências, zero URLs externos, zero imagens)
+    const markSvg = renderSilaGeometricMark('w-4 h-4 text-blue-400');
+    const darkWatermark = renderGeometricWatermarkLayer('dark', 'center');
+    const lightWatermark = renderGeometricWatermarkLayer('light', 'corner');
+
+    for (const fragment of [markSvg, darkWatermark, lightWatermark]) {
+      assert(fragment.includes('<svg') && fragment.includes('</svg>'), 'Identidade deve usar apenas SVG inline');
+      assert(!/https?:\/\//i.test(fragment), 'Identidade geométrica não pode conter URLs externos');
+      assert(!/<img/i.test(fragment), 'Identidade geométrica não pode usar imagens raster externas');
+    }
+    for (const wm of [darkWatermark, lightWatermark]) {
+      assert(
+        wm.includes('no-print') &&
+          wm.includes('sila-watermark-layer') &&
+          wm.includes('pointer-events-none') &&
+          wm.includes('aria-hidden="true"'),
+        'Fundo d’água geométrico deve ser não-interactivo e isolado da impressão'
+      );
+    }
+
+    // 2. Onboarding (Desktop & Mobile) e Bloqueio em modo offline com identidade geométrica
+    const onboardingHtml = renderTenantOnboardingView({
+      userEmail: '',
+      isSignedIn: false,
+      isOnline: false,
+      isSyncing: false,
+      syncMessage: null,
+    });
+    assert(
+      onboardingHtml.includes('sila-bg-grid-light') &&
+        onboardingHtml.includes('sila-watermark-layer') &&
+        onboardingHtml.includes('sila-card-elevated') &&
+        onboardingHtml.includes('Cadastrar Nova Empresa'),
+      'Onboarding deve apresentar micro-grelha clara, selo geométrico e cartão elevado funcionando offline'
+    );
+
+    const compRecord = {
+      id: 'comp_jaimona',
+      normalizedNif: '5003069940',
+      profile: JAIMONA_COMPANY,
+      status: 'active' as const,
+      plan: {
+        planTier: 'PROFISSIONAL' as const,
+        commercialActive: true,
+        maxUsers: null,
+        maxInvoicesPerMonth: null,
+        updatedAtIso: new Date().toISOString(),
+      },
+      baseSequence: 0,
+      allowManagerCancel: false,
+      createdAtIso: new Date().toISOString(),
+      updatedAtIso: new Date().toISOString(),
+    };
+
+    const lockHtml = renderTerminalLockScreen({
+      company: compRecord,
+      companies: [compRecord],
+      members: [
+        {
+          id: 'mem_owner_1',
+          companyId: 'comp_jaimona',
+          uid: 'uid_owner_1',
+          email: 'owner@jaimona.ao',
+          displayName: 'Proprietário',
+          role: 'owner',
+          allowInvoiceCancel: true,
+          pinHash: 'pbkdf2$100000$salt$hash',
+          active: true,
+          status: 'active',
+          createdAtIso: new Date().toISOString(),
+          updatedAtIso: new Date().toISOString(),
+        },
+      ],
+      roles: [],
+      selectedMemberId: 'mem_owner_1',
+      pinInput: '',
+      newPinConfirmInput: '',
+      isSubmitting: false,
+      errorMessage: null,
+      lockReasonMessage: null,
+      isOnline: false,
+      isSignedIn: false,
+      signedInEmail: '',
+      isPlatformAdmin: false,
+    });
+    assert(
+      lockHtml.includes('no-print') &&
+        lockHtml.includes('sila-bg-grid-dark') &&
+        lockHtml.includes('sila-watermark-layer'),
+      'Ecrã de bloqueio deve aplicar micro-grelha escura e selo geométrico com isolamento no-print'
+    );
+
+    const mobileHtml = renderMobileOperationalView({
+      activeCompany: compRecord,
+      settings: {
+        companyId: 'comp_jaimona',
+        company: JAIMONA_COMPANY,
+        defaultCashier: '01',
+        defaultOperator: '001',
+        defaultFormat: 'POS',
+        defaultDocType: 'FR',
+        defaultNotes: '',
+        autoPrintOnEmit: false,
+        hidePromotionalFooter: false,
+        allowCashierPriceEdit: false,
+        updatedAtIso: new Date().toISOString(),
+      },
+      companyMasterDraftProfile: null,
+      companyMasterDraftSettings: null,
+      companyMasterSection: 'ALL',
+      companySeries: [],
+      canManageCompanySettings: true,
+      companyFormError: null,
+      companyFormSavedNotice: false,
+      showRequestAgtSeriesForm: false,
+      confirmFinalizeSeriesId: null,
+      agtSeriesErrorMessage: null,
+      agtSeriesSuccessMessage: null,
+      showEstablishmentForm: false,
+      editingEstablishment: null,
+      establishmentError: null,
+      showWarehouseForm: false,
+      editingWarehouse: null,
+      warehouseError: null,
+      isOnline: false,
+      user: null,
+      mobileTab: 'HOME',
+      mobileCheckoutStep: 'CART',
+      cart: [],
+      products: [],
+      customers: [],
+      invoices: [],
+      selectedCustomerId: '999999999',
+      docType: 'FR',
+      paymentMethod: 'Dinheiro',
+      amountReceivedInput: '',
+      mobileSearchQuery: '',
+      mobileProductSearchInput: '',
+      lastEmittedInvoice: null,
+      showQuickProductModal: false,
+      showQuickCustomerModal: false,
+      showQuickCompanyModal: false,
+      showCustomerPickerModal: false,
+      editingMobileProduct: null,
+      editingCustomer: null,
+      editingCustomerCreditLimitInput: '',
+      showCustomerAdvancedFields: false,
+      mobileCustomerModalMode: 'QUICK',
+      canEditExistingCustomers: true,
+      quickCustomerDraft: {
+        name: '',
+        nif: '',
+        phone: '',
+        address: '',
+        locality: 'Luanda',
+        customerType: 'PARTICULAR',
+        countryCode: 'AO',
+        foreignTaxId: '',
+      },
+      quickProductError: null,
+      quickCustomerError: null,
+      operator: '001',
+      canSellPos: true,
+      canViewProducts: true,
+      canViewCustomers: true,
+      canViewDocs: true,
+      canViewMaster: true,
+    });
+    assert(
+      mobileHtml.includes('sila-bg-grid-dark') &&
+        mobileHtml.includes('sila-watermark-layer') &&
+        mobileHtml.includes('Offline'),
+      'Workspace Mobile deve preservar modo offline com micro-grelha escura e selo geométrico'
+    );
+
+    // 3. CSS de impressão isola grelha/selos + renderDocumentHtml (A4 e POS) permanece 100% intacto sem marcas d'água
+    const indexCss = fs.readFileSync(path.resolve(process.cwd(), 'src/index.css'), 'utf8');
+    const printSection = indexCss.slice(indexCss.indexOf('@media print'));
+    assert(
+      printSection.includes('.sila-watermark-layer') &&
+        printSection.includes('.sila-bg-grid-light') &&
+        printSection.includes('.sila-bg-grid-dark') &&
+        printSection.includes('background-image: none !important'),
+      'Regra @media print em src/index.css deve anular completamente fundos, grelhas e selos na impressão'
+    );
+
+    const appTs = fs.readFileSync(path.resolve(process.cwd(), 'frontend/app.ts'), 'utf8');
+    assert(
+      appTs.includes('sila-shell-bar') &&
+        appTs.includes('sila-bg-grid-light') &&
+        appTs.includes("renderGeometricWatermarkLayer('light', 'corner')"),
+      'Shell Desktop deve integrar barra institucional, micro-grelha clara e selo geométrico no workspace'
+    );
+
+    const t = calculateInvoiceTotals([
+      { productId: 'p1', code: 'P1', description: 'Artigo Teste', unit: 'un', qty: 1, unitPrice: 1140, discountPct: 0, ivaRate: 14 },
+    ]);
+    const sampleInv: InvoiceRecord = {
+      id: 'inv_print_clean',
+      number: 'FR A2026/000001',
+      docType: 'FR',
+      issuedAtIso: '2026-06-10T10:00:00.000Z',
+      createdAtIso: '2026-06-10T10:00:00.000Z',
+      updatedAtIso: '2026-06-10T10:00:00.000Z',
+      cashier: '01',
+      operator: '001',
+      paymentMethod: 'Dinheiro',
+      customerId: '999999999',
+      customerName: 'Consumidor Final',
+      customerNif: '999999999',
+      customerLocality: 'Luanda - Angola',
+      merchandiseTotal: t.merchandiseTotal,
+      discountTotal: 0,
+      taxBase14: t.taxBase14,
+      taxAmount14: t.taxAmount14,
+      taxBase0: 0,
+      taxAmount0: 0,
+      taxTotal: t.taxTotal,
+      grandTotal: t.grandTotal,
+      amountInWords: t.amountInWords,
+      amountReceived: t.grandTotal,
+      changeAmount: 0,
+      notes: '',
+      status: 'issued',
+      lines: t.lines,
+    };
+
+    for (const fmt of ['A4', 'POS'] as const) {
+      const docHtml = renderDocumentHtml(sampleInv, fmt, JAIMONA_COMPANY, '');
+      assert(
+        !docHtml.includes('sila-watermark-layer') && !docHtml.includes('sila-bg-grid'),
+        `Documento ${fmt} não pode receber marcas d'água nem estilos de grelha da interface`
+      );
+    }
   });
 
   console.log(`\n=== FASE 5 CONCLUÍDA: ${passed}/${total} TESTES PASSARAM COM SUCESSO ===\n`);
