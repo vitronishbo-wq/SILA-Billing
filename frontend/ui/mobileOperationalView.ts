@@ -14,8 +14,13 @@ import {
   inferCustomerType,
 } from '../../src/core/customerValidator';
 import {
+  buildFinancialIntelligenceSnapshot,
+} from '../../src/core/financialIntelligence';
+import {
   AppSettings,
   CartDraftItem,
+  CashMovement,
+  CashSession,
   CompanyProfile,
   CompanyRecord,
   Customer,
@@ -29,6 +34,7 @@ import {
   InvoiceRecord,
   PaymentMethod,
   Product,
+  PurchaseRecord,
   TaxRate,
   WarehouseRecord,
 } from '../../src/core/types';
@@ -38,6 +44,7 @@ import {
 } from './companyMasterForm';
 import { renderGeometricWatermarkLayer, renderSilaGeometricMark } from './brandIdentity';
 import { renderCustomerMasterForm } from './customerForm';
+import { renderMobileFinancialIntelligenceSection } from './financialIntelligenceView';
 import { ICONS } from './icons';
 
 export type MobileTab = 'HOME' | 'SALE' | 'DOCS' | 'CUSTOMERS' | 'MORE' | 'PRODUCTS';
@@ -71,6 +78,9 @@ export interface MobileOperationalProps {
   products: Product[];
   customers: Customer[];
   invoices: InvoiceRecord[];
+  cashSessions?: CashSession[];
+  cashMovements?: CashMovement[];
+  purchases?: PurchaseRecord[];
   selectedCustomerId: string;
   docType: DocumentType;
   paymentMethod: PaymentMethod;
@@ -118,6 +128,7 @@ export interface MobileOperationalProps {
   isMasterProductionReady?: boolean;
   canManageRbac?: boolean;
   canViewSecurityAudit?: boolean;
+  canAccessAccountant?: boolean;
   companiesCount?: number;
   syncPendingCount?: number;
   syncMessage?: string | null;
@@ -216,19 +227,40 @@ function renderMobileHome(props: MobileOperationalProps): string {
     '---';
   const envLabel = profile.agtEnvironment === 'PRODUCAO' ? 'Produção AGT' : 'Simulação';
 
-  // Métricas rápidas do dia
-  const todayPrefix = new Date().toISOString().slice(0, 10);
-  const todayInvoices = invoices.filter(
-    (inv) => inv.issuedAtIso.slice(0, 10) === todayPrefix && inv.status !== 'cancelled'
-  );
-  const todayTotal = todayInvoices.reduce((acc, inv) => acc + inv.grandTotal, 0);
-
   const canSellPos = Boolean(props.canSellPos);
   const canViewProducts = Boolean(props.canViewProducts);
   const canViewCustomers = Boolean(props.canViewCustomers);
   const canViewMaster = Boolean(props.canViewMaster);
   const canViewDocs = Boolean(props.canViewDocs);
-  const canViewFinancialTotals = Boolean(props.canViewDocs || props.canViewProfitsMargins);
+  const canViewFinancialTotals = Boolean(
+    props.canViewDocs || props.canViewProfitsMargins || props.canOperateCash
+  );
+  const intelSnap = canViewFinancialTotals
+    ? buildFinancialIntelligenceSnapshot({
+        invoices,
+        products: props.products,
+        customers: props.customers,
+        cashSessions: props.cashSessions || [],
+        cashMovements: props.cashMovements || [],
+        purchases: props.purchases || [],
+        permissions: {
+          canViewMargins: Boolean(props.canViewCostPrices && props.canViewProfitsMargins),
+          canViewCashVariance: Boolean(
+            props.canOperateCash || props.canViewDocs || props.canViewProfitsMargins
+          ),
+          canViewReceivables: Boolean(
+            props.canViewDocs ||
+              props.canViewCustomers ||
+              props.canOperateCash ||
+              props.canViewProfitsMargins
+          ),
+          canViewStockAlerts: Boolean(props.canViewProducts || props.canSellPos),
+          ...(!props.canViewDocs && !props.canViewProfitsMargins && props.canOperateCash
+            ? { activeCashierFilter: props.settings.defaultCashier || '01' }
+            : {}),
+        },
+      })
+    : null;
 
   return `
     <div class="p-4 flex flex-col gap-4 max-w-lg mx-auto">
@@ -450,29 +482,13 @@ function renderMobileHome(props: MobileOperationalProps): string {
       </section>
 
       ${
-        canViewFinancialTotals
-          ? `<!-- Resumo Rápido de Vendas do Dia + Envio WhatsApp ao Proprietário -->
-            <section class="bg-slate-900/60 border border-slate-800/80 rounded-2xl p-3.5 flex items-center justify-between gap-2 text-xs">
-              <div>
-                <span class="text-slate-400 block">Vendas hoje:</span>
-                <span class="text-sm font-semibold text-white tabular-nums">${todayInvoices.length} ${todayInvoices.length === 1 ? 'documento' : 'documentos'}</span>
-              </div>
-              <div class="flex items-center gap-2.5">
-                <div class="text-right">
-                  <span class="text-slate-400 block">Total faturado:</span>
-                  <span class="text-sm font-bold text-emerald-400 tabular-nums">${formatKzNumber(todayTotal)} Kz</span>
-                </div>
-                <button
-                  type="button"
-                  data-action="whatsapp-daily-summary"
-                  title="Enviar resumo diário ao proprietário via WhatsApp"
-                  class="h-10 px-3 rounded-xl bg-emerald-600/20 hover:bg-emerald-600 border border-emerald-700/60 text-emerald-300 hover:text-white text-xs font-semibold flex items-center gap-1.5 active:scale-95 transition-colors shrink-0"
-                >
-                  ${ICONS.whatsapp}
-                  <span>Resumo</span>
-                </button>
-              </div>
-            </section>`
+        canViewFinancialTotals && intelSnap
+          ? renderMobileFinancialIntelligenceSection(intelSnap, {
+              canAccessProducts: canViewProducts,
+              canShareDailyWhatsApp: Boolean(
+                props.canViewDocs || props.canOperateCash || props.canViewProfitsMargins
+              ),
+            })
           : ''
       }
     </div>
@@ -530,6 +546,15 @@ function renderMobileProducts(props: MobileOperationalProps): string {
           ${
             canManageProducts
               ? `<button
+                  type="button"
+                  data-action="open-bulk-import-products"
+                  title="Importar artigos em lote por Excel ou CSV"
+                  class="h-9 px-2.5 rounded-xl bg-slate-800 hover:bg-slate-700 border border-slate-700 text-slate-200 text-xs font-semibold flex items-center gap-1 active:scale-95"
+                >
+                  ${ICONS.upload}
+                  <span>Importar</span>
+                </button>
+                <button
                   type="button"
                   data-action="mobile-open-quick-product"
                   class="h-9 px-3 rounded-xl bg-blue-600 hover:bg-blue-500 text-white text-xs font-bold flex items-center gap-1.5 shadow-md shadow-blue-600/30 active:scale-95"
@@ -1489,19 +1514,30 @@ function renderMobileCustomers(props: MobileOperationalProps): string {
           <h2 class="text-base font-bold text-white">Clientes Cadastrados</h2>
           <p class="text-[11px] text-slate-400 tabular-nums">${customers.length} registo(s)</p>
         </div>
-        ${
-          canCreateCustomers
-            ? `<button
-                type="button"
-                data-action="mobile-open-quick-customer"
-                data-value="FULL"
-                class="h-10 px-3 rounded-lg bg-blue-600 hover:bg-blue-500 text-white text-xs font-semibold flex items-center gap-1 active:scale-95"
-              >
-                ${ICONS.plus}
-                <span>Novo Cliente</span>
-              </button>`
-            : ''
-        }
+        <div class="flex items-center gap-1.5 shrink-0">
+          ${
+            canCreateCustomers
+              ? `<button
+                  type="button"
+                  data-action="open-bulk-import-customers"
+                  title="Importar clientes por Excel ou CSV"
+                  class="h-10 px-2.5 rounded-lg bg-slate-800 hover:bg-slate-700 border border-slate-700 text-slate-200 text-xs font-semibold flex items-center gap-1 active:scale-95"
+                >
+                  ${ICONS.upload}
+                  <span>Importar</span>
+                </button>
+                <button
+                  type="button"
+                  data-action="mobile-open-quick-customer"
+                  data-value="FULL"
+                  class="h-10 px-3 rounded-lg bg-blue-600 hover:bg-blue-500 text-white text-xs font-semibold flex items-center gap-1 active:scale-95"
+                >
+                  ${ICONS.plus}
+                  <span>Novo Cliente</span>
+                </button>`
+              : ''
+          }
+        </div>
       </div>
 
       <div class="flex flex-col gap-2">
@@ -1640,6 +1676,28 @@ function renderMobileMore(props: MobileOperationalProps): string {
         }
 
         ${
+          canManageProducts || props.canManageCompanySettings
+            ? `<!-- Entrada Rápida (< 10 min) & Importação Excel/CSV -->
+              <button
+                type="button"
+                data-action="open-quick-onboarding-wizard"
+                class="bg-slate-900 hover:bg-slate-850 rounded-xl p-3.5 flex items-center justify-between border border-blue-800/70 text-left active:scale-[0.98]"
+              >
+                <div class="flex items-center gap-3">
+                  <div class="h-8 w-8 rounded-lg bg-blue-600 text-white flex items-center justify-center shrink-0">
+                    ${ICONS.upload}
+                  </div>
+                  <div>
+                    <span class="text-sm font-bold text-white block">Entrada Rápida (&lt; 10 min)</span>
+                    <span class="text-xs text-slate-400 block">Importar Excel/CSV, caixa e impressora</span>
+                  </div>
+                </div>
+                <span class="text-slate-500">${ICONS.chevronRight}</span>
+              </button>`
+            : ''
+        }
+
+        ${
           canManageProducts
             ? `<!-- Cadastrar Artigo Rápido -->
               <button
@@ -1698,6 +1756,28 @@ function renderMobileMore(props: MobileOperationalProps): string {
                   <div>
                     <span class="text-sm font-bold text-white block">Ficha Mestre &amp; Definições</span>
                     <span class="text-xs text-slate-400 block">Caixa, impressão, dados fiscais, logótipo, bancos e séries</span>
+                  </div>
+                </div>
+                <span class="text-slate-500">${ICONS.chevronRight}</span>
+              </button>`
+            : ''
+        }
+
+        ${
+          props.canAccessAccountant
+            ? `<!-- Modo Contabilista -->
+              <button
+                type="button"
+                data-action="mobile-open-accountant"
+                class="bg-slate-900 hover:bg-slate-850 rounded-xl p-3.5 flex items-center justify-between border border-blue-800/70 text-left active:scale-[0.98]"
+              >
+                <div class="flex items-center gap-3">
+                  <div class="h-8 w-8 rounded-lg bg-blue-600 text-white flex items-center justify-center shrink-0">
+                    ${ICONS.chartBar}
+                  </div>
+                  <div>
+                    <span class="text-sm font-bold text-white block">Modo Contabilista</span>
+                    <span class="text-xs text-slate-400 block">IVA, retenções, SAF-T, pacotes .zip e empresas</span>
                   </div>
                 </div>
                 <span class="text-slate-500">${ICONS.chevronRight}</span>

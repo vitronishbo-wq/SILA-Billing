@@ -53,6 +53,8 @@ import {
   JAIMONA_COMPANY_ID,
   resolveCompanyProfileFromSnapshot,
   VITRONIS_INSTITUTIONAL,
+  type CashMovement,
+  type CashSession,
   type CompanyProfile,
   type Customer,
   type InvoiceRecord,
@@ -106,6 +108,40 @@ import {
   WHATSAPP_DISCREET_SIGNATURE,
 } from './whatsappChannel.ts';
 import { renderWhatsAppShareModal } from '../../frontend/ui/whatsappShareModal.ts';
+import { buildFinancialIntelligenceSnapshot } from './financialIntelligence.ts';
+import {
+  renderFinancialIntelligenceGrid,
+  renderFinancialIntelligenceModal,
+} from '../../frontend/ui/financialIntelligenceView.ts';
+import {
+  applyStagedCustomerImportBatch,
+  applyStagedProductImportBatch,
+  buildMinimalXlsxBytes,
+  buildSampleCustomersCsv,
+  buildSampleCustomersXlsx,
+  buildSampleProductsCsv,
+  buildSampleProductsXlsx,
+  parseSpreadsheetFileBytes,
+  prepareCustomerImportBatch,
+  prepareProductImportBatch,
+} from './spreadsheetImport.ts';
+import { renderQuickOnboardingModal } from '../../frontend/ui/quickOnboardingWizard.ts';
+import {
+  buildAccountantAuditTrail,
+  buildAccountantMonthlyPackage,
+  buildAccountantMonthlyZipPackage,
+  buildAccountantMonthOptions,
+} from './accountantEngine.ts';
+import {
+  buildDefaultCompanyRoles,
+  hasPermission,
+  resolveMemberPermissions,
+} from './rbac.ts';
+import { canViewerAccessTenant } from '../services/localStore.ts';
+import {
+  renderAccountantMonthlyDossierHtml,
+  renderAccountantWorkspaceHtml,
+} from '../../frontend/ui/accountantWorkspace.ts';
 
 function assert(condition: boolean, message: string): void {
   if (!condition) {
@@ -2884,6 +2920,1120 @@ export async function runPhase5ValidationTests(): Promise<{ passed: number; tota
     assert(
       mobileHomeHtml.includes('data-action="whatsapp-daily-summary"'),
       'Ecrã inicial Mobile deve expor botão rápido para envio de resumo diário ao proprietário via WhatsApp'
+    );
+  });
+
+  await test('5.16 Inteligência Financeira (7 Respostas Imediatas): cálculos exactos, RBAC de margens e renderização Desktop/Mobile sem complicar o POS', () => {
+    const refIso = '2026-08-12T16:30:00.000Z';
+    const yesterdayIso = '2026-08-11T11:00:00.000Z';
+    const olderIso = '2026-07-01T09:00:00.000Z';
+
+    const productsIntel: Product[] = [
+      {
+        id: 'p_agua',
+        code: 'BEB-01',
+        name: 'Água Mineral 1.5L',
+        category: 'Bebidas',
+        unit: 'un',
+        costPrice: 200,
+        price: 500, // isento 0%
+        ivaRate: 0,
+        exemptionReason: 'Cesta Básica',
+        active: true,
+        trackStock: true,
+        stockQty: 3,
+        minStockQty: 10,
+        createdAtIso: olderIso,
+        updatedAtIso: olderIso,
+      },
+      {
+        id: 'p_sumo',
+        code: 'BEB-02',
+        name: 'Sumo Tropical 1L',
+        category: 'Bebidas',
+        unit: 'un',
+        costPrice: 500,
+        price: 1140, // 1.000 base + 140 IVA -> margem 50% (500/1000)
+        ivaRate: 14,
+        exemptionReason: '',
+        active: true,
+        trackStock: true,
+        stockQty: 0,
+        minStockQty: 5,
+        createdAtIso: olderIso,
+        updatedAtIso: olderIso,
+      },
+      {
+        id: 'p_serv',
+        code: 'SRV-01',
+        name: 'Entrega Express',
+        category: 'Serviços',
+        unit: 'serv',
+        price: 2000, // sem costPrice definido
+        ivaRate: 0,
+        exemptionReason: 'Isento',
+        active: true,
+        trackStock: false,
+        createdAtIso: olderIso,
+        updatedAtIso: olderIso,
+      },
+    ];
+
+    const customersIntel: Customer[] = [
+      {
+        id: 'cli_intel_1',
+        name: 'Mercearia Central, Lda',
+        nif: '5001122334',
+        locality: 'Luanda',
+        address: 'Rua 1',
+        phone: '923111222',
+        paymentTerms: '15_DIAS',
+        createdAtIso: olderIso,
+        updatedAtIso: olderIso,
+      },
+    ];
+
+    // Venda 1 Hoje: Pago pronto (Dinheiro 1.000 + Multicaixa 1.140 = 2.140)
+    const totTodayPaid = calculateInvoiceTotals([
+      {
+        productId: 'p_agua',
+        code: 'BEB-01',
+        description: 'Água Mineral 1.5L',
+        unit: 'un',
+        qty: 2,
+        unitPrice: 500,
+        discountPct: 0,
+        ivaRate: 0,
+      },
+      {
+        productId: 'p_sumo',
+        code: 'BEB-02',
+        description: 'Sumo Tropical 1L',
+        unit: 'un',
+        qty: 1,
+        unitPrice: 1140,
+        discountPct: 0,
+        ivaRate: 14,
+      },
+    ]);
+
+    // Venda 2 Hoje: Fatura a crédito (2.000 Kz, recebeu entrada 500 Dinheiro, falta 1.500)
+    const totTodayCredit = calculateInvoiceTotals([
+      {
+        productId: 'p_serv',
+        code: 'SRV-01',
+        description: 'Entrega Express',
+        unit: 'serv',
+        qty: 1,
+        unitPrice: 2000,
+        discountPct: 0,
+        ivaRate: 0,
+      },
+    ]);
+
+    // Venda Antiga em Dívida Vencida (cliente 15 dias, emitida há > 40 dias -> 10.000 em dívida)
+    const totOldDebt = calculateInvoiceTotals([
+      {
+        productId: 'p_agua',
+        code: 'BEB-01',
+        description: 'Água Mineral 1.5L',
+        unit: 'un',
+        qty: 20,
+        unitPrice: 500,
+        discountPct: 0,
+        ivaRate: 0,
+      },
+    ]);
+
+    const invoicesIntel: InvoiceRecord[] = [
+      {
+        id: 'inv_i_1',
+        number: 'FR S12026/000101',
+        docType: 'FR',
+        issuedAtIso: '2026-08-12T10:00:00.000Z',
+        createdAtIso: '2026-08-12T10:00:00.000Z',
+        updatedAtIso: '2026-08-12T10:00:00.000Z',
+        cashier: '01',
+        operator: '001',
+        sessionId: 'sess_open_today',
+        paymentMethod: 'Combinado',
+        paymentSplits: [
+          { method: 'Dinheiro', amount: 1000 },
+          { method: 'Multicaixa', amount: 1140 },
+        ],
+        customerId: '999999999',
+        customerName: 'Consumidor Final',
+        customerNif: '999999999',
+        customerLocality: 'Luanda',
+        merchandiseTotal: totTodayPaid.merchandiseTotal,
+        discountTotal: 0,
+        taxBase14: totTodayPaid.taxBase14,
+        taxAmount14: totTodayPaid.taxAmount14,
+        taxBase0: totTodayPaid.taxBase0,
+        taxAmount0: 0,
+        taxTotal: totTodayPaid.taxTotal,
+        grandTotal: totTodayPaid.grandTotal,
+        amountInWords: totTodayPaid.amountInWords,
+        amountReceived: 2140,
+        initialAmountReceived: 2140,
+        changeAmount: 0,
+        initialChangeAmount: 0,
+        notes: '',
+        status: 'issued',
+        lines: totTodayPaid.lines,
+      },
+      {
+        id: 'inv_i_2',
+        number: 'FR S12026/000102',
+        docType: 'FR',
+        issuedAtIso: '2026-08-12T12:00:00.000Z',
+        createdAtIso: '2026-08-12T12:00:00.000Z',
+        updatedAtIso: '2026-08-12T12:00:00.000Z',
+        cashier: '01',
+        operator: '001',
+        sessionId: 'sess_open_today',
+        paymentMethod: 'Crédito',
+        customerId: 'cli_intel_1',
+        customerName: 'Mercearia Central, Lda',
+        customerNif: '5001122334',
+        customerLocality: 'Luanda',
+        merchandiseTotal: totTodayCredit.merchandiseTotal,
+        discountTotal: 0,
+        taxBase14: 0,
+        taxAmount14: 0,
+        taxBase0: totTodayCredit.taxBase0,
+        taxAmount0: 0,
+        taxTotal: 0,
+        grandTotal: totTodayCredit.grandTotal,
+        amountInWords: totTodayCredit.amountInWords,
+        amountReceived: 500,
+        initialAmountReceived: 500,
+        changeAmount: 0,
+        initialChangeAmount: 0,
+        amountDue: 1500,
+        notes: '',
+        status: 'issued',
+        lines: totTodayCredit.lines,
+      },
+      {
+        id: 'inv_i_yday',
+        number: 'FR S12026/000100',
+        docType: 'FR',
+        issuedAtIso: yesterdayIso,
+        createdAtIso: yesterdayIso,
+        updatedAtIso: yesterdayIso,
+        cashier: '01',
+        operator: '001',
+        paymentMethod: 'Dinheiro',
+        customerId: '999999999',
+        customerName: 'Consumidor Final',
+        customerNif: '999999999',
+        customerLocality: 'Luanda',
+        merchandiseTotal: 2070,
+        discountTotal: 0,
+        taxBase14: 0,
+        taxAmount14: 0,
+        taxBase0: 2070,
+        taxAmount0: 0,
+        taxTotal: 0,
+        grandTotal: 2070,
+        amountInWords: '',
+        amountReceived: 2070,
+        changeAmount: 0,
+        notes: '',
+        status: 'issued',
+        lines: [],
+      },
+      {
+        id: 'inv_i_old_due',
+        number: 'FR S12026/000050',
+        docType: 'FR',
+        issuedAtIso: olderIso,
+        createdAtIso: olderIso,
+        updatedAtIso: olderIso,
+        cashier: '01',
+        operator: '001',
+        paymentMethod: 'Crédito',
+        customerId: 'cli_intel_1',
+        customerName: 'Mercearia Central, Lda',
+        customerNif: '5001122334',
+        customerLocality: 'Luanda',
+        merchandiseTotal: totOldDebt.merchandiseTotal,
+        discountTotal: 0,
+        taxBase14: 0,
+        taxAmount14: 0,
+        taxBase0: totOldDebt.taxBase0,
+        taxAmount0: 0,
+        taxTotal: 0,
+        grandTotal: totOldDebt.grandTotal,
+        amountInWords: totOldDebt.amountInWords,
+        amountReceived: 0,
+        initialAmountReceived: 0,
+        changeAmount: 0,
+        amountDue: 10000,
+        notes: '',
+        status: 'issued',
+        lines: totOldDebt.lines,
+      },
+    ];
+
+    const sessionsIntel: CashSession[] = [
+      {
+        id: 'sess_closed_prev',
+        companyId: JAIMONA_COMPANY_ID,
+        cashier: '01',
+        operator: '001',
+        status: 'closed',
+        openingFloat: 5000,
+        openedAtIso: yesterdayIso,
+        closedAtIso: '2026-08-11T20:00:00.000Z',
+        countedCash: 6570, // esperado 5000 + venda de ontem 2070 = 7070 -> diferença -500
+        createdAtIso: yesterdayIso,
+        updatedAtIso: '2026-08-11T20:00:00.000Z',
+      },
+      {
+        id: 'sess_open_today',
+        companyId: JAIMONA_COMPANY_ID,
+        cashier: '01',
+        operator: '001',
+        status: 'open',
+        openingFloat: 10000,
+        openedAtIso: '2026-08-12T08:00:00.000Z',
+        createdAtIso: '2026-08-12T08:00:00.000Z',
+        updatedAtIso: '2026-08-12T08:00:00.000Z',
+      },
+    ];
+
+    const movementsIntel: CashMovement[] = [
+      {
+        id: 'mov_liq_today',
+        companyId: JAIMONA_COMPANY_ID,
+        sessionId: 'sess_open_today',
+        cashier: '01',
+        operator: '001',
+        type: 'LIQUIDACAO_DIVIDA',
+        amount: 3000,
+        paymentMethod: 'Transferência',
+        reason: 'Liquidação parcial cliente',
+        createdAtIso: '2026-08-12T14:00:00.000Z',
+      },
+    ];
+
+    // (a) Perfil Proprietário / Gestão Completa
+    const ownerSnap = buildFinancialIntelligenceSnapshot({
+      invoices: invoicesIntel,
+      products: productsIntel,
+      customers: customersIntel,
+      cashSessions: sessionsIntel,
+      cashMovements: movementsIntel,
+      permissions: {
+        canViewMargins: true,
+        canViewCashVariance: true,
+        canViewReceivables: true,
+        canViewStockAlerts: true,
+      },
+      referenceNowIso: refIso,
+    });
+
+    // 1. Quanto vendi hoje? 2.140 + 2.000 = 4.140 Kz (ontem 2.070 -> +100%)
+    assert(
+      ownerSnap.soldToday.grossTotal === 4140 &&
+        ownerSnap.soldToday.docCount === 2 &&
+        ownerSnap.soldToday.vsYesterdayPct === 100,
+      `1. Vendas hoje esperadas 4.140 Kz (+100%), obtido ${ownerSnap.soldToday.grossTotal} (${ownerSnap.soldToday.vsYesterdayPct}%)`
+    );
+
+    // 2. Quanto recebi efectivamente? Vendas (1000 Din + 1140 MCX + 500 Din entrada) + 3000 Trf liquidação = 5.640 Kz
+    assert(
+      ownerSnap.collectedToday.totalReceived === 5640 &&
+        ownerSnap.collectedToday.byMethod.Dinheiro === 1500 &&
+        ownerSnap.collectedToday.byMethod.Multicaixa === 1140 &&
+        ownerSnap.collectedToday.byMethod.Transferência === 3000 &&
+        ownerSnap.collectedToday.creditLeftUnpaidToday === 1500,
+      `2. Recebido efectivo esperado 5.640 Kz (Din 1500, MCX 1140, Trf 3000, Créd 1500), obtido ${ownerSnap.collectedToday.totalReceived}`
+    );
+
+    // 3. Quanto tenho por receber? 1.500 (hoje, dentro prazo) + 10.000 (antiga, vencida >15d) = 11.500 Kz (10.000 vencido)
+    assert(
+      ownerSnap.receivables.totalDue === 11500 &&
+        ownerSnap.receivables.overdueTotal === 10000 &&
+        ownerSnap.receivables.invoiceCount === 2 &&
+        ownerSnap.receivables.customerCount === 1,
+      `3. Por receber esperado 11.500 Kz (10.000 vencido), obtido ${ownerSnap.receivables.totalDue}`
+    );
+
+    // 4. Produtos mais vendidos hoje: Água Mineral 1.5L (2 un) em #1
+    assert(
+      ownerSnap.topProducts.today[0]?.productId === 'p_agua' &&
+        ownerSnap.topProducts.today[0]?.qty === 2,
+      '4. Produto mais vendido hoje deve ser Água Mineral 1.5L (2 un)'
+    );
+
+    // 5. Stock a acabar: Sumo Tropical (0, esgotado) primeiro, depois Água Mineral (3/10)
+    assert(
+      ownerSnap.lowStock.outOfStockCount === 1 &&
+        ownerSnap.lowStock.lowStockCount === 1 &&
+        ownerSnap.lowStock.urgentItems[0]?.id === 'p_sumo' &&
+        ownerSnap.lowStock.urgentItems[1]?.id === 'p_agua',
+      '5. Alertas de stock devem priorizar artigo esgotado (Sumo) seguido de stock mínimo (Água)'
+    );
+
+    // 6. Margem estimada hoje: linhas com custo = Água (net 1000 - custo 400 = 600) + Sumo (net 1000 - custo 500 = 500) => lucro 1100 / 2000 = 55%, cobertura 50% (2000/4000 pois Serviço 2000 não tem custo)
+    assert(
+      !ownerSnap.estimatedMargin.restricted &&
+        ownerSnap.estimatedMargin.today?.estimatedProfitKz === 1100 &&
+        ownerSnap.estimatedMargin.today?.estimatedMarginPct === 55 &&
+        ownerSnap.estimatedMargin.today?.costCoveragePct === 50,
+      `6. Margem estimada esperada 55% (1.100 Kz) com cobertura 50%, obtida ${ownerSnap.estimatedMargin.today?.estimatedMarginPct}%`
+    );
+
+    // 7. Diferença de caixa: sessão aberta actual esperado 10.000 + 1.500 = 11.500 (por contar), último fecho diferença -500 (Falta)
+    assert(
+      ownerSnap.cashDifference.primary?.varianceStatus === 'UNCOUNTED_OPEN' &&
+        ownerSnap.cashDifference.primary?.expectedCash === 11500 &&
+        ownerSnap.cashDifference.latestClosed?.varianceStatus === 'SHORTAGE' &&
+        ownerSnap.cashDifference.latestClosed?.differenceAmount === -500,
+      `7. Caixa aberto deve esperar 11.500 Kz e último fecho registar falta de -500 Kz`
+    );
+
+    // (b) RBAC: Operador sem acesso a custos/margens nunca recebe margem calculada nem vê lucro na UI
+    const cashierSnap = buildFinancialIntelligenceSnapshot({
+      invoices: invoicesIntel,
+      products: productsIntel,
+      customers: customersIntel,
+      cashSessions: sessionsIntel,
+      cashMovements: movementsIntel,
+      permissions: {
+        canViewMargins: false,
+        canViewCashVariance: true,
+        canViewReceivables: false,
+        canViewStockAlerts: true,
+        activeCashierFilter: '01',
+      },
+      referenceNowIso: refIso,
+    });
+    assert(
+      cashierSnap.estimatedMargin.restricted &&
+        cashierSnap.estimatedMargin.today === null &&
+        cashierSnap.estimatedMargin.last30Days === null &&
+        cashierSnap.receivables.restricted &&
+        cashierSnap.receivables.totalDue === 0,
+      'RBAC deve bloquear margens e carteira de cobrança para perfis sem autorização'
+    );
+
+    const ownerModalHtml = renderFinancialIntelligenceModal(ownerSnap, {
+      companyName: 'Jaimona Teste',
+      canAccessCash: true,
+      canAccessProducts: true,
+      canAccessFinance: true,
+      canAccessHistory: true,
+      canShareDailyWhatsApp: true,
+    });
+    assert(
+      ownerModalHtml.includes('1. Quanto vendi hoje?') &&
+        ownerModalHtml.includes('2. Quanto recebi efectivamente?') &&
+        ownerModalHtml.includes('3. Quanto tenho por receber?') &&
+        ownerModalHtml.includes('4. Produtos mais vendidos') &&
+        ownerModalHtml.includes('5. Quais estão a acabar?') &&
+        ownerModalHtml.includes('6. Qual é a minha margem estimada?') &&
+        ownerModalHtml.includes('7. Esperado vs. Contado (Caixa)') &&
+        ownerModalHtml.includes('4.140,00 Kz') &&
+        ownerModalHtml.includes('5.640,00 Kz') &&
+        ownerModalHtml.includes('11.500,00 Kz') &&
+        ownerModalHtml.includes('55,00%'),
+      'Modal Pulso Financeiro deve apresentar as 7 perguntas com os valores reais formatados'
+    );
+
+    const cashierGridHtml = renderFinancialIntelligenceGrid(cashierSnap, {
+      companyName: 'Jaimona Teste',
+      canAccessCash: true,
+      canAccessProducts: true,
+      canAccessFinance: false,
+      canAccessHistory: true,
+      canShareDailyWhatsApp: false,
+    });
+    assert(
+      cashierGridHtml.includes('Protegido por perfil') &&
+        !cashierGridHtml.includes('55,00%') &&
+        !cashierGridHtml.includes('1.100,00 Kz'),
+      'Grelha UI para operador de caixa nunca pode expor percentagem ou lucro de margem'
+    );
+  });
+
+  await test('5.17 Entrada no Mercado < 10 min: Excel (.xlsx)/CSV de 5.000 produtos e 500 clientes, pré-visualização, validação e desfazer pré-confirmação', async () => {
+    const companyId = 'comp_fast_10m';
+    const encoder = new TextEncoder();
+
+    // 1. Geração & leitura offline de modelos .xlsx e .csv (com BOM UTF-8 e separador ';')
+    const prodXlsx = buildSampleProductsXlsx('GERAL');
+    const parsedProdXlsx = await parseSpreadsheetFileBytes({
+      fileName: 'modelo-produtos.xlsx',
+      bytes: prodXlsx,
+    });
+    assert(
+      parsedProdXlsx.format === 'XLSX' && parsedProdXlsx.rows.length === 4,
+      'Modelo .xlsx de produtos deve ser gerado e lido offline com 4 artigos de exemplo'
+    );
+
+    const prodCsv = buildSampleProductsCsv('EXCLUSAO');
+    const parsedProdCsv = await parseSpreadsheetFileBytes({
+      fileName: 'modelo-produtos.csv',
+      bytes: encoder.encode(prodCsv),
+    });
+    assert(
+      parsedProdCsv.format === 'CSV' && parsedProdCsv.rows.length === 4,
+      'Modelo .csv de produtos deve ser gerado e lido offline'
+    );
+
+    const custXlsx = buildSampleCustomersXlsx();
+    const parsedCustXlsx = await parseSpreadsheetFileBytes({
+      fileName: 'modelo-clientes.xlsx',
+      bytes: custXlsx,
+    });
+    assert(
+      parsedCustXlsx.format === 'XLSX' && parsedCustXlsx.rows.length === 2,
+      'Modelo .xlsx de clientes deve ser gerado e lido offline com 2 linhas de exemplo'
+    );
+
+    // 2. Stress test: 5.000 produtos + erros + duplicados + formato decimal angolano (12.500,50)
+    const rows5k: Array<Array<string | number>> = [
+      ['codigo', 'nome', 'preco', 'custo', 'iva', 'categoria', 'unidade', 'tipo', 'controlar_stock', 'stock', 'stock_minimo'],
+    ];
+    for (let i = 1; i <= 5000; i += 1) {
+      if (i === 2) {
+        // Linha com preço inválido (erro esperado)
+        rows5k.push(['ART0002', 'Artigo Preço Inválido', '-50', '100', '14', 'Geral', 'un', 'P', 'SIM', '10', '2']);
+      } else if (i === 3) {
+        // Linha com código duplicado no ficheiro (erro esperado)
+        rows5k.push(['ART0001', 'Artigo Código Duplicado', '1.500,00', '900,00', '14', 'Geral', 'un', 'P', 'SIM', '5', '1']);
+      } else if (i === 4) {
+        // Linha com taxa IVA inválida (erro esperado)
+        rows5k.push(['ART0004', 'Artigo IVA Inválido', '2000', '1200', '23', 'Geral', 'un', 'P', 'SIM', '5', '1']);
+      } else if (i === 5) {
+        // Linha com formato monetário angolano
+        rows5k.push(['ART0005', 'Óleo Especial 5L', '12.500,50 Kz', '9.100,25 Kz', '14%', 'Mercearia', 'un', 'P', 'SIM', '30', '5']);
+      } else {
+        rows5k.push([`ART${String(i).padStart(4, '0')}`, `Produto Lote ${i}`, i * 100, i * 60, 14, 'Mercearia', 'un', 'P', 'SIM', 25, 5]);
+      }
+    }
+
+    const xlsx5k = buildMinimalXlsxBytes('Catalogo5K', rows5k);
+    const parsed5k = await parseSpreadsheetFileBytes({
+      fileName: 'catalogo-5000.xlsx',
+      bytes: xlsx5k,
+    });
+    assert(parsed5k.rows.length === 5000, `Esperadas 5.000 linhas no .xlsx, obtidas ${parsed5k.rows.length}`);
+
+    const tStart = Date.now();
+    const staged5k = prepareProductImportBatch({
+      parsed: parsedProdXlsx.headers.length > 0 ? parsed5k : parsed5k,
+      companyId,
+      taxRegime: 'GERAL',
+      existingProducts: [
+        {
+          id: 'existing_art10',
+          companyId,
+          code: 'ART0010',
+          name: 'Artigo Existente',
+          category: 'Geral',
+          unit: 'un',
+          price: 999,
+          ivaRate: 14,
+          exemptionReason: '',
+          active: true,
+          createdAtIso: new Date().toISOString(),
+          updatedAtIso: new Date().toISOString(),
+        },
+      ],
+      duplicateMode: 'SKIP',
+    });
+    const elapsedMs = Date.now() - tStart;
+
+    assert(elapsedMs < 3000, `Validação de 5.000 linhas deve concluir rapidamente (<3s, levou ${elapsedMs}ms)`);
+    assert(
+      staged5k.totalRows === 5000 &&
+        staged5k.errorCount === 3 &&
+        staged5k.duplicateSkipCount === 1 &&
+        staged5k.newCount === 4996,
+      `Contagem esperada em 5.000 linhas: 4996 novos, 3 erros, 1 duplicado ignorado (obtido: novos=${staged5k.newCount}, erros=${staged5k.errorCount}, dup=${staged5k.duplicateSkipCount})`
+    );
+
+    const row5 = staged5k.rows.find((r) => r.rawCode === 'ART0005');
+    assert(
+      row5?.product?.price === 12500.5 && row5?.product?.costPrice === 9100.25,
+      'Formato decimal angolano "12.500,50 Kz" deve ser convertido exactamente para 12500.5'
+    );
+
+    // 3. Desfazer/excluir linhas específicas ANTES da confirmação
+    staged5k.excludedRowNumbers = [2, 6]; // rowNumber 2 é ART0001 (linha Excel 2), rowNumber 6 é ART0005
+    const applied5k = applyStagedProductImportBatch({
+      batch: staged5k,
+      existingProducts: [],
+    });
+    assert(
+      applied5k.createdCount === 4994 &&
+        applied5k.toSave.every((p) => p.code !== 'ART0001' && p.code !== 'ART0005'),
+      'Exclusão pré-confirmação deve impedir a gravação dos artigos desmarcados'
+    );
+
+    // 4. Importação de 500 clientes com sequência única CLI-XXXX e validação de NIF
+    const custCsvLines = [buildSampleCustomersCsv().split(/\r?\n/)[0]!];
+    for (let c = 1; c <= 500; c += 1) {
+      custCsvLines.push(
+        `Cliente Lote ${c};PARTICULAR;;923${String(c).padStart(6, '0')};;Rua ${c};Luanda;Luanda;Ingombota;0;Pronto pagamento`
+      );
+    }
+    // Cliente empresa sem NIF (erro esperado pela validação fiscal)
+    custCsvLines.push('Empresa Sem NIF;EMPRESA;;912000111;;;;Luanda;;;');
+
+    const parsedCust500 = await parseSpreadsheetFileBytes({
+      fileName: 'clientes-500.csv',
+      bytes: encoder.encode(custCsvLines.join('\r\n')),
+    });
+    const stagedCust = prepareCustomerImportBatch({
+      parsed: parsedCust500,
+      companyId,
+      existingCustomers: [],
+      duplicateMode: 'SKIP',
+    });
+    assert(
+      stagedCust.newCount === 500 && stagedCust.errorCount === 1,
+      `Importação de clientes deve validar 500 válidos e rejeitar 1 empresa sem NIF (novos=${stagedCust.newCount}, erros=${stagedCust.errorCount})`
+    );
+    const appliedCust = applyStagedCustomerImportBatch({
+      batch: stagedCust,
+      existingCustomers: [],
+    });
+    const uniqueCodes = new Set(appliedCust.toSave.map((c) => c.internalCode));
+    assert(
+      appliedCust.createdCount === 500 && uniqueCodes.size === 500,
+      'Todos os 500 clientes importados devem receber código interno CLI-XXXX único sem colisões'
+    );
+
+    // 5. Renderização segura do Assistente < 10 min (Passos 1..5)
+    const compRec = {
+      id: companyId,
+      normalizedNif: '5401122330',
+      profile: JAIMONA_COMPANY,
+      status: 'active' as const,
+      plan: {
+        planTier: 'FREE' as const,
+        commercialActive: false,
+        maxUsers: null,
+        maxInvoicesPerMonth: null,
+        updatedAtIso: new Date().toISOString(),
+      },
+      baseSequence: 0,
+      allowManagerCancel: false,
+      createdAtIso: new Date().toISOString(),
+      updatedAtIso: new Date().toISOString(),
+    };
+    const wizardHtml = renderQuickOnboardingModal({
+      mode: 'WIZARD',
+      step: 'PRODUCTS',
+      hasActiveCompany: true,
+      activeCompany: compRec,
+      settings: {
+        companyId,
+        company: JAIMONA_COMPANY,
+        defaultCashier: '01',
+        defaultOperator: '001',
+        defaultFormat: 'POS',
+        defaultDocType: 'FR',
+        defaultNotes: '',
+        autoPrintOnEmit: false,
+        hidePromotionalFooter: false,
+        allowCashierPriceEdit: false,
+        updatedAtIso: new Date().toISOString(),
+      },
+      productsCount: 0,
+      customersCount: 1,
+      openCashSession: null,
+      isSignedIn: false,
+      isOnline: false,
+      showCreateCompanyForm: false,
+      isCreatingCompany: false,
+      companyFormError: null,
+      productBatch: staged5k,
+      productDuplicateMode: 'SKIP',
+      productDefaultIvaRate: 14,
+      productPreviewFilter: 'ALL',
+      productPreviewPage: 1,
+      productImportError: null,
+      productImportNotice: null,
+      isCommittingProducts: false,
+      lastUndoableProductImport: null,
+      customerBatch: null,
+      customerDuplicateMode: 'SKIP',
+      customerPreviewFilter: 'ALL',
+      customerPreviewPage: 1,
+      customerImportError: null,
+      customerImportNotice: null,
+      isCommittingCustomers: false,
+      lastUndoableCustomerImport: null,
+      cashPrinterError: null,
+      cashPrinterNotice: null,
+      canCreateCompany: true,
+      canManageProducts: true,
+      canImportCustomers: true,
+      canManageSettings: true,
+      canOperateCash: true,
+    });
+    assert(
+      wizardHtml.includes('Entrada Rápida no Mercado (&lt; 10 minutos)') &&
+        wizardHtml.includes('Desfazer carregamento') &&
+        wizardHtml.includes('Confirmar Importação (4994 artigos)') &&
+        !wizardHtml.includes('window.alert'),
+      'Assistente < 10 min deve mostrar pré-visualização, contagem exacta pós-exclusão e controlo de desfazer antes da confirmação'
+    );
+  });
+
+  await test('5.18 Modo Contabilista: carteira autorizada, IVA/retenções, anulados/rectificados, auditoria, ZIP mensal + SAF-T XSD e A4 dossier', () => {
+    const compId = 'comp_contab_test';
+    const otherCompId = 'comp_contab_unauth';
+    const accUid = 'uid_contabilista_01';
+    const roles = buildDefaultCompanyRoles(compId);
+    const accMember = {
+      id: `${compId}_${accUid}`,
+      companyId: compId,
+      uid: accUid,
+      email: 'contabilista@ocpca.ao',
+      displayName: 'Dra. Helena Contabilista',
+      role: 'accountant' as const,
+      roleId: `role_accountant_${compId}`,
+      status: 'active' as const,
+      allowInvoiceCancel: false,
+      active: true,
+      createdAtIso: '2026-11-01T08:00:00.000Z',
+      updatedAtIso: '2026-11-01T08:00:00.000Z',
+    };
+    const accPerms = resolveMemberPermissions(accMember, roles);
+    assert(
+      accPerms.saft_export &&
+        hasPermission(accMember, 'saft_export', roles) &&
+        hasPermission(accMember, 'reports_financial', roles) &&
+        hasPermission(accMember, 'audit_view', roles) &&
+        hasPermission(accMember, 'cost_prices_view', roles) &&
+        !hasPermission(accMember, 'pos_sell', roles) &&
+        !hasPermission(accMember, 'invoice_cancel', roles) &&
+        !hasPermission(accMember, 'master_edit', roles) &&
+        !hasPermission(accMember, 'users_manage', roles),
+      'Perfil Contabilista deve ter leitura contabilística/auditoria/SAF-T e bloqueio estrito de venda, anulação e edição de utilizadores'
+    );
+
+    const compA = {
+      id: compId,
+      normalizedNif: '5007778889',
+      profile: {
+        ...JAIMONA_COMPANY,
+        legalName: 'Kwanza Consultores, Lda',
+        shortName: 'Kwanza Consultores',
+        nif: '5007778889',
+        taxRegime: 'GERAL' as const,
+        specialTaxTerritory: 'AO-CAB' as const,
+        isVatRetentionAgent: true,
+        defaultWithholdingTax: 6.5,
+        accountantName: 'Dra. Helena Contabilista',
+        accountantOcpcaNumber: 'OCPCA-4419',
+      },
+      status: 'active' as const,
+      plan: {
+        planTier: 'PROFISSIONAL' as const,
+        commercialActive: true,
+        maxUsers: null,
+        maxInvoicesPerMonth: null,
+        updatedAtIso: '2026-11-01T08:00:00.000Z',
+      },
+      baseSequence: 0,
+      allowManagerCancel: false,
+      ownerUid: 'uid_owner_other',
+      ownerEmail: 'socio@kwanza.ao',
+      createdAtIso: '2026-11-01T08:00:00.000Z',
+      updatedAtIso: '2026-11-01T08:00:00.000Z',
+    };
+    const compUnauth = {
+      ...compA,
+      id: otherCompId,
+      normalizedNif: '5009990001',
+      profile: { ...compA.profile, legalName: 'Empresa Não Autorizada', nif: '5009990001' },
+      ownerUid: 'uid_someone_else',
+      ownerEmail: 'outro@empresa.ao',
+    };
+
+    const viewer = { uid: accUid, email: 'contabilista@ocpca.ao' };
+    assert(
+      canViewerAccessTenant(compA, [accMember], viewer, false) &&
+        !canViewerAccessTenant(compUnauth, [accMember], viewer, false),
+      'Carteira multiempresa do contabilista deve mostrar apenas empresas onde possui vínculo autorizado'
+    );
+
+    const prodService: Product = {
+      id: 'p_srv',
+      companyId: compId,
+      code: 'SRV01',
+      name: 'Consultoria Fiscal Mensal',
+      productType: 'S',
+      category: 'Serviços',
+      unit: 'serv',
+      costPrice: 20000,
+      price: 100000,
+      ivaRate: 14,
+      exemptionReason: '',
+      active: true,
+      priceHistory: [
+        {
+          changedAtIso: '2026-11-04T09:15:00.000Z',
+          previousPrice: 90000,
+          newPrice: 100000,
+          previousCost: 18000,
+          newCost: 20000,
+          changedBy: 'Gerente',
+        },
+      ],
+      createdAtIso: '2026-11-01T08:00:00.000Z',
+      updatedAtIso: '2026-11-04T09:15:00.000Z',
+    };
+    const prodRed: Product = {
+      id: 'p_red',
+      companyId: compId,
+      code: 'RED01',
+      name: 'Produto Taxa Reduzida 5%',
+      productType: 'P',
+      category: 'Mercearia',
+      unit: 'un',
+      price: 10000,
+      ivaRate: 5,
+      exemptionReason: '',
+      active: true,
+      createdAtIso: '2026-11-01T08:00:00.000Z',
+      updatedAtIso: '2026-11-01T08:00:00.000Z',
+    };
+    const prodInt: Product = {
+      id: 'p_int',
+      companyId: compId,
+      code: 'INT01',
+      name: 'Produto Cabinda 1%',
+      productType: 'P',
+      category: 'Mercearia',
+      unit: 'un',
+      price: 10000,
+      ivaRate: 1,
+      exemptionReason: '',
+      active: true,
+      createdAtIso: '2026-11-01T08:00:00.000Z',
+      updatedAtIso: '2026-11-01T08:00:00.000Z',
+    };
+    const prodExempt: Product = {
+      id: 'p_ise',
+      companyId: compId,
+      code: 'ISE01',
+      name: 'Bem Isento M10',
+      productType: 'P',
+      category: 'Mercearia',
+      unit: 'un',
+      price: 5000,
+      ivaRate: 0,
+      exemptionCode: 'M10',
+      exemptionReason: 'Isento Art. 12 CIVA',
+      active: true,
+      createdAtIso: '2026-11-01T08:00:00.000Z',
+      updatedAtIso: '2026-11-01T08:00:00.000Z',
+    };
+
+    const customer: Customer = {
+      id: 'cust_acc_1',
+      companyId: compId,
+      internalCode: 'CLI-0001',
+      customerType: 'EMPRESA',
+      name: 'Banco Atlântico Cliente, SA',
+      nif: '5001122334',
+      countryCode: 'AO',
+      locality: 'Luanda',
+      address: 'Av. 4 de Fevereiro',
+      phone: '923000111',
+      changeHistory: [
+        {
+          changedAtIso: '2026-11-05T11:00:00.000Z',
+          changedBy: 'Admin',
+          summary: 'Limite de crédito actualizado',
+        },
+      ],
+      createdAtIso: '2026-11-01T08:00:00.000Z',
+      updatedAtIso: '2026-11-05T11:00:00.000Z',
+    };
+
+    const supplier: Supplier = {
+      id: 'sup_1',
+      companyId: compId,
+      name: 'Fornecedor Central, Lda',
+      nif: '5004455667',
+      phone: '912000222',
+      address: 'Viana',
+      locality: 'Luanda',
+    };
+
+    // Factura principal com serviço (14%), reduzida (5%), Cabinda (1%) e isenta M10 (0%)
+    const totSale = calculateInvoiceTotals([
+      { productId: prodService.id, code: prodService.code, description: prodService.name, unit: 'serv', qty: 1, unitPrice: 100000, discountPct: 0, ivaRate: 14 },
+      { productId: prodRed.id, code: prodRed.code, description: prodRed.name, unit: 'un', qty: 1, unitPrice: 10000, discountPct: 0, ivaRate: 5 },
+      { productId: prodInt.id, code: prodInt.code, description: prodInt.name, unit: 'un', qty: 1, unitPrice: 10000, discountPct: 0, ivaRate: 1 },
+      { productId: prodExempt.id, code: prodExempt.code, description: prodExempt.name, unit: 'un', qty: 1, unitPrice: 5000, discountPct: 0, ivaRate: 0, exemptionCode: 'M10', exemptionReason: 'Isento' },
+    ]);
+    const invSale: InvoiceRecord = {
+      id: 'inv_acc_1',
+      companyId: compId,
+      number: 'FR A2026/000001',
+      seriesCode: 'A2026',
+      docType: 'FR',
+      issuedAtIso: '2026-11-10T10:00:00.000Z',
+      createdAtIso: '2026-11-10T10:00:00.000Z',
+      updatedAtIso: '2026-11-10T10:00:00.000Z',
+      cashier: '01',
+      operator: '001',
+      paymentMethod: 'Transferência',
+      customerId: customer.id,
+      customerName: customer.name,
+      customerNif: customer.nif,
+      customerLocality: customer.locality,
+      merchandiseTotal: totSale.merchandiseTotal,
+      discountTotal: 0,
+      taxBase14: totSale.taxBase14,
+      taxAmount14: totSale.taxAmount14,
+      taxBaseIntermediate: totSale.taxBaseIntermediate,
+      taxAmountIntermediate: totSale.taxAmountIntermediate,
+      taxBaseReduced: totSale.taxBaseReduced,
+      taxAmountReduced: totSale.taxAmountReduced,
+      taxBase0: totSale.taxBase0,
+      taxAmount0: 0,
+      taxTotal: totSale.taxTotal,
+      grandTotal: totSale.grandTotal,
+      amountInWords: totSale.amountInWords,
+      amountReceived: totSale.grandTotal,
+      changeAmount: 0,
+      notes: '',
+      status: 'issued',
+      reprintCount: 2,
+      lastReprintedAtIso: '2026-11-11T14:00:00.000Z',
+      lastReprintedBy: 'Caixa 01',
+      lines: totSale.lines,
+    };
+
+    // Nota de Crédito parcial sobre serviço (20.000 Kz)
+    const totNc = calculateInvoiceTotals([
+      { productId: prodService.id, code: prodService.code, description: prodService.name, unit: 'serv', qty: 1, unitPrice: 20000, discountPct: 0, ivaRate: 14 },
+    ]);
+    const invNc: InvoiceRecord = {
+      id: 'inv_acc_nc',
+      companyId: compId,
+      number: 'NC A2026/000001',
+      seriesCode: 'A2026',
+      docType: 'NC',
+      issuedAtIso: '2026-11-12T12:00:00.000Z',
+      createdAtIso: '2026-11-12T12:00:00.000Z',
+      updatedAtIso: '2026-11-12T12:00:00.000Z',
+      cashier: '01',
+      operator: '001',
+      paymentMethod: 'Transferência',
+      customerId: customer.id,
+      customerName: customer.name,
+      customerNif: customer.nif,
+      customerLocality: customer.locality,
+      merchandiseTotal: totNc.merchandiseTotal,
+      discountTotal: 0,
+      taxBase14: totNc.taxBase14,
+      taxAmount14: totNc.taxAmount14,
+      taxBase0: 0,
+      taxAmount0: 0,
+      taxTotal: totNc.taxTotal,
+      grandTotal: totNc.grandTotal,
+      amountInWords: totNc.amountInWords,
+      amountReceived: 0,
+      changeAmount: 0,
+      returnOriginInvoiceId: invSale.id,
+      returnOriginNumber: invSale.number,
+      notes: 'Acerto de honorários',
+      status: 'issued',
+      lines: totNc.lines,
+    };
+
+    // Documento anulado (excluído do IVA) e Proforma (não fiscal)
+    const invCancelled: InvoiceRecord = {
+      ...invSale,
+      id: 'inv_acc_cancel',
+      number: 'FR A2026/000002',
+      issuedAtIso: '2026-11-13T10:00:00.000Z',
+      status: 'cancelled',
+      cancelReason: 'Erro de NIF do cliente',
+      cancelledBy: 'Gerente',
+      cancelledAtIso: '2026-11-13T10:10:00.000Z',
+    };
+    const invProforma: InvoiceRecord = {
+      ...invSale,
+      id: 'inv_acc_fp',
+      number: 'FP A2026/000001',
+      docType: 'FP',
+      issuedAtIso: '2026-11-14T10:00:00.000Z',
+      status: 'issued',
+    };
+
+    const pkg = buildAccountantMonthlyPackage({
+      company: compA.profile,
+      invoices: [invSale, invNc, invCancelled, invProforma],
+      products: [prodService, prodRed, prodInt, prodExempt],
+      customers: [customer],
+      suppliers: [supplier],
+      purchases: [
+        {
+          id: 'pur_1',
+          companyId: compId,
+          number: 'CMP-001',
+          supplierId: supplier.id,
+          supplierName: supplier.name,
+          supplierNif: supplier.nif,
+          issuedAtIso: '2026-11-08T10:00:00.000Z',
+          lines: [{ productId: prodRed.id, code: prodRed.code, name: prodRed.name, unit: 'un', qty: 5, unitCost: 7000, total: 35000 }],
+          totalAmount: 35000,
+          amountPaid: 20000,
+          amountDue: 15000,
+          paymentMethod: 'Crédito',
+          warehouseId: 'armazem_principal',
+          updateStock: true,
+          notes: '',
+          operator: '001',
+          status: 'recorded',
+        },
+      ],
+      cashSessions: [
+        {
+          id: 'sess_acc_1',
+          companyId: compId,
+          cashier: '01',
+          operator: '001',
+          status: 'closed',
+          openingFloat: 10000,
+          openedAtIso: '2026-11-10T08:00:00.000Z',
+          closedAtIso: '2026-11-10T18:00:00.000Z',
+          expectedCash: 10000,
+          countedCash: 9800,
+          differenceAmount: -200,
+          invoiceCount: 1,
+          createdAtIso: '2026-11-10T08:00:00.000Z',
+          updatedAtIso: '2026-11-10T18:00:00.000Z',
+        },
+      ],
+      securityAuditLogs: [
+        {
+          id: 'aud_1',
+          companyId: compId,
+          actorUid: 'uid_mgr',
+          actorName: 'Gerente',
+          actorRole: 'Gestor',
+          action: 'INVOICE_CANCEL',
+          targetType: 'invoice',
+          targetId: invCancelled.number,
+          summary: 'Anulação confirmada em Novembro',
+          outcome: 'allowed',
+          createdAtIso: '2026-11-13T10:10:00.000Z',
+        },
+      ],
+      yearMonth: '2026-11',
+      canViewCostPrices: true,
+    });
+
+    const expectedNetVat = roundKz(totSale.taxTotal - totNc.taxTotal);
+    assert(
+      Math.abs(pkg.vatReport.netVatPayable - expectedNetVat) < 0.02 &&
+        pkg.vatReport.cancelledInMonthCount === 1 &&
+        pkg.vatReport.nonFiscalProformaCount === 1 &&
+        pkg.vatReport.exemptionLines.some((e) => e.exemptionCode === 'M10'),
+      `Apuramento de IVA mensal deve reconciliar líquido=${expectedNetVat} e desdobrar isenção M10`
+    );
+
+    const expectedNetServiceBase = roundKz(totSale.lines[0]!.lineBase - totNc.lines[0]!.lineBase);
+    assert(
+      Math.abs(pkg.withholdingReport.netServiceBase - expectedNetServiceBase) < 0.02 &&
+        pkg.withholdingReport.isVatRetentionAgent &&
+        pkg.withholdingReport.estimatedIiTotal > 0 &&
+        pkg.withholdingReport.purchasesDueAmount === 15000,
+      'Mapa de retenções deve calcular base de serviços líquida, II 6,5% e dívida a fornecedores'
+    );
+
+    assert(
+      pkg.cancelledRectified.cancelledCount === 1 &&
+        pkg.cancelledRectified.creditNotesCount === 1 &&
+        pkg.auxiliaryMaps.cashNetDifference === -200,
+      'Relatório de anulados/rectificados e diferença de caixa deve reconciliar exacto'
+    );
+
+    const trailNoCost = buildAccountantAuditTrail({
+      securityAuditLogs: [],
+      products: [prodService],
+      customers: [customer],
+      invoices: [invSale],
+      yearMonth: '2026-11',
+      periodMode: 'MONTH',
+      canViewCostPrices: false,
+    });
+    assert(
+      trailNoCost.some((t) => t.source === 'price_history' && !t.summary.includes('Custo:')) &&
+        trailNoCost.some((t) => t.source === 'customer_history') &&
+        trailNoCost.some((t) => t.actionCode === 'INVOICE_REPRINT'),
+      'Histórico consolidado deve agregar preços (sem custo se restrito), alterações de clientes e reimpressões'
+    );
+
+    const zipOut = buildAccountantMonthlyZipPackage({
+      pkg,
+      invoices: [invSale, invNc, invCancelled, invProforma],
+    });
+    assert(
+      zipOut.filename === 'Contabilidade_5007778889_2026_11.zip' &&
+        zipOut.includedFiles.length === 9 &&
+        zipOut.bytes.length > 1000 &&
+        zipOut.bytes[0] === 0x50 &&
+        zipOut.bytes[1] === 0x4b &&
+        pkg.xsdReport.valid,
+      'Pacote ZIP mensal deve conter os 9 ficheiros esperados e SAF-T (AO) válido no XSD v1.01_01'
+    );
+
+    const months = buildAccountantMonthOptions({ invoices: [invSale] });
+    const uiHtml = renderAccountantWorkspaceHtml({
+      companyId: compId,
+      company: compA.profile,
+      activeTab: 'VAT_WITHHOLDING',
+      yearMonth: '2026-11',
+      monthOptions: months,
+      pkg,
+      auditItems: pkg.auditEntriesInMonth,
+      auditCategory: 'ALL',
+      auditPeriodMode: 'MONTH',
+      auditSearch: '',
+      portfolioItems: [
+        {
+          company: compA,
+          viewerRole: 'accountant',
+          viewerRoleLabelPt: 'Contabilista',
+          memberDisplayName: 'Dra. Helena Contabilista',
+          invoiceCount: 4,
+          lastInvoiceIso: '2026-11-14T10:00:00.000Z',
+        },
+      ],
+      portfolioSearch: '',
+      canViewCostPrices: true,
+      canViewMaster: true,
+      canManageUsers: false,
+      isOnline: false,
+      isSignedIn: false,
+      noticeMessage: null,
+    });
+    const dossierHtml = renderAccountantMonthlyDossierHtml(pkg, compA.profile, true);
+    assert(
+      uiHtml.includes('Kwanza Consultores') &&
+        uiHtml.includes('OCPCA-4419') &&
+        !uiHtml.includes('undefined') &&
+        !uiHtml.includes('NaN') &&
+        dossierHtml.includes('Dossier Contabilístico Mensal') &&
+        dossierHtml.includes('Emitido por SILA-Billing'),
+      'Interface do Modo Contabilista e Dossier A4 devem renderizar limpos sem undefined/NaN'
     );
   });
 

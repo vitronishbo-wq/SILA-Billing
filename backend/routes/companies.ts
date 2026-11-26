@@ -319,6 +319,14 @@ companiesRouter.get(
           membership.permissions.suppliers_manage ||
           membership.permissions.finance_view
       );
+      const canSeeSeries = Boolean(
+        membership.permissions.series_view ||
+          membership.permissions.saft_export ||
+          membership.permissions.master_view ||
+          membership.permissions.pos_sell ||
+          membership.permissions.a4_sell
+      );
+      const canSeeAudit = Boolean(membership.permissions.audit_view);
 
       const [
         prodSnap,
@@ -332,6 +340,8 @@ companiesRouter.get(
         supSnap,
         purSnap,
         settingsDoc,
+        seriesSnap,
+        auditSnap,
       ] = await Promise.all([
         compRef.collection('products').get(),
         compRef.collection('customers').get(),
@@ -348,6 +358,15 @@ companiesRouter.get(
         membership.permissions.pos_sell ||
         membership.permissions.a4_sell
           ? compRef.collection('settings').doc('general').get()
+          : Promise.resolve(null),
+        canSeeSeries ? compRef.collection('fiscal_series').get() : Promise.resolve(null),
+        canSeeAudit
+          ? compRef
+              .collection('audit_logs')
+              .orderBy('createdAtIso', 'desc')
+              .limit(300)
+              .get()
+              .catch(() => compRef.collection('audit_logs').limit(300).get())
           : Promise.resolve(null),
       ]);
 
@@ -492,6 +511,28 @@ companiesRouter.get(
         ...customRoles,
       ];
 
+      const fiscalSeries = seriesSnap
+        ? seriesSnap.docs.map((sd) => ({ id: sd.id, ...sd.data() }))
+        : undefined;
+
+      const auditLogs = auditSnap
+        ? auditSnap.docs.map((ad) => {
+            const raw = ad.data() as Record<string, unknown>;
+            const rawTs = raw.createdAtIso;
+            const createdAtIso =
+              typeof rawTs === 'string' && rawTs
+                ? rawTs
+                : rawTs && typeof (rawTs as { toDate?: () => Date }).toDate === 'function'
+                  ? (rawTs as { toDate: () => Date }).toDate().toISOString()
+                  : new Date().toISOString();
+            return {
+              id: ad.id,
+              ...raw,
+              createdAtIso,
+            };
+          })
+        : undefined;
+
       res.status(200).json({
         ok: true,
         role: membership.role,
@@ -511,6 +552,8 @@ companiesRouter.get(
         stockMovements: stockMovSnap.docs.map((sm) => ({ id: sm.id, ...sm.data() })),
         suppliers,
         purchases,
+        ...(fiscalSeries ? { fiscalSeries } : {}),
+        ...(auditLogs ? { auditLogs } : {}),
         settings: settingsDoc && settingsDoc.exists ? settingsDoc.data() : null,
       });
     } catch (err) {

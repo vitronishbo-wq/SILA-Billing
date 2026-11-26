@@ -409,6 +409,15 @@ export function renderTenantOnboardingView(params: {
         <div class="flex flex-wrap items-center gap-2.5">
           <button
             type="button"
+            data-action="open-quick-onboarding-wizard"
+            class="h-10 px-4 rounded-lg bg-blue-600 text-white text-xs font-semibold hover:bg-blue-700 flex items-center gap-1.5 whitespace-nowrap"
+          >
+            ${ICONS.play}
+            <span>Entrada Rápida (&lt; 10 min)</span>
+          </button>
+
+          <button
+            type="button"
             data-action="open-new-company-modal"
             class="h-10 px-4 rounded-lg bg-slate-900 text-white text-xs font-semibold hover:bg-slate-800 flex items-center gap-1.5 whitespace-nowrap"
           >

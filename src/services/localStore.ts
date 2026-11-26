@@ -15,7 +15,9 @@ import {
 } from '../core/companyValidator';
 import {
   buildDefaultCompanyRoles,
+  formatRoleLabelPt,
   normalizeLegacyMember,
+  resolveMemberBaseRole,
   resolveMemberStatus,
 } from '../core/rbac';
 import { seriesStorage } from '../core/seriesManager';
@@ -31,6 +33,7 @@ import {
   CompanyMember,
   CompanyProfile,
   CompanyRecord,
+  CompanyRole,
   CompanyRoleDefinition,
   createDefaultEstablishmentForCompany,
   Customer,
@@ -74,6 +77,7 @@ export interface PosWorkspaceDraft {
     | 'FINANCE'
     | 'INDICATORS'
     | 'HISTORY'
+    | 'ACCOUNTANT'
     | 'SETTINGS'
     | 'SYNC';
   previewFormat: DocumentFormat;
@@ -682,6 +686,73 @@ async function deleteFromStore(storeName: string, id: string): Promise<void> {
   });
 }
 
+const IDB_BATCH_CHUNK_SIZE = 500;
+
+async function putBatchInStore<T>(storeName: string, records: T[]): Promise<void> {
+  if (!records || records.length === 0) return;
+  return withDbRetry(async (db) => {
+    if (!db.objectStoreNames.contains(storeName)) {
+      const keyProp = storeName === 'meta' ? 'key' : 'id';
+      const existing = await readFallbackListFromMeta<Record<string, unknown>>(db, storeName);
+      const map = new Map<unknown, Record<string, unknown>>();
+      for (const item of existing) {
+        map.set(item[keyProp], item);
+      }
+      for (const rec of records) {
+        const recObj = rec as unknown as Record<string, unknown>;
+        map.set(recObj[keyProp], recObj);
+      }
+      await writeFallbackListToMeta(db, storeName, Array.from(map.values()));
+      return;
+    }
+
+    for (let offset = 0; offset < records.length; offset += IDB_BATCH_CHUNK_SIZE) {
+      const chunk = records.slice(offset, offset + IDB_BATCH_CHUNK_SIZE);
+      await new Promise<void>((resolve, reject) => {
+        const tx = db.transaction(storeName, 'readwrite');
+        const store = tx.objectStore(storeName);
+        for (const rec of chunk) {
+          store.put(rec);
+        }
+        tx.oncomplete = () => resolve();
+        tx.onerror = () => reject(tx.error || new Error(`Erro ao gravar lote em ${storeName}.`));
+        tx.onabort = () => reject(tx.error || new Error(`Lote abortado em ${storeName}.`));
+      });
+    }
+  });
+}
+
+async function deleteBatchFromStore(storeName: string, ids: string[]): Promise<void> {
+  if (!ids || ids.length === 0) return;
+  return withDbRetry(async (db) => {
+    if (!db.objectStoreNames.contains(storeName)) {
+      const keyProp = storeName === 'meta' ? 'key' : 'id';
+      const idSet = new Set(ids);
+      const existing = await readFallbackListFromMeta<Record<string, unknown>>(db, storeName);
+      await writeFallbackListToMeta(
+        db,
+        storeName,
+        existing.filter((item) => !idSet.has(String(item[keyProp] || '')))
+      );
+      return;
+    }
+
+    for (let offset = 0; offset < ids.length; offset += IDB_BATCH_CHUNK_SIZE) {
+      const chunk = ids.slice(offset, offset + IDB_BATCH_CHUNK_SIZE);
+      await new Promise<void>((resolve, reject) => {
+        const tx = db.transaction(storeName, 'readwrite');
+        const store = tx.objectStore(storeName);
+        for (const id of chunk) {
+          store.delete(id);
+        }
+        tx.oncomplete = () => resolve();
+        tx.onerror = () => reject(tx.error || new Error(`Erro ao remover lote em ${storeName}.`));
+        tx.onabort = () => reject(tx.error || new Error(`Remoção em lote abortada em ${storeName}.`));
+      });
+    }
+  });
+}
+
 function inferProductCategory(p: Product): string {
   if (p.category && p.category.trim()) return p.category.trim();
   const seedMatch = INITIAL_PRODUCTS.find((sp) => sp.id === p.id || sp.code === p.code);
@@ -766,7 +837,7 @@ async function healOrphanCompanyRecordsOnce(): Promise<void> {
   }
 }
 
-function canViewerAccessTenant(
+export function canViewerAccessTenant(
   company: CompanyRecord,
   allMembers: CompanyMember[],
   viewer?: WorkspaceViewerIdentity | null,
@@ -1387,6 +1458,100 @@ export async function loadCompanyWorkspace(
   };
 }
 
+export interface AuthorizedCompanyPortfolioItem {
+  company: CompanyRecord;
+  viewerRole: CompanyRole;
+  viewerRoleLabelPt: string;
+  memberDisplayName: string;
+  invoiceCount: number;
+  lastInvoiceIso?: string;
+}
+
+/**
+ * Devolve a carteira de empresas estritamente autorizadas para o utilizador / contabilista actual,
+ * respeitando o isolamento multi-empresa (canViewerAccessTenant) sem expor dados de terceiros.
+ */
+export async function getAuthorizedCompaniesOverview(
+  viewer?: WorkspaceViewerIdentity | null
+): Promise<AuthorizedCompanyPortfolioItem[]> {
+  await ensureMulticompanyInitialized(viewer);
+
+  const [allCompaniesRaw, allMembersRaw, allInvoicesRaw, migrationMeta] = await Promise.all([
+    getAllFromStore<CompanyRecord>('companies'),
+    getAllFromStore<CompanyMember>('company_members'),
+    getAllFromStore<InvoiceRecord>('invoices'),
+    getFromStore<{ key: string; value: { completedAtIso: string; mode: string } }>(
+      'meta',
+      'migration_multicompany_v2'
+    ),
+  ]);
+
+  const hasLegacyV1Upgrade = migrationMeta?.value?.mode === 'upgraded_from_v1';
+  const uid = String(viewer?.uid || '').trim();
+  const emailLower = String(viewer?.email || '').trim().toLowerCase();
+
+  const invoiceStatsByCompany = new Map<string, { count: number; lastIso?: string }>();
+  for (const inv of allInvoicesRaw) {
+    const cid = inv.companyId || JAIMONA_COMPANY_ID;
+    const prev = invoiceStatsByCompany.get(cid);
+    if (!prev) {
+      invoiceStatsByCompany.set(cid, { count: 1, lastIso: inv.issuedAtIso });
+    } else {
+      prev.count += 1;
+      if (inv.issuedAtIso && (!prev.lastIso || inv.issuedAtIso > prev.lastIso)) {
+        prev.lastIso = inv.issuedAtIso;
+      }
+    }
+  }
+
+  const accessible = allCompaniesRaw.filter((comp) =>
+    canViewerAccessTenant(comp, allMembersRaw, viewer, hasLegacyV1Upgrade)
+  );
+
+  const items: AuthorizedCompanyPortfolioItem[] = accessible.map((comp) => {
+    const compOwnerUid = String(comp.ownerUid || '').trim();
+    const compOwnerEmail = String(comp.ownerEmail || '').trim().toLowerCase();
+    const isOwnerByRecord =
+      Boolean(uid && compOwnerUid && compOwnerUid === uid) ||
+      Boolean(emailLower && compOwnerEmail && compOwnerEmail === emailLower) ||
+      (comp.id === JAIMONA_COMPANY_ID && isJaimonaOwnerEmail(emailLower));
+
+    const matchedMember = allMembersRaw.find(
+      (m) =>
+        m.companyId === comp.id &&
+        resolveMemberStatus(m) === 'active' &&
+        ((uid && m.uid === uid) ||
+          (emailLower && m.email.trim().toLowerCase() === emailLower))
+    );
+
+    const viewerRole: CompanyRole = isOwnerByRecord
+      ? 'owner'
+      : matchedMember
+        ? resolveMemberBaseRole(matchedMember)
+        : !compOwnerUid && !compOwnerEmail
+          ? 'owner'
+          : 'accountant';
+
+    const stats = invoiceStatsByCompany.get(comp.id);
+    return {
+      company: {
+        ...comp,
+        profile: normalizeCompanyMasterProfile(comp.profile),
+      },
+      viewerRole,
+      viewerRoleLabelPt: formatRoleLabelPt(viewerRole),
+      memberDisplayName: matchedMember?.displayName || comp.ownerEmail || 'Operador Local',
+      invoiceCount: stats?.count || 0,
+      ...(stats?.lastIso ? { lastInvoiceIso: stats.lastIso } : {}),
+    };
+  });
+
+  items.sort((a, b) =>
+    a.company.profile.shortName.localeCompare(b.company.profile.shortName, 'pt')
+  );
+  return items;
+}
+
 export async function bootstrapLocalStore(
   preferredCompanyId?: string,
   viewer?: WorkspaceViewerIdentity | null
@@ -1808,7 +1973,22 @@ export const localDb = {
       String(p.id || '').trim() || `prod_${Date.now()}_${Math.random().toString(36).slice(2, 6)}`;
     return putInStore('products', { ...p, id: resolvedId, companyId: resolvedCompanyId });
   },
+  saveProductsBatch: (products: Product[], companyId: string) => {
+    const resolvedCompanyId = String(companyId || '').trim();
+    if (!resolvedCompanyId) {
+      return Promise.reject(new Error('Selecione ou cadastre uma empresa antes de importar artigos.'));
+    }
+    const prepared = products.map((p, idx) => ({
+      ...p,
+      id:
+        String(p.id || '').trim() ||
+        `prod_${Date.now()}_${idx}_${Math.random().toString(36).slice(2, 5)}`,
+      companyId: resolvedCompanyId,
+    }));
+    return putBatchInStore('products', prepared);
+  },
   deleteProduct: (id: string) => deleteFromStore('products', id),
+  deleteProductsBatch: (ids: string[]) => deleteBatchFromStore('products', ids),
   saveCustomer: (c: Customer, companyId: string) => {
     const resolvedCompanyId = String(companyId || c.companyId || '').trim();
     if (!resolvedCompanyId) {
@@ -1818,7 +1998,22 @@ export const localDb = {
       String(c.id || '').trim() || `cust_${Date.now()}_${Math.random().toString(36).slice(2, 6)}`;
     return putInStore('customers', { ...c, id: resolvedId, companyId: resolvedCompanyId });
   },
+  saveCustomersBatch: (customers: Customer[], companyId: string) => {
+    const resolvedCompanyId = String(companyId || '').trim();
+    if (!resolvedCompanyId) {
+      return Promise.reject(new Error('Selecione ou cadastre uma empresa antes de importar clientes.'));
+    }
+    const prepared = customers.map((c, idx) => ({
+      ...c,
+      id:
+        String(c.id || '').trim() ||
+        `cust_${Date.now()}_${idx}_${Math.random().toString(36).slice(2, 5)}`,
+      companyId: resolvedCompanyId,
+    }));
+    return putBatchInStore('customers', prepared);
+  },
   deleteCustomer: (id: string) => deleteFromStore('customers', id),
+  deleteCustomersBatch: (ids: string[]) => deleteBatchFromStore('customers', ids),
   saveInvoice: (inv: InvoiceRecord, companyId: string) => {
     const resolvedCompanyId = String(companyId || inv.companyId || '').trim();
     if (!resolvedCompanyId) {

@@ -609,6 +609,7 @@ export async function fetchCompanyWorkspaceBackend(companyId: string): Promise<{
   suppliers: Supplier[];
   purchases: PurchaseRecord[];
   fiscalSeries?: AgtSeriesRecord[];
+  auditLogs?: SecurityAuditEntry[];
   members?: CompanyMember[];
   roles?: CompanyRoleDefinition[];
   settings: AppSettings | null;
@@ -640,6 +641,7 @@ export async function fetchCompanyWorkspaceBackend(companyId: string): Promise<{
       suppliers?: Array<Record<string, unknown>>;
       purchases?: Array<Record<string, unknown>>;
       fiscalSeries?: Array<Record<string, unknown>>;
+      auditLogs?: Array<Record<string, unknown>>;
       settings?: Record<string, unknown> | null;
     };
     if (!json.ok) return null;
@@ -1173,6 +1175,27 @@ export async function fetchCompanyWorkspaceBackend(companyId: string): Promise<{
         }))
       : undefined;
 
+    const auditLogs: SecurityAuditEntry[] | undefined = Array.isArray(json.auditLogs)
+      ? json.auditLogs.map((al) => ({
+          id: String(al.id || ''),
+          companyId: resolvedId,
+          ...(al.establishmentId ? { establishmentId: String(al.establishmentId) } : {}),
+          actorUid: String(al.actorUid || ''),
+          ...(al.actorEmail ? { actorEmail: String(al.actorEmail) } : {}),
+          actorName: String(al.actorName || 'Operador'),
+          actorRole: String(al.actorRole || ''),
+          action: String(al.action || 'LOGIN') as SecurityAuditEntry['action'],
+          targetType: String(al.targetType || ''),
+          ...(al.targetId ? { targetId: String(al.targetId) } : {}),
+          summary: String(al.summary || ''),
+          ...(al.beforeJson ? { beforeJson: String(al.beforeJson) } : {}),
+          ...(al.afterJson ? { afterJson: String(al.afterJson) } : {}),
+          outcome: al.outcome === 'denied' ? 'denied' : 'allowed',
+          createdAtIso: String(al.createdAtIso || now),
+          synced: true,
+        }))
+      : undefined;
+
     return {
       products,
       customers,
@@ -1183,6 +1206,7 @@ export async function fetchCompanyWorkspaceBackend(companyId: string): Promise<{
       suppliers,
       purchases,
       fiscalSeries,
+      auditLogs,
       members,
       roles,
       settings,

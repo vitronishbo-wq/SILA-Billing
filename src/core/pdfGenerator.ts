@@ -466,7 +466,7 @@ function drawCompanyHeaderBlock(
   pdf.drawRectFill(MARGIN_L, 808, CONTENT_W, 3.5, [0.11, 0.31, 0.85]);
 
   const topY = 792;
-  const leftMaxW = 305;
+  const leftMaxW = 285;
 
   pdf.drawText(company.legalName || company.shortName || 'Empresa', MARGIN_L, topY, {
     font: 'F2',
@@ -522,7 +522,7 @@ function drawCompanyHeaderBlock(
   }
 
   // Caixa documental à direita
-  const boxW = 192;
+  const boxW = 214;
   const boxX = MARGIN_R - boxW;
   const boxH = 54;
   const boxY = topY - boxH + 10;
@@ -530,7 +530,7 @@ function drawCompanyHeaderBlock(
   pdf.drawRectStroke(boxX, boxY, boxW, boxH, [0.83, 0.87, 0.92], 0.7);
   pdf.drawText(rightTitle, boxX + boxW - 10, topY - 4, {
     font: 'F2',
-    size: 10.5,
+    size: rightTitle.length > 20 ? 9.5 : 10.5,
     color: [0.11, 0.31, 0.85],
     align: 'right',
     maxWidth: boxW - 20,

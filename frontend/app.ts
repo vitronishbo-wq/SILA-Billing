@@ -20,6 +20,7 @@ import {
   formatFiscalDocumentNo,
   inicializarSeriesPadraoSeNecessario,
   listarSeries,
+  mergeSeriesFromCloud,
   obterSerieAtiva,
   reservarProximoNumeroFiscal,
   solicitarSerie,
@@ -142,7 +143,7 @@ import {
   searchProductsSmart,
   SmartProductSearchResult,
 } from '../src/core/smartSearch';
-import { UNASSIGNED_TENANT_RECORD } from '../src/core/seedData';
+import { createDirectCustomerForCompany, UNASSIGNED_TENANT_RECORD } from '../src/core/seedData';
 import {
   appendSecurityAuditCloud,
   cancelInvoiceCloud,
@@ -184,8 +185,10 @@ import {
   validateFirestoreConnection,
 } from '../src/services/firebaseClient';
 import {
+  type AuthorizedCompanyPortfolioItem,
   bootstrapLocalStore,
   CompanyWorkspaceBundle,
+  getAuthorizedCompaniesOverview,
   loadCompanyWorkspace,
   localDb,
   registerNewCompanyLocal,
@@ -304,6 +307,61 @@ import {
   renderWhatsAppShareModal,
   type WhatsAppShareDraftState,
 } from './ui/whatsappShareModal';
+import {
+  buildFinancialIntelligenceSnapshot,
+  type FinancialIntelligenceSnapshot,
+} from '../src/core/financialIntelligence';
+import {
+  renderFinancialIntelligenceGrid,
+  renderFinancialIntelligenceModal,
+  type FinancialIntelligenceRenderOptions,
+} from './ui/financialIntelligenceView';
+import {
+  applyStagedCustomerImportBatch,
+  applyStagedProductImportBatch,
+  buildSampleCustomersCsv,
+  buildSampleCustomersXlsx,
+  buildSampleProductsCsv,
+  buildSampleProductsXlsx,
+  parseSpreadsheetFileBytes,
+  prepareCustomerImportBatch,
+  prepareProductImportBatch,
+  type ImportDuplicateMode,
+  type ParsedSpreadsheetResult,
+  type StagedCustomerImportBatch,
+  type StagedProductImportBatch,
+} from '../src/core/spreadsheetImport';
+import {
+  renderQuickOnboardingModal,
+  type ImportPreviewFilter,
+  type QuickOnboardingModalMode,
+  type QuickWizardStep,
+  type UndoableCustomerImportRecord,
+  type UndoableProductImportRecord,
+} from './ui/quickOnboardingWizard';
+import {
+  type AccountantAuditCategory,
+  type AccountantMonthlyPackage,
+  buildAccountantAuditTrail,
+  buildAccountantMonthlyPackage,
+  buildAccountantMonthlyZipPackage,
+  buildAccountantMonthOptions,
+  buildAuditTrailCsv,
+  buildAuditTrailExcelBytes,
+  buildAuxiliaryMapsExcelBytes,
+  buildCancelledRectifiedCsv,
+  buildCancelledRectifiedExcelBytes,
+  buildVatCsv,
+  buildVatExcelBytes,
+  buildWithholdingCsv,
+  buildWithholdingExcelBytes,
+  resolveAccountantMonthScope,
+} from '../src/core/accountantEngine';
+import {
+  type AccountantWorkspaceTab,
+  renderAccountantMonthlyDossierHtml,
+  renderAccountantWorkspaceHtml,
+} from './ui/accountantWorkspace';
 
 type ActiveModule =
   | 'NEW_POS'
@@ -315,6 +373,7 @@ type ActiveModule =
   | 'FINANCE'
   | 'INDICATORS'
   | 'HISTORY'
+  | 'ACCOUNTANT'
   | 'SETTINGS'
   | 'SYNC';
 
@@ -693,7 +752,39 @@ export class SilaBillingApp {
   private settleReference = '';
   private settleError: string | null = null;
   private whatsappShareDraft: WhatsAppShareDraftState | null = null;
+  private showFinancialIntelligenceModal = false;
   private lastPaymentReceiptProof: PaymentReceiptPdfPayload | null = null;
+
+  // Assistente Entrada Rápida (< 10 min) & Importação em Massa (Excel/CSV)
+  private quickOnboardingMode: QuickOnboardingModalMode | null = null;
+  private quickWizardStep: QuickWizardStep = 'COMPANY';
+  private quickWizardShowCreateCompany = false;
+  private quickWizardCompanyError: string | null = null;
+  private quickProductLastParsed: ParsedSpreadsheetResult | null = null;
+  private quickProductBatch: StagedProductImportBatch | null = null;
+  private quickProductDuplicateMode: ImportDuplicateMode = 'SKIP';
+  private quickProductDefaultIvaRate: TaxRate = 14;
+  private quickProductPreviewFilter: ImportPreviewFilter = 'ALL';
+  private quickProductPreviewPage = 1;
+  private quickProductImportError: string | null = null;
+  private quickProductImportNotice: string | null = null;
+  private isCommittingProductImport = false;
+  private undoableProductImport:
+    | (UndoableProductImportRecord & { previousSnapshots: Product[] })
+    | null = null;
+  private quickCustomerLastParsed: ParsedSpreadsheetResult | null = null;
+  private quickCustomerBatch: StagedCustomerImportBatch | null = null;
+  private quickCustomerDuplicateMode: ImportDuplicateMode = 'SKIP';
+  private quickCustomerPreviewFilter: ImportPreviewFilter = 'ALL';
+  private quickCustomerPreviewPage = 1;
+  private quickCustomerImportError: string | null = null;
+  private quickCustomerImportNotice: string | null = null;
+  private isCommittingCustomerImport = false;
+  private undoableCustomerImport:
+    | (UndoableCustomerImportRecord & { previousSnapshots: Customer[] })
+    | null = null;
+  private quickCashPrinterError: string | null = null;
+  private quickCashPrinterNotice: string | null = null;
 
   // Estado Caixa e Pagamentos (Turnos, Fundo Inicial, Sangria, Reforço, Entradas/Saídas e Fecho)
   private cashSessions: CashSession[] = [];
@@ -866,6 +957,20 @@ export class SilaBillingApp {
     invoices: InvoiceRecord[];
     filterLabel: string;
   } | null = null;
+  private accountantReportPrintJob: {
+    pkg: AccountantMonthlyPackage;
+  } | null = null;
+
+  // Modo Contabilista
+  private accountantSubTab: AccountantWorkspaceTab = 'OVERVIEW';
+  private accountantYearMonth = new Date().toISOString().slice(0, 7);
+  private accountantAuditCategory: AccountantAuditCategory = 'ALL';
+  private accountantAuditPeriodMode: 'MONTH' | 'ALL' = 'MONTH';
+  private accountantAuditSearch = '';
+  private accountantPortfolioSearch = '';
+  private accountantPortfolioItems: AuthorizedCompanyPortfolioItem[] = [];
+  private accountantWorkspaceNotice: string | null = null;
+  private pendingPostUnlockModule: ActiveModule | null = null;
 
   constructor(root: HTMLElement) {
     this.root = root;
@@ -1018,6 +1123,8 @@ export class SilaBillingApp {
     this.rbacEditingRoleId = null;
     this.rbacFormError = null;
     this.rbacNoticeMessage = null;
+    this.accountantWorkspaceNotice = null;
+    void this.refreshAccountantPortfolio();
 
     this.roles =
       Array.isArray(data.roles) && data.roles.length > 0
@@ -1118,7 +1225,24 @@ export class SilaBillingApp {
     this.settlingCustomerAccountId = null;
     this.settleError = null;
     this.whatsappShareDraft = null;
+    this.showFinancialIntelligenceModal = false;
     this.lastPaymentReceiptProof = null;
+    this.quickProductLastParsed = null;
+    this.quickProductBatch = null;
+    this.quickProductPreviewPage = 1;
+    this.quickProductImportError = null;
+    this.quickProductImportNotice = null;
+    this.undoableProductImport = null;
+    this.quickCustomerLastParsed = null;
+    this.quickCustomerBatch = null;
+    this.quickCustomerPreviewPage = 1;
+    this.quickCustomerImportError = null;
+    this.quickCustomerImportNotice = null;
+    this.undoableCustomerImport = null;
+    this.quickCashPrinterError = null;
+    this.quickCashPrinterNotice = null;
+    this.quickProductDefaultIvaRate =
+      data.activeCompany.profile?.taxRegime === 'GERAL' ? 14 : 0;
     this.historyStatusFilter = 'ALL';
     this.historyDebtOnly = false;
     this.historyPeriod = 'ALL';
@@ -1377,6 +1501,12 @@ export class SilaBillingApp {
           this.hasPerm('saft_export') ||
           this.hasPerm('audit_view')
         );
+      case 'ACCOUNTANT':
+        return (
+          this.hasPerm('saft_export') ||
+          this.hasPerm('reports_financial') ||
+          this.hasPerm('audit_view')
+        );
       case 'SETTINGS':
         return (
           this.hasPerm('master_view') ||
@@ -1392,6 +1522,10 @@ export class SilaBillingApp {
   }
 
   private getFirstAllowedModule(): ActiveModule {
+    const unlocked = this.getUnlockedMember();
+    if (unlocked && resolveMemberBaseRole(unlocked) === 'accountant' && this.canAccessModule('ACCOUNTANT')) {
+      return 'ACCOUNTANT';
+    }
     const order: ActiveModule[] = [
       'NEW_POS',
       'NEW_A4',
@@ -1402,6 +1536,7 @@ export class SilaBillingApp {
       'HISTORY',
       'FINANCE',
       'INDICATORS',
+      'ACCOUNTANT',
       'SETTINGS',
       'SYNC',
     ];
@@ -1454,6 +1589,7 @@ export class SilaBillingApp {
     this.showRbacMobileModal = false;
     this.showCompanyDropdown = false;
     this.whatsappShareDraft = null;
+    this.showFinancialIntelligenceModal = false;
     this.render();
   }
 
@@ -1632,6 +1768,75 @@ export class SilaBillingApp {
       totalSpent: roundKz(totalSpent),
       purchaseCount,
       invoices: custInvoices,
+    };
+  }
+
+  private canOpenFinancialPulse(): boolean {
+    if (this.isTerminalLocked()) return false;
+    return (
+      this.hasPerm('pos_sell') ||
+      this.hasPerm('cash_own_shift') ||
+      this.hasPerm('cash_all_shifts') ||
+      this.hasPerm('finance_view') ||
+      this.hasPerm('reports_operational') ||
+      this.hasPerm('reports_financial') ||
+      this.hasPerm('profits_margins_view')
+    );
+  }
+
+  private buildFinancialIntelligenceData(): FinancialIntelligenceSnapshot {
+    const canSeeAllCash =
+      this.hasPerm('cash_all_shifts') ||
+      this.hasPerm('finance_view') ||
+      this.hasPerm('reports_operational') ||
+      this.hasPerm('reports_financial');
+
+    return buildFinancialIntelligenceSnapshot({
+      invoices: this.invoices,
+      products: this.products,
+      customers: this.customers,
+      cashSessions: this.cashSessions,
+      cashMovements: this.cashMovements,
+      purchases: this.purchases,
+      permissions: {
+        canViewMargins: this.canViewCostPrices() && this.canViewProfitsMargins(),
+        canViewCashVariance:
+          this.hasPerm('cash_own_shift') ||
+          this.hasPerm('cash_all_shifts') ||
+          this.hasPerm('finance_view') ||
+          this.hasPerm('reports_operational'),
+        canViewReceivables:
+          this.hasPerm('finance_view') ||
+          this.hasPerm('customers_view') ||
+          this.hasPerm('reports_operational') ||
+          this.hasPerm('cash_own_shift') ||
+          this.hasPerm('cash_all_shifts'),
+        canViewStockAlerts:
+          this.hasPerm('products_view') ||
+          this.hasPerm('products_manage') ||
+          this.hasPerm('stock_view') ||
+          this.hasPerm('stock_manage') ||
+          this.hasPerm('pos_sell'),
+        ...(!canSeeAllCash && this.hasPerm('cash_own_shift')
+          ? { activeCashierFilter: this.cashier || this.settings.defaultCashier || '01' }
+          : {}),
+      },
+    });
+  }
+
+  private getFinancialIntelligenceRenderOptions(): FinancialIntelligenceRenderOptions {
+    return {
+      companyName: this.settings.company.shortName || this.settings.company.legalName || 'Empresa',
+      canAccessCash: this.canAccessModule('CASH'),
+      canAccessProducts: this.canAccessModule('PRODUCTS'),
+      canAccessFinance: this.canAccessModule('FINANCE'),
+      canAccessHistory: this.canAccessModule('HISTORY'),
+      canShareDailyWhatsApp:
+        this.hasPerm('reports_operational') ||
+        this.hasPerm('reports_own_sales') ||
+        this.hasPerm('cash_own_shift') ||
+        this.hasPerm('cash_all_shifts') ||
+        this.hasPerm('finance_view'),
     };
   }
 
@@ -2030,6 +2235,7 @@ export class SilaBillingApp {
     document.body.setAttribute('data-print-mode', format);
     this.printJob = null;
     this.historyReportPrintJob = null;
+    this.accountantReportPrintJob = null;
     this.cashPrintJob = { session, summary, format };
     this.render();
     window.setTimeout(() => {
@@ -3304,7 +3510,11 @@ export class SilaBillingApp {
     this.showCompanyDropdown = false;
     this.render();
 
-    if (this.user && this.isOnline && this.hasUnsyncedLocalRecords()) {
+    if (
+      this.user &&
+      this.isOnline &&
+      (this.hasUnsyncedLocalRecords() || canCompanySyncCloudData(bundle.activeCompany))
+    ) {
       void this.syncAllWithCloud();
     }
   }
@@ -5275,6 +5485,14 @@ export class SilaBillingApp {
         this.render();
         break;
       }
+      case 'mobile-open-accountant': {
+        if (!this.canAccessModule('ACCOUNTANT')) return;
+        this.activeModule = 'ACCOUNTANT';
+        this.forceDesktopView = true;
+        void this.refreshAccountantPortfolio();
+        this.render();
+        break;
+      }
       case 'mobile-switch-to-desktop': {
         this.forceDesktopView = true;
         this.render();
@@ -5845,6 +6063,7 @@ export class SilaBillingApp {
           }
         }
         if (mod === 'SYNC') this.refreshBackendHealth();
+        if (mod === 'ACCOUNTANT') void this.refreshAccountantPortfolio();
         this.scheduleDraftSave();
         this.render();
         break;
@@ -8343,6 +8562,762 @@ export class SilaBillingApp {
         }
         break;
       }
+      case 'open-financial-intelligence': {
+        if (!this.canOpenFinancialPulse()) return;
+        this.showFinancialIntelligenceModal = true;
+        this.render();
+        break;
+      }
+      case 'close-financial-intelligence':
+      case 'intel-backdrop-close': {
+        this.showFinancialIntelligenceModal = false;
+        this.render();
+        break;
+      }
+      case 'set-accountant-tab': {
+        const nextTab = value as AccountantWorkspaceTab;
+        if (
+          nextTab === 'OVERVIEW' ||
+          nextTab === 'VAT_WITHHOLDING' ||
+          nextTab === 'CANCELLED_RECTIFIED' ||
+          nextTab === 'AUDIT_HISTORY' ||
+          nextTab === 'PORTFOLIO'
+        ) {
+          this.accountantSubTab = nextTab;
+          this.accountantWorkspaceNotice = null;
+          if (nextTab === 'PORTFOLIO') void this.refreshAccountantPortfolio();
+          this.render();
+        }
+        break;
+      }
+      case 'accountant-audit-category': {
+        const nextCat = value as AccountantAuditCategory;
+        if (
+          nextCat === 'ALL' ||
+          nextCat === 'DOCUMENTS' ||
+          nextCat === 'PRICES_CUSTOMERS' ||
+          nextCat === 'ACCESS_SECURITY' ||
+          nextCat === 'USERS_ROLES'
+        ) {
+          this.accountantAuditCategory = nextCat;
+          this.render();
+        }
+        break;
+      }
+      case 'accountant-audit-period': {
+        if (value === 'MONTH' || value === 'ALL') {
+          this.accountantAuditPeriodMode = value;
+          this.render();
+        }
+        break;
+      }
+      case 'export-accountant-zip': {
+        if (!this.canAccessModule('ACCOUNTANT')) return;
+        const pkg = this.buildCurrentAccountantPackage();
+        const zip = buildAccountantMonthlyZipPackage({ pkg, invoices: this.invoices });
+        this.triggerBinaryDownload(zip.bytes, zip.filename, 'application/zip');
+        this.accountantWorkspaceNotice = `Pacote mensal ${zip.filename} exportado (${zip.includedFiles.length} ficheiros).`;
+        this.render();
+        break;
+      }
+      case 'export-accountant-saft': {
+        if (!this.canAccessModule('ACCOUNTANT')) return;
+        const pkg = this.buildCurrentAccountantPackage();
+        triggerBrowserDownload(pkg.saftResult.xml, pkg.saftResult.filename, 'application/xml;charset=utf-8');
+        this.accountantWorkspaceNotice = `SAF-T (AO) ${pkg.saftResult.filename} exportado.`;
+        this.render();
+        break;
+      }
+      case 'export-accountant-dossier': {
+        if (!this.canAccessModule('ACCOUNTANT')) return;
+        const pkg = this.buildCurrentAccountantPackage();
+        this.triggerAccountantDossierPrint(pkg);
+        break;
+      }
+      case 'export-accountant-vat-xlsx': {
+        if (!this.canAccessModule('ACCOUNTANT')) return;
+        const pkg = this.buildCurrentAccountantPackage();
+        const bytes = buildVatExcelBytes(pkg.vatReport, this.settings.company);
+        this.triggerBinaryDownload(
+          bytes,
+          `Mapa_IVA_${pkg.scope.yearMonth}.xlsx`,
+          'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet'
+        );
+        break;
+      }
+      case 'export-accountant-vat-csv': {
+        if (!this.canAccessModule('ACCOUNTANT')) return;
+        const pkg = this.buildCurrentAccountantPackage();
+        triggerBrowserDownload(
+          buildVatCsv(pkg.vatReport, this.settings.company),
+          `Mapa_IVA_${pkg.scope.yearMonth}.csv`,
+          'text/csv;charset=utf-8'
+        );
+        break;
+      }
+      case 'export-accountant-wht-xlsx': {
+        if (!this.canAccessModule('ACCOUNTANT')) return;
+        const pkg = this.buildCurrentAccountantPackage();
+        const bytes = buildWithholdingExcelBytes(pkg.withholdingReport, this.settings.company);
+        this.triggerBinaryDownload(
+          bytes,
+          `Mapa_Retencoes_${pkg.scope.yearMonth}.xlsx`,
+          'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet'
+        );
+        break;
+      }
+      case 'export-accountant-wht-csv': {
+        if (!this.canAccessModule('ACCOUNTANT')) return;
+        const pkg = this.buildCurrentAccountantPackage();
+        triggerBrowserDownload(
+          buildWithholdingCsv(pkg.withholdingReport, this.settings.company),
+          `Mapa_Retencoes_${pkg.scope.yearMonth}.csv`,
+          'text/csv;charset=utf-8'
+        );
+        break;
+      }
+      case 'export-accountant-cancelled-xlsx': {
+        if (!this.canAccessModule('ACCOUNTANT')) return;
+        const pkg = this.buildCurrentAccountantPackage();
+        const bytes = buildCancelledRectifiedExcelBytes(
+          pkg.cancelledRectified,
+          this.settings.company
+        );
+        this.triggerBinaryDownload(
+          bytes,
+          `Anulados_Rectificados_${pkg.scope.yearMonth}.xlsx`,
+          'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet'
+        );
+        break;
+      }
+      case 'export-accountant-cancelled-csv': {
+        if (!this.canAccessModule('ACCOUNTANT')) return;
+        const pkg = this.buildCurrentAccountantPackage();
+        triggerBrowserDownload(
+          buildCancelledRectifiedCsv(pkg.cancelledRectified, this.settings.company),
+          `Anulados_Rectificados_${pkg.scope.yearMonth}.csv`,
+          'text/csv;charset=utf-8'
+        );
+        break;
+      }
+      case 'export-accountant-aux-xlsx': {
+        if (!this.canAccessModule('ACCOUNTANT')) return;
+        const pkg = this.buildCurrentAccountantPackage();
+        const bytes = buildAuxiliaryMapsExcelBytes(
+          pkg.auxiliaryMaps,
+          pkg.withholdingReport,
+          this.settings.company
+        );
+        this.triggerBinaryDownload(
+          bytes,
+          `Mapas_Auxiliares_${pkg.scope.yearMonth}.xlsx`,
+          'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet'
+        );
+        break;
+      }
+      case 'export-accountant-audit-xlsx': {
+        if (!this.canAccessModule('ACCOUNTANT')) return;
+        const scope = resolveAccountantMonthScope(this.accountantYearMonth);
+        const items = buildAccountantAuditTrail({
+          securityAuditLogs: this.securityAuditLogs,
+          products: this.products,
+          customers: this.customers,
+          invoices: this.invoices,
+          yearMonth: this.accountantYearMonth,
+          periodMode: this.accountantAuditPeriodMode,
+          category: this.accountantAuditCategory,
+          search: this.accountantAuditSearch,
+          canViewCostPrices: this.canViewCostPrices(),
+        });
+        const label =
+          this.accountantAuditPeriodMode === 'MONTH' ? scope.labelPt : 'Todo o Histórico';
+        const bytes = buildAuditTrailExcelBytes(items, this.settings.company, label);
+        this.triggerBinaryDownload(
+          bytes,
+          `Auditoria_Contabilidade_${scope.yearMonth}.xlsx`,
+          'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet'
+        );
+        break;
+      }
+      case 'export-accountant-audit-csv': {
+        if (!this.canAccessModule('ACCOUNTANT')) return;
+        const scope = resolveAccountantMonthScope(this.accountantYearMonth);
+        const items = buildAccountantAuditTrail({
+          securityAuditLogs: this.securityAuditLogs,
+          products: this.products,
+          customers: this.customers,
+          invoices: this.invoices,
+          yearMonth: this.accountantYearMonth,
+          periodMode: this.accountantAuditPeriodMode,
+          category: this.accountantAuditCategory,
+          search: this.accountantAuditSearch,
+          canViewCostPrices: this.canViewCostPrices(),
+        });
+        const label =
+          this.accountantAuditPeriodMode === 'MONTH' ? scope.labelPt : 'Todo o Histórico';
+        triggerBrowserDownload(
+          buildAuditTrailCsv(items, this.settings.company, label),
+          `Auditoria_Contabilidade_${scope.yearMonth}.csv`,
+          'text/csv;charset=utf-8'
+        );
+        break;
+      }
+      case 'accountant-switch-company': {
+        const targetCompanyId = target.dataset.companyId || value;
+        if (targetCompanyId && targetCompanyId !== this.activeCompany.id) {
+          this.pendingPostUnlockModule = 'ACCOUNTANT';
+          await this.switchActiveCompany(targetCompanyId);
+        }
+        break;
+      }
+      case 'accountant-invite-shortcut': {
+        if (!this.canAccessModule('SETTINGS')) return;
+        this.activeModule = 'SETTINGS';
+        this.rbacActiveTab = 'USERS';
+        this.rbacEditingMemberId = '__NEW__';
+        this.render();
+        break;
+      }
+      case 'intel-go-module': {
+        const targetMod = value as ActiveModule;
+        this.showFinancialIntelligenceModal = false;
+        if (targetMod && this.canAccessModule(targetMod)) {
+          this.activeModule = targetMod;
+          this.scheduleDraftSave();
+        }
+        this.render();
+        break;
+      }
+      case 'intel-go-today-docs': {
+        this.showFinancialIntelligenceModal = false;
+        const dayIso = id && /^\d{4}-\d{2}-\d{2}$/.test(id) ? id : new Date().toISOString().slice(0, 10);
+        if (this.canAccessModule('HISTORY')) {
+          this.activeModule = 'HISTORY';
+          this.historyPeriod = 'CUSTOM';
+          this.historyDateFrom = dayIso;
+          this.historyDateTo = dayIso;
+          this.historyStatusFilter = 'ALL';
+          this.historyDebtOnly = false;
+          this.historySearch = '';
+          this.historyOperatorFilter = 'ALL';
+          this.scheduleDraftSave();
+        }
+        this.render();
+        break;
+      }
+      case 'intel-go-receivables': {
+        this.showFinancialIntelligenceModal = false;
+        if (this.canAccessModule('FINANCE')) {
+          this.activeModule = 'FINANCE';
+          this.financeSubView = 'ACCOUNTS';
+          this.financeAccountsSide = 'RECEIVABLES';
+          this.scheduleDraftSave();
+        }
+        this.render();
+        break;
+      }
+      case 'intel-go-margins': {
+        this.showFinancialIntelligenceModal = false;
+        if (this.canAccessModule('FINANCE') && this.canViewCostPrices() && this.canViewProfitsMargins()) {
+          this.activeModule = 'FINANCE';
+          this.financeSubView = 'MARGINS';
+          this.scheduleDraftSave();
+        }
+        this.render();
+        break;
+      }
+      case 'open-quick-onboarding-wizard': {
+        const hasCompany = !this.requiresCompanyOnboarding && Boolean(this.activeCompany.id);
+        this.quickOnboardingMode = 'WIZARD';
+        this.quickWizardStep = hasCompany ? 'PRODUCTS' : 'COMPANY';
+        this.quickWizardShowCreateCompany = !hasCompany;
+        this.quickWizardCompanyError = null;
+        this.quickProductImportError = null;
+        this.quickCustomerImportError = null;
+        this.quickCashPrinterError = null;
+        this.quickCashPrinterNotice = null;
+        this.quickProductDefaultIvaRate =
+          this.activeCompany.profile?.taxRegime === 'GERAL' ? 14 : 0;
+        this.render();
+        break;
+      }
+      case 'open-bulk-import-products': {
+        if (!this.canManageCatalog()) return;
+        this.quickOnboardingMode = 'IMPORT_PRODUCTS';
+        this.quickProductImportError = null;
+        this.quickProductImportNotice = null;
+        this.quickProductDefaultIvaRate =
+          this.activeCompany.profile?.taxRegime === 'GERAL' ? 14 : 0;
+        this.render();
+        break;
+      }
+      case 'open-bulk-import-customers': {
+        if (!this.hasPerm('customers_create') && !this.hasPerm('customers_manage')) return;
+        this.quickOnboardingMode = 'IMPORT_CUSTOMERS';
+        this.quickCustomerImportError = null;
+        this.quickCustomerImportNotice = null;
+        this.render();
+        break;
+      }
+      case 'close-quick-onboarding-wizard': {
+        if (this.isCommittingProductImport || this.isCommittingCustomerImport || this.isCreatingCompany) {
+          return;
+        }
+        this.quickOnboardingMode = null;
+        this.render();
+        break;
+      }
+      case 'quick-wizard-go-step': {
+        const target = value as QuickWizardStep;
+        const hasCompany = !this.requiresCompanyOnboarding && Boolean(this.activeCompany.id);
+        if (target !== 'COMPANY' && !hasCompany) return;
+        this.quickWizardStep = target;
+        this.quickWizardCompanyError = null;
+        this.quickCashPrinterError = null;
+        this.render();
+        break;
+      }
+      case 'quick-wizard-toggle-new-company': {
+        this.quickWizardShowCreateCompany = !this.quickWizardShowCreateCompany;
+        this.quickWizardCompanyError = null;
+        this.render();
+        break;
+      }
+      case 'download-products-template-xlsx': {
+        const regime = this.activeCompany.profile?.taxRegime || 'GERAL';
+        const bytes = buildSampleProductsXlsx(regime);
+        this.triggerBinaryDownload(
+          bytes,
+          'modelo-produtos-sila-billing.xlsx',
+          'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet'
+        );
+        break;
+      }
+      case 'download-products-template-csv': {
+        const regime = this.activeCompany.profile?.taxRegime || 'GERAL';
+        const csv = buildSampleProductsCsv(regime);
+        triggerBrowserDownload(csv, 'modelo-produtos-sila-billing.csv', 'text/csv;charset=utf-8');
+        break;
+      }
+      case 'download-customers-template-xlsx': {
+        const bytes = buildSampleCustomersXlsx();
+        this.triggerBinaryDownload(
+          bytes,
+          'modelo-clientes-sila-billing.xlsx',
+          'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet'
+        );
+        break;
+      }
+      case 'download-customers-template-csv': {
+        const csv = buildSampleCustomersCsv();
+        triggerBrowserDownload(csv, 'modelo-clientes-sila-billing.csv', 'text/csv;charset=utf-8');
+        break;
+      }
+      case 'set-product-import-filter': {
+        if (value === 'ALL' || value === 'VALID' || value === 'ERRORS') {
+          this.quickProductPreviewFilter = value;
+          this.quickProductPreviewPage = 1;
+          this.render();
+        }
+        break;
+      }
+      case 'product-import-prev-page': {
+        this.quickProductPreviewPage = Math.max(1, this.quickProductPreviewPage - 1);
+        this.render();
+        break;
+      }
+      case 'product-import-next-page': {
+        this.quickProductPreviewPage += 1;
+        this.render();
+        break;
+      }
+      case 'toggle-product-import-row': {
+        const rowNum = parseInt(id, 10);
+        if (!this.quickProductBatch || Number.isNaN(rowNum)) return;
+        const exists = this.quickProductBatch.excludedRowNumbers.includes(rowNum);
+        this.quickProductBatch = {
+          ...this.quickProductBatch,
+          excludedRowNumbers: exists
+            ? this.quickProductBatch.excludedRowNumbers.filter((n) => n !== rowNum)
+            : [...this.quickProductBatch.excludedRowNumbers, rowNum],
+        };
+        this.render();
+        break;
+      }
+      case 'discard-product-import-stage': {
+        this.quickProductLastParsed = null;
+        this.quickProductBatch = null;
+        this.quickProductPreviewPage = 1;
+        this.quickProductImportError = null;
+        this.quickProductImportNotice = 'Carregamento descartado antes da confirmação. Nenhum artigo foi alterado.';
+        this.render();
+        break;
+      }
+      case 'confirm-product-import': {
+        await this.commitStagedProductImport();
+        break;
+      }
+      case 'undo-last-product-import': {
+        await this.undoLastCommittedProductImport();
+        break;
+      }
+      case 'set-customer-import-filter': {
+        if (value === 'ALL' || value === 'VALID' || value === 'ERRORS') {
+          this.quickCustomerPreviewFilter = value;
+          this.quickCustomerPreviewPage = 1;
+          this.render();
+        }
+        break;
+      }
+      case 'customer-import-prev-page': {
+        this.quickCustomerPreviewPage = Math.max(1, this.quickCustomerPreviewPage - 1);
+        this.render();
+        break;
+      }
+      case 'customer-import-next-page': {
+        this.quickCustomerPreviewPage += 1;
+        this.render();
+        break;
+      }
+      case 'toggle-customer-import-row': {
+        const rowNum = parseInt(id, 10);
+        if (!this.quickCustomerBatch || Number.isNaN(rowNum)) return;
+        const exists = this.quickCustomerBatch.excludedRowNumbers.includes(rowNum);
+        this.quickCustomerBatch = {
+          ...this.quickCustomerBatch,
+          excludedRowNumbers: exists
+            ? this.quickCustomerBatch.excludedRowNumbers.filter((n) => n !== rowNum)
+            : [...this.quickCustomerBatch.excludedRowNumbers, rowNum],
+        };
+        this.render();
+        break;
+      }
+      case 'discard-customer-import-stage': {
+        this.quickCustomerLastParsed = null;
+        this.quickCustomerBatch = null;
+        this.quickCustomerPreviewPage = 1;
+        this.quickCustomerImportError = null;
+        this.quickCustomerImportNotice = 'Carregamento descartado antes da confirmação. Nenhum cliente foi alterado.';
+        this.render();
+        break;
+      }
+      case 'confirm-customer-import': {
+        await this.commitStagedCustomerImport();
+        break;
+      }
+      case 'undo-last-customer-import': {
+        await this.undoLastCommittedCustomerImport();
+        break;
+      }
+      case 'quick-wizard-test-print': {
+        const formEl = document.querySelector(
+          'form[data-form="quick-wizard-cash-printer-form"]'
+        ) as HTMLFormElement | null;
+        const fmtVal = formEl
+          ? ((new FormData(formEl).get('defaultFormat') as DocumentFormat) || this.settings.defaultFormat)
+          : this.settings.defaultFormat;
+        const format: DocumentFormat = fmtVal === 'A4' ? 'A4' : 'POS';
+        const testCustomer =
+          this.customers.find((c) => c.id === getDirectCustomerIdForCompany(this.activeCompany.id)) ||
+          createDirectCustomerForCompany(this.activeCompany);
+        const testRate: TaxRate = this.activeCompany.profile?.taxRegime === 'GERAL' ? 14 : 0;
+        const testItems: CartDraftItem[] = [
+          {
+            productId: 'test_print_item',
+            code: 'TESTE',
+            description: 'Artigo Teste de Impressora (Sem Valor Fiscal)',
+            qty: 1,
+            unit: 'un',
+            unitPrice: 1000,
+            ivaRate: testRate,
+            ...(testRate === 0 ? { exemptionCode: 'M80' as const } : {}),
+            discountPct: 0,
+          },
+        ];
+        const testTotals = calculateInvoiceTotals(testItems, 0);
+        const now = new Date().toISOString();
+        const activeEst = resolveActiveEstablishment(
+          this.settings.company,
+          this.settings.defaultEstablishmentId
+        );
+        const estLocality = resolveEstablishmentLocality(this.settings.company, activeEst);
+        const sampleInv: InvoiceRecord = {
+          id: 'test_print_preview',
+          companyId: this.activeCompany.id,
+          number: 'FP TESTE/000000',
+          docType: 'FP',
+          issuedAtIso: now,
+          cashier: this.cashier || this.settings.defaultCashier || '01',
+          operator: this.operator || this.settings.defaultOperator || '001',
+          paymentMethod: 'Dinheiro',
+          customerId: testCustomer.id,
+          customerName: testCustomer.name,
+          customerNif: testCustomer.nif,
+          customerType: testCustomer.customerType || 'CONSUMIDOR_FINAL',
+          customerCountryCode: testCustomer.countryCode || 'AO',
+          customerLocality: testCustomer.locality || estLocality,
+          merchandiseTotal: testTotals.merchandiseTotal,
+          discountTotal: testTotals.discountTotal,
+          taxBase14: testTotals.taxBase14,
+          taxAmount14: testTotals.taxAmount14,
+          taxBaseIntermediate: testTotals.taxBaseIntermediate,
+          taxAmountIntermediate: testTotals.taxAmountIntermediate,
+          taxBaseReduced: testTotals.taxBaseReduced,
+          taxAmountReduced: testTotals.taxAmountReduced,
+          taxBase0: testTotals.taxBase0,
+          taxAmount0: 0,
+          taxTotal: testTotals.taxTotal,
+          grandTotal: testTotals.grandTotal,
+          amountInWords: testTotals.amountInWords,
+          issuerSnapshot: buildInvoiceIssuerSnapshot(this.settings.company, {
+            companyId: this.activeCompany.id,
+            establishment: activeEst,
+            capturedAtIso: now,
+          }),
+          establishmentId: activeEst.id,
+          establishmentCode: activeEst.code,
+          establishmentName: activeEst.name,
+          seriesCode: 'TESTE',
+          seriesEnvironment: 'SIMULACAO',
+          amountReceived: testTotals.grandTotal,
+          changeAmount: 0,
+          notes: 'Página de teste de impressão SILA-Billing — sem validade fiscal.',
+          status: 'issued',
+          lines: testTotals.lines,
+          createdAtIso: now,
+          updatedAtIso: now,
+        };
+        await this.triggerPrint(sampleInv, format, false);
+        break;
+      }
+      case 'quick-wizard-start-selling': {
+        this.quickOnboardingMode = null;
+        const targetMod: ActiveModule =
+          this.settings.defaultFormat === 'A4' && this.canAccessModule('NEW_A4')
+            ? 'NEW_A4'
+            : this.canAccessModule('NEW_POS')
+              ? 'NEW_POS'
+              : this.getFirstAllowedModule();
+        this.activeModule = targetMod;
+        this.previewFormat = targetMod === 'NEW_A4' ? 'A4' : 'POS';
+        if (window.innerWidth < 768 && this.hasPerm('pos_sell')) {
+          this.mobileTab = 'SALE';
+          this.mobileCheckoutStep = 'CART';
+        }
+        this.scheduleDraftSave();
+        this.render();
+        break;
+      }
+    }
+  }
+
+  private triggerBinaryDownload(bytes: Uint8Array, filename: string, mimeType: string): void {
+    const copy = new Uint8Array(bytes.length);
+    copy.set(bytes);
+    const blob = new Blob([copy], { type: mimeType });
+    const url = URL.createObjectURL(blob);
+    const a = document.createElement('a');
+    a.href = url;
+    a.download = filename;
+    document.body.appendChild(a);
+    a.click();
+    a.remove();
+    URL.revokeObjectURL(url);
+  }
+
+  private restageProductImportIfLoaded(): void {
+    if (!this.quickProductLastParsed || !this.activeCompany.id) return;
+    this.quickProductBatch = prepareProductImportBatch({
+      parsed: this.quickProductLastParsed,
+      companyId: this.activeCompany.id,
+      taxRegime: this.activeCompany.profile?.taxRegime || 'GERAL',
+      defaultExemptionCode: this.activeCompany.profile?.defaultExemptionCode,
+      existingProducts: this.products,
+      duplicateMode: this.quickProductDuplicateMode,
+      defaultIvaRate: this.quickProductDefaultIvaRate,
+    });
+    this.quickProductPreviewPage = 1;
+  }
+
+  private restageCustomerImportIfLoaded(): void {
+    if (!this.quickCustomerLastParsed || !this.activeCompany.id) return;
+    this.quickCustomerBatch = prepareCustomerImportBatch({
+      parsed: this.quickCustomerLastParsed,
+      companyId: this.activeCompany.id,
+      existingCustomers: this.customers,
+      duplicateMode: this.quickCustomerDuplicateMode,
+    });
+    this.quickCustomerPreviewPage = 1;
+  }
+
+  private async commitStagedProductImport(): Promise<void> {
+    if (!this.quickProductBatch || this.isCommittingProductImport || !this.canManageCatalog()) return;
+    this.isCommittingProductImport = true;
+    this.quickProductImportError = null;
+    this.render();
+
+    try {
+      const applied = applyStagedProductImportBatch({
+        batch: this.quickProductBatch,
+        existingProducts: this.products,
+      });
+      if (applied.toSave.length === 0) {
+        throw new Error('Nenhum artigo válido seleccionado para importação.');
+      }
+
+      await localDb.saveProductsBatch(applied.toSave, this.activeCompany.id);
+      const savedMap = new Map(applied.toSave.map((p) => [p.id, p]));
+      const updatedList = this.products.map((p) => savedMap.get(p.id) || p);
+      for (const p of applied.toSave) {
+        if (!this.products.some((ex) => ex.id === p.id)) {
+          updatedList.push(p);
+        }
+      }
+      this.products = updatedList;
+      this.undoableProductImport = {
+        createdIds: applied.createdIds,
+        previousSnapshots: applied.previousSnapshots,
+        previousSnapshotsCount: applied.previousSnapshots.length,
+        summaryText: `${applied.createdCount} criados, ${applied.updatedCount} actualizados`,
+      };
+      this.quickProductLastParsed = null;
+      this.quickProductBatch = null;
+      this.quickProductPreviewPage = 1;
+      this.quickProductImportNotice = `Importação concluída: ${applied.createdCount} artigo(s) novo(s) e ${applied.updatedCount} actualizado(s).`;
+      this.productSavedNotice = this.quickProductImportNotice;
+      this.render();
+
+      if (this.user && this.isOnline && canCompanySyncCloudData(this.activeCompany) && applied.toSave.length <= 250) {
+        void (async () => {
+          for (const p of applied.toSave) {
+            await upsertProductCloud(p, true, this.activeCompany).catch(() => null);
+          }
+        })();
+      }
+    } catch (err) {
+      this.quickProductImportError =
+        err instanceof Error ? err.message : 'Erro ao gravar o lote de artigos.';
+    } finally {
+      this.isCommittingProductImport = false;
+      this.render();
+    }
+  }
+
+  private async undoLastCommittedProductImport(): Promise<void> {
+    if (!this.undoableProductImport || !this.canManageCatalog()) return;
+    const rec = this.undoableProductImport;
+    this.quickProductImportError = null;
+    try {
+      if (rec.createdIds.length > 0) {
+        await localDb.deleteProductsBatch(rec.createdIds);
+      }
+      if (rec.previousSnapshots.length > 0) {
+        await localDb.saveProductsBatch(rec.previousSnapshots, this.activeCompany.id);
+      }
+      const createdSet = new Set(rec.createdIds);
+      const prevMap = new Map(rec.previousSnapshots.map((p) => [p.id, p]));
+      this.products = this.products
+        .filter((p) => !createdSet.has(p.id))
+        .map((p) => prevMap.get(p.id) || p);
+      this.undoableProductImport = null;
+      this.quickProductImportNotice = `Última importação revertida (${rec.summaryText}).`;
+      this.productSavedNotice = this.quickProductImportNotice;
+      this.render();
+    } catch (err) {
+      this.quickProductImportError =
+        err instanceof Error ? err.message : 'Não foi possível reverter a última importação.';
+      this.render();
+    }
+  }
+
+  private async commitStagedCustomerImport(): Promise<void> {
+    if (
+      !this.quickCustomerBatch ||
+      this.isCommittingCustomerImport ||
+      (!this.hasPerm('customers_create') && !this.hasPerm('customers_manage'))
+    ) {
+      return;
+    }
+    this.isCommittingCustomerImport = true;
+    this.quickCustomerImportError = null;
+    this.render();
+
+    try {
+      const applied = applyStagedCustomerImportBatch({
+        batch: this.quickCustomerBatch,
+        existingCustomers: this.customers,
+      });
+      if (applied.toSave.length === 0) {
+        throw new Error('Nenhum cliente válido seleccionado para importação.');
+      }
+
+      await localDb.saveCustomersBatch(applied.toSave, this.activeCompany.id);
+      const savedMap = new Map(applied.toSave.map((c) => [c.id, c]));
+      const updatedList = this.customers.map((c) => savedMap.get(c.id) || c);
+      for (const c of applied.toSave) {
+        if (!this.customers.some((ex) => ex.id === c.id)) {
+          updatedList.push(c);
+        }
+      }
+      this.customers = updatedList;
+      this.undoableCustomerImport = {
+        createdIds: applied.createdIds,
+        previousSnapshots: applied.previousSnapshots,
+        previousSnapshotsCount: applied.previousSnapshots.length,
+        summaryText: `${applied.createdCount} criados, ${applied.updatedCount} actualizados`,
+      };
+      this.quickCustomerLastParsed = null;
+      this.quickCustomerBatch = null;
+      this.quickCustomerPreviewPage = 1;
+      this.quickCustomerImportNotice = `Importação concluída: ${applied.createdCount} cliente(s) novo(s) e ${applied.updatedCount} actualizado(s).`;
+      this.customerSavedNotice = this.quickCustomerImportNotice;
+      this.render();
+
+      if (this.user && this.isOnline && canCompanySyncCloudData(this.activeCompany) && applied.toSave.length <= 250) {
+        void (async () => {
+          for (const c of applied.toSave) {
+            await upsertCustomerCloud(c, this.activeCompany).catch(() => null);
+          }
+        })();
+      }
+    } catch (err) {
+      this.quickCustomerImportError =
+        err instanceof Error ? err.message : 'Erro ao gravar o lote de clientes.';
+    } finally {
+      this.isCommittingCustomerImport = false;
+      this.render();
+    }
+  }
+
+  private async undoLastCommittedCustomerImport(): Promise<void> {
+    if (
+      !this.undoableCustomerImport ||
+      (!this.hasPerm('customers_create') && !this.hasPerm('customers_manage'))
+    ) {
+      return;
+    }
+    const rec = this.undoableCustomerImport;
+    this.quickCustomerImportError = null;
+    try {
+      if (rec.createdIds.length > 0) {
+        await localDb.deleteCustomersBatch(rec.createdIds);
+      }
+      if (rec.previousSnapshots.length > 0) {
+        await localDb.saveCustomersBatch(rec.previousSnapshots, this.activeCompany.id);
+      }
+      const createdSet = new Set(rec.createdIds);
+      const prevMap = new Map(rec.previousSnapshots.map((c) => [c.id, c]));
+      this.customers = this.customers
+        .filter((c) => !createdSet.has(c.id))
+        .map((c) => prevMap.get(c.id) || c);
+      this.undoableCustomerImport = null;
+      this.quickCustomerImportNotice = `Última importação revertida (${rec.summaryText}).`;
+      this.customerSavedNotice = this.quickCustomerImportNotice;
+      this.render();
+    } catch (err) {
+      this.quickCustomerImportError =
+        err instanceof Error ? err.message : 'Não foi possível reverter a última importação.';
+      this.render();
     }
   }
 
@@ -8465,14 +9440,28 @@ export class SilaBillingApp {
       Boolean(this.growthModalReason) ||
       Boolean(this.cancellingInvoiceId) ||
       Boolean(this.whatsappShareDraft) ||
+      this.showFinancialIntelligenceModal ||
+      Boolean(this.quickOnboardingMode) ||
       this.showNewCompanyModal ||
       this.showMasterAdminModal;
 
     // 2. Escape inteligente em cascata (Modais -> Painéis -> Limpeza de Pesquisa)
     if (e.key === 'Escape') {
       this.barcodeBuffer = '';
+      if (this.quickOnboardingMode) {
+        if (!this.isCommittingProductImport && !this.isCommittingCustomerImport && !this.isCreatingCompany) {
+          this.quickOnboardingMode = null;
+          this.render();
+        }
+        return;
+      }
       if (this.whatsappShareDraft) {
         this.whatsappShareDraft = null;
+        this.render();
+        return;
+      }
+      if (this.showFinancialIntelligenceModal) {
+        this.showFinancialIntelligenceModal = false;
         this.render();
         return;
       }
@@ -8761,6 +9750,18 @@ export class SilaBillingApp {
     if (el.id === 'rbac-audit-search-input') {
       this.rbacAuditSearch = el.value;
       this.renderPreservingFocus('rbac-audit-search-input', el.selectionStart);
+      return;
+    }
+
+    if (el.id === 'accountant-audit-search-input') {
+      this.accountantAuditSearch = el.value;
+      this.renderPreservingFocus('accountant-audit-search-input', el.selectionStart);
+      return;
+    }
+
+    if (el.id === 'accountant-portfolio-search-input') {
+      this.accountantPortfolioSearch = el.value;
+      this.renderPreservingFocus('accountant-portfolio-search-input', el.selectionStart);
       return;
     }
 
@@ -9317,6 +10318,13 @@ export class SilaBillingApp {
       return;
     }
 
+    if (el.id === 'accountant-month-select') {
+      this.accountantYearMonth = el.value || new Date().toISOString().slice(0, 7);
+      this.accountantWorkspaceNotice = null;
+      this.render();
+      return;
+    }
+
     if (el.id === 'rbac-inactivity-minutes-select') {
       if (!this.canManageCompanySettings()) return;
       const parsed = parseInt(el.value, 10);
@@ -9350,6 +10358,79 @@ export class SilaBillingApp {
           err instanceof Error ? err.message : 'Erro ao processar o ficheiro de logótipo.';
         this.render();
       }
+      return;
+    }
+
+    if (el.id === 'quick-import-product-dup-mode') {
+      this.quickProductDuplicateMode = el.value === 'UPDATE' ? 'UPDATE' : 'SKIP';
+      this.restageProductImportIfLoaded();
+      this.render();
+      return;
+    }
+
+    if (el.id === 'quick-import-product-default-iva') {
+      const parsed = Number(el.value);
+      this.quickProductDefaultIvaRate =
+        parsed === 0 || parsed === 1 || parsed === 5 || parsed === 7 || parsed === 14
+          ? parsed
+          : 14;
+      this.restageProductImportIfLoaded();
+      this.render();
+      return;
+    }
+
+    if (el.id === 'quick-import-customer-dup-mode') {
+      this.quickCustomerDuplicateMode = el.value === 'UPDATE' ? 'UPDATE' : 'SKIP';
+      this.restageCustomerImportIfLoaded();
+      this.render();
+      return;
+    }
+
+    if (el.dataset.action === 'upload-products-spreadsheet') {
+      const file = (el as HTMLInputElement).files?.[0];
+      if (!file) return;
+      if (!this.canManageCatalog()) return;
+      this.quickProductImportError = null;
+      this.quickProductImportNotice = null;
+      try {
+        const ab = await file.arrayBuffer();
+        const parsed = await parseSpreadsheetFileBytes({
+          fileName: file.name,
+          bytes: new Uint8Array(ab),
+        });
+        this.quickProductLastParsed = parsed;
+        this.quickProductPreviewFilter = 'ALL';
+        this.restageProductImportIfLoaded();
+      } catch (err) {
+        this.quickProductImportError =
+          err instanceof Error ? err.message : 'Não foi possível ler o ficheiro de produtos.';
+      }
+      (el as HTMLInputElement).value = '';
+      this.render();
+      return;
+    }
+
+    if (el.dataset.action === 'upload-customers-spreadsheet') {
+      const file = (el as HTMLInputElement).files?.[0];
+      if (!file) return;
+      if (!this.hasPerm('customers_create') && !this.hasPerm('customers_manage')) return;
+      this.quickCustomerImportError = null;
+      this.quickCustomerImportNotice = null;
+      try {
+        const ab = await file.arrayBuffer();
+        const parsed = await parseSpreadsheetFileBytes({
+          fileName: file.name,
+          bytes: new Uint8Array(ab),
+        });
+        this.quickCustomerLastParsed = parsed;
+        this.quickCustomerPreviewFilter = 'ALL';
+        this.restageCustomerImportIfLoaded();
+      } catch (err) {
+        this.quickCustomerImportError =
+          err instanceof Error ? err.message : 'Não foi possível ler o ficheiro de clientes.';
+      }
+      (el as HTMLInputElement).value = '';
+      this.render();
       return;
     }
 
@@ -10087,6 +11168,10 @@ export class SilaBillingApp {
         if (unlockedMember.authorizedCashiers && unlockedMember.authorizedCashiers.length > 0) {
           this.cashier = unlockedMember.authorizedCashiers[0]!;
         }
+        if (this.pendingPostUnlockModule && this.canAccessModule(this.pendingPostUnlockModule)) {
+          this.activeModule = this.pendingPostUnlockModule;
+        }
+        this.pendingPostUnlockModule = null;
         this.enforceModulePermission();
         this.touchActivity();
         void this.appendSecurityAuditEvent({
@@ -10461,6 +11546,155 @@ export class SilaBillingApp {
         this.render();
       } finally {
         this.isCreatingCompany = false;
+        this.render();
+      }
+      return;
+    }
+
+    if (formName === 'quick-wizard-company-form') {
+      if (this.isCreatingCompany) return;
+      this.quickWizardCompanyError = null;
+      this.isCreatingCompany = true;
+      this.render();
+
+      try {
+        const legalName = String(fd.get('legalName') || '').trim();
+        const shortName = String(fd.get('shortName') || '').trim();
+        const nif = String(fd.get('nif') || '').trim();
+        const taxRegimeRaw = String(fd.get('taxRegime') || '').trim();
+        if (
+          taxRegimeRaw !== 'GERAL' &&
+          taxRegimeRaw !== 'SIMPLIFICADO' &&
+          taxRegimeRaw !== 'EXCLUSAO'
+        ) {
+          throw new Error(
+            'Seleccione obrigatoriamente o Regime de IVA (Geral, Simplificado ou Exclusão).'
+          );
+        }
+        const taxRegime = taxRegimeRaw as AngolaTaxRegime;
+        const cityCountry = String(fd.get('cityCountry') || 'Luanda - Angola').trim();
+        const phone = String(fd.get('phone') || '').trim();
+        const address = String(fd.get('address') || '').trim();
+        const termsAccepted = fd.get('acceptTerms') === 'on';
+
+        const createdCompany = await registerNewCompanyLocal({
+          legalName,
+          shortName,
+          nif,
+          taxRegime,
+          agtEnvironment: 'SIMULACAO',
+          cityCountry,
+          phone,
+          address,
+          copyStarterCatalog: false,
+          termsAccepted,
+          ownerUid: this.user?.uid,
+          ownerEmail: this.user?.email || undefined,
+          ownerDisplayName: this.user?.displayName || undefined,
+        });
+
+        if (this.user && this.isOnline) {
+          const backendRes = await registerCompanyBackend(createdCompany);
+          if (
+            !backendRes.ok &&
+            (backendRes.statusCode === 409 ||
+              backendRes.statusCode === 429 ||
+              backendRes.statusCode === 400)
+          ) {
+            await localDb.deleteCompanyRollback(createdCompany.id);
+            throw new Error(
+              backendRes.error || 'Este NIF já se encontra registado noutra empresa no sistema.'
+            );
+          }
+
+          try {
+            await ensureCompanyRegisteredCloud(createdCompany, true);
+            const syncedComp: CompanyRecord = {
+              ...createdCompany,
+              ownerUid: createdCompany.ownerUid || this.user.uid,
+              ownerEmail: createdCompany.ownerEmail || this.user.email || undefined,
+              syncState: 'synced',
+              synced: true,
+              syncError: undefined,
+            };
+            await localDb.saveCompany(syncedComp);
+          } catch (cloudErr) {
+            const errMsg =
+              cloudErr instanceof Error ? cloudErr.message : 'Falha ao registar empresa na Cloud.';
+            if (/NIF|já se encontra registado|conflito/i.test(errMsg)) {
+              await localDb.deleteCompanyRollback(createdCompany.id);
+              throw cloudErr;
+            }
+          }
+        }
+
+        this.supportCompanyId = null;
+        await this.flushDraftNow();
+        const bundle = await loadCompanyWorkspace(createdCompany.id, this.getViewerIdentity());
+        this.applyWorkspaceBundle(bundle);
+        this.quickWizardShowCreateCompany = false;
+        this.quickWizardStep = 'PRODUCTS';
+        this.quickProductDefaultIvaRate =
+          createdCompany.profile.taxRegime === 'GERAL' ? 14 : 0;
+        this.render();
+      } catch (err) {
+        this.quickWizardCompanyError =
+          err instanceof Error
+            ? err.message
+            : 'Não foi possível criar a empresa. Verifique os dados e o NIF.';
+      } finally {
+        this.isCreatingCompany = false;
+        this.render();
+      }
+      return;
+    }
+
+    if (formName === 'quick-wizard-cash-printer-form') {
+      this.quickCashPrinterError = null;
+      this.quickCashPrinterNotice = null;
+      try {
+        const formatRaw = String(fd.get('defaultFormat') || 'POS').trim();
+        const defaultFormat: DocumentFormat = formatRaw === 'A4' ? 'A4' : 'POS';
+        const defaultCashier = String(fd.get('defaultCashier') || '01').trim().slice(0, 16) || '01';
+        const defaultOperator = String(fd.get('defaultOperator') || '001').trim().slice(0, 32) || '001';
+        const autoPrintOnEmit = fd.get('autoPrintOnEmit') === 'on';
+        const openCashNow = fd.get('openCashNow') === 'on';
+        const rawFloat = String(fd.get('openingFloat') || '0').trim();
+        const parsedFloat = rawFloat === '' ? 0 : parseDecimalInput(rawFloat);
+
+        if (this.canManageCompanySettings()) {
+          const nextSettings: AppSettings = {
+            ...this.settings,
+            companyId: this.activeCompany.id,
+            defaultFormat,
+            defaultCashier,
+            defaultOperator,
+            autoPrintOnEmit,
+            syncState: 'pending',
+            synced: false,
+            updatedAtIso: new Date().toISOString(),
+          };
+          await this.persistSettings(nextSettings);
+        }
+
+        if (openCashNow && !this.getActiveOpenCashSession() && (this.hasPerm('cash_own_shift') || this.hasPerm('cash_all_shifts'))) {
+          const cashRes = await this.openNewCashSession({
+            cashier: defaultCashier,
+            operator: defaultOperator,
+            openingFloat: parsedFloat,
+            openingNotes: 'Abertura inicial (Entrada Rápida)',
+          });
+          if (!cashRes.ok) {
+            throw new Error(cashRes.error || 'Não foi possível abrir o turno de caixa.');
+          }
+        }
+
+        this.quickCashPrinterNotice = 'Caixa e impressora configuradas com sucesso.';
+        this.quickWizardStep = 'READY';
+        this.render();
+      } catch (err) {
+        this.quickCashPrinterError =
+          err instanceof Error ? err.message : 'Erro ao guardar caixa e impressora.';
         this.render();
       }
       return;
@@ -13324,6 +14558,14 @@ export class SilaBillingApp {
             })
             .catch(() => null);
         }
+        if ('fiscalSeries' in cloudData && Array.isArray(cloudData.fiscalSeries) && cloudData.fiscalSeries.length > 0) {
+          mergeSeriesFromCloud(this.activeCompany.id, cloudData.fiscalSeries);
+        }
+        if ('auditLogs' in cloudData && Array.isArray(cloudData.auditLogs) && cloudData.auditLogs.length > 0) {
+          for (const al of cloudData.auditLogs) {
+            await localDb.appendSecurityAudit({ ...al, synced: true }).catch(() => null);
+          }
+        }
       }
 
       const refreshed = await loadCompanyWorkspace(
@@ -13421,6 +14663,7 @@ export class SilaBillingApp {
     document.body.setAttribute('data-print-mode', format);
     this.cashPrintJob = null;
     this.historyReportPrintJob = null;
+    this.accountantReportPrintJob = null;
     this.printJob = { invoice, format, qr, isReprint };
     this.render();
     setTimeout(() => {
@@ -13443,7 +14686,28 @@ export class SilaBillingApp {
     document.body.setAttribute('data-print-mode', 'A4');
     this.printJob = null;
     this.cashPrintJob = null;
+    this.accountantReportPrintJob = null;
     this.historyReportPrintJob = { invoices, filterLabel };
+    this.render();
+    window.setTimeout(() => {
+      try {
+        window.print();
+      } finally {
+        window.setTimeout(() => {
+          this.isPrinting = false;
+        }, 1200);
+      }
+    }, 100);
+  }
+
+  private triggerAccountantDossierPrint(pkg: AccountantMonthlyPackage): void {
+    this.isPrinting = true;
+    this.syncPrintPageStyle('A4');
+    document.body.setAttribute('data-print-mode', 'A4');
+    this.printJob = null;
+    this.cashPrintJob = null;
+    this.historyReportPrintJob = null;
+    this.accountantReportPrintJob = { pkg };
     this.render();
     window.setTimeout(() => {
       try {
@@ -13669,6 +14933,9 @@ export class SilaBillingApp {
                   products: this.products,
                   customers: this.customers,
                   invoices: this.invoices,
+                  cashSessions: this.cashSessions,
+                  cashMovements: this.cashMovements,
+                  purchases: this.purchases,
                   selectedCustomerId: this.selectedCustomerId,
                   docType: this.docType,
                   paymentMethod: this.paymentMethod,
@@ -13713,6 +14980,7 @@ export class SilaBillingApp {
                     unlockedPerms.roles_manage ||
                     unlockedPerms.audit_view,
                   canViewSecurityAudit: unlockedPerms.audit_view,
+                  canAccessAccountant: this.canAccessModule('ACCOUNTANT'),
                   companiesCount: this.companies.length,
                   syncPendingCount: pendingCount,
                   syncMessage: this.syncMessage,
@@ -13789,6 +15057,19 @@ export class SilaBillingApp {
           </div>
 
           <div class="flex items-center gap-1.5 sm:gap-2 shrink-0">
+            ${
+              !isUnassigned && this.canOpenFinancialPulse()
+                ? `<button
+                    type="button"
+                    data-action="open-financial-intelligence"
+                    title="Centro de Inteligência Financeira (7 respostas imediatas)"
+                    class="h-8 px-2.5 rounded-md bg-slate-800 hover:bg-blue-700 text-[11px] font-medium text-slate-200 hover:text-white flex items-center gap-1.5 transition-colors whitespace-nowrap shrink-0"
+                  >
+                    ${ICONS.trendingUp}
+                    <span class="hidden sm:inline">Pulso</span>
+                  </button>`
+                : ''
+            }
             ${
               !isUnassigned && this.canAccessModule('SETTINGS')
                 ? `<button
@@ -13994,7 +15275,58 @@ export class SilaBillingApp {
             })
           : ''
       }
+      ${
+        this.showFinancialIntelligenceModal && !this.isTerminalLocked()
+          ? renderFinancialIntelligenceModal(
+              this.buildFinancialIntelligenceData(),
+              this.getFinancialIntelligenceRenderOptions()
+            )
+          : ''
+      }
       ${this.whatsappShareDraft ? renderWhatsAppShareModal(this.whatsappShareDraft) : ''}
+      ${
+        this.quickOnboardingMode && !this.isTerminalLocked()
+          ? renderQuickOnboardingModal({
+              mode: this.quickOnboardingMode,
+              step: this.quickWizardStep,
+              hasActiveCompany: !this.requiresCompanyOnboarding && Boolean(this.activeCompany.id),
+              activeCompany: this.activeCompany,
+              settings: this.settings,
+              productsCount: this.products.length,
+              customersCount: this.customers.length,
+              openCashSession: this.getActiveOpenCashSession(),
+              isSignedIn: Boolean(this.user),
+              isOnline: this.isOnline,
+              showCreateCompanyForm: this.quickWizardShowCreateCompany,
+              isCreatingCompany: this.isCreatingCompany,
+              companyFormError: this.quickWizardCompanyError,
+              productBatch: this.quickProductBatch,
+              productDuplicateMode: this.quickProductDuplicateMode,
+              productDefaultIvaRate: this.quickProductDefaultIvaRate,
+              productPreviewFilter: this.quickProductPreviewFilter,
+              productPreviewPage: this.quickProductPreviewPage,
+              productImportError: this.quickProductImportError,
+              productImportNotice: this.quickProductImportNotice,
+              isCommittingProducts: this.isCommittingProductImport,
+              lastUndoableProductImport: this.undoableProductImport,
+              customerBatch: this.quickCustomerBatch,
+              customerDuplicateMode: this.quickCustomerDuplicateMode,
+              customerPreviewFilter: this.quickCustomerPreviewFilter,
+              customerPreviewPage: this.quickCustomerPreviewPage,
+              customerImportError: this.quickCustomerImportError,
+              customerImportNotice: this.quickCustomerImportNotice,
+              isCommittingCustomers: this.isCommittingCustomerImport,
+              lastUndoableCustomerImport: this.undoableCustomerImport,
+              cashPrinterError: this.quickCashPrinterError,
+              cashPrinterNotice: this.quickCashPrinterNotice,
+              canCreateCompany: true,
+              canManageProducts: this.canManageCatalog(),
+              canImportCustomers: this.hasPerm('customers_create') || this.hasPerm('customers_manage'),
+              canManageSettings: this.canManageCompanySettings(),
+              canOperateCash: this.hasPerm('cash_own_shift') || this.hasPerm('cash_all_shifts'),
+            })
+          : ''
+      }
 
       ${
         this.printJob
@@ -14031,7 +15363,15 @@ export class SilaBillingApp {
                     showViralFooter
                   )}
                 </div>`
-              : ''
+              : this.accountantReportPrintJob
+                ? `<div class="hidden print-only-container">
+                    ${renderAccountantMonthlyDossierHtml(
+                      this.accountantReportPrintJob.pkg,
+                      this.settings.company,
+                      showViralFooter
+                    )}
+                  </div>`
+                : ''
       }
     `;
   }
@@ -14059,6 +15399,7 @@ export class SilaBillingApp {
       { id: 'FINANCE', label: 'Gestão financeira', icon: ICONS.chartBar },
       { id: 'INDICATORS', label: 'Indicadores comerciais', icon: ICONS.trendingUp },
       { id: 'HISTORY', label: 'Histórico de faturas', icon: ICONS.history },
+      { id: 'ACCOUNTANT', label: 'Modo Contabilista', icon: ICONS.shieldCheck },
     ];
 
     const bottomItems: Array<{ id: ActiveModule; label: string; icon: string; badge?: number }> = [
@@ -14195,6 +15536,8 @@ export class SilaBillingApp {
         return this.renderIndicatorsWorkspace();
       case 'HISTORY':
         return this.renderHistoryWorkspace();
+      case 'ACCOUNTANT':
+        return this.renderAccountantWorkspace();
       case 'SETTINGS':
         return this.renderSettingsWorkspace();
       case 'SYNC':
@@ -14611,7 +15954,21 @@ export class SilaBillingApp {
                                   type="button"
                                   data-action="toggle-quick-product"
                                   class="text-blue-600 hover:underline font-semibold whitespace-nowrap"
-                                >+ Cadastrar artigo rápido</button>`
+                                >+ Cadastrar artigo rápido</button>
+                                ${
+                                  this.products.length === 0
+                                    ? `<button
+                                        type="button"
+                                        data-action="open-bulk-import-products"
+                                        class="text-slate-800 hover:underline font-semibold whitespace-nowrap"
+                                      >Importar Excel / CSV</button>
+                                      <button
+                                        type="button"
+                                        data-action="open-quick-onboarding-wizard"
+                                        class="text-blue-700 hover:underline font-semibold whitespace-nowrap"
+                                      >Configuração Rápida (&lt; 10 min)</button>`
+                                    : ''
+                                }`
                               : ''
                           }
                           ${
@@ -15892,6 +17249,19 @@ export class SilaBillingApp {
               title="Iniciar venda rápida no POS para Consumidor Final"
               class="h-10 px-3 rounded-lg border border-slate-200 bg-white text-xs font-medium text-slate-700 hover:bg-slate-50 hover:text-slate-900 transition-colors whitespace-nowrap shrink-0"
             >Consumidor Final (POS)</button>
+            ${
+              this.hasPerm('customers_create') || this.hasPerm('customers_manage')
+                ? `<button
+                    type="button"
+                    data-action="open-bulk-import-customers"
+                    ${isSuspended ? 'disabled' : ''}
+                    class="h-10 px-3 rounded-lg border border-slate-200 bg-white text-xs font-medium text-slate-700 hover:bg-slate-50 disabled:opacity-40 flex items-center gap-1.5 whitespace-nowrap shrink-0"
+                  >
+                    ${ICONS.upload}
+                    <span>Importar Excel / CSV</span>
+                  </button>`
+                : ''
+            }
             <button
               type="button"
               data-action="new-customer"
@@ -17400,6 +18770,14 @@ export class SilaBillingApp {
           ${
             canManageCat
               ? `<button
+                  type="button"
+                  data-action="open-bulk-import-products"
+                  class="h-8 px-3 rounded-lg border border-blue-200 bg-blue-50 text-blue-800 text-xs font-semibold hover:bg-blue-100 flex items-center gap-1.5 whitespace-nowrap"
+                >
+                  ${ICONS.upload}
+                  <span>Importar Excel / CSV</span>
+                </button>
+                <button
                   type="button"
                   data-action="open-stock-movement-panel"
                   data-value="ENTRADA_MERCADORIA"
@@ -20101,6 +21479,14 @@ export class SilaBillingApp {
               ${
                 canViewMaster
                   ? `<button
+                      type="button"
+                      data-action="open-quick-onboarding-wizard"
+                      class="h-9 px-3 rounded-lg border border-blue-200 bg-blue-50 text-xs font-semibold text-blue-800 hover:bg-blue-100 flex items-center gap-1.5 whitespace-nowrap"
+                    >
+                      ${ICONS.play}
+                      <span>Assistente &lt; 10 min</span>
+                    </button>
+                    <button
                       type="button"
                       data-action="reset-settings"
                       ${!canManage ? 'disabled' : ''}
@@ -25774,8 +27160,17 @@ export class SilaBillingApp {
             </div>
           </div>
 
-          <!-- Ações Rápidas: Indicadores Comerciais, Despesa Operacional & Receita Extraordinária -->
+          <!-- Ações Rápidas: Pulso 7 Respostas, Indicadores Comerciais, Despesa Operacional & Receita Extraordinária -->
           <div class="flex items-center gap-2 shrink-0">
+            <button
+              type="button"
+              data-action="open-financial-intelligence"
+              title="Abrir 7 respostas imediatas de inteligência financeira"
+              class="h-8 px-3 rounded-md border border-blue-200 bg-blue-50 hover:bg-blue-100 text-blue-800 text-xs font-semibold flex items-center gap-1.5 whitespace-nowrap shrink-0"
+            >
+              ${ICONS.trendingUp}
+              <span>Pulso (7 Respostas)</span>
+            </button>
             ${
               canViewIndicators
                 ? `<button
@@ -27685,8 +29080,20 @@ export class SilaBillingApp {
           </div>
         </div>
 
-        <!-- Corpo Rolável dos 11 Indicadores Comerciais -->
+        <!-- Corpo Rolável dos Indicadores Comerciais e Centro de Inteligência -->
         <div class="flex-1 overflow-y-auto p-4 space-y-4">
+          <!-- Centro de Inteligência Financeira (7 Respostas Imediatas) -->
+          <section class="space-y-2">
+            <div class="flex items-center justify-between gap-2">
+              <h2 class="text-xs font-bold uppercase tracking-wide text-slate-600">Centro de Inteligência Financeira · 7 Respostas Imediatas</h2>
+              <span class="text-[11px] text-slate-500">Leitura operacional instantânea</span>
+            </div>
+            ${renderFinancialIntelligenceGrid(
+              this.buildFinancialIntelligenceData(),
+              this.getFinancialIntelligenceRenderOptions()
+            )}
+          </section>
+
           <!-- Secção 1: Volume Diário, Vendas Mensais, N.º de Transações e Ticket Médio -->
           <div class="grid grid-cols-1 sm:grid-cols-2 xl:grid-cols-4 gap-3">
             <!-- 1. Volume de Vendas Diário -->
@@ -28546,7 +29953,88 @@ export class SilaBillingApp {
       </div>
     `;
   }
+
+  private async refreshAccountantPortfolio(): Promise<void> {
+    try {
+      const targetCompanyId = this.activeCompany.id;
+      const items = await getAuthorizedCompaniesOverview(this.getViewerIdentity());
+      if (this.activeCompany.id !== targetCompanyId && targetCompanyId) return;
+      this.accountantPortfolioItems = items;
+      if (this.activeModule === 'ACCOUNTANT' && this.accountantSubTab === 'PORTFOLIO') {
+        this.render();
+      }
+    } catch {
+      // Mantém lista actual em caso de erro transitório
+    }
+  }
+
+  private buildCurrentAccountantPackage(): AccountantMonthlyPackage {
+    const companySeries = listarSeries({ companyId: this.activeCompany.id });
+    return buildAccountantMonthlyPackage({
+      company: this.settings.company,
+      invoices: this.invoices,
+      products: this.products,
+      customers: this.customers,
+      suppliers: this.suppliers,
+      purchases: this.purchases,
+      cashSessions: this.cashSessions,
+      cashMovements: this.cashMovements,
+      securityAuditLogs: this.securityAuditLogs,
+      series: companySeries,
+      yearMonth: this.accountantYearMonth,
+      canViewCostPrices: this.canViewCostPrices(),
+    });
+  }
+
+  private renderAccountantWorkspace(): string {
+    const monthOptions = buildAccountantMonthOptions({
+      invoices: this.invoices,
+      purchases: this.purchases,
+      cashSessions: this.cashSessions,
+      securityAuditLogs: this.securityAuditLogs,
+    });
+    if (
+      monthOptions.length > 0 &&
+      !monthOptions.some((o) => o.yearMonth === this.accountantYearMonth)
+    ) {
+      this.accountantYearMonth = monthOptions[0]!.yearMonth;
+    }
+    const pkg = this.buildCurrentAccountantPackage();
+    const auditItems = buildAccountantAuditTrail({
+      securityAuditLogs: this.securityAuditLogs,
+      products: this.products,
+      customers: this.customers,
+      invoices: this.invoices,
+      yearMonth: this.accountantYearMonth,
+      periodMode: this.accountantAuditPeriodMode,
+      category: this.accountantAuditCategory,
+      search: this.accountantAuditSearch,
+      canViewCostPrices: this.canViewCostPrices(),
+    });
+
+    return renderAccountantWorkspaceHtml({
+      companyId: this.activeCompany.id,
+      company: this.settings.company,
+      activeTab: this.accountantSubTab,
+      yearMonth: this.accountantYearMonth,
+      monthOptions,
+      pkg,
+      auditItems,
+      auditCategory: this.accountantAuditCategory,
+      auditPeriodMode: this.accountantAuditPeriodMode,
+      auditSearch: this.accountantAuditSearch,
+      portfolioItems: this.accountantPortfolioItems,
+      portfolioSearch: this.accountantPortfolioSearch,
+      canViewCostPrices: this.canViewCostPrices(),
+      canViewMaster: this.hasPerm('master_view') || this.canManageCompanySettings(),
+      canManageUsers: this.hasPerm('users_manage'),
+      isOnline: this.isOnline,
+      isSignedIn: Boolean(this.user),
+      noticeMessage: this.accountantWorkspaceNotice,
+    });
+  }
 }
+
 
 
 
