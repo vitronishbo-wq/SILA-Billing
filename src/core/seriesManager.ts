@@ -55,6 +55,7 @@ export interface ListarSeriesFilter {
 export interface SeriesResolutionOptions {
   environment?: AgtSeriesEnvironment;
   establishmentId?: string;
+  minLastDocumentNumber?: number;
 }
 
 export interface ProximoNumeroFiscalResult {
@@ -81,26 +82,28 @@ const STORAGE_PREFIX = 'sila_agt_series_';
 
 class SeriesStorage {
   private cache = new Map<string, AgtSeriesRecord[]>();
+  private rawSnapshotCache = new Map<string, string>();
 
   private getStorageKey(companyId: string): string {
     return `${STORAGE_PREFIX}${companyId}`;
   }
 
   loadSeries(companyId: string): AgtSeriesRecord[] {
-    if (this.cache.has(companyId)) {
-      return this.cache.get(companyId)!;
-    }
-
     try {
       if (typeof window !== 'undefined' && window.localStorage) {
-        const raw = window.localStorage.getItem(this.getStorageKey(companyId));
+        const key = this.getStorageKey(companyId);
+        const raw = window.localStorage.getItem(key);
         if (raw) {
+          if (this.rawSnapshotCache.get(companyId) === raw && this.cache.has(companyId)) {
+            return this.cache.get(companyId)!;
+          }
           const parsed = JSON.parse(raw);
           if (Array.isArray(parsed)) {
             const normalized = parsed.map((rec: AgtSeriesRecord) => ({
               ...rec,
               environment: normalizeSeriesEnvironment(rec.environment),
             }));
+            this.rawSnapshotCache.set(companyId, raw);
             this.cache.set(companyId, normalized);
             return normalized;
           }
@@ -108,6 +111,10 @@ class SeriesStorage {
       }
     } catch (err) {
       console.warn('[SeriesStorage] Erro ao carregar séries do armazenamento local:', err);
+    }
+
+    if (this.cache.has(companyId)) {
+      return this.cache.get(companyId)!;
     }
 
     const initial: AgtSeriesRecord[] = [];
@@ -123,7 +130,9 @@ class SeriesStorage {
     this.cache.set(companyId, normalized);
     try {
       if (typeof window !== 'undefined' && window.localStorage) {
-        window.localStorage.setItem(this.getStorageKey(companyId), JSON.stringify(normalized));
+        const serialized = JSON.stringify(normalized);
+        this.rawSnapshotCache.set(companyId, serialized);
+        window.localStorage.setItem(this.getStorageKey(companyId), serialized);
       }
     } catch (err) {
       console.warn('[SeriesStorage] Erro ao persistir séries:', err);
@@ -132,6 +141,7 @@ class SeriesStorage {
 
   clearMemoryCache(): void {
     this.cache.clear();
+    this.rawSnapshotCache.clear();
   }
 }
 
@@ -446,26 +456,35 @@ export function reservarProximoNumeroFiscal(
     );
 
     if (specific) {
-      return aplicarIncrementoNaSerie(companyId, specific);
+      return aplicarIncrementoNaSerie(companyId, specific, options?.minLastDocumentNumber);
     }
   }
 
-  return aplicarIncrementoNaSerie(companyId, series);
+  return aplicarIncrementoNaSerie(companyId, series, options?.minLastDocumentNumber);
 }
 
-function aplicarIncrementoNaSerie(companyId: string, series: AgtSeriesRecord): ProximoNumeroFiscalResult {
+function aplicarIncrementoNaSerie(
+  companyId: string,
+  series: AgtSeriesRecord,
+  minLastDocumentNumber?: number
+): ProximoNumeroFiscalResult {
   const currentRecords = seriesStorage.loadSeries(companyId);
   const idx = currentRecords.findIndex((s) => s.id === series.id);
   if (idx === -1) {
     throw new Error(`Série ${series.id} não encontrada para atualização atómica.`);
   }
 
-  const target = currentRecords[idx]!;
+  const target = { ...currentRecords[idx]! };
   if (target.status === 'F') {
     throw new Error(`A série fiscal ${target.seriesCode} encontra-se finalizada ('F'). Emissão proibida.`);
   }
 
-  const nextSeq = target.lastDocumentNumber === 0 ? target.firstDocumentNumber : target.lastDocumentNumber + 1;
+  const floorLast = Math.max(
+    Math.floor(target.lastDocumentNumber || 0),
+    Math.floor(minLastDocumentNumber || 0)
+  );
+  const nextSeq =
+    floorLast === 0 ? target.firstDocumentNumber : Math.max(target.firstDocumentNumber, floorLast + 1);
   const newStatus: AgtSeriesStatus = 'U'; // Transita para 'U' (Em Uso)
 
   target.lastDocumentNumber = nextSeq;
@@ -487,6 +506,31 @@ function aplicarIncrementoNaSerie(companyId: string, series: AgtSeriesRecord): P
     establishmentCode: target.establishmentCode,
     agtAuthorizationCode: target.agtAuthorizationCode,
   };
+}
+
+/**
+ * Avança o contador local de uma série caso exista documento emitido com sequência superior
+ * (usado após recuperação ou resolução de colisão multi-terminal sem nunca regredir).
+ */
+export function sincronizarSequenciaMaximaSerie(
+  companyId: string,
+  seriesId: string,
+  minLastNumber: number
+): AgtSeriesRecord | null {
+  const records = seriesStorage.loadSeries(companyId);
+  const idx = records.findIndex((s) => s.id === seriesId);
+  if (idx === -1) return null;
+  const target = { ...records[idx]! };
+  const normalizedMin = Math.max(0, Math.floor(minLastNumber || 0));
+  if (normalizedMin > (target.lastDocumentNumber || 0)) {
+    target.lastDocumentNumber = normalizedMin;
+    if (target.status === 'A') {
+      target.status = 'U';
+    }
+    records[idx] = target;
+    seriesStorage.saveSeries(companyId, records);
+  }
+  return target;
 }
 
 /**

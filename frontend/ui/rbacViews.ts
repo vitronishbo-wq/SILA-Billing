@@ -60,6 +60,7 @@ const AUDIT_ACTION_LABELS: Record<SecurityAuditAction, string> = {
   ROLE_UPDATE: 'Função Criada/Actualizada',
   INVITE_CLAIM: 'Convite Cloud Reivindicado',
   PRIVACY_ACCEPTED: 'Privacidade Aceite',
+  SYNC_CONFLICT_RESOLVED: 'Conflito de Sincronização Resolvido',
 };
 
 function formatAuditDt(iso: string): string {

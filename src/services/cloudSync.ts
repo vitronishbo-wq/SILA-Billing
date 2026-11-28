@@ -95,6 +95,26 @@ function normalizeTaxRate(raw: unknown): TaxRate {
   return 0;
 }
 
+function extractCloudTimestampIso(raw: unknown, fallback = ''): string {
+  if (!raw) return fallback;
+  if (typeof raw === 'string') return raw;
+  if (typeof raw === 'object') {
+    const asObj = raw as { toDate?: () => Date; seconds?: number; _seconds?: number };
+    if (typeof asObj.toDate === 'function') {
+      try {
+        return asObj.toDate().toISOString();
+      } catch {
+        return fallback;
+      }
+    }
+    const secs = typeof asObj.seconds === 'number' ? asObj.seconds : asObj._seconds;
+    if (typeof secs === 'number' && Number.isFinite(secs)) {
+      return new Date(secs * 1000).toISOString();
+    }
+  }
+  return fallback;
+}
+
 const VALID_DOC_TYPES: ReadonlySet<DocumentType> = new Set([
   'FR',
   'FA',
@@ -1973,8 +1993,11 @@ export async function pullCompanyFromCloud(companyIdRaw: string): Promise<{
           ...(history.length > 0 ? { priceHistory: history } : {}),
           syncState: 'synced',
           synced: true,
-          createdAtIso: new Date().toISOString(),
-          updatedAtIso: new Date().toISOString(),
+          createdAtIso: extractCloudTimestampIso(data.createdAt, '2025-01-01T00:00:00.000Z'),
+          updatedAtIso: extractCloudTimestampIso(
+            data.updatedAt,
+            extractCloudTimestampIso(data.createdAt, '2025-01-01T00:00:00.000Z')
+          ),
         };
       })
     );
@@ -2087,8 +2110,11 @@ export async function pullCompanyFromCloud(companyIdRaw: string): Promise<{
           ...(Array.isArray(data.changeHistory) ? { changeHistory: data.changeHistory } : {}),
           syncState: 'synced',
           synced: true,
-          createdAtIso: new Date().toISOString(),
-          updatedAtIso: new Date().toISOString(),
+          createdAtIso: extractCloudTimestampIso(data.createdAt, '2025-01-01T00:00:00.000Z'),
+          updatedAtIso: extractCloudTimestampIso(
+            data.updatedAt,
+            extractCloudTimestampIso(data.createdAt, '2025-01-01T00:00:00.000Z')
+          ),
         };
       })
     );
@@ -2432,7 +2458,10 @@ export async function pullCompanyFromCloud(companyIdRaw: string): Promise<{
           active: data.active !== false,
           syncState: 'synced',
           synced: true,
-          updatedAtIso: new Date().toISOString(),
+          updatedAtIso: extractCloudTimestampIso(
+            data.updatedAt,
+            extractCloudTimestampIso(data.createdAt, '2025-01-01T00:00:00.000Z')
+          ),
         };
       })
     );
@@ -2541,7 +2570,7 @@ export async function pullCompanyFromCloud(companyIdRaw: string): Promise<{
         allowCashierPriceEdit: Boolean(sd.allowCashierPriceEdit ?? false),
         syncState: 'synced',
         synced: true,
-        updatedAtIso: new Date().toISOString(),
+        updatedAtIso: extractCloudTimestampIso(sd.updatedAt, '2025-01-01T00:00:00.000Z'),
       };
     }
 

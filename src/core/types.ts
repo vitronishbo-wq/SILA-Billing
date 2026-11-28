@@ -28,7 +28,7 @@ export type CompanyRole =
   | 'accountant'
   | 'warehouse'
   | 'seller';
-export type SyncState = 'synced' | 'pending' | 'error';
+export type SyncState = 'synced' | 'pending' | 'error' | 'conflict';
 
 export type MemberStatus = 'pending_invite' | 'active' | 'suspended';
 
@@ -687,7 +687,8 @@ export type SecurityAuditAction =
   | 'USER_SUSPEND'
   | 'ROLE_UPDATE'
   | 'INVITE_CLAIM'
-  | 'PRIVACY_ACCEPTED';
+  | 'PRIVACY_ACCEPTED'
+  | 'SYNC_CONFLICT_RESOLVED';
 
 export interface SecurityAuditEntry {
   id: string;
@@ -722,14 +723,71 @@ export interface SyncQueueEntry {
     | 'stock_movement'
     | 'supplier'
     | 'purchase'
+    | 'fiscal_series'
     | 'role'
     | 'audit_log';
   entityId: string;
+  entityLabel?: string;
   operation: 'upsert' | 'delete' | 'cancel';
   status: SyncState;
+  retryCount?: number;
+  lastAttemptIso?: string;
+  nextRetryAfterIso?: string;
+  clientOperationId?: string;
+  deviceId?: string;
+  baselineFingerprint?: string;
   errorMessage?: string;
   createdAtIso: string;
   updatedAtIso: string;
+}
+
+export type SyncConflictType =
+  | 'FISCAL_NUMBER_COLLISION'
+  | 'INVOICE_STATE_CONFLICT'
+  | 'PRODUCT_CONFLICT'
+  | 'CUSTOMER_CONFLICT'
+  | 'SUPPLIER_CONFLICT'
+  | 'SETTINGS_CONFLICT'
+  | 'CASH_SESSION_CONFLICT'
+  | 'HASH_CHAIN_FORK';
+
+export type SyncConflictResolutionChoice =
+  | 'KEEP_LOCAL'
+  | 'USE_CLOUD'
+  | 'REASSIGN_LOCAL_SERIES_NUMBER'
+  | 'ACKNOWLEDGE_AUDIT';
+
+export interface SyncConflictRecord {
+  id: string;
+  companyId: string;
+  type: SyncConflictType;
+  entityType: SyncQueueEntry['entityType'];
+  entityId: string;
+  entityLabel: string;
+  summary: string;
+  details: string;
+  localSummary: string;
+  cloudSummary: string;
+  localSnapshotJson?: string;
+  cloudSnapshotJson?: string;
+  recommendedAction: SyncConflictResolutionChoice;
+  status: 'open' | 'resolved';
+  resolutionChoice?: SyncConflictResolutionChoice;
+  resolvedBy?: string;
+  resolvedAtIso?: string;
+  createdAtIso: string;
+  updatedAtIso: string;
+}
+
+export type SyncBaselineMap = Record<string, string>;
+
+export interface CommittedCheckoutOpRecord {
+  operationId: string;
+  invoiceId: string;
+  invoiceNumber: string;
+  cartFingerprint: string;
+  grandTotal: number;
+  committedAtIso: string;
 }
 
 export interface AppSettings {
@@ -1029,6 +1087,8 @@ export interface InvoiceRecord {
   lastReprintedAtIso?: string;
   lastReprintedBy?: string;
   lines: CalculatedLineItem[];
+  clientOperationId?: string;
+  terminalDeviceId?: string;
   syncState?: SyncState;
   syncError?: string;
   synced?: boolean;

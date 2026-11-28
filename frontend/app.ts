@@ -21,8 +21,10 @@ import {
   inicializarSeriesPadraoSeNecessario,
   listarSeries,
   mergeSeriesFromCloud,
+  normalizeSeriesEnvironment,
   obterSerieAtiva,
   reservarProximoNumeroFiscal,
+  sincronizarSequenciaMaximaSerie,
   solicitarSerie,
   validarPermissaoEmissaoFiscal,
   type ProximoNumeroFiscalResult,
@@ -108,6 +110,11 @@ import {
   StockMovementType,
   Supplier,
   SuspendedSale,
+  SyncBaselineMap,
+  SyncConflictRecord,
+  SyncConflictResolutionChoice,
+  SyncQueueEntry,
+  CommittedCheckoutOpRecord,
   TaxRate,
   VITRONIS_INSTITUTIONAL,
   WarehouseRecord,
@@ -362,6 +369,24 @@ import {
   renderAccountantMonthlyDossierHtml,
   renderAccountantWorkspaceHtml,
 } from './ui/accountantWorkspace';
+import {
+  analyzePrePushSyncConflicts,
+  buildSyncBaselinesFromRecords,
+  checkDuplicateCheckoutSubmission,
+  computeBaselineKey,
+  computeCartFingerprint,
+  computeCustomerFingerprint,
+  computeProductFingerprint,
+  computeSettingsFingerprint,
+  computeSupplierFingerprint,
+  detectHashChainForks,
+  generateUniqueEntityId,
+  getHighestSequenceForSeriesInInvoices,
+  getOrCreateTerminalDeviceId,
+  normalizeFiscalNumberKey,
+  reassignCollidingLocalInvoice,
+  withTerminalExecutionLock,
+} from '../src/core/syncIntegrity';
 
 type ActiveModule =
   | 'NEW_POS'
@@ -919,6 +944,14 @@ export class SilaBillingApp {
   private lastSyncedIso: string | null = null;
   private syncMessage: string | null = null;
   private backendHealth: BackendHealthStatus | null = null;
+  private terminalDeviceId: string = getOrCreateTerminalDeviceId();
+  private cartOperationId: string = generateUniqueEntityId('op', getOrCreateTerminalDeviceId());
+  private committedCheckoutOps: CommittedCheckoutOpRecord[] = [];
+  private syncQueueEntries: SyncQueueEntry[] = [];
+  private syncConflicts: SyncConflictRecord[] = [];
+  private syncBaselines: SyncBaselineMap = {};
+  private storagePersisted: boolean | null = null;
+  private backgroundSyncTimer: number | null = null;
 
   private deferredPrompt: BeforeInstallPromptEvent | null = null;
   private isInstalled = false;
@@ -1390,6 +1423,7 @@ export class SilaBillingApp {
     };
     this.cashCloseOperator = this.operator || '001';
 
+    this.refreshCartOperationId();
     if (data.activeCompany.id) {
       const targetCompId = data.activeCompany.id;
       void localDb.getSuspendedSales(targetCompId).then((sales) => {
@@ -1400,6 +1434,12 @@ export class SilaBillingApp {
           }
         }
       });
+      void this.loadOfflineIntegrityState(targetCompId);
+    } else {
+      this.committedCheckoutOps = [];
+      this.syncQueueEntries = [];
+      this.syncConflicts = [];
+      this.syncBaselines = {};
     }
 
     if (typeof document !== 'undefined') {
@@ -1974,6 +2014,7 @@ export class SilaBillingApp {
       ? this.cashSessions.map((s) => (s.id === session.id ? session : s))
       : [session, ...this.cashSessions];
     this.cashSessions.sort((a, b) => b.openedAtIso.localeCompare(a.openedAtIso));
+    await this.enqueueSyncMutation('cash_session', session.id, 'upsert', `Caixa ${session.cashier}`);
 
     if (this.user && this.isOnline && canCompanySyncCloudData(this.activeCompany)) {
       void ensureCompanyRegisteredCloud(this.activeCompany)
@@ -1982,9 +2023,17 @@ export class SilaBillingApp {
           const synced: CashSession = { ...session, syncState: 'synced', synced: true };
           await localDb.saveCashSession(synced, this.activeCompany.id);
           this.cashSessions = this.cashSessions.map((s) => (s.id === synced.id ? synced : s));
+          await this.markSyncMutationSuccess('cash_session', synced.id);
           if (this.activeModule === 'CASH' || this.activeModule === 'SYNC') this.render();
         })
-        .catch(() => null);
+        .catch((err) =>
+          this.markSyncMutationError(
+            'cash_session',
+            session.id,
+            err instanceof Error ? err.message : 'Erro ao sincronizar turno',
+            `Caixa ${session.cashier}`
+          )
+        );
     }
   }
 
@@ -1996,6 +2045,7 @@ export class SilaBillingApp {
       ? this.cashMovements.map((m) => (m.id === mov.id ? mov : m))
       : [mov, ...this.cashMovements];
     this.cashMovements.sort((a, b) => b.createdAtIso.localeCompare(a.createdAtIso));
+    await this.enqueueSyncMutation('cash_movement', mov.id, 'upsert', mov.reason);
 
     if (this.user && this.isOnline && canCompanySyncCloudData(this.activeCompany)) {
       void ensureCompanyRegisteredCloud(this.activeCompany)
@@ -2004,6 +2054,7 @@ export class SilaBillingApp {
           const synced: CashMovement = { ...mov, syncState: 'synced', synced: true };
           await localDb.saveCashMovement(synced, this.activeCompany.id);
           this.cashMovements = this.cashMovements.map((m) => (m.id === synced.id ? synced : m));
+          await this.markSyncMutationSuccess('cash_movement', synced.id);
           if (
             this.activeModule === 'CASH' ||
             this.activeModule === 'FINANCE' ||
@@ -2012,7 +2063,14 @@ export class SilaBillingApp {
             this.render();
           }
         })
-        .catch(() => null);
+        .catch((err) =>
+          this.markSyncMutationError(
+            'cash_movement',
+            mov.id,
+            err instanceof Error ? err.message : 'Erro ao sincronizar movimento de caixa',
+            mov.reason
+          )
+        );
     }
   }
 
@@ -2047,7 +2105,7 @@ export class SilaBillingApp {
     const now = new Date().toISOString();
     const cleanNotes = (params.openingNotes || '').trim().slice(0, 240);
     const session: CashSession = {
-      id: `cs_${Date.now()}`,
+      id: generateUniqueEntityId('cs', this.terminalDeviceId),
       companyId: this.activeCompany.id,
       cashier: cleanCashier,
       operator: cleanOperator,
@@ -2120,7 +2178,7 @@ export class SilaBillingApp {
     const cleanRef = (params.reference || '').trim().slice(0, 80);
     const cleanCat = (params.category || '').trim().slice(0, 64);
     const movement: CashMovement = {
-      id: `cm_${Date.now()}_${Math.random().toString(36).slice(2, 6)}`,
+      id: generateUniqueEntityId('cm', this.terminalDeviceId),
       companyId: this.activeCompany.id,
       sessionId: params.session.id,
       cashier: params.session.cashier,
@@ -2257,6 +2315,7 @@ export class SilaBillingApp {
       ? this.stockMovements.map((m) => (m.id === mov.id ? mov : m))
       : [mov, ...this.stockMovements];
     this.stockMovements.sort((a, b) => b.createdAtIso.localeCompare(a.createdAtIso));
+    await this.enqueueSyncMutation('stock_movement', mov.id, 'upsert', mov.productName);
 
     if (this.user && this.isOnline && canCompanySyncCloudData(this.activeCompany)) {
       void ensureCompanyRegisteredCloud(this.activeCompany)
@@ -2265,9 +2324,17 @@ export class SilaBillingApp {
           const synced: StockMovement = { ...mov, syncState: 'synced', synced: true };
           await localDb.saveStockMovement(synced, this.activeCompany.id);
           this.stockMovements = this.stockMovements.map((m) => (m.id === synced.id ? synced : m));
+          await this.markSyncMutationSuccess('stock_movement', synced.id);
           if (this.activeModule === 'PRODUCTS' || this.activeModule === 'SYNC') this.render();
         })
-        .catch(() => null);
+        .catch((err) =>
+          this.markSyncMutationError(
+            'stock_movement',
+            mov.id,
+            err instanceof Error ? err.message : 'Erro ao sincronizar movimento de stock',
+            mov.productName
+          )
+        );
     }
   }
 
@@ -2328,6 +2395,7 @@ export class SilaBillingApp {
       this.products[idx] = nextProd;
       updatedProducts.push(nextProd);
       await localDb.saveProduct(nextProd, this.activeCompany.id).catch(() => null);
+      await this.enqueueSyncMutation('product', nextProd.id, 'upsert', nextProd.name);
 
       const defaultReason =
         direction === 'DEDUCT'
@@ -2335,7 +2403,7 @@ export class SilaBillingApp {
           : `Reposição em stock${context?.invoiceNumber ? ` ref. ${context.invoiceNumber}` : ''}`;
 
       const mov: StockMovement = {
-        id: `sm_${Date.now()}_${Math.random().toString(36).slice(2, 6)}`,
+        id: generateUniqueEntityId('sm', this.terminalDeviceId),
         companyId: this.activeCompany.id,
         productId: nextProd.id,
         productCode: nextProd.code,
@@ -2362,6 +2430,7 @@ export class SilaBillingApp {
       };
       createdMovements.push(mov);
       await localDb.saveStockMovement(mov, this.activeCompany.id).catch(() => null);
+      await this.enqueueSyncMutation('stock_movement', mov.id, 'upsert', mov.productName);
     }
 
     if (createdMovements.length > 0) {
@@ -2387,6 +2456,7 @@ export class SilaBillingApp {
             const synced: Product = { ...up, syncState: 'synced', synced: true };
             await localDb.saveProduct(synced, this.activeCompany.id).catch(() => null);
             this.products = this.products.map((p) => (p.id === synced.id ? synced : p));
+            await this.markSyncMutationSuccess('product', up.id);
           })
           .catch(() => null);
       }
@@ -2398,10 +2468,349 @@ export class SilaBillingApp {
             this.stockMovements = this.stockMovements.map((m) =>
               m.id === syncedMov.id ? syncedMov : m
             );
+            await this.markSyncMutationSuccess('stock_movement', sm.id);
           })
           .catch(() => null);
       }
     }
+  }
+
+  private refreshCartOperationId(): void {
+    this.cartOperationId = generateUniqueEntityId('op', this.terminalDeviceId);
+  }
+
+  private getOpenSyncConflicts(): SyncConflictRecord[] {
+    return this.syncConflicts.filter((c) => c.status === 'open');
+  }
+
+  private getQueuedDeleteIds(entityType: SyncQueueEntry['entityType']): Set<string> {
+    return new Set(
+      this.syncQueueEntries
+        .filter((q) => q.entityType === entityType && q.operation === 'delete' && q.status !== 'synced')
+        .map((q) => q.entityId)
+    );
+  }
+
+  private async loadOfflineIntegrityState(companyId: string): Promise<void> {
+    if (!companyId) return;
+    try {
+      const [queue, conflicts, baselines, ops, persisted] = await Promise.all([
+        localDb.getSyncQueueByCompany(companyId),
+        localDb.getSyncConflicts(companyId),
+        localDb.getSyncBaselines(companyId),
+        localDb.getCommittedCheckoutOps(companyId),
+        localDb.requestDurableBrowserStorage(),
+      ]);
+      if (this.activeCompany.id !== companyId) return;
+      this.syncQueueEntries = queue.filter((q) => q.status !== 'synced');
+      this.syncConflicts = conflicts;
+      this.committedCheckoutOps = ops;
+      this.storagePersisted = persisted;
+      if (Object.keys(baselines).length === 0) {
+        const seeded = buildSyncBaselinesFromRecords({
+          products: this.products,
+          customers: this.customers,
+          suppliers: this.suppliers,
+          settings: this.settings,
+        });
+        this.syncBaselines = seeded;
+        if (Object.keys(seeded).length > 0) {
+          await localDb.saveSyncBaselines(companyId, seeded).catch(() => null);
+        }
+      } else {
+        this.syncBaselines = baselines;
+      }
+      if (this.activeModule === 'SYNC' || this.getOpenSyncConflicts().length > 0) {
+        this.render();
+      }
+    } catch {
+      // Mantém estado em memória sem bloquear o terminal
+    }
+  }
+
+  private async enqueueSyncMutation(
+    entityType: SyncQueueEntry['entityType'],
+    entityId: string,
+    operation: 'upsert' | 'delete',
+    entityLabel?: string,
+    clientOperationId?: string
+  ): Promise<void> {
+    if (!this.activeCompany.id || !entityId) return;
+    const now = new Date().toISOString();
+    const existing = this.syncQueueEntries.find(
+      (q) => q.entityType === entityType && q.entityId === entityId
+    );
+    const entry: SyncQueueEntry = {
+      id: existing?.id || `sq_${entityType}_${entityId}`,
+      companyId: this.activeCompany.id,
+      entityType,
+      entityId,
+      ...(entityLabel ? { entityLabel: entityLabel.slice(0, 120) } : {}),
+      operation,
+      status: 'pending',
+      createdAtIso: existing?.createdAtIso || now,
+      retryCount: 0,
+      ...(clientOperationId ? { clientOperationId } : {}),
+      deviceId: this.terminalDeviceId,
+      updatedAtIso: now,
+    };
+    this.syncQueueEntries = [
+      entry,
+      ...this.syncQueueEntries.filter((q) => !(q.entityType === entityType && q.entityId === entityId)),
+    ];
+    await localDb.enqueueSync(entry).catch(() => null);
+  }
+
+  private async markSyncMutationSuccess(
+    entityType: SyncQueueEntry['entityType'],
+    entityId: string
+  ): Promise<void> {
+    if (!this.activeCompany.id || !entityId) return;
+    this.syncQueueEntries = this.syncQueueEntries.filter(
+      (q) => !(q.entityType === entityType && q.entityId === entityId)
+    );
+    await localDb.clearSyncQueueForEntity(this.activeCompany.id, entityType, entityId).catch(() => null);
+  }
+
+  private async markSyncMutationError(
+    entityType: SyncQueueEntry['entityType'],
+    entityId: string,
+    errorMessage: string,
+    entityLabel?: string
+  ): Promise<void> {
+    if (!this.activeCompany.id || !entityId) return;
+    const nowMs = Date.now();
+    const nowIso = new Date(nowMs).toISOString();
+    const existing = this.syncQueueEntries.find(
+      (q) => q.entityType === entityType && q.entityId === entityId
+    );
+    const retryCount = (existing?.retryCount || 0) + 1;
+    const backoffMs = Math.min(300_000, 5000 * Math.pow(2, Math.min(6, retryCount - 1)));
+    const entry: SyncQueueEntry = {
+      id: existing?.id || `sq_${entityType}_${entityId}`,
+      companyId: this.activeCompany.id,
+      entityType,
+      entityId,
+      ...(entityLabel || existing?.entityLabel
+        ? { entityLabel: (entityLabel || existing?.entityLabel || '').slice(0, 120) }
+        : {}),
+      operation: existing?.operation || 'upsert',
+      status: 'error',
+      createdAtIso: existing?.createdAtIso || nowIso,
+      retryCount,
+      lastAttemptIso: nowIso,
+      nextRetryAfterIso: new Date(nowMs + backoffMs).toISOString(),
+      errorMessage: errorMessage.slice(0, 240),
+      deviceId: this.terminalDeviceId,
+      updatedAtIso: nowIso,
+    };
+    this.syncQueueEntries = [
+      entry,
+      ...this.syncQueueEntries.filter((q) => !(q.entityType === entityType && q.entityId === entityId)),
+    ];
+    await localDb.enqueueSync(entry).catch(() => null);
+  }
+
+  private async resolveSyncConflict(
+    conflictId: string,
+    choice: SyncConflictResolutionChoice
+  ): Promise<void> {
+    if (!this.activeCompany.id) return;
+    const target = this.syncConflicts.find((c) => c.id === conflictId);
+    if (!target) return;
+
+    const nowIso = new Date().toISOString();
+    let resolutionNote = '';
+
+    try {
+      if (choice === 'REASSIGN_LOCAL_SERIES_NUMBER' && target.entityType === 'invoice') {
+        const collidingLocal =
+          this.invoices.find((i) => i.id === target.entityId) ||
+          (target.localSnapshotJson ? (JSON.parse(target.localSnapshotJson) as InvoiceRecord) : null);
+        if (!collidingLocal) {
+          throw new Error('Documento local colidente não encontrado para reatribuição.');
+        }
+
+        const cloudPeer = target.cloudSnapshotJson
+          ? (JSON.parse(target.cloudSnapshotJson) as InvoiceRecord)
+          : null;
+        if (cloudPeer && !this.invoices.some((i) => i.id === cloudPeer.id)) {
+          await localDb.saveInvoice(cloudPeer, this.activeCompany.id);
+          this.invoices = [cloudPeer, ...this.invoices];
+        }
+
+        const reassigned = reassignCollidingLocalInvoice({
+          companyId: this.activeCompany.id,
+          collidingInvoice: collidingLocal,
+          allInvoices: this.invoices,
+          existingStockMovements: this.stockMovements,
+          existingCashMovements: this.cashMovements,
+        });
+
+        await localDb.saveInvoice(reassigned.updatedInvoice, this.activeCompany.id);
+        this.invoices = this.invoices.map((i) =>
+          i.id === reassigned.updatedInvoice.id ? reassigned.updatedInvoice : i
+        );
+
+        for (const sm of reassigned.updatedStockMovements) {
+          const pendingSm: StockMovement = { ...sm, syncState: 'pending', synced: false };
+          await localDb.saveStockMovement(pendingSm, this.activeCompany.id);
+          this.stockMovements = this.stockMovements.map((m) =>
+            m.id === pendingSm.id ? pendingSm : m
+          );
+          await this.enqueueSyncMutation('stock_movement', pendingSm.id, 'upsert', pendingSm.invoiceNumber);
+        }
+
+        for (const cm of reassigned.updatedCashMovements) {
+          const pendingCm: CashMovement = { ...cm, syncState: 'pending', synced: false };
+          await localDb.saveCashMovement(pendingCm, this.activeCompany.id);
+          this.cashMovements = this.cashMovements.map((m) =>
+            m.id === pendingCm.id ? pendingCm : m
+          );
+          await this.enqueueSyncMutation('cash_movement', pendingCm.id, 'upsert', pendingCm.invoiceNumber);
+        }
+
+        await this.enqueueSyncMutation(
+          'invoice',
+          reassigned.updatedInvoice.id,
+          'upsert',
+          reassigned.updatedInvoice.number,
+          reassigned.updatedInvoice.clientOperationId
+        );
+        resolutionNote = `Fatura local reatribuída de ${reassigned.previousNumber} para ${reassigned.newNumber} com hash SAF-T recalculado.`;
+      } else if (choice === 'USE_CLOUD') {
+        if (!target.cloudSnapshotJson) {
+          throw new Error('Sem cópia Cloud disponível para aplicar.');
+        }
+        if (target.entityType === 'product') {
+          const cp = JSON.parse(target.cloudSnapshotJson) as Product;
+          const syncedCp: Product = { ...cp, syncState: 'synced', synced: true, syncError: undefined };
+          await localDb.saveProduct(syncedCp, this.activeCompany.id);
+          this.products = [...this.products.filter((p) => p.id !== syncedCp.id), syncedCp];
+          this.syncBaselines[computeBaselineKey('product', syncedCp.id)] = computeProductFingerprint(syncedCp);
+          await this.markSyncMutationSuccess('product', syncedCp.id);
+        } else if (target.entityType === 'customer') {
+          const cc = JSON.parse(target.cloudSnapshotJson) as Customer;
+          const syncedCc: Customer = { ...cc, syncState: 'synced', synced: true, syncError: undefined };
+          await localDb.saveCustomer(syncedCc, this.activeCompany.id);
+          this.customers = [...this.customers.filter((c) => c.id !== syncedCc.id), syncedCc];
+          this.syncBaselines[computeBaselineKey('customer', syncedCc.id)] = computeCustomerFingerprint(syncedCc);
+          await this.markSyncMutationSuccess('customer', syncedCc.id);
+        } else if (target.entityType === 'supplier') {
+          const cs = JSON.parse(target.cloudSnapshotJson) as Supplier;
+          const syncedCs: Supplier = { ...cs, syncState: 'synced', synced: true, syncError: undefined };
+          await localDb.saveSupplier(syncedCs, this.activeCompany.id);
+          this.suppliers = [...this.suppliers.filter((s) => s.id !== syncedCs.id), syncedCs];
+          this.syncBaselines[computeBaselineKey('supplier', syncedCs.id)] = computeSupplierFingerprint(syncedCs);
+          await this.markSyncMutationSuccess('supplier', syncedCs.id);
+        } else if (target.entityType === 'invoice') {
+          const ci = JSON.parse(target.cloudSnapshotJson) as InvoiceRecord;
+          const syncedCi: InvoiceRecord = { ...ci, syncState: 'synced', synced: true, syncError: undefined };
+          await localDb.saveInvoice(syncedCi, this.activeCompany.id);
+          this.invoices = this.invoices.map((i) => (i.id === syncedCi.id ? syncedCi : i));
+          await this.markSyncMutationSuccess('invoice', syncedCi.id);
+        } else if (target.entityType === 'cash_session') {
+          const csess = JSON.parse(target.cloudSnapshotJson) as CashSession;
+          const syncedSess: CashSession = { ...csess, syncState: 'synced', synced: true, syncError: undefined };
+          await localDb.saveCashSession(syncedSess, this.activeCompany.id);
+          this.cashSessions = this.cashSessions.map((s) => (s.id === syncedSess.id ? syncedSess : s));
+          await this.markSyncMutationSuccess('cash_session', syncedSess.id);
+        } else if (target.entityType === 'settings') {
+          const cset = JSON.parse(target.cloudSnapshotJson) as AppSettings;
+          const syncedSet: AppSettings = { ...cset, syncState: 'synced', synced: true };
+          await localDb.saveSettings(syncedSet, this.activeCompany.id);
+          this.settings = syncedSet;
+          this.syncBaselines[computeBaselineKey('settings', 'general')] = computeSettingsFingerprint(syncedSet);
+          await this.markSyncMutationSuccess('settings', 'general');
+        }
+        await localDb.saveSyncBaselines(this.activeCompany.id, this.syncBaselines);
+        resolutionNote = `Versão oficial da Cloud aplicada para ${target.entityLabel}.`;
+      } else if (choice === 'KEEP_LOCAL') {
+        if (target.entityType === 'product' && target.cloudSnapshotJson) {
+          const cp = JSON.parse(target.cloudSnapshotJson) as Product;
+          this.syncBaselines[computeBaselineKey('product', cp.id)] = computeProductFingerprint(cp);
+          this.products = this.products.map((p) =>
+            p.id === target.entityId ? { ...p, syncState: 'pending', synced: false, syncError: undefined } : p
+          );
+          const prod = this.products.find((p) => p.id === target.entityId);
+          if (prod) await localDb.saveProduct(prod, this.activeCompany.id);
+        } else if (target.entityType === 'customer' && target.cloudSnapshotJson) {
+          const cc = JSON.parse(target.cloudSnapshotJson) as Customer;
+          this.syncBaselines[computeBaselineKey('customer', cc.id)] = computeCustomerFingerprint(cc);
+          this.customers = this.customers.map((c) =>
+            c.id === target.entityId ? { ...c, syncState: 'pending', synced: false, syncError: undefined } : c
+          );
+          const cust = this.customers.find((c) => c.id === target.entityId);
+          if (cust) await localDb.saveCustomer(cust, this.activeCompany.id);
+        } else if (target.entityType === 'supplier' && target.cloudSnapshotJson) {
+          const cs = JSON.parse(target.cloudSnapshotJson) as Supplier;
+          this.syncBaselines[computeBaselineKey('supplier', cs.id)] = computeSupplierFingerprint(cs);
+          this.suppliers = this.suppliers.map((s) =>
+            s.id === target.entityId ? { ...s, syncState: 'pending', synced: false, syncError: undefined } : s
+          );
+          const sup = this.suppliers.find((s) => s.id === target.entityId);
+          if (sup) await localDb.saveSupplier(sup, this.activeCompany.id);
+        } else if (target.entityType === 'settings' && target.cloudSnapshotJson) {
+          const cset = JSON.parse(target.cloudSnapshotJson) as AppSettings;
+          this.syncBaselines[computeBaselineKey('settings', 'general')] = computeSettingsFingerprint(cset);
+          this.settings = { ...this.settings, syncState: 'pending', synced: false };
+          await localDb.saveSettings(this.settings, this.activeCompany.id);
+        }
+        await localDb.saveSyncBaselines(this.activeCompany.id, this.syncBaselines);
+        resolutionNote = `Versão local mantida e desbloqueada para envio à Cloud (${target.entityLabel}).`;
+      } else if (choice === 'ACKNOWLEDGE_AUDIT') {
+        void this.appendSecurityAuditEvent({
+          action: 'SYNC_CONFLICT_RESOLVED',
+          targetType: 'sync_conflict',
+          targetId: target.entityId,
+          summary: `Bifurcação de cadeia SAF-T reconhecida manualmente (${target.entityLabel}). Recomenda-se série fiscal dedicada por terminal.`,
+          outcome: 'allowed',
+        });
+        resolutionNote = `Ocorrência registada em auditoria para ${target.entityLabel}.`;
+      }
+
+      this.syncConflicts = this.syncConflicts.map((c) =>
+        c.id === conflictId
+          ? { ...c, status: 'resolved', resolvedAtIso: nowIso, resolvedChoice: choice, updatedAtIso: nowIso }
+          : c
+      );
+      await localDb.saveSyncConflicts(this.activeCompany.id, this.syncConflicts);
+      this.syncMessage = resolutionNote;
+      this.render();
+
+      if (choice !== 'USE_CLOUD' && choice !== 'ACKNOWLEDGE_AUDIT' && this.user && this.isOnline) {
+        void this.syncAllWithCloud(false);
+      }
+    } catch (err) {
+      this.syncMessage =
+        err instanceof Error ? err.message : 'Não foi possível resolver o conflito de sincronização.';
+      this.render();
+    }
+  }
+
+  private exportUnsyncedQueueAndConflictsJson(): void {
+    const payload = {
+      exportedAtIso: new Date().toISOString(),
+      companyId: this.activeCompany.id,
+      companyNif: this.activeCompany.profile.nif,
+      terminalDeviceId: this.terminalDeviceId,
+      openConflicts: this.getOpenSyncConflicts(),
+      outboxQueue: this.syncQueueEntries,
+      unsyncedInvoices: this.invoices.filter((i) => !i.synced),
+      unsyncedProducts: this.products.filter((p) => !p.synced),
+      unsyncedCustomers: this.customers.filter((c) => !c.synced),
+      unsyncedCashSessions: this.cashSessions.filter((s) => !s.synced),
+      unsyncedCashMovements: this.cashMovements.filter((m) => !m.synced),
+      unsyncedStockMovements: this.stockMovements.filter((m) => !m.synced),
+      unsyncedPurchases: this.purchases.filter((p) => !p.synced),
+      unsyncedSuppliers: this.suppliers.filter((s) => !s.synced),
+    };
+    const safeNif = (this.activeCompany.profile.nif || 'empresa').replace(/[^a-zA-Z0-9]/g, '');
+    triggerBrowserDownload(
+      JSON.stringify(payload, null, 2),
+      `SILA_Pendentes_Conflitos_${safeNif}_${new Date().toISOString().slice(0, 10)}.json`,
+      'application/json;charset=utf-8'
+    );
   }
 
   private openStockMovementModalForProduct(
@@ -2571,7 +2980,7 @@ export class SilaBillingApp {
 
     const cleanRef = (params.reference || '').trim().slice(0, 80);
     const movement: StockMovement = {
-      id: `sm_${Date.now()}_${Math.random().toString(36).slice(2, 6)}`,
+      id: generateUniqueEntityId('sm', this.terminalDeviceId),
       companyId: this.activeCompany.id,
       productId: updatedProd.id,
       productCode: updatedProd.code,
@@ -2598,6 +3007,7 @@ export class SilaBillingApp {
     };
 
     await this.persistAndSyncStockMovement(movement);
+    await this.enqueueSyncMutation('product', updatedProd.id, 'upsert', updatedProd.name);
 
     if (this.user && this.isOnline && canCompanySyncCloudData(this.activeCompany)) {
       void ensureCompanyRegisteredCloud(this.activeCompany)
@@ -2606,6 +3016,7 @@ export class SilaBillingApp {
           const synced: Product = { ...updatedProd, syncState: 'synced', synced: true };
           await localDb.saveProduct(synced, this.activeCompany.id);
           this.products = this.products.map((p) => (p.id === synced.id ? synced : p));
+          await this.markSyncMutationSuccess('product', updatedProd.id);
           if (this.activeModule === 'PRODUCTS' || this.activeModule === 'SYNC') this.render();
         })
         .catch(() => null);
@@ -2693,12 +3104,13 @@ export class SilaBillingApp {
         updatedAtIso: now,
       };
       await localDb.saveProduct(updatedProd, this.activeCompany.id);
+      await this.enqueueSyncMutation('product', updatedProd.id, 'upsert', updatedProd.name);
       updatedProducts.push(updatedProd);
 
       const direction: StockMovementDirection =
         item.diff > 0 ? 'IN' : item.diff < 0 ? 'OUT' : 'NEUTRAL';
       const mov: StockMovement = {
-        id: `sm_inv_${Date.now()}_${Math.random().toString(36).slice(2, 6)}`,
+        id: generateUniqueEntityId('sm_inv', this.terminalDeviceId),
         companyId: this.activeCompany.id,
         productId: updatedProd.id,
         productCode: updatedProd.code,
@@ -2722,6 +3134,7 @@ export class SilaBillingApp {
         createdAtIso: now,
       };
       await localDb.saveStockMovement(mov, this.activeCompany.id);
+      await this.enqueueSyncMutation('stock_movement', mov.id, 'upsert', mov.productName);
       createdMovements.push(mov);
     }
 
@@ -2742,6 +3155,7 @@ export class SilaBillingApp {
               const synced: Product = { ...up, syncState: 'synced', synced: true };
               await localDb.saveProduct(synced, this.activeCompany.id);
               this.products = this.products.map((p) => (p.id === synced.id ? synced : p));
+              await this.markSyncMutationSuccess('product', up.id);
             })
             .catch(() => null);
         }
@@ -2753,6 +3167,7 @@ export class SilaBillingApp {
               this.stockMovements = this.stockMovements.map((m) =>
                 m.id === syncedMov.id ? syncedMov : m
               );
+              await this.markSyncMutationSuccess('stock_movement', sm.id);
             })
             .catch(() => null);
         }
@@ -3794,6 +4209,8 @@ export class SilaBillingApp {
     }
     return (
       !this.activeCompany.synced ||
+      this.syncQueueEntries.some((q) => q.status !== 'synced') ||
+      this.getOpenSyncConflicts().length > 0 ||
       this.invoices.some((i) => !i.synced) ||
       this.products.some((p) => !p.synced) ||
       this.customers.some((c) => !c.synced) ||
@@ -3878,6 +4295,59 @@ export class SilaBillingApp {
       this.isOnline = false;
       this.render();
     });
+
+    window.addEventListener('beforeunload', (e) => {
+      void this.flushDraftNow();
+      const hasCriticalPending =
+        this.invoices.some((i) => !i.synced) ||
+        this.getOpenSyncConflicts().length > 0 ||
+        (canCompanySyncCloudData(this.activeCompany) &&
+          this.syncQueueEntries.some((q) => q.status !== 'synced'));
+      if (hasCriticalPending) {
+        e.preventDefault();
+        e.returnValue = '';
+      }
+    });
+
+    if (typeof document !== 'undefined') {
+      document.addEventListener('visibilitychange', () => {
+        if (
+          document.visibilityState === 'visible' &&
+          this.isOnline &&
+          this.user &&
+          !this.isSyncing &&
+          this.hasUnsyncedLocalRecords() &&
+          this.getOpenSyncConflicts().length === 0
+        ) {
+          void this.syncAllWithCloud();
+        }
+      });
+    }
+
+    window.addEventListener('storage', (evt) => {
+      if (evt.key && evt.key.includes('sila_agt_series') && this.activeCompany.id) {
+        this.render();
+      }
+    });
+
+    if (this.backgroundSyncTimer !== null) {
+      window.clearInterval(this.backgroundSyncTimer);
+    }
+    this.backgroundSyncTimer = window.setInterval(() => {
+      if (
+        this.isOnline &&
+        this.user &&
+        !this.isSyncing &&
+        !this.isBooting &&
+        this.activeCompany.id &&
+        !this.requiresCompanyOnboarding &&
+        canCompanySyncCloudData(this.activeCompany) &&
+        this.getOpenSyncConflicts().length === 0 &&
+        this.hasUnsyncedLocalRecords()
+      ) {
+        void this.syncAllWithCloud(false);
+      }
+    }, 90_000);
 
     window.addEventListener('beforeprint', () => {
       this.isPrinting = true;
@@ -5167,11 +5637,30 @@ export class SilaBillingApp {
         const prod = this.products.find((p) => p.id === prodId);
         if (prod) {
           prod.active = prod.active === false ? true : false;
+          prod.synced = false;
+          prod.syncState = 'pending';
           prod.updatedAtIso = new Date().toISOString();
           await localDb.saveProduct(prod, this.activeCompany.id);
+          await this.enqueueSyncMutation('product', prod.id, 'upsert', prod.name);
           this.render();
           if (this.user && this.isOnline && canCompanySyncCloudData(this.activeCompany)) {
-            void upsertProductCloud(prod, false, this.activeCompany).catch(() => null);
+            void ensureCompanyRegisteredCloud(this.activeCompany)
+              .then(() => upsertProductCloud(prod, false, this.activeCompany))
+              .then(async () => {
+                const synced: Product = { ...prod, synced: true, syncState: 'synced' };
+                await localDb.saveProduct(synced, this.activeCompany.id);
+                this.products = this.products.map((p) => (p.id === synced.id ? synced : p));
+                await this.markSyncMutationSuccess('product', synced.id);
+                this.render();
+              })
+              .catch((err) => {
+                void this.markSyncMutationError(
+                  'product',
+                  prod.id,
+                  err instanceof Error ? err.message : 'Erro ao sincronizar artigo.',
+                  prod.name
+                );
+              });
           }
         }
         break;
@@ -5300,6 +5789,7 @@ export class SilaBillingApp {
       }
       case 'mobile-cart-clear': {
         this.cart = [];
+        this.refreshCartOperationId();
         this.render();
         break;
       }
@@ -5439,6 +5929,7 @@ export class SilaBillingApp {
       }
       case 'mobile-start-new-sale': {
         this.cart = [];
+        this.refreshCartOperationId();
         this.mobileCheckoutStep = 'CART';
         this.mobileTab = 'SALE';
         this.render();
@@ -5713,8 +6204,11 @@ export class SilaBillingApp {
           );
           this.confirmFinalizeSeriesId = null;
           this.agtSeriesSuccessMessage = `Série ${finalized.seriesCode} (${finalized.documentType}) encerrada com sucesso (estado F).`;
+          await this.enqueueSyncMutation('fiscal_series', finalized.id, 'upsert', finalized.seriesCode);
           if (this.user && this.isOnline && canCompanySyncCloudData(this.activeCompany)) {
-            void upsertFiscalSeriesCloud(finalized, this.activeCompany).catch(() => null);
+            void upsertFiscalSeriesCloud(finalized, this.activeCompany)
+              .then(() => this.markSyncMutationSuccess('fiscal_series', finalized.id))
+              .catch(() => null);
           }
           this.render();
         } catch (err: any) {
@@ -6307,6 +6801,7 @@ export class SilaBillingApp {
       }
       case 'clear-pos': {
         this.cart = [];
+        this.refreshCartOperationId();
         this.globalDiscountPct = 0;
         this.globalDiscountInput = '';
         this.amountReceivedInput = '';
@@ -6345,6 +6840,7 @@ export class SilaBillingApp {
         this.suspendedSales = [entry, ...this.suspendedSales].slice(0, 25);
         await localDb.saveSuspendedSales(this.suspendedSales, this.activeCompany.id);
         this.cart = [];
+        this.refreshCartOperationId();
         this.globalDiscountPct = 0;
         this.globalDiscountInput = '';
         this.amountReceivedInput = '';
@@ -6394,6 +6890,7 @@ export class SilaBillingApp {
         this.suspendedSales = remaining;
         await localDb.saveSuspendedSales(this.suspendedSales, this.activeCompany.id);
         this.cart = targetSale.cart.map((c) => ({ ...c }));
+        this.refreshCartOperationId();
         this.globalDiscountPct = targetSale.globalDiscountPct || 0;
         this.globalDiscountInput = this.globalDiscountPct > 0 ? String(this.globalDiscountPct) : '';
         this.selectedCustomerId = this.customers.some((c) => c.id === targetSale.customerId)
@@ -6549,7 +7046,7 @@ export class SilaBillingApp {
         this.editingProductStockInput = '0';
         this.editingProductMinStockInput = '2';
         this.editingProduct = {
-          id: `prod_${Date.now()}_${rand}`,
+          id: generateUniqueEntityId('prod', this.terminalDeviceId),
           companyId: this.activeCompany.id,
           code: nextCode,
           barcode: '',
@@ -6800,6 +7297,7 @@ export class SilaBillingApp {
         };
         try {
           await localDb.saveProduct(toggled, this.activeCompany.id);
+          await this.enqueueSyncMutation('product', toggled.id, 'upsert', toggled.name);
           this.products = this.products.map((p) => (p.id === toggled.id ? toggled : p));
           if (this.editingProduct?.id === toggled.id) {
             this.editingProduct = { ...this.editingProduct, active: toggled.active };
@@ -6821,6 +7319,7 @@ export class SilaBillingApp {
               const synced: Product = { ...toggled, syncState: 'synced', synced: true };
               await localDb.saveProduct(synced, this.activeCompany.id);
               this.products = this.products.map((p) => (p.id === synced.id ? synced : p));
+              await this.markSyncMutationSuccess('product', synced.id);
               this.render();
             } catch {
               // Fica pendente localmente
@@ -6875,8 +7374,10 @@ export class SilaBillingApp {
       case 'delete-product': {
         if (!this.canManageCatalog()) return;
         this.confirmDeleteProductId = null;
+        const deletedProd = this.products.find((p) => p.id === id);
         try {
           await localDb.deleteProduct(id);
+          await this.enqueueSyncMutation('product', id, 'delete', deletedProd?.name || id);
           this.products = this.products.filter((p) => p.id !== id);
           if (this.selectedProductDetailId === id) {
             this.selectedProductDetailId = this.products[0]?.id || '';
@@ -6888,12 +7389,18 @@ export class SilaBillingApp {
             this.editingProductMarkupInput = '';
           }
           this.render();
-          if (this.user && this.isOnline) {
+          if (this.user && this.isOnline && canCompanySyncCloudData(this.activeCompany)) {
             try {
               await ensureCompanyRegisteredCloud(this.activeCompany);
               await removeProductCloud(id, this.activeCompany.id, this.activeCompany);
-            } catch {
-              // Mantém estado local
+              await this.markSyncMutationSuccess('product', id);
+            } catch (err) {
+              await this.markSyncMutationError(
+                'product',
+                id,
+                err instanceof Error ? err.message : 'Erro ao remover produto na Cloud',
+                deletedProd?.name
+              );
             }
           }
         } catch (err) {
@@ -6912,7 +7419,7 @@ export class SilaBillingApp {
         this.showCustomerAdvancedFields = false;
         this.editingCustomerCreditLimitInput = '';
         this.editingCustomer = {
-          id: `cust_${Date.now()}_${rand}`,
+          id: generateUniqueEntityId('cust', this.terminalDeviceId),
           companyId: this.activeCompany.id,
           internalCode: generateNextCustomerInternalCode(this.customers, this.activeCompany.id),
           customerType: 'PARTICULAR',
@@ -6975,7 +7482,9 @@ export class SilaBillingApp {
         if (!this.canEditExistingCustomers()) return;
         const directCustId = getDirectCustomerIdForCompany(this.activeCompany.id);
         if (id === directCustId) return;
+        const deletedCust = this.customers.find((c) => c.id === id);
         await localDb.deleteCustomer(id);
+        await this.enqueueSyncMutation('customer', id, 'delete', deletedCust?.name || id);
         this.customers = this.customers.filter((c) => c.id !== id);
         if (this.selectedCustomerDetailId === id) {
           this.selectedCustomerDetailId = this.customers[0]?.id || '';
@@ -6985,12 +7494,18 @@ export class SilaBillingApp {
           this.editingCustomerCreditLimitInput = '';
         }
         this.render();
-        if (this.user && this.isOnline) {
+        if (this.user && this.isOnline && canCompanySyncCloudData(this.activeCompany)) {
           try {
             await ensureCompanyRegisteredCloud(this.activeCompany);
             await removeCustomerCloud(id, this.activeCompany.id, this.activeCompany);
-          } catch {
-            // Removido localmente
+            await this.markSyncMutationSuccess('customer', id);
+          } catch (err) {
+            await this.markSyncMutationError(
+              'customer',
+              id,
+              err instanceof Error ? err.message : 'Erro ao remover cliente na Cloud',
+              deletedCust?.name
+            );
           }
         }
         break;
@@ -7194,6 +7709,7 @@ export class SilaBillingApp {
           discountPct: l.discountPct,
           ivaRate: l.ivaRate,
         }));
+        this.refreshCartOperationId();
         this.globalDiscountPct = fp.globalDiscountPct || 0;
         this.globalDiscountInput = this.globalDiscountPct > 0 ? String(this.globalDiscountPct) : '';
         this.selectedCustomerId =
@@ -7443,6 +7959,29 @@ export class SilaBillingApp {
       }
       case 'sync-now': {
         await this.syncAllWithCloud(true);
+        break;
+      }
+      case 'retry-sync-queue': {
+        if (this.activeCompany.id && this.syncQueueEntries.length > 0) {
+          this.syncQueueEntries = this.syncQueueEntries.map((q) => ({
+            ...q,
+            nextRetryAfterIso: undefined,
+          }));
+          for (const q of this.syncQueueEntries) {
+            await localDb.enqueueSync(q).catch(() => null);
+          }
+        }
+        await this.syncAllWithCloud(true);
+        break;
+      }
+      case 'resolve-sync-conflict': {
+        if (!id || !value) break;
+        await this.resolveSyncConflict(id, value as SyncConflictResolutionChoice);
+        break;
+      }
+      case 'export-unsynced-json': {
+        if (!this.activeCompany.id || this.requiresCompanyOnboarding) break;
+        this.exportUnsyncedQueueAndConflictsJson();
         break;
       }
       case 'export-backup-local': {
@@ -7930,7 +8469,7 @@ export class SilaBillingApp {
         this.purchasesWorkspaceNotice = null;
         this.editingSupplierTermsInput = '30';
         this.editingSupplier = {
-          id: `sup_${Date.now()}_${Math.random().toString(36).slice(2, 6)}`,
+          id: generateUniqueEntityId('sup', this.terminalDeviceId),
           companyId: this.activeCompany.id,
           name: '',
           nif: '',
@@ -8030,14 +8569,24 @@ export class SilaBillingApp {
             this.render();
           });
         } else {
-          void localDb.deleteSupplier(sup.id).then(() => {
+          void localDb.deleteSupplier(sup.id).then(async () => {
+            await this.enqueueSyncMutation('supplier', sup.id, 'delete', sup.name);
             this.suppliers = this.suppliers.filter((s) => s.id !== sup.id);
             if (this.selectedSupplierDetailId === sup.id) {
               this.selectedSupplierDetailId = this.suppliers[0]?.id || '';
             }
             this.purchasesWorkspaceNotice = `Fornecedor "${sup.name}" removido.`;
             if (this.user && this.isOnline && canCompanySyncCloudData(this.activeCompany)) {
-              void removeSupplierCloud(sup.id, this.activeCompany.id).catch(() => null);
+              void removeSupplierCloud(sup.id, this.activeCompany.id)
+                .then(() => this.markSyncMutationSuccess('supplier', sup.id))
+                .catch((err) =>
+                  this.markSyncMutationError(
+                    'supplier',
+                    sup.id,
+                    err instanceof Error ? err.message : 'Erro ao remover fornecedor na Cloud',
+                    sup.name
+                  )
+                );
             }
             this.render();
           });
@@ -9166,6 +9715,9 @@ export class SilaBillingApp {
       }
 
       await localDb.saveProductsBatch(applied.toSave, this.activeCompany.id);
+      for (const p of applied.toSave) {
+        await this.enqueueSyncMutation('product', p.id, 'upsert', p.name);
+      }
       const savedMap = new Map(applied.toSave.map((p) => [p.id, p]));
       const updatedList = this.products.map((p) => savedMap.get(p.id) || p);
       for (const p of applied.toSave) {
@@ -9190,7 +9742,17 @@ export class SilaBillingApp {
       if (this.user && this.isOnline && canCompanySyncCloudData(this.activeCompany) && applied.toSave.length <= 250) {
         void (async () => {
           for (const p of applied.toSave) {
-            await upsertProductCloud(p, true, this.activeCompany).catch(() => null);
+            try {
+              await upsertProductCloud(p, true, this.activeCompany);
+              await this.markSyncMutationSuccess('product', p.id);
+            } catch (err) {
+              await this.markSyncMutationError(
+                'product',
+                p.id,
+                err instanceof Error ? err.message : 'Erro ao sincronizar artigo importado.',
+                p.name
+              );
+            }
           }
         })();
       }
@@ -9210,9 +9772,15 @@ export class SilaBillingApp {
     try {
       if (rec.createdIds.length > 0) {
         await localDb.deleteProductsBatch(rec.createdIds);
+        for (const id of rec.createdIds) {
+          await this.enqueueSyncMutation('product', id, 'delete', id);
+        }
       }
       if (rec.previousSnapshots.length > 0) {
         await localDb.saveProductsBatch(rec.previousSnapshots, this.activeCompany.id);
+        for (const prev of rec.previousSnapshots) {
+          await this.enqueueSyncMutation('product', prev.id, 'upsert', prev.name);
+        }
       }
       const createdSet = new Set(rec.createdIds);
       const prevMap = new Map(rec.previousSnapshots.map((p) => [p.id, p]));
@@ -9252,6 +9820,9 @@ export class SilaBillingApp {
       }
 
       await localDb.saveCustomersBatch(applied.toSave, this.activeCompany.id);
+      for (const c of applied.toSave) {
+        await this.enqueueSyncMutation('customer', c.id, 'upsert', c.name);
+      }
       const savedMap = new Map(applied.toSave.map((c) => [c.id, c]));
       const updatedList = this.customers.map((c) => savedMap.get(c.id) || c);
       for (const c of applied.toSave) {
@@ -9276,7 +9847,17 @@ export class SilaBillingApp {
       if (this.user && this.isOnline && canCompanySyncCloudData(this.activeCompany) && applied.toSave.length <= 250) {
         void (async () => {
           for (const c of applied.toSave) {
-            await upsertCustomerCloud(c, this.activeCompany).catch(() => null);
+            try {
+              await upsertCustomerCloud(c, this.activeCompany);
+              await this.markSyncMutationSuccess('customer', c.id);
+            } catch (err) {
+              await this.markSyncMutationError(
+                'customer',
+                c.id,
+                err instanceof Error ? err.message : 'Erro ao sincronizar cliente importado.',
+                c.name
+              );
+            }
           }
         })();
       }
@@ -9301,9 +9882,15 @@ export class SilaBillingApp {
     try {
       if (rec.createdIds.length > 0) {
         await localDb.deleteCustomersBatch(rec.createdIds);
+        for (const id of rec.createdIds) {
+          await this.enqueueSyncMutation('customer', id, 'delete', id);
+        }
       }
       if (rec.previousSnapshots.length > 0) {
         await localDb.saveCustomersBatch(rec.previousSnapshots, this.activeCompany.id);
+        for (const prev of rec.previousSnapshots) {
+          await this.enqueueSyncMutation('customer', prev.id, 'upsert', prev.name);
+        }
       }
       const createdSet = new Set(rec.createdIds);
       const prevMap = new Map(rec.previousSnapshots.map((c) => [c.id, c]));
@@ -11269,6 +11856,7 @@ export class SilaBillingApp {
         };
 
           await localDb.saveProduct(updated, this.activeCompany.id);
+          await this.enqueueSyncMutation('product', updated.id, 'upsert', updated.name);
           this.products = this.products.map((p) => (p.id === productId ? updated : p));
           this.editingMobileProduct = null;
           this.showQuickProductForm = false;
@@ -11276,9 +11864,20 @@ export class SilaBillingApp {
 
           if (this.user && this.isOnline && canCompanySyncCloudData(this.activeCompany)) {
             try {
+              await ensureCompanyRegisteredCloud(this.activeCompany);
               await upsertProductCloud(updated, true, this.activeCompany);
-            } catch {
-              // Mantém pendente local
+              const synced: Product = { ...updated, synced: true, syncState: 'synced' };
+              await localDb.saveProduct(synced, this.activeCompany.id);
+              this.products = this.products.map((p) => (p.id === synced.id ? synced : p));
+              await this.markSyncMutationSuccess('product', synced.id);
+              this.render();
+            } catch (err) {
+              await this.markSyncMutationError(
+                'product',
+                updated.id,
+                err instanceof Error ? err.message : 'Erro ao sincronizar artigo.',
+                updated.name
+              );
             }
           }
           return;
@@ -11286,7 +11885,7 @@ export class SilaBillingApp {
 
       // Modo Criação de Novo Artigo
       const newProd: Product = {
-        id: `prod_${Date.now()}_${Math.random().toString(36).substring(2, 7)}`,
+        id: generateUniqueEntityId('prod', this.terminalDeviceId),
         companyId: this.activeCompany.id,
         code,
         barcode: barcode || undefined,
@@ -11310,6 +11909,7 @@ export class SilaBillingApp {
       };
 
       await localDb.saveProduct(newProd, this.activeCompany.id);
+      await this.enqueueSyncMutation('product', newProd.id, 'upsert', newProd.name);
       this.products = [newProd, ...this.products];
       if (this.mobileTab === 'SALE') {
         this.addProductToCart(newProd);
@@ -11320,9 +11920,20 @@ export class SilaBillingApp {
 
       if (this.user && this.isOnline && canCompanySyncCloudData(this.activeCompany)) {
         try {
+          await ensureCompanyRegisteredCloud(this.activeCompany);
           await upsertProductCloud(newProd, true, this.activeCompany);
-        } catch {
-          // Mantém pendente local
+          const synced: Product = { ...newProd, synced: true, syncState: 'synced' };
+          await localDb.saveProduct(synced, this.activeCompany.id);
+          this.products = this.products.map((p) => (p.id === synced.id ? synced : p));
+          await this.markSyncMutationSuccess('product', synced.id);
+          this.render();
+        } catch (err) {
+          await this.markSyncMutationError(
+            'product',
+            newProd.id,
+            err instanceof Error ? err.message : 'Erro ao sincronizar artigo.',
+            newProd.name
+          );
         }
       }
       return;
@@ -11382,6 +11993,7 @@ export class SilaBillingApp {
       const savedCust = validation.customer;
       this.quickCustomerError = null;
       await localDb.saveCustomer(savedCust, this.activeCompany.id);
+      await this.enqueueSyncMutation('customer', savedCust.id, 'upsert', savedCust.name);
       this.customers = [savedCust, ...this.customers.filter((c) => c.id !== savedCust.id)].sort(
         (a, b) =>
           a.id === directCustId ? -1 : b.id === directCustId ? 1 : a.name.localeCompare(b.name, 'pt')
@@ -11413,9 +12025,15 @@ export class SilaBillingApp {
           const syncedCust: Customer = { ...savedCust, synced: true, syncState: 'synced' };
           await localDb.saveCustomer(syncedCust, this.activeCompany.id);
           this.customers = this.customers.map((c) => (c.id === syncedCust.id ? syncedCust : c));
+          await this.markSyncMutationSuccess('customer', syncedCust.id);
           this.render();
-        } catch {
-          // Mantém pendente local
+        } catch (err) {
+          await this.markSyncMutationError(
+            'customer',
+            savedCust.id,
+            err instanceof Error ? err.message : 'Erro ao sincronizar cliente.',
+            savedCust.name
+          );
         }
       }
       return;
@@ -11762,6 +12380,7 @@ export class SilaBillingApp {
       };
 
       await localDb.saveInvoice(cancelled, this.activeCompany.id);
+      await this.enqueueSyncMutation('invoice', cancelled.id, 'upsert', cancelled.number);
       if (inv.docType === 'FR') {
         await this.adjustCatalogStockForInvoiceLines(inv.lines, 'RESTORE', {
           type: 'DEVOLUCAO_CLIENTE',
@@ -11798,10 +12417,16 @@ export class SilaBillingApp {
             const synced: InvoiceRecord = { ...cancelled, syncState: 'synced', synced: true };
             await localDb.saveInvoice(synced, this.activeCompany.id);
             this.invoices = this.invoices.map((x) => (x.id === invoiceId ? synced : x));
+            await this.markSyncMutationSuccess('invoice', invoiceId);
             this.render();
           }
-        } catch {
-          // Mantém pendente localmente para reenvio
+        } catch (err) {
+          await this.markSyncMutationError(
+            'invoice',
+            invoiceId,
+            err instanceof Error ? err.message : 'Erro ao sincronizar anulação.',
+            inv.number
+          );
         }
       }
       return;
@@ -11833,13 +12458,14 @@ export class SilaBillingApp {
       const updatedInv = this.buildSettledInvoiceRecord(inv, applied, extraChange, method, refText);
 
       await localDb.saveInvoice(updatedInv, this.activeCompany.id);
+      await this.enqueueSyncMutation('invoice', updatedInv.id, 'upsert', updatedInv.number);
       this.invoices = this.invoices.map((x) => (x.id === updatedInv.id ? updatedInv : x));
 
       const openSess = this.getActiveOpenCashSession();
       if (applied > 0) {
         const nowMov = new Date().toISOString();
         const debtMov: CashMovement = {
-          id: `cm_liq_${Date.now()}_${Math.random().toString(36).slice(2, 6)}`,
+          id: generateUniqueEntityId('cm_liq', this.terminalDeviceId),
           companyId: this.activeCompany.id,
           sessionId: openSess ? openSess.id : 'sem_turno',
           cashier: openSess?.cashier || this.cashier || '01',
@@ -11917,9 +12543,15 @@ export class SilaBillingApp {
           const synced: InvoiceRecord = { ...updatedInv, syncState: 'synced', synced: true };
           await localDb.saveInvoice(synced, this.activeCompany.id);
           this.invoices = this.invoices.map((x) => (x.id === synced.id ? synced : x));
+          await this.markSyncMutationSuccess('invoice', synced.id);
           this.render();
-        } catch {
-          // Mantém pendente localmente
+        } catch (err) {
+          await this.markSyncMutationError(
+            'invoice',
+            updatedInv.id,
+            err instanceof Error ? err.message : 'Erro ao sincronizar liquidação.',
+            updatedInv.number
+          );
         }
       }
       return;
@@ -11980,11 +12612,12 @@ export class SilaBillingApp {
         );
         updatedMap.set(updatedInv.id, updatedInv);
         await localDb.saveInvoice(updatedInv, this.activeCompany.id);
+        await this.enqueueSyncMutation('invoice', updatedInv.id, 'upsert', updatedInv.number);
 
         if (applied > 0) {
           const nowMov = new Date().toISOString();
           const debtMov: CashMovement = {
-            id: `cm_liq_${Date.now()}_${idx}_${Math.random().toString(36).slice(2, 5)}`,
+            id: generateUniqueEntityId('cm_liq', this.terminalDeviceId),
             companyId: this.activeCompany.id,
             sessionId: openSess ? openSess.id : 'sem_turno',
             cashier: openSess?.cashier || this.cashier || '01',
@@ -12067,14 +12700,31 @@ export class SilaBillingApp {
         try {
           await ensureCompanyRegisteredCloud(this.activeCompany);
           for (const updatedInv of updatedMap.values()) {
-            await createInvoiceCloud(updatedInv, this.activeCompany);
-            const synced: InvoiceRecord = { ...updatedInv, syncState: 'synced', synced: true };
-            await localDb.saveInvoice(synced, this.activeCompany.id);
-            this.invoices = this.invoices.map((x) => (x.id === synced.id ? synced : x));
+            try {
+              await createInvoiceCloud(updatedInv, this.activeCompany);
+              const synced: InvoiceRecord = { ...updatedInv, syncState: 'synced', synced: true };
+              await localDb.saveInvoice(synced, this.activeCompany.id);
+              this.invoices = this.invoices.map((x) => (x.id === synced.id ? synced : x));
+              await this.markSyncMutationSuccess('invoice', synced.id);
+            } catch (err) {
+              await this.markSyncMutationError(
+                'invoice',
+                updatedInv.id,
+                err instanceof Error ? err.message : 'Erro ao sincronizar liquidação.',
+                updatedInv.number
+              );
+            }
           }
           this.render();
-        } catch {
-          // Mantém pendente localmente
+        } catch (err) {
+          for (const updatedInv of updatedMap.values()) {
+            await this.markSyncMutationError(
+              'invoice',
+              updatedInv.id,
+              err instanceof Error ? err.message : 'Erro ao sincronizar liquidação.',
+              updatedInv.number
+            );
+          }
         }
       }
       return;
@@ -12343,7 +12993,7 @@ export class SilaBillingApp {
       const now = new Date().toISOString();
       const validCost = rawCost && parsedCost > 0 ? roundKz(parsedCost) : undefined;
       const created: Product = {
-        id: `prod_${Date.now()}_${Math.random().toString(36).slice(2, 6)}`,
+        id: generateUniqueEntityId('prod', this.terminalDeviceId),
         companyId: this.activeCompany.id,
         code,
         ...(barcode ? { barcode } : {}),
@@ -12366,6 +13016,7 @@ export class SilaBillingApp {
 
       try {
         await localDb.saveProduct(created, this.activeCompany.id);
+        await this.enqueueSyncMutation('product', created.id, 'upsert', created.name);
       } catch (err) {
         this.quickProductError = formatStorageErrorPt(err, 'o artigo');
         this.render();
@@ -12375,7 +13026,7 @@ export class SilaBillingApp {
       this.products = [...this.products, created].sort((a, b) => a.code.localeCompare(b.code));
       if (created.trackStock && (created.stockQty ?? 0) > 0) {
         const initMov: StockMovement = {
-          id: `sm_init_${Date.now()}_${Math.random().toString(36).slice(2, 6)}`,
+          id: generateUniqueEntityId('sm_init', this.terminalDeviceId),
           companyId: this.activeCompany.id,
           productId: created.id,
           productCode: created.code,
@@ -12413,9 +13064,15 @@ export class SilaBillingApp {
           const synced: Product = { ...created, syncState: 'synced', synced: true };
           await localDb.saveProduct(synced, this.activeCompany.id);
           this.products = this.products.map((p) => (p.id === synced.id ? synced : p));
+          await this.markSyncMutationSuccess('product', synced.id);
           this.render();
-        } catch {
-          // Mantém pendente
+        } catch (err) {
+          await this.markSyncMutationError(
+            'product',
+            created.id,
+            err instanceof Error ? err.message : 'Erro ao sincronizar artigo.',
+            created.name
+          );
         }
       }
       return;
@@ -12929,10 +13586,9 @@ export class SilaBillingApp {
       }
 
       const now = new Date().toISOString();
-      const rand = Math.random().toString(36).slice(2, 6);
       const directCustId = getDirectCustomerIdForCompany(this.activeCompany.id);
       const created: Customer = {
-        id: `cust_${Date.now()}_${rand}`,
+        id: generateUniqueEntityId('cust', this.terminalDeviceId),
         companyId: this.activeCompany.id,
         name,
         nif,
@@ -12947,6 +13603,7 @@ export class SilaBillingApp {
 
       try {
         await localDb.saveCustomer(created, this.activeCompany.id);
+        await this.enqueueSyncMutation('customer', created.id, 'upsert', created.name);
       } catch (err) {
         this.quickCustomerError = formatStorageErrorPt(err, 'o cliente');
         this.render();
@@ -12973,10 +13630,16 @@ export class SilaBillingApp {
             const synced: Customer = { ...created, syncState: 'synced', synced: true };
             await localDb.saveCustomer(synced, this.activeCompany.id);
             this.customers = this.customers.map((c) => (c.id === synced.id ? synced : c));
+            await this.markSyncMutationSuccess('customer', synced.id);
             this.render();
           }
-        } catch {
-          // Mantém pendente localmente
+        } catch (err) {
+          await this.markSyncMutationError(
+            'customer',
+            created.id,
+            err instanceof Error ? err.message : 'Erro ao sincronizar cliente.',
+            created.name
+          );
         }
       }
       return;
@@ -13149,6 +13812,7 @@ export class SilaBillingApp {
       const wasNew = this.isNewProduct;
       try {
         await localDb.saveProduct(updated, this.activeCompany.id);
+        await this.enqueueSyncMutation('product', updated.id, 'upsert', updated.name);
       } catch (err) {
         this.productFormError = formatStorageErrorPt(err, 'o artigo');
         this.render();
@@ -13167,7 +13831,7 @@ export class SilaBillingApp {
         const stockDelta = roundKz(nextStockVal - prevStock);
         if ((wasNew && nextStockVal > 0) || (!wasNew && stockDelta !== 0)) {
           const formMov: StockMovement = {
-            id: `sm_cat_${Date.now()}_${Math.random().toString(36).slice(2, 6)}`,
+            id: generateUniqueEntityId('sm_cat', this.terminalDeviceId),
             companyId: this.activeCompany.id,
             productId: updated.id,
             productCode: updated.code,
@@ -13222,10 +13886,16 @@ export class SilaBillingApp {
             const synced: Product = { ...updated, syncState: 'synced', synced: true };
             await localDb.saveProduct(synced, this.activeCompany.id);
             this.products = this.products.map((p) => (p.id === synced.id ? synced : p));
+            await this.markSyncMutationSuccess('product', synced.id);
             this.render();
           }
-        } catch {
-          // Fica pendente para sync
+        } catch (err) {
+          await this.markSyncMutationError(
+            'product',
+            updated.id,
+            err instanceof Error ? err.message : 'Erro ao sincronizar artigo.',
+            updated.name
+          );
         }
       }
       return;
@@ -13289,6 +13959,7 @@ export class SilaBillingApp {
 
       try {
         await localDb.saveCustomer(updated, this.activeCompany.id);
+        await this.enqueueSyncMutation('customer', updated.id, 'upsert', updated.name);
       } catch (err) {
         this.customerFormError = formatStorageErrorPt(err, 'o cliente');
         this.render();
@@ -13325,10 +13996,16 @@ export class SilaBillingApp {
             const synced: Customer = { ...updated, syncState: 'synced', synced: true };
             await localDb.saveCustomer(synced, this.activeCompany.id);
             this.customers = this.customers.map((c) => (c.id === synced.id ? synced : c));
+            await this.markSyncMutationSuccess('customer', synced.id);
             this.render();
           }
-        } catch {
-          // Fica pendente localmente
+        } catch (err) {
+          await this.markSyncMutationError(
+            'customer',
+            updated.id,
+            err instanceof Error ? err.message : 'Erro ao sincronizar cliente.',
+            updated.name
+          );
         }
       }
       return;
@@ -13425,7 +14102,7 @@ export class SilaBillingApp {
         !Number.isNaN(parsedTerms) && parsedTerms >= 0 ? Math.min(3650, parsedTerms) : 30;
       const now = new Date().toISOString();
       const quickSup: Supplier = {
-        id: `sup_${Date.now()}_${Math.random().toString(36).slice(2, 6)}`,
+        id: generateUniqueEntityId('sup', this.terminalDeviceId),
         companyId: this.activeCompany.id,
         name: cleanName.slice(0, 160),
         nif: cleanNif,
@@ -13698,8 +14375,19 @@ export class SilaBillingApp {
           operator: this.operator,
         });
 
+        await this.enqueueSyncMutation('fiscal_series', created.id, 'upsert', created.seriesCode);
+
         if (this.user && this.isOnline && canCompanySyncCloudData(this.activeCompany)) {
-          void upsertFiscalSeriesCloud(created, this.activeCompany).catch(() => null);
+          void upsertFiscalSeriesCloud(created, this.activeCompany)
+            .then(() => this.markSyncMutationSuccess('fiscal_series', created.id))
+            .catch((err) => {
+              void this.markSyncMutationError(
+                'fiscal_series',
+                created.id,
+                err instanceof Error ? err.message : 'Erro ao sincronizar série fiscal.',
+                created.seriesCode
+              );
+            });
         }
 
         this.agtSeriesSuccessMessage = `Série fiscal ${created.seriesCode} (${created.documentType} · ${created.environment}) aprovada com sucesso! Código de Autorização AGT: ${created.agtAuthorizationCode}`;
@@ -13745,8 +14433,16 @@ export class SilaBillingApp {
         company: updatedCompany.profile,
         defaultEstablishmentId: updatedCompany.profile.defaultEstablishmentId,
         agtEnvironment: updatedCompany.profile.agtEnvironment,
+        syncState: 'pending',
+        synced: false,
       };
       this.settings = savedSettings;
+      await this.enqueueSyncMutation(
+        'settings',
+        'general',
+        'upsert',
+        savedSettings.company.shortName || 'Configurações'
+      );
       const savedEst = resolveActiveEstablishment(
         updatedCompany.profile,
         updatedCompany.profile.defaultEstablishmentId
@@ -13810,6 +14506,11 @@ export class SilaBillingApp {
             defaultEstablishmentId: syncedCompany.profile.defaultEstablishmentId,
             agtEnvironment: syncedCompany.profile.agtEnvironment,
           };
+          await this.markSyncMutationSuccess('settings', 'general');
+          this.syncBaselines[computeBaselineKey('settings', 'general')] = computeSettingsFingerprint(
+            this.settings
+          );
+          await localDb.saveSyncBaselines(this.activeCompany.id, this.syncBaselines).catch(() => null);
         } else {
           const markedCompany: CompanyRecord = {
             ...this.activeCompany,
@@ -13834,6 +14535,11 @@ export class SilaBillingApp {
         this.syncMessage = null;
         this.render();
       } catch (cloudErr) {
+        const msg =
+          cloudErr instanceof Error
+            ? cloudErr.message
+            : 'Ficha guardada localmente, mas pendente de sincronização Cloud.';
+        await this.markSyncMutationError('settings', 'general', msg, this.settings.company.shortName);
         this.syncMessage =
           cloudErr instanceof Error
             ? `Ficha guardada localmente, mas pendente na Cloud: ${cloudErr.message}`
@@ -13904,701 +14610,1078 @@ export class SilaBillingApp {
       }
     }
 
-    this.isEmitting = true;
-    this.render();
+    await withTerminalExecutionLock(`sila_emit_${this.activeCompany.id}`, async () => {
+      const cartFingerprint = computeCartFingerprint({
+        companyId: this.activeCompany.id,
+        docType: this.docType,
+        customerId: this.selectedCustomerId,
+        paymentMethod: this.paymentMethod,
+        globalDiscountPct: this.globalDiscountPct,
+        grandTotal: previewDraft.grandTotal,
+        cart: this.cart,
+      });
 
-    try {
-      const draft = previewDraft;
-      const now = new Date().toISOString();
-      const originReturnId = this.returnOriginInvoice?.id || null;
-
-      const activeEnv =
-        this.activeCompany.profile.agtEnvironment || this.settings.agtEnvironment || 'SIMULACAO';
-      const activeEst = resolveActiveEstablishment(
-        this.settings.company,
-        this.settings.defaultEstablishmentId
-      );
-
-      let officialNumber = draft.number;
-      let reservedSeriesMeta: ProximoNumeroFiscalResult | null = null;
-      try {
-        reservedSeriesMeta = reservarProximoNumeroFiscal(
-          this.activeCompany.id,
-          draft.docType as AgtDocumentType,
-          undefined,
-          undefined,
-          { environment: activeEnv, establishmentId: activeEst.id }
-        );
-        officialNumber = reservedSeriesMeta.documentNo;
-      } catch (seriesErr: any) {
-        if (AGT_DOCUMENT_TYPES[draft.docType as AgtDocumentType]?.requiresSeries) {
-          this.isEmitting = false;
-          this.showScannerFeedback(
-            seriesErr.message || 'Emissão fiscal bloqueada: série AGT inexistente ou finalizada.',
-            true
-          );
-          this.render();
-          return;
-        }
+      const dupCheck = checkDuplicateCheckoutSubmission({
+        companyId: this.activeCompany.id,
+        clientOperationId: this.cartOperationId,
+        cartFingerprint,
+        existingInvoices: this.invoices,
+        recentCommittedOps: this.committedCheckoutOps,
+      });
+      if (dupCheck.duplicate) {
+        this.showScannerFeedback(dupCheck.reason || 'Submissão duplicada bloqueada.', true);
+        this.render();
+        return;
       }
 
-      const openSession = this.getActiveOpenCashSession();
-      const maxCashierPct = this.settings.maxCashierDiscountPct ?? 5;
-      const hasExcessDiscount =
-        (draft.globalDiscountPct && draft.globalDiscountPct > maxCashierPct) ||
-        draft.lines.some((l) => l.discountPct > maxCashierPct);
-      const discountAuth = this.supervisorAuthorizedBy
-        ? this.supervisorAuthorizedBy
-        : hasExcessDiscount &&
-          (this.getEffectiveRole() === 'owner' || this.getEffectiveRole() === 'manager')
-        ? `${formatRoleLabelPt(this.getEffectiveRole())} (${openSession ? openSession.operator : draft.operator})`
-        : undefined;
+      if (this.isEmitting) return;
+      this.isEmitting = true;
+      this.render();
 
-      const issuerSnapshot = buildInvoiceIssuerSnapshot(this.settings.company, {
-        companyId: this.activeCompany.id,
-        establishment: activeEst,
-        capturedAtIso: now,
-      });
-      const targetSeriesCode = reservedSeriesMeta?.seriesCode || draft.seriesCode;
-      const prevSeriesInv = this.invoices.find(
-        (i) =>
-          i.companyId === this.activeCompany.id &&
-          (!targetSeriesCode || i.seriesCode === targetSeriesCode) &&
-          (i.seriesEnvironment || 'SIMULACAO') === activeEnv
-      );
-      const previousInvoiceHash = prevSeriesInv
-        ? prevSeriesInv.saftHashFull ||
-          generateChainedDocumentHash(prevSeriesInv, prevSeriesInv.previousInvoiceHash || '')
-        : '';
-      const hashResult = computeDocumentSaftHash4(
-        {
-          issuedAtIso: now,
-          number: officialNumber,
-          grandTotal: draft.grandTotal,
-        },
-        previousInvoiceHash
-      );
-      const officialAtcud =
-        reservedSeriesMeta?.environment === 'PRODUCAO' && reservedSeriesMeta.agtAuthorizationCode
-          ? `${reservedSeriesMeta.agtAuthorizationCode.trim()}-${reservedSeriesMeta.sequenceNumber}`
-          : undefined;
+      try {
+        const draft = previewDraft;
+        const now = new Date().toISOString();
+        const originReturnId = this.returnOriginInvoice?.id || null;
 
-      const invoice: InvoiceRecord = {
-        ...draft,
-        number: officialNumber,
-        id: `inv_${Date.now()}`,
-        companyId: this.activeCompany.id,
-        cashier: openSession ? openSession.cashier : draft.cashier,
-        operator: openSession ? openSession.operator : draft.operator,
-        issuerSnapshot,
-        establishmentId: reservedSeriesMeta?.establishmentId || activeEst.id,
-        establishmentCode: reservedSeriesMeta?.establishmentCode || activeEst.code,
-        establishmentName: activeEst.name,
-        ...(reservedSeriesMeta
-          ? {
-              seriesCode: reservedSeriesMeta.seriesCode,
-              seriesEnvironment: reservedSeriesMeta.environment,
-              ...(reservedSeriesMeta.agtAuthorizationCode
-                ? { agtAuthorizationCode: reservedSeriesMeta.agtAuthorizationCode }
-                : {}),
-              ...(officialAtcud ? { atcud: officialAtcud } : {}),
+        const activeEnv =
+          this.activeCompany.profile.agtEnvironment || this.settings.agtEnvironment || 'SIMULACAO';
+        const activeEst = resolveActiveEstablishment(
+          this.settings.company,
+          this.settings.defaultEstablishmentId
+        );
+
+        let officialNumber = draft.number;
+        let reservedSeriesMeta: ProximoNumeroFiscalResult | null = null;
+        try {
+          const activeSer = obterSerieAtiva(
+            this.activeCompany.id,
+            draft.docType as AgtDocumentType,
+            undefined,
+            { environment: activeEnv, establishmentId: activeEst.id }
+          );
+          const minLastDoc = activeSer
+            ? getHighestSequenceForSeriesInInvoices(this.invoices, {
+                companyId: this.activeCompany.id,
+                docType: draft.docType as AgtDocumentType,
+                seriesCode: activeSer.seriesCode,
+                environment: activeEnv,
+              })
+            : 0;
+          reservedSeriesMeta = reservarProximoNumeroFiscal(
+            this.activeCompany.id,
+            draft.docType as AgtDocumentType,
+            undefined,
+            undefined,
+            {
+              environment: activeEnv,
+              establishmentId: activeEst.id,
+              minLastDocumentNumber: minLastDoc,
             }
-          : { seriesEnvironment: activeEnv }),
-        saftHash4: hashResult.hash4,
-        saftHashFull: hashResult.fullHash,
-        ...(previousInvoiceHash ? { previousInvoiceHash } : {}),
-        ...(discountAuth ? { discountAuthorizedBy: discountAuth } : {}),
-        ...(draft.docType === 'FR'
-          ? {
-              ...(openSession ? { sessionId: openSession.id } : {}),
-              initialAmountReceived: draft.amountReceived,
-              initialChangeAmount: draft.changeAmount,
-            }
-          : {}),
-        issuedAtIso: now,
-        syncState: 'pending',
-        synced: false,
-        createdAtIso: now,
-        updatedAtIso: now,
-      };
+          );
+          officialNumber = reservedSeriesMeta.documentNo;
 
-      await localDb.saveInvoice(invoice, this.activeCompany.id);
-      if (invoice.docType === 'FR') {
-        if (originReturnId) {
-          const originInv = this.invoices.find((i) => i.id === originReturnId);
-          if (originInv && originInv.docType === 'FR') {
-            await this.adjustCatalogStockForInvoiceLines(originInv.lines, 'RESTORE', {
-              type: 'DEVOLUCAO_CLIENTE',
-              reason: `Devolução / troca em caixa ref. ${originInv.number} (nova emissão ${invoice.number})`,
-              invoiceId: originInv.id,
-              invoiceNumber: originInv.number,
-              operator: invoice.operator,
-            });
+          const existingSameNum = this.invoices.some(
+            (i) =>
+              (i.companyId || this.activeCompany.id) === this.activeCompany.id &&
+              normalizeFiscalNumberKey(i.number, i.seriesEnvironment) ===
+                normalizeFiscalNumberKey(
+                  officialNumber,
+                  reservedSeriesMeta?.environment || activeEnv
+                )
+          );
+          if (existingSameNum && reservedSeriesMeta) {
+            sincronizarSequenciaMaximaSerie(
+              this.activeCompany.id,
+              reservedSeriesMeta.seriesId,
+              reservedSeriesMeta.sequenceNumber
+            );
+            reservedSeriesMeta = reservarProximoNumeroFiscal(
+              this.activeCompany.id,
+              draft.docType as AgtDocumentType,
+              undefined,
+              reservedSeriesMeta.seriesCode,
+              {
+                environment: activeEnv,
+                establishmentId: activeEst.id,
+                minLastDocumentNumber: Math.max(minLastDoc, reservedSeriesMeta.sequenceNumber),
+              }
+            );
+            officialNumber = reservedSeriesMeta.documentNo;
+          }
+        } catch (seriesErr: any) {
+          if (AGT_DOCUMENT_TYPES[draft.docType as AgtDocumentType]?.requiresSeries) {
+            this.isEmitting = false;
+            this.showScannerFeedback(
+              seriesErr.message ||
+                'Emissão fiscal bloqueada: série AGT inexistente ou finalizada.',
+              true
+            );
+            this.render();
+            return;
           }
         }
-        await this.adjustCatalogStockForInvoiceLines(invoice.lines, 'DEDUCT', {
-          type: 'SAIDA_VENDA',
-          reason: `Saída automática por venda ${invoice.number}`,
-          invoiceId: invoice.id,
-          invoiceNumber: invoice.number,
-          operator: invoice.operator,
-        });
-      }
 
-      if (!this.activeCompany.maxObservedIso || now > this.activeCompany.maxObservedIso) {
-        const trackedCompany: CompanyRecord = {
-          ...this.activeCompany,
-          maxObservedIso: now,
+        const openSession = this.getActiveOpenCashSession();
+        const maxCashierPct = this.settings.maxCashierDiscountPct ?? 5;
+        const hasExcessDiscount =
+          (draft.globalDiscountPct && draft.globalDiscountPct > maxCashierPct) ||
+          draft.lines.some((l) => l.discountPct > maxCashierPct);
+        const discountAuth = this.supervisorAuthorizedBy
+          ? this.supervisorAuthorizedBy
+          : hasExcessDiscount &&
+              (this.getEffectiveRole() === 'owner' || this.getEffectiveRole() === 'manager')
+            ? `${formatRoleLabelPt(this.getEffectiveRole())} (${openSession ? openSession.operator : draft.operator})`
+            : undefined;
+
+        const issuerSnapshot = buildInvoiceIssuerSnapshot(this.settings.company, {
+          companyId: this.activeCompany.id,
+          establishment: activeEst,
+          capturedAtIso: now,
+        });
+        const targetSeriesCode = reservedSeriesMeta?.seriesCode || draft.seriesCode;
+        const prevSeriesInv = this.invoices.find(
+          (i) =>
+            i.companyId === this.activeCompany.id &&
+            (!targetSeriesCode || i.seriesCode === targetSeriesCode) &&
+            (i.seriesEnvironment || 'SIMULACAO') === activeEnv
+        );
+        const previousInvoiceHash = prevSeriesInv
+          ? prevSeriesInv.saftHashFull ||
+            generateChainedDocumentHash(prevSeriesInv, prevSeriesInv.previousInvoiceHash || '')
+          : '';
+        const hashResult = computeDocumentSaftHash4(
+          {
+            issuedAtIso: now,
+            number: officialNumber,
+            grandTotal: draft.grandTotal,
+          },
+          previousInvoiceHash
+        );
+        const officialAtcud =
+          reservedSeriesMeta?.environment === 'PRODUCAO' && reservedSeriesMeta.agtAuthorizationCode
+            ? `${reservedSeriesMeta.agtAuthorizationCode.trim()}-${reservedSeriesMeta.sequenceNumber}`
+            : undefined;
+
+        const opId = this.cartOperationId;
+        const invoice: InvoiceRecord = {
+          ...draft,
+          number: officialNumber,
+          id: generateUniqueEntityId('inv', this.terminalDeviceId),
+          companyId: this.activeCompany.id,
+          clientOperationId: opId,
+          terminalDeviceId: this.terminalDeviceId,
+          cashier: openSession ? openSession.cashier : draft.cashier,
+          operator: openSession ? openSession.operator : draft.operator,
+          issuerSnapshot,
+          establishmentId: reservedSeriesMeta?.establishmentId || activeEst.id,
+          establishmentCode: reservedSeriesMeta?.establishmentCode || activeEst.code,
+          establishmentName: activeEst.name,
+          ...(reservedSeriesMeta
+            ? {
+                seriesCode: reservedSeriesMeta.seriesCode,
+                seriesEnvironment: reservedSeriesMeta.environment,
+                ...(reservedSeriesMeta.agtAuthorizationCode
+                  ? { agtAuthorizationCode: reservedSeriesMeta.agtAuthorizationCode }
+                  : {}),
+                ...(officialAtcud ? { atcud: officialAtcud } : {}),
+              }
+            : { seriesEnvironment: activeEnv }),
+          saftHash4: hashResult.hash4,
+          saftHashFull: hashResult.fullHash,
+          ...(previousInvoiceHash ? { previousInvoiceHash } : {}),
+          ...(discountAuth ? { discountAuthorizedBy: discountAuth } : {}),
+          ...(draft.docType === 'FR'
+            ? {
+                ...(openSession ? { sessionId: openSession.id } : {}),
+                initialAmountReceived: draft.amountReceived,
+                initialChangeAmount: draft.changeAmount,
+              }
+            : {}),
+          issuedAtIso: now,
+          syncState: 'pending',
+          synced: false,
+          createdAtIso: now,
           updatedAtIso: now,
         };
-        await localDb.saveCompany(trackedCompany);
-        this.activeCompany = trackedCompany;
-        this.companies = this.companies.map((c) =>
-          c.id === trackedCompany.id ? trackedCompany : c
-        );
-      }
 
-      this.invoices = [invoice, ...this.invoices];
-      this.selectedHistoryId = invoice.id;
-      this.lastEmitted = invoice;
-      this.cart = [];
-      this.globalDiscountPct = 0;
-      this.globalDiscountInput = '';
-      this.amountReceivedInput = '';
-      this.transferReference = '';
-      this.splitInputs = { Dinheiro: '', Multicaixa: '', Transferência: '' };
-      this.returnOriginInvoice = null;
-      this.confirmClearCart = false;
-      this.confirmRemoveCartProductId = null;
-      this.supervisorAuthorizedBy = null;
-      this.notes = this.settings.defaultNotes || 'Venda directa a retalho.';
-      this.mobilePane = 'PREVIEW';
-      await this.flushDraftNow();
-      this.render();
-
-      // Sincronização Cloud + Auditoria Backend (/api/audit/invoices) quando online e autenticado
-      if (this.user && this.isOnline) {
-        try {
-          await ensureCompanyRegisteredCloud(this.activeCompany);
-          if (canCompanySyncCloudData(this.activeCompany)) {
-            await createInvoiceCloud(invoice, this.activeCompany);
-            if (reservedSeriesMeta) {
-              const updatedSeries = listarSeries({ companyId: this.activeCompany.id }).find(
-                (s) => s.id === reservedSeriesMeta!.seriesId
-              );
-              if (updatedSeries) {
-                await upsertFiscalSeriesCloud(updatedSeries, this.activeCompany).catch(() => null);
-              }
-            }
-            const syncedInv: InvoiceRecord = { ...invoice, syncState: 'synced', synced: true };
-            await localDb.saveInvoice(syncedInv, this.activeCompany.id);
-            this.invoices = this.invoices.map((i) => (i.id === syncedInv.id ? syncedInv : i));
-            this.lastEmitted = syncedInv;
-
-            const auditRes = await submitInvoiceAudit(syncedInv, this.activeCompany.id);
-            if (auditRes.ok && auditRes.auditHash) {
-              this.lastAuditHash = auditRes.auditHash.slice(0, 12);
-            }
-            this.render();
-          }
-        } catch {
-          // Guardada localmente para sincronização posterior
+        await localDb.saveInvoice(invoice, this.activeCompany.id);
+        const committedRec: CommittedCheckoutOpRecord = {
+          operationId: opId,
+          invoiceId: invoice.id,
+          invoiceNumber: invoice.number,
+          cartFingerprint,
+          grandTotal: invoice.grandTotal,
+          committedAtIso: now,
+        };
+        await localDb.recordCommittedCheckoutOp(this.activeCompany.id, committedRec).catch(() => null);
+        this.committedCheckoutOps = [
+          committedRec,
+          ...this.committedCheckoutOps.filter((o) => o.operationId !== committedRec.operationId),
+        ].slice(0, 120);
+        await this.enqueueSyncMutation('invoice', invoice.id, 'upsert', invoice.number, opId);
+        if (reservedSeriesMeta) {
+          await this.enqueueSyncMutation(
+            'fiscal_series',
+            reservedSeriesMeta.seriesId,
+            'upsert',
+            reservedSeriesMeta.seriesCode
+          );
         }
-      }
 
-      if (autoPrint) {
-        await this.triggerPrint(invoice, this.previewFormat);
+        if (invoice.docType === 'FR') {
+          if (originReturnId) {
+            const originInv = this.invoices.find((i) => i.id === originReturnId);
+            if (originInv && originInv.docType === 'FR') {
+              await this.adjustCatalogStockForInvoiceLines(originInv.lines, 'RESTORE', {
+                type: 'DEVOLUCAO_CLIENTE',
+                reason: `Devolução / troca em caixa ref. ${originInv.number} (nova emissão ${invoice.number})`,
+                invoiceId: originInv.id,
+                invoiceNumber: originInv.number,
+                operator: invoice.operator,
+              });
+            }
+          }
+          await this.adjustCatalogStockForInvoiceLines(invoice.lines, 'DEDUCT', {
+            type: 'SAIDA_VENDA',
+            reason: `Saída automática por venda ${invoice.number}`,
+            invoiceId: invoice.id,
+            invoiceNumber: invoice.number,
+            operator: invoice.operator,
+          });
+        }
+
+        if (!this.activeCompany.maxObservedIso || now > this.activeCompany.maxObservedIso) {
+          const trackedCompany: CompanyRecord = {
+            ...this.activeCompany,
+            maxObservedIso: now,
+            updatedAtIso: now,
+          };
+          await localDb.saveCompany(trackedCompany);
+          this.activeCompany = trackedCompany;
+          this.companies = this.companies.map((c) =>
+            c.id === trackedCompany.id ? trackedCompany : c
+          );
+        }
+
+        this.invoices = [invoice, ...this.invoices];
+        this.selectedHistoryId = invoice.id;
+        this.lastEmitted = invoice;
+        this.cart = [];
+        this.refreshCartOperationId();
+        this.globalDiscountPct = 0;
+        this.globalDiscountInput = '';
+        this.amountReceivedInput = '';
+        this.transferReference = '';
+        this.splitInputs = { Dinheiro: '', Multicaixa: '', Transferência: '' };
+        this.returnOriginInvoice = null;
+        this.confirmClearCart = false;
+        this.confirmRemoveCartProductId = null;
+        this.supervisorAuthorizedBy = null;
+        this.notes = this.settings.defaultNotes || 'Venda directa a retalho.';
+        this.mobilePane = 'PREVIEW';
+        await this.flushDraftNow();
+        this.render();
+
+        // Sincronização Cloud + Auditoria Backend (/api/audit/invoices) quando online e autenticado
+        if (this.user && this.isOnline) {
+          try {
+            await ensureCompanyRegisteredCloud(this.activeCompany);
+            if (canCompanySyncCloudData(this.activeCompany)) {
+              await createInvoiceCloud(invoice, this.activeCompany);
+              if (reservedSeriesMeta) {
+                const updatedSeries = listarSeries({ companyId: this.activeCompany.id }).find(
+                  (s) => s.id === reservedSeriesMeta!.seriesId
+                );
+                if (updatedSeries) {
+                  await upsertFiscalSeriesCloud(updatedSeries, this.activeCompany)
+                    .then(() => this.markSyncMutationSuccess('fiscal_series', updatedSeries.id))
+                    .catch(() => null);
+                }
+              }
+              const syncedInv: InvoiceRecord = { ...invoice, syncState: 'synced', synced: true };
+              await localDb.saveInvoice(syncedInv, this.activeCompany.id);
+              this.invoices = this.invoices.map((i) => (i.id === syncedInv.id ? syncedInv : i));
+              this.lastEmitted = syncedInv;
+              await this.markSyncMutationSuccess('invoice', syncedInv.id);
+
+              const auditRes = await submitInvoiceAudit(syncedInv, this.activeCompany.id);
+              if (auditRes.ok && auditRes.auditHash) {
+                this.lastAuditHash = auditRes.auditHash.slice(0, 12);
+              }
+              this.render();
+            }
+          } catch (err) {
+            await this.markSyncMutationError(
+              'invoice',
+              invoice.id,
+              err instanceof Error ? err.message : 'Erro ao sincronizar documento.',
+              invoice.number
+            );
+          }
+        }
+
+        if (autoPrint) {
+          await this.triggerPrint(invoice, this.previewFormat);
+        }
+      } finally {
+        this.isEmitting = false;
+        this.render();
       }
-    } finally {
-      this.isEmitting = false;
-      this.render();
-    }
+    });
   }
 
   private async syncAllWithCloud(manualTrigger = false): Promise<void> {
     if (!this.user || !this.isOnline || this.isSyncing) return;
-    this.isSyncing = true;
-    this.syncMessage = null;
-    this.render();
 
-    try {
-      // 1. Descobre empresas da conta autenticada na Cloud e sincroniza eventuais ativações de planos comerciais
-      const ownedCloudCompanies = await pullOwnedCompaniesFromCloud();
-      for (const cloudComp of ownedCloudCompanies) {
-        const localExisting = this.companies.find(
-          (c) => c.id === cloudComp.id || c.normalizedNif === cloudComp.normalizedNif
-        );
-        if (!localExisting) {
-          await localDb.saveCompany(cloudComp);
-        } else {
-          const mergedComp: CompanyRecord = {
-            ...localExisting,
-            status: cloudComp.status,
-            plan: cloudComp.plan,
-            allowManagerCancel: cloudComp.allowManagerCancel,
-            ownerUid: cloudComp.ownerUid,
-            ownerEmail: cloudComp.ownerEmail,
-            syncState: 'synced',
-            synced: true,
-          };
-          await localDb.saveCompany(mergedComp);
-          if (this.activeCompany.id === mergedComp.id) {
-            this.activeCompany = mergedComp;
-          }
-        }
-      }
+    await withTerminalExecutionLock(`sila_sync_${this.activeCompany.id || 'global'}`, async () => {
+      if (!this.user || !this.isOnline || this.isSyncing) return;
+      this.isSyncing = true;
+      this.syncMessage = null;
+      this.render();
 
-      if (!this.activeCompany.id || this.requiresCompanyOnboarding) {
-        if (ownedCloudCompanies.length > 0) {
-          const recovered = await loadCompanyWorkspace(
-            ownedCloudCompanies[0]!.id,
-            this.getViewerIdentity()
+      try {
+        // 1. Descobre empresas da conta autenticada na Cloud e sincroniza eventuais ativações de planos comerciais
+        const ownedCloudCompanies = await pullOwnedCompaniesFromCloud();
+        for (const cloudComp of ownedCloudCompanies) {
+          const localExisting = this.companies.find(
+            (c) => c.id === cloudComp.id || c.normalizedNif === cloudComp.normalizedNif
           );
-          this.applyWorkspaceBundle(recovered);
-        } else {
-          this.syncMessage =
-            'Nenhuma empresa registada na Cloud para esta conta. Cadastre a sua empresa para iniciar.';
-          return;
-        }
-      }
-
-      const isSupportInspection =
-        Boolean(this.supportCompanyId && this.supportCompanyId === this.activeCompany.id) &&
-        isPlatformAdminEmail(this.user.email) &&
-        this.activeCompany.ownerUid !== this.user.uid;
-
-      // 2. Regista/atualiza sempre todas as empresas locais próprias ou ainda não vinculadas no Firestore (incluindo plano Base Orgânico e Essencial)
-      const companiesToEnsure = new Map<string, CompanyRecord>();
-      for (const lc of this.companies) {
-        if (!lc.id) continue;
-        if (lc.id === JAIMONA_COMPANY_ID && !isJaimonaOwnerEmail(this.user.email)) continue;
-        if (lc.ownerUid && lc.ownerUid !== this.user.uid && !isPlatformAdminEmail(this.user.email)) {
-          continue;
-        }
-        companiesToEnsure.set(lc.id, lc);
-      }
-      if (
-        !isSupportInspection &&
-        this.activeCompany.id &&
-        !this.requiresCompanyOnboarding &&
-        (this.activeCompany.id !== JAIMONA_COMPANY_ID || isJaimonaOwnerEmail(this.user.email))
-      ) {
-        companiesToEnsure.set(this.activeCompany.id, this.activeCompany);
-      }
-
-      const companySyncErrors: string[] = [];
-      for (const localComp of companiesToEnsure.values()) {
-        try {
-          await ensureCompanyRegisteredCloud(localComp, !localComp.synced);
-          const canClaimCompanyOwnership =
-            localComp.id !== JAIMONA_COMPANY_ID || isJaimonaOwnerEmail(this.user.email);
-          if ((!localComp.synced || !localComp.ownerUid || localComp.syncError) && canClaimCompanyOwnership) {
-            const markedComp: CompanyRecord = {
-              ...localComp,
-              ownerUid: localComp.ownerUid || this.user.uid,
-              ownerEmail:
-                localComp.id === JAIMONA_COMPANY_ID
-                  ? JAIMONA_OWNER_EMAIL
-                  : localComp.ownerEmail || this.user.email || undefined,
+          if (!localExisting) {
+            await localDb.saveCompany(cloudComp);
+          } else {
+            const mergedComp: CompanyRecord = {
+              ...localExisting,
+              status: cloudComp.status,
+              plan: cloudComp.plan,
+              allowManagerCancel: cloudComp.allowManagerCancel,
+              ownerUid: cloudComp.ownerUid,
+              ownerEmail: cloudComp.ownerEmail,
               syncState: 'synced',
               synced: true,
-              syncError: undefined,
             };
-            await localDb.saveCompany(markedComp);
-            this.companies = this.companies.map((c) => (c.id === markedComp.id ? markedComp : c));
-            if (this.activeCompany.id === markedComp.id) {
-              this.activeCompany = markedComp;
+            await localDb.saveCompany(mergedComp);
+            if (this.activeCompany.id === mergedComp.id) {
+              this.activeCompany = mergedComp;
             }
           }
-        } catch (compErr) {
-          const errText =
-            compErr instanceof Error ? compErr.message : 'Erro ao registar empresa na Cloud.';
-          companySyncErrors.push(`${localComp.profile.shortName}: ${errText}`);
-          const erroredComp: CompanyRecord = {
-            ...localComp,
-            syncState: 'error',
-            synced: false,
-            syncError: errText,
-          };
-          await localDb.saveCompany(erroredComp).catch(() => null);
-          this.companies = this.companies.map((c) => (c.id === erroredComp.id ? erroredComp : c));
-          if (this.activeCompany.id === erroredComp.id) {
-            this.activeCompany = erroredComp;
+        }
+
+        if (!this.activeCompany.id || this.requiresCompanyOnboarding) {
+          if (ownedCloudCompanies.length > 0) {
+            const recovered = await loadCompanyWorkspace(
+              ownedCloudCompanies[0]!.id,
+              this.getViewerIdentity()
+            );
+            this.applyWorkspaceBundle(recovered);
+          } else {
+            this.syncMessage =
+              'Nenhuma empresa registada na Cloud para esta conta. Cadastre a sua empresa para iniciar.';
+            return;
           }
         }
-      }
-      if (companySyncErrors.length > 0) {
-        this.syncMessage = companySyncErrors[0]!;
-      }
 
-      // Empresas em plano Base Orgânico (FREE) ou Essencial (1.000 Kz) operam com base de dados 100% local (custo zero de subcoleções Cloud)
-      if (!isSupportInspection && !canCompanySyncCloudData(this.activeCompany)) {
-        const refreshedLocal = await loadCompanyWorkspace(
-          this.activeCompany.id,
-          this.getViewerIdentity()
+        const isSupportInspection =
+          Boolean(this.supportCompanyId && this.supportCompanyId === this.activeCompany.id) &&
+          isPlatformAdminEmail(this.user.email) &&
+          this.activeCompany.ownerUid !== this.user.uid;
+
+        // 2. Regista/atualiza sempre todas as empresas locais próprias ou ainda não vinculadas no Firestore
+        const companiesToEnsure = new Map<string, CompanyRecord>();
+        for (const lc of this.companies) {
+          if (!lc.id) continue;
+          if (lc.id === JAIMONA_COMPANY_ID && !isJaimonaOwnerEmail(this.user.email)) continue;
+          if (lc.ownerUid && lc.ownerUid !== this.user.uid && !isPlatformAdminEmail(this.user.email)) {
+            continue;
+          }
+          companiesToEnsure.set(lc.id, lc);
+        }
+        if (
+          !isSupportInspection &&
+          this.activeCompany.id &&
+          !this.requiresCompanyOnboarding &&
+          (this.activeCompany.id !== JAIMONA_COMPANY_ID || isJaimonaOwnerEmail(this.user.email))
+        ) {
+          companiesToEnsure.set(this.activeCompany.id, this.activeCompany);
+        }
+
+        const companySyncErrors: string[] = [];
+        for (const localComp of companiesToEnsure.values()) {
+          try {
+            await ensureCompanyRegisteredCloud(localComp, !localComp.synced);
+            const canClaimCompanyOwnership =
+              localComp.id !== JAIMONA_COMPANY_ID || isJaimonaOwnerEmail(this.user.email);
+            if (
+              (!localComp.synced || !localComp.ownerUid || localComp.syncError) &&
+              canClaimCompanyOwnership
+            ) {
+              const markedComp: CompanyRecord = {
+                ...localComp,
+                ownerUid: localComp.ownerUid || this.user.uid,
+                ownerEmail:
+                  localComp.id === JAIMONA_COMPANY_ID
+                    ? JAIMONA_OWNER_EMAIL
+                    : localComp.ownerEmail || this.user.email || undefined,
+                syncState: 'synced',
+                synced: true,
+                syncError: undefined,
+              };
+              await localDb.saveCompany(markedComp);
+              this.companies = this.companies.map((c) => (c.id === markedComp.id ? markedComp : c));
+              if (this.activeCompany.id === markedComp.id) {
+                this.activeCompany = markedComp;
+              }
+            }
+          } catch (compErr) {
+            const errText =
+              compErr instanceof Error ? compErr.message : 'Erro ao registar empresa na Cloud.';
+            companySyncErrors.push(`${localComp.profile.shortName}: ${errText}`);
+            const erroredComp: CompanyRecord = {
+              ...localComp,
+              syncState: 'error',
+              synced: false,
+              syncError: errText,
+            };
+            await localDb.saveCompany(erroredComp).catch(() => null);
+            this.companies = this.companies.map((c) => (c.id === erroredComp.id ? erroredComp : c));
+            if (this.activeCompany.id === erroredComp.id) {
+              this.activeCompany = erroredComp;
+            }
+          }
+        }
+        if (companySyncErrors.length > 0) {
+          this.syncMessage = companySyncErrors[0]!;
+        }
+
+        // Empresas em plano Base Orgânico (FREE) ou Essencial (1.000 Kz) operam 100% locais
+        if (!isSupportInspection && !canCompanySyncCloudData(this.activeCompany)) {
+          const refreshedLocal = await loadCompanyWorkspace(
+            this.activeCompany.id,
+            this.getViewerIdentity()
+          );
+          this.activeCompany = refreshedLocal.activeCompany;
+          this.companies = refreshedLocal.companies;
+          this.members = refreshedLocal.members;
+          this.roles = refreshedLocal.roles;
+          this.securityAuditLogs = refreshedLocal.securityAuditLogs;
+          this.lastSyncedIso = new Date().toISOString();
+          await this.refreshBackendHealth();
+
+          if (manualTrigger && companySyncErrors.length === 0) {
+            if (this.activeCompany.plan.planTier === 'ESSENCIAL') {
+              this.syncMessage =
+                'Licença Essencial verificada — faturação local ilimitada ativa neste dispositivo. Para backup automático na Cloud, conheça o Plano Cloud Profissional.';
+            } else {
+              this.growthModalNotice = null;
+              this.growthModalReason = 'cloud_protection';
+            }
+          }
+          return;
+        }
+
+        // 3. PULL BEFORE PUSH + Análise Pré-Envio de Conflitos e Reconciliação Aditiva de Stock
+        const targetCompId = this.activeCompany.id;
+        const cloudData = isSupportInspection
+          ? await fetchCompanyWorkspaceBackend(targetCompId)
+          : (await pullCompanyFromCloud(targetCompId)) ||
+            (await fetchCompanyWorkspaceBackend(targetCompId));
+
+        let blockedEntityKeys = new Set<string>();
+        let reconcileNotes: string[] = [];
+
+        if (!isSupportInspection) {
+          const nowIso = new Date().toISOString();
+          const [preSyncLocal, storedQueue, storedConflicts, storedBaselines] = await Promise.all([
+            loadCompanyWorkspace(targetCompId, this.getViewerIdentity()),
+            localDb.getSyncQueueByCompany(targetCompId),
+            localDb.getSyncConflicts(targetCompId),
+            localDb.getSyncBaselines(targetCompId),
+          ]);
+          this.syncQueueEntries = storedQueue.filter((q) => q.status !== 'synced');
+          this.syncBaselines = storedBaselines;
+
+          if (cloudData) {
+            const analysis = analyzePrePushSyncConflicts({
+              companyId: targetCompId,
+              localProducts: preSyncLocal.products,
+              cloudProducts: cloudData.products || [],
+              localCustomers: preSyncLocal.customers,
+              cloudCustomers: cloudData.customers || [],
+              localSuppliers: preSyncLocal.suppliers,
+              cloudSuppliers: cloudData.suppliers || [],
+              localInvoices: preSyncLocal.invoices,
+              cloudInvoices: cloudData.invoices || [],
+              localCashSessions: preSyncLocal.cashSessions,
+              cloudCashSessions: cloudData.cashSessions || [],
+              localStockMovements: preSyncLocal.stockMovements,
+              cloudStockMovements: cloudData.stockMovements || [],
+              localSettings: preSyncLocal.settings,
+              cloudSettings: cloudData.settings || null,
+              queueEntries: this.syncQueueEntries,
+              baselines: storedBaselines,
+              existingConflicts: storedConflicts,
+            });
+            blockedEntityKeys = analysis.blockedEntityKeys;
+            reconcileNotes = analysis.reconcileNotes;
+
+            for (const c of analysis.conflictsToSave) {
+              if (c.status === 'open') {
+                blockedEntityKeys.add(computeBaselineKey(c.entityType, c.entityId));
+              }
+            }
+
+            if (analysis.reconciledProducts.length > 0) {
+              const reconciledMap = new Map<string, Product>();
+              for (const rp of analysis.reconciledProducts) {
+                reconciledMap.set(rp.id, rp);
+                await localDb.saveProduct(rp, targetCompId);
+              }
+              preSyncLocal.products = preSyncLocal.products.map((p) => reconciledMap.get(p.id) || p);
+            }
+
+            // Marca visualmente entidades bloqueadas por conflito para nunca serem sobrescritas silenciosamente
+            for (const lp of preSyncLocal.products) {
+              if (blockedEntityKeys.has(computeBaselineKey('product', lp.id)) && lp.syncState !== 'conflict') {
+                await localDb.saveProduct({ ...lp, syncState: 'conflict', synced: false }, targetCompId);
+              }
+            }
+            for (const lc of preSyncLocal.customers) {
+              if (blockedEntityKeys.has(computeBaselineKey('customer', lc.id)) && lc.syncState !== 'conflict') {
+                await localDb.saveCustomer({ ...lc, syncState: 'conflict', synced: false }, targetCompId);
+              }
+            }
+            for (const ls of preSyncLocal.suppliers) {
+              if (blockedEntityKeys.has(computeBaselineKey('supplier', ls.id)) && ls.syncState !== 'conflict') {
+                await localDb.saveSupplier({ ...ls, syncState: 'conflict', synced: false }, targetCompId);
+              }
+            }
+            for (const li of preSyncLocal.invoices) {
+              if (blockedEntityKeys.has(computeBaselineKey('invoice', li.id)) && li.syncState !== 'conflict') {
+                await localDb.saveInvoice({ ...li, syncState: 'conflict', synced: false }, targetCompId);
+              }
+            }
+            for (const lcs of preSyncLocal.cashSessions) {
+              if (blockedEntityKeys.has(computeBaselineKey('cash_session', lcs.id)) && lcs.syncState !== 'conflict') {
+                await localDb.saveCashSession({ ...lcs, syncState: 'conflict', synced: false }, targetCompId);
+              }
+            }
+
+            this.syncConflicts = analysis.conflictsToSave;
+            await localDb.saveSyncConflicts(targetCompId, analysis.conflictsToSave).catch(() => null);
+          }
+
+          const isBlocked = (et: SyncQueueEntry['entityType'], id: string): boolean =>
+            blockedEntityKeys.has(computeBaselineKey(et, id));
+          const shouldSkipBackoff = (et: SyncQueueEntry['entityType'], id: string): boolean => {
+            if (manualTrigger) return false;
+            const entry = this.syncQueueEntries.find((q) => q.entityType === et && q.entityId === id);
+            return Boolean(entry?.nextRetryAfterIso && entry.nextRetryAfterIso > nowIso);
+          };
+
+          // 3A. Executa eliminações em fila (produtos, clientes, fornecedores) antes de pulls
+          const queuedDeletes = this.syncQueueEntries.filter((q) => q.operation === 'delete');
+          for (const q of queuedDeletes) {
+            if (isBlocked(q.entityType, q.entityId) || shouldSkipBackoff(q.entityType, q.entityId)) {
+              continue;
+            }
+            try {
+              if (q.entityType === 'product') {
+                await removeProductCloud(q.entityId, targetCompId, this.activeCompany);
+                await this.markSyncMutationSuccess('product', q.entityId);
+              } else if (q.entityType === 'customer') {
+                await removeCustomerCloud(q.entityId, targetCompId, this.activeCompany);
+                await this.markSyncMutationSuccess('customer', q.entityId);
+              } else if (q.entityType === 'supplier') {
+                await removeSupplierCloud(q.entityId, targetCompId);
+                await this.markSyncMutationSuccess('supplier', q.entityId);
+              }
+            } catch (delErr) {
+              await this.markSyncMutationError(
+                q.entityType,
+                q.entityId,
+                delErr instanceof Error ? delErr.message : 'Erro ao remover registo na Cloud',
+                q.entityLabel
+              );
+            }
+          }
+
+          // 3B. Envia alterações locais não bloqueadas por conflito
+          const unsyncedProducts = preSyncLocal.products.filter(
+            (p) => !p.synced && !isBlocked('product', p.id) && !shouldSkipBackoff('product', p.id)
+          );
+          for (const prod of unsyncedProducts) {
+            try {
+              await upsertProductCloud(prod, true, this.activeCompany);
+              await localDb.saveProduct(
+                { ...prod, syncState: 'synced', synced: true, syncError: undefined },
+                targetCompId
+              );
+              await this.markSyncMutationSuccess('product', prod.id);
+            } catch (itemErr) {
+              const msg = itemErr instanceof Error ? itemErr.message : 'Erro de sincronização';
+              await localDb.saveProduct(
+                { ...prod, syncState: 'error', synced: false, syncError: msg },
+                targetCompId
+              );
+              await this.markSyncMutationError('product', prod.id, msg, prod.name);
+            }
+          }
+
+          const unsyncedCustomers = preSyncLocal.customers.filter(
+            (c) => !c.synced && !isBlocked('customer', c.id) && !shouldSkipBackoff('customer', c.id)
+          );
+          for (const cust of unsyncedCustomers) {
+            try {
+              await upsertCustomerCloud(cust, this.activeCompany);
+              await localDb.saveCustomer(
+                { ...cust, syncState: 'synced', synced: true, syncError: undefined },
+                targetCompId
+              );
+              await this.markSyncMutationSuccess('customer', cust.id);
+            } catch (itemErr) {
+              const msg = itemErr instanceof Error ? itemErr.message : 'Erro de sincronização';
+              await localDb.saveCustomer(
+                { ...cust, syncState: 'error', synced: false, syncError: msg },
+                targetCompId
+              );
+              await this.markSyncMutationError('customer', cust.id, msg, cust.name);
+            }
+          }
+
+          const unsyncedInvoices = preSyncLocal.invoices.filter(
+            (i) => !i.synced && !isBlocked('invoice', i.id) && !shouldSkipBackoff('invoice', i.id)
+          );
+          for (const inv of unsyncedInvoices) {
+            try {
+              await createInvoiceCloud(inv, this.activeCompany);
+              if (inv.status === 'cancelled' && inv.cancelReason) {
+                await cancelInvoiceCloud(inv.id, inv.cancelReason, targetCompId, this.activeCompany);
+              }
+              await submitInvoiceAudit(inv, targetCompId).catch(() => null);
+              await localDb.saveInvoice(
+                { ...inv, syncState: 'synced', synced: true, syncError: undefined },
+                targetCompId
+              );
+              await this.markSyncMutationSuccess('invoice', inv.id);
+            } catch (itemErr) {
+              const msg = itemErr instanceof Error ? itemErr.message : 'Erro de sincronização';
+              await localDb.saveInvoice(
+                { ...inv, syncState: 'error', synced: false, syncError: msg },
+                targetCompId
+              );
+              await this.markSyncMutationError('invoice', inv.id, msg, inv.number);
+            }
+          }
+
+          const unsyncedCashSessions = preSyncLocal.cashSessions.filter(
+            (s) =>
+              !s.synced && !isBlocked('cash_session', s.id) && !shouldSkipBackoff('cash_session', s.id)
+          );
+          for (const sess of unsyncedCashSessions) {
+            try {
+              await upsertCashSessionCloud(sess, this.activeCompany);
+              await localDb.saveCashSession(
+                { ...sess, syncState: 'synced', synced: true, syncError: undefined },
+                targetCompId
+              );
+              await this.markSyncMutationSuccess('cash_session', sess.id);
+            } catch (itemErr) {
+              const msg = itemErr instanceof Error ? itemErr.message : 'Erro de sincronização';
+              await localDb.saveCashSession(
+                { ...sess, syncState: 'error', synced: false, syncError: msg },
+                targetCompId
+              );
+              await this.markSyncMutationError('cash_session', sess.id, msg, `Caixa ${sess.cashier}`);
+            }
+          }
+
+          const unsyncedCashMovements = preSyncLocal.cashMovements.filter(
+            (m) => !m.synced && !shouldSkipBackoff('cash_movement', m.id)
+          );
+          for (const mov of unsyncedCashMovements) {
+            try {
+              await createCashMovementCloud(mov, this.activeCompany);
+              await localDb.saveCashMovement(
+                { ...mov, syncState: 'synced', synced: true, syncError: undefined },
+                targetCompId
+              );
+              await this.markSyncMutationSuccess('cash_movement', mov.id);
+            } catch (itemErr) {
+              const msg = itemErr instanceof Error ? itemErr.message : 'Erro de sincronização';
+              await localDb.saveCashMovement(
+                { ...mov, syncState: 'error', synced: false, syncError: msg },
+                targetCompId
+              );
+              await this.markSyncMutationError('cash_movement', mov.id, msg, mov.reason);
+            }
+          }
+
+          const unsyncedStockMovements = preSyncLocal.stockMovements.filter(
+            (m) => !m.synced && !shouldSkipBackoff('stock_movement', m.id)
+          );
+          for (const smov of unsyncedStockMovements) {
+            try {
+              await createStockMovementCloud(smov, this.activeCompany);
+              await localDb.saveStockMovement(
+                { ...smov, syncState: 'synced', synced: true, syncError: undefined },
+                targetCompId
+              );
+              await this.markSyncMutationSuccess('stock_movement', smov.id);
+            } catch (itemErr) {
+              const msg = itemErr instanceof Error ? itemErr.message : 'Erro de sincronização';
+              await localDb.saveStockMovement(
+                { ...smov, syncState: 'error', synced: false, syncError: msg },
+                targetCompId
+              );
+              await this.markSyncMutationError('stock_movement', smov.id, msg, smov.productName);
+            }
+          }
+
+          const unsyncedSuppliers = preSyncLocal.suppliers.filter(
+            (s) => !s.synced && !isBlocked('supplier', s.id) && !shouldSkipBackoff('supplier', s.id)
+          );
+          for (const sup of unsyncedSuppliers) {
+            try {
+              await upsertSupplierCloud(sup, this.activeCompany);
+              await localDb.saveSupplier(
+                { ...sup, syncState: 'synced', synced: true, syncError: undefined },
+                targetCompId
+              );
+              await this.markSyncMutationSuccess('supplier', sup.id);
+            } catch (itemErr) {
+              const msg = itemErr instanceof Error ? itemErr.message : 'Erro de sincronização';
+              await localDb.saveSupplier(
+                { ...sup, syncState: 'error', synced: false, syncError: msg },
+                targetCompId
+              );
+              await this.markSyncMutationError('supplier', sup.id, msg, sup.name);
+            }
+          }
+
+          const unsyncedPurchases = preSyncLocal.purchases.filter(
+            (pr) => !pr.synced && !shouldSkipBackoff('purchase', pr.id)
+          );
+          for (const pur of unsyncedPurchases) {
+            try {
+              await upsertPurchaseCloud(pur, this.activeCompany);
+              await localDb.savePurchase(
+                { ...pur, syncState: 'synced', synced: true, syncError: undefined },
+                targetCompId
+              );
+              await this.markSyncMutationSuccess('purchase', pur.id);
+            } catch (itemErr) {
+              const msg = itemErr instanceof Error ? itemErr.message : 'Erro de sincronização';
+              await localDb.savePurchase(
+                { ...pur, syncState: 'error', synced: false, syncError: msg },
+                targetCompId
+              );
+              await this.markSyncMutationError(
+                'purchase',
+                pur.id,
+                msg,
+                pur.number || pur.supplierName
+              );
+            }
+          }
+
+          if (
+            !preSyncLocal.settings.synced &&
+            this.canManageCompanySettings() &&
+            !isBlocked('settings', 'general') &&
+            !shouldSkipBackoff('settings', 'general')
+          ) {
+            try {
+              await upsertSettingsCloud(preSyncLocal.settings, this.activeCompany);
+              const syncedSettings: AppSettings = {
+                ...preSyncLocal.settings,
+                syncState: 'synced',
+                synced: true,
+              };
+              await localDb.saveSettings(syncedSettings, targetCompId);
+              await this.markSyncMutationSuccess('settings', 'general');
+            } catch (setErr) {
+              await this.markSyncMutationError(
+                'settings',
+                'general',
+                setErr instanceof Error ? setErr.message : 'Erro ao sincronizar configurações',
+                preSyncLocal.settings.company.shortName
+              );
+            }
+          }
+
+          // Envia séries fiscais locais (evita dessincronização de numeração entre dispositivos)
+          const localSeriesList = listarSeries({ companyId: targetCompId });
+          for (const ser of localSeriesList) {
+            try {
+              await upsertFiscalSeriesCloud(ser, this.activeCompany);
+              await this.markSyncMutationSuccess('fiscal_series', ser.id);
+            } catch (serErr) {
+              await this.markSyncMutationError(
+                'fiscal_series',
+                ser.id,
+                serErr instanceof Error ? serErr.message : 'Erro ao sincronizar série fiscal',
+                ser.seriesCode
+              );
+            }
+          }
+
+          if (this.hasPerm('roles_manage')) {
+            for (const r of this.roles) {
+              await upsertCompanyRoleCloud(this.activeCompany, r).catch(() => null);
+            }
+          }
+          if (this.hasPerm('users_manage')) {
+            for (const m of this.members) {
+              await upsertCompanyMemberCloud(this.activeCompany, m).catch(() => null);
+            }
+          }
+          const unsyncedAudits = this.securityAuditLogs.filter((l) => !l.synced);
+          for (const aud of unsyncedAudits) {
+            try {
+              await appendSecurityAuditCloud(this.activeCompany, aud);
+              await localDb.appendSecurityAudit({ ...aud, synced: true });
+            } catch {
+              // Mantém pendente
+            }
+          }
+        }
+
+        // 4. Merge seguro dos dados Cloud para IndexedDB (preservando pendentes, conflitos e eliminações offline)
+        if (cloudData) {
+          const preMergeLocal = await loadCompanyWorkspace(targetCompId, this.getViewerIdentity());
+          const queuedProdDeletes = this.getQueuedDeleteIds('product');
+          const queuedCustDeletes = this.getQueuedDeleteIds('customer');
+          const queuedSupDeletes = this.getQueuedDeleteIds('supplier');
+
+          const pendingProdIds = new Set(
+            preMergeLocal.products
+              .filter(
+                (p) =>
+                  !p.synced ||
+                  p.syncState === 'conflict' ||
+                  blockedEntityKeys.has(computeBaselineKey('product', p.id))
+              )
+              .map((p) => p.id)
+          );
+          const pendingCustIds = new Set(
+            preMergeLocal.customers
+              .filter(
+                (c) =>
+                  !c.synced ||
+                  c.syncState === 'conflict' ||
+                  blockedEntityKeys.has(computeBaselineKey('customer', c.id))
+              )
+              .map((c) => c.id)
+          );
+          const pendingInvIds = new Set(
+            preMergeLocal.invoices
+              .filter(
+                (i) =>
+                  !i.synced ||
+                  i.syncState === 'conflict' ||
+                  blockedEntityKeys.has(computeBaselineKey('invoice', i.id))
+              )
+              .map((i) => i.id)
+          );
+          const pendingSessIds = new Set(
+            preMergeLocal.cashSessions
+              .filter(
+                (s) =>
+                  !s.synced ||
+                  s.syncState === 'conflict' ||
+                  blockedEntityKeys.has(computeBaselineKey('cash_session', s.id))
+              )
+              .map((s) => s.id)
+          );
+          const pendingMovIds = new Set(
+            preMergeLocal.cashMovements.filter((m) => !m.synced).map((m) => m.id)
+          );
+          const pendingStockMovIds = new Set(
+            preMergeLocal.stockMovements.filter((m) => !m.synced).map((m) => m.id)
+          );
+          const pendingSupIds = new Set(
+            preMergeLocal.suppliers
+              .filter(
+                (s) =>
+                  !s.synced ||
+                  s.syncState === 'conflict' ||
+                  blockedEntityKeys.has(computeBaselineKey('supplier', s.id))
+              )
+              .map((s) => s.id)
+          );
+          const pendingPurIds = new Set(
+            preMergeLocal.purchases.filter((p) => !p.synced).map((p) => p.id)
+          );
+
+          for (const cp of cloudData.products) {
+            if (!pendingProdIds.has(cp.id) && !queuedProdDeletes.has(cp.id)) {
+              await localDb.saveProduct(cp, targetCompId);
+            }
+          }
+          for (const cc of cloudData.customers) {
+            if (!pendingCustIds.has(cc.id) && !queuedCustDeletes.has(cc.id)) {
+              await localDb.saveCustomer(cc, targetCompId);
+            }
+          }
+          for (const ci of cloudData.invoices) {
+            // Faturas Cloud com ID distinto de fatura local colidente são preservadas em paralelo
+            if (!pendingInvIds.has(ci.id) && !blockedEntityKeys.has(computeBaselineKey('invoice', ci.id))) {
+              await localDb.saveInvoice(ci, targetCompId);
+            }
+          }
+          for (const cs of cloudData.cashSessions || []) {
+            if (!pendingSessIds.has(cs.id)) {
+              await localDb.saveCashSession(cs, targetCompId);
+            }
+          }
+          for (const cm of cloudData.cashMovements || []) {
+            if (!pendingMovIds.has(cm.id)) {
+              await localDb.saveCashMovement(cm, targetCompId);
+            }
+          }
+          for (const sm of cloudData.stockMovements || []) {
+            if (!pendingStockMovIds.has(sm.id)) {
+              await localDb.saveStockMovement(sm, targetCompId);
+            }
+          }
+          for (const csup of cloudData.suppliers || []) {
+            if (!pendingSupIds.has(csup.id) && !queuedSupDeletes.has(csup.id)) {
+              await localDb.saveSupplier(csup, targetCompId);
+            }
+          }
+          for (const cpur of cloudData.purchases || []) {
+            if (!pendingPurIds.has(cpur.id)) {
+              await localDb.savePurchase(cpur, targetCompId);
+            }
+          }
+          if (
+            cloudData.settings &&
+            preMergeLocal.settings.synced !== false &&
+            !blockedEntityKeys.has(computeBaselineKey('settings', 'general'))
+          ) {
+            await localDb.saveSettings(cloudData.settings, targetCompId).catch(() => null);
+          }
+          for (const cr of cloudData.roles || []) {
+            await localDb.saveRole({ ...cr, companyId: targetCompId }).catch(() => null);
+          }
+          for (const cm of cloudData.members || []) {
+            const existingLocal = preMergeLocal.members.find(
+              (m) => m.id === cm.id || (cm.uid && m.uid === cm.uid)
+            );
+            await localDb
+              .saveMember({
+                ...cm,
+                companyId: targetCompId,
+                pinHash: cm.pinHash || existingLocal?.pinHash,
+                pinFailedAttempts: existingLocal?.pinFailedAttempts ?? cm.pinFailedAttempts,
+                pinLockedUntilIso: existingLocal?.pinLockedUntilIso ?? cm.pinLockedUntilIso,
+              })
+              .catch(() => null);
+          }
+          if (
+            'fiscalSeries' in cloudData &&
+            Array.isArray(cloudData.fiscalSeries) &&
+            cloudData.fiscalSeries.length > 0
+          ) {
+            mergeSeriesFromCloud(targetCompId, cloudData.fiscalSeries);
+          }
+          if (
+            'auditLogs' in cloudData &&
+            Array.isArray(cloudData.auditLogs) &&
+            cloudData.auditLogs.length > 0
+          ) {
+            for (const al of cloudData.auditLogs) {
+              await localDb.appendSecurityAudit({ ...al, synced: true }).catch(() => null);
+            }
+          }
+        }
+
+        const refreshed = await loadCompanyWorkspace(targetCompId, this.getViewerIdentity());
+        this.products = refreshed.products;
+        this.customers = refreshed.customers;
+        this.invoices = refreshed.invoices;
+        this.cashSessions = refreshed.cashSessions;
+        this.cashMovements = refreshed.cashMovements;
+        this.stockMovements = refreshed.stockMovements;
+        this.suppliers = refreshed.suppliers;
+        this.purchases = refreshed.purchases;
+        this.settings = refreshed.settings;
+        this.activeCompany = refreshed.activeCompany;
+        this.companies = refreshed.companies;
+        this.requiresCompanyOnboarding = Boolean(
+          refreshed.requiresCompanyOnboarding || !refreshed.activeCompany.id
         );
-        this.activeCompany = refreshedLocal.activeCompany;
-        this.companies = refreshedLocal.companies;
-        this.members = refreshedLocal.members;
-        this.roles = refreshedLocal.roles;
-        this.securityAuditLogs = refreshedLocal.securityAuditLogs;
+        this.members = refreshed.members;
+        this.roles = refreshed.roles;
+        this.securityAuditLogs = refreshed.securityAuditLogs;
+
+        // 5. Atualiza contadores locais das séries com base em todas as faturas locais + Cloud
+        for (const ser of listarSeries({ companyId: targetCompId })) {
+          const maxInvSeq = getHighestSequenceForSeriesInInvoices(refreshed.invoices, {
+            companyId: targetCompId,
+            docType: ser.documentType,
+            seriesCode: ser.seriesCode,
+            environment: normalizeSeriesEnvironment(ser.environment),
+          });
+          if (maxInvSeq > ser.lastDocumentNumber) {
+            sincronizarSequenciaMaximaSerie(targetCompId, ser.id, maxInvSeq);
+          }
+        }
+
+        // 6. Deteta ramificações na cadeia SAF-T e actualiza snapshots de baseline para futuros merges
+        if (!isSupportInspection) {
+          const hashForks = detectHashChainForks(targetCompId, refreshed.invoices);
+          if (hashForks.length > 0) {
+            const existingMap = new Map(this.syncConflicts.map((c) => [c.id, c]));
+            let changed = false;
+            for (const fork of hashForks) {
+              const prevFork = existingMap.get(fork.id);
+              if (!prevFork) {
+                existingMap.set(fork.id, fork);
+                changed = true;
+              }
+            }
+            if (changed) {
+              this.syncConflicts = Array.from(existingMap.values());
+              await localDb.saveSyncConflicts(targetCompId, this.syncConflicts).catch(() => null);
+            }
+          }
+
+          const freshBaselines = buildSyncBaselinesFromRecords({
+            products: refreshed.products,
+            customers: refreshed.customers,
+            suppliers: refreshed.suppliers,
+            settings: refreshed.settings,
+          });
+          const mergedBaselines: SyncBaselineMap = { ...freshBaselines };
+          for (const [k, v] of Object.entries(this.syncBaselines)) {
+            if (!(k in mergedBaselines)) {
+              mergedBaselines[k] = v;
+            }
+          }
+          this.syncBaselines = mergedBaselines;
+          await localDb.saveSyncBaselines(targetCompId, mergedBaselines).catch(() => null);
+
+          const latestQueue = await localDb.getSyncQueueByCompany(targetCompId);
+          this.syncQueueEntries = latestQueue.filter((q) => q.status !== 'synced');
+        }
+
+        const openConflictCount = this.getOpenSyncConflicts().length;
+        if (openConflictCount > 0) {
+          this.syncMessage = `Existem ${openConflictCount} conflito(s) de sincronização que requerem revisão. Os documentos locais foram preservados sem perdas.`;
+        } else if (reconcileNotes.length > 0) {
+          this.syncMessage = reconcileNotes[0]!;
+        }
+
         this.lastSyncedIso = new Date().toISOString();
         await this.refreshBackendHealth();
-
-        if (manualTrigger && companySyncErrors.length === 0) {
-          if (this.activeCompany.plan.planTier === 'ESSENCIAL') {
-            this.syncMessage =
-              'Licença Essencial verificada — faturação local ilimitada ativa neste dispositivo. Para backup automático na Cloud, conheça o Plano Cloud Profissional.';
-          } else {
-            this.growthModalNotice = null;
-            this.growthModalReason = 'cloud_protection';
-          }
-        }
-        return;
+      } catch (err) {
+        this.syncMessage =
+          err instanceof Error ? err.message : 'Erro ao sincronizar com o Firestore.';
+      } finally {
+        this.isSyncing = false;
+        this.render();
       }
-
-      if (!isSupportInspection) {
-        // 3. Envia registos pendentes da empresa ativa (apenas planos Cloud Profissional / Enterprise / JAIMONA)
-        const unsyncedProducts = this.products.filter((p) => !p.synced);
-        for (const prod of unsyncedProducts) {
-          try {
-            await upsertProductCloud(prod, true, this.activeCompany);
-            await localDb.saveProduct(
-              { ...prod, syncState: 'synced', synced: true, syncError: undefined },
-              this.activeCompany.id
-            );
-          } catch (itemErr) {
-            await localDb.saveProduct(
-              {
-                ...prod,
-                syncState: 'error',
-                synced: false,
-                syncError: itemErr instanceof Error ? itemErr.message : 'Erro de sincronização',
-              },
-              this.activeCompany.id
-            );
-          }
-        }
-
-        const unsyncedCustomers = this.customers.filter((c) => !c.synced);
-        for (const cust of unsyncedCustomers) {
-          try {
-            await upsertCustomerCloud(cust, this.activeCompany);
-            await localDb.saveCustomer(
-              { ...cust, syncState: 'synced', synced: true, syncError: undefined },
-              this.activeCompany.id
-            );
-          } catch (itemErr) {
-            await localDb.saveCustomer(
-              {
-                ...cust,
-                syncState: 'error',
-                synced: false,
-                syncError: itemErr instanceof Error ? itemErr.message : 'Erro de sincronização',
-              },
-              this.activeCompany.id
-            );
-          }
-        }
-
-        const unsyncedInvoices = this.invoices.filter((i) => !i.synced);
-        for (const inv of unsyncedInvoices) {
-          try {
-            await createInvoiceCloud(inv, this.activeCompany);
-            if (inv.status === 'cancelled' && inv.cancelReason) {
-              await cancelInvoiceCloud(inv.id, inv.cancelReason, this.activeCompany.id, this.activeCompany);
-            }
-            await submitInvoiceAudit(inv, this.activeCompany.id).catch(() => null);
-            await localDb.saveInvoice(
-              { ...inv, syncState: 'synced', synced: true, syncError: undefined },
-              this.activeCompany.id
-            );
-          } catch (itemErr) {
-            await localDb.saveInvoice(
-              {
-                ...inv,
-                syncState: 'error',
-                synced: false,
-                syncError: itemErr instanceof Error ? itemErr.message : 'Erro de sincronização',
-              },
-              this.activeCompany.id
-            );
-          }
-        }
-
-        const unsyncedCashSessions = this.cashSessions.filter((s) => !s.synced);
-        for (const sess of unsyncedCashSessions) {
-          try {
-            await upsertCashSessionCloud(sess, this.activeCompany);
-            await localDb.saveCashSession(
-              { ...sess, syncState: 'synced', synced: true, syncError: undefined },
-              this.activeCompany.id
-            );
-          } catch (itemErr) {
-            await localDb.saveCashSession(
-              {
-                ...sess,
-                syncState: 'error',
-                synced: false,
-                syncError: itemErr instanceof Error ? itemErr.message : 'Erro de sincronização',
-              },
-              this.activeCompany.id
-            );
-          }
-        }
-
-        const unsyncedCashMovements = this.cashMovements.filter((m) => !m.synced);
-        for (const mov of unsyncedCashMovements) {
-          try {
-            await createCashMovementCloud(mov, this.activeCompany);
-            await localDb.saveCashMovement(
-              { ...mov, syncState: 'synced', synced: true, syncError: undefined },
-              this.activeCompany.id
-            );
-          } catch (itemErr) {
-            await localDb.saveCashMovement(
-              {
-                ...mov,
-                syncState: 'error',
-                synced: false,
-                syncError: itemErr instanceof Error ? itemErr.message : 'Erro de sincronização',
-              },
-              this.activeCompany.id
-            );
-          }
-        }
-
-        const unsyncedStockMovements = this.stockMovements.filter((m) => !m.synced);
-        for (const smov of unsyncedStockMovements) {
-          try {
-            await createStockMovementCloud(smov, this.activeCompany);
-            await localDb.saveStockMovement(
-              { ...smov, syncState: 'synced', synced: true, syncError: undefined },
-              this.activeCompany.id
-            );
-          } catch (itemErr) {
-            await localDb.saveStockMovement(
-              {
-                ...smov,
-                syncState: 'error',
-                synced: false,
-                syncError: itemErr instanceof Error ? itemErr.message : 'Erro de sincronização',
-              },
-              this.activeCompany.id
-            );
-          }
-        }
-
-        const unsyncedSuppliers = this.suppliers.filter((s) => !s.synced);
-        for (const sup of unsyncedSuppliers) {
-          try {
-            await upsertSupplierCloud(sup, this.activeCompany);
-            await localDb.saveSupplier(
-              { ...sup, syncState: 'synced', synced: true, syncError: undefined },
-              this.activeCompany.id
-            );
-          } catch (itemErr) {
-            await localDb.saveSupplier(
-              {
-                ...sup,
-                syncState: 'error',
-                synced: false,
-                syncError: itemErr instanceof Error ? itemErr.message : 'Erro de sincronização',
-              },
-              this.activeCompany.id
-            );
-          }
-        }
-
-        const unsyncedPurchases = this.purchases.filter((pr) => !pr.synced);
-        for (const pur of unsyncedPurchases) {
-          try {
-            await upsertPurchaseCloud(pur, this.activeCompany);
-            await localDb.savePurchase(
-              { ...pur, syncState: 'synced', synced: true, syncError: undefined },
-              this.activeCompany.id
-            );
-          } catch (itemErr) {
-            await localDb.savePurchase(
-              {
-                ...pur,
-                syncState: 'error',
-                synced: false,
-                syncError: itemErr instanceof Error ? itemErr.message : 'Erro de sincronização',
-              },
-              this.activeCompany.id
-            );
-          }
-        }
-
-        if (!this.settings.synced && this.canManageCompanySettings()) {
-          await upsertSettingsCloud(this.settings, this.activeCompany);
-          const syncedSettings: AppSettings = {
-            ...this.settings,
-            syncState: 'synced',
-            synced: true,
-          };
-          await localDb.saveSettings(syncedSettings, this.activeCompany.id);
-        }
-
-        if (this.hasPerm('roles_manage')) {
-          for (const r of this.roles) {
-            await upsertCompanyRoleCloud(this.activeCompany, r).catch(() => null);
-          }
-        }
-        if (this.hasPerm('users_manage')) {
-          for (const m of this.members) {
-            await upsertCompanyMemberCloud(this.activeCompany, m).catch(() => null);
-          }
-        }
-        const unsyncedAudits = this.securityAuditLogs.filter((l) => !l.synced);
-        for (const aud of unsyncedAudits) {
-          try {
-            await appendSecurityAuditCloud(this.activeCompany, aud);
-            await localDb.appendSecurityAudit({ ...aud, synced: true });
-          } catch {
-            // Mantém pendente
-          }
-        }
-      }
-
-      // 4. Descarrega dados atualizados da empresa ativa (Admin SDK em modo suporte/membro ou Firestore direto para proprietário)
-      const cloudData = isSupportInspection
-        ? await fetchCompanyWorkspaceBackend(this.activeCompany.id)
-        : (await pullCompanyFromCloud(this.activeCompany.id)) ||
-          (await fetchCompanyWorkspaceBackend(this.activeCompany.id));
-      if (cloudData) {
-        // Proteção estrita: nunca sobrescrever registos locais ainda pendentes de sincronização
-        const preMergeLocal = await loadCompanyWorkspace(
-          this.activeCompany.id,
-          this.getViewerIdentity()
-        );
-        const pendingProdIds = new Set(
-          preMergeLocal.products.filter((p) => !p.synced).map((p) => p.id)
-        );
-        const pendingCustIds = new Set(
-          preMergeLocal.customers.filter((c) => !c.synced).map((c) => c.id)
-        );
-        const pendingInvIds = new Set(
-          preMergeLocal.invoices.filter((i) => !i.synced).map((i) => i.id)
-        );
-        const pendingSessIds = new Set(
-          preMergeLocal.cashSessions.filter((s) => !s.synced).map((s) => s.id)
-        );
-        const pendingMovIds = new Set(
-          preMergeLocal.cashMovements.filter((m) => !m.synced).map((m) => m.id)
-        );
-        const pendingStockMovIds = new Set(
-          preMergeLocal.stockMovements.filter((m) => !m.synced).map((m) => m.id)
-        );
-        const pendingSupIds = new Set(
-          preMergeLocal.suppliers.filter((s) => !s.synced).map((s) => s.id)
-        );
-        const pendingPurIds = new Set(
-          preMergeLocal.purchases.filter((p) => !p.synced).map((p) => p.id)
-        );
-
-        for (const cp of cloudData.products) {
-          if (!pendingProdIds.has(cp.id)) {
-            await localDb.saveProduct(cp, this.activeCompany.id);
-          }
-        }
-        for (const cc of cloudData.customers) {
-          if (!pendingCustIds.has(cc.id)) {
-            await localDb.saveCustomer(cc, this.activeCompany.id);
-          }
-        }
-        for (const ci of cloudData.invoices) {
-          if (!pendingInvIds.has(ci.id)) {
-            await localDb.saveInvoice(ci, this.activeCompany.id);
-          }
-        }
-        for (const cs of cloudData.cashSessions || []) {
-          if (!pendingSessIds.has(cs.id)) {
-            await localDb.saveCashSession(cs, this.activeCompany.id);
-          }
-        }
-        for (const cm of cloudData.cashMovements || []) {
-          if (!pendingMovIds.has(cm.id)) {
-            await localDb.saveCashMovement(cm, this.activeCompany.id);
-          }
-        }
-        for (const sm of cloudData.stockMovements || []) {
-          if (!pendingStockMovIds.has(sm.id)) {
-            await localDb.saveStockMovement(sm, this.activeCompany.id);
-          }
-        }
-        for (const csup of cloudData.suppliers || []) {
-          if (!pendingSupIds.has(csup.id)) {
-            await localDb.saveSupplier(csup, this.activeCompany.id);
-          }
-        }
-        for (const cpur of cloudData.purchases || []) {
-          if (!pendingPurIds.has(cpur.id)) {
-            await localDb.savePurchase(cpur, this.activeCompany.id);
-          }
-        }
-        if (cloudData.settings && preMergeLocal.settings.synced !== false) {
-          await localDb.saveSettings(cloudData.settings, this.activeCompany.id).catch(() => null);
-        }
-        for (const cr of cloudData.roles || []) {
-          await localDb.saveRole({ ...cr, companyId: this.activeCompany.id }).catch(() => null);
-        }
-        for (const cm of cloudData.members || []) {
-          const existingLocal = preMergeLocal.members.find(
-            (m) => m.id === cm.id || (cm.uid && m.uid === cm.uid)
-          );
-          await localDb
-            .saveMember({
-              ...cm,
-              companyId: this.activeCompany.id,
-              pinHash: cm.pinHash || existingLocal?.pinHash,
-              pinFailedAttempts: existingLocal?.pinFailedAttempts ?? cm.pinFailedAttempts,
-              pinLockedUntilIso: existingLocal?.pinLockedUntilIso ?? cm.pinLockedUntilIso,
-            })
-            .catch(() => null);
-        }
-        if ('fiscalSeries' in cloudData && Array.isArray(cloudData.fiscalSeries) && cloudData.fiscalSeries.length > 0) {
-          mergeSeriesFromCloud(this.activeCompany.id, cloudData.fiscalSeries);
-        }
-        if ('auditLogs' in cloudData && Array.isArray(cloudData.auditLogs) && cloudData.auditLogs.length > 0) {
-          for (const al of cloudData.auditLogs) {
-            await localDb.appendSecurityAudit({ ...al, synced: true }).catch(() => null);
-          }
-        }
-      }
-
-      const refreshed = await loadCompanyWorkspace(
-        this.activeCompany.id,
-        this.getViewerIdentity()
-      );
-      this.products = refreshed.products;
-      this.customers = refreshed.customers;
-      this.invoices = refreshed.invoices;
-      this.cashSessions = refreshed.cashSessions;
-      this.cashMovements = refreshed.cashMovements;
-      this.stockMovements = refreshed.stockMovements;
-      this.suppliers = refreshed.suppliers;
-      this.purchases = refreshed.purchases;
-      this.settings = refreshed.settings;
-      this.activeCompany = refreshed.activeCompany;
-      this.companies = refreshed.companies;
-      this.requiresCompanyOnboarding = Boolean(
-        refreshed.requiresCompanyOnboarding || !refreshed.activeCompany.id
-      );
-      this.members = refreshed.members;
-      this.roles = refreshed.roles;
-      this.securityAuditLogs = refreshed.securityAuditLogs;
-
-      this.lastSyncedIso = new Date().toISOString();
-      await this.refreshBackendHealth();
-    } catch (err) {
-      this.syncMessage =
-        err instanceof Error ? err.message : 'Erro ao sincronizar com o Firestore.';
-    } finally {
-      this.isSyncing = false;
-      this.render();
-    }
+    });
   }
 
   private exportLocalJsonBackup(): void {
@@ -14823,6 +15906,10 @@ export class SilaBillingApp {
 
     const isUnassigned = this.requiresCompanyOnboarding || !this.activeCompany.id;
     const cloudSyncEntitled = !isUnassigned && canCompanySyncCloudData(this.activeCompany);
+    const queuedDeleteCount = !cloudSyncEntitled
+      ? 0
+      : this.syncQueueEntries.filter((q) => q.operation === 'delete').length;
+    const openConflictsCount = !cloudSyncEntitled ? 0 : this.getOpenSyncConflicts().length;
     const pendingCount = !cloudSyncEntitled
       ? 0
       : this.products.filter((p) => !p.synced).length +
@@ -14833,7 +15920,9 @@ export class SilaBillingApp {
         this.stockMovements.filter((m) => !m.synced).length +
         this.suppliers.filter((s) => !s.synced).length +
         this.purchases.filter((pr) => !pr.synced).length +
-        (this.settings.synced ? 0 : 1);
+        (this.settings.synced ? 0 : 1) +
+        queuedDeleteCount +
+        openConflictsCount;
 
     const canInstall = !this.isInstalled && (Boolean(this.deferredPrompt) || this.isIOS);
     const effectiveRole = this.getEffectiveRole();
@@ -20057,302 +21146,340 @@ export class SilaBillingApp {
       return;
     }
 
-    const ncTotals = calculateInvoiceTotals(draftItems, originInv.globalDiscountPct || 0);
-    const activeEnv =
-      originInv.seriesEnvironment ||
-      this.activeCompany.profile.agtEnvironment ||
-      this.settings.agtEnvironment ||
-      'SIMULACAO';
-    const activeEst = resolveActiveEstablishment(
-      this.settings.company,
-      originInv.establishmentId || this.settings.defaultEstablishmentId
-    );
-    let nextNumber = generateNextInvoiceNumber(
-      this.invoices.map((i) => i.number),
-      'NC',
-      this.activeCompany.baseSequence
-    );
-    let reservedNcSeries: ProximoNumeroFiscalResult | null = null;
-    try {
-      reservedNcSeries = reservarProximoNumeroFiscal(
-        this.activeCompany.id,
-        'NC',
-        undefined,
-        undefined,
-        { environment: activeEnv, establishmentId: activeEst.id }
+    await withTerminalExecutionLock(`sila_emit_${this.activeCompany.id}`, async () => {
+      const ncTotals = calculateInvoiceTotals(draftItems, originInv.globalDiscountPct || 0);
+      const activeEnv =
+        originInv.seriesEnvironment ||
+        this.activeCompany.profile.agtEnvironment ||
+        this.settings.agtEnvironment ||
+        'SIMULACAO';
+      const activeEst = resolveActiveEstablishment(
+        this.settings.company,
+        originInv.establishmentId || this.settings.defaultEstablishmentId
       );
-      nextNumber = reservedNcSeries.documentNo;
-    } catch {
-      // Mantém fallback sequencial caso série específica NC não tenha sido inicializada
-    }
-
-    const openSess = this.getActiveOpenCashSession();
-    const now = new Date().toISOString();
-    const originDue = Math.max(0, roundKz(originInv.amountDue || 0));
-    const abatedFromDebt = Math.min(originDue, ncTotals.grandTotal);
-    const remainderAfterDebt = Math.max(0, roundKz(ncTotals.grandTotal - abatedFromDebt));
-    const isImmediateRefund =
-      this.creditNoteRefundMode === 'REFUND_NOW' && remainderAfterDebt > 0;
-    const refundedNow = isImmediateRefund ? remainderAfterDebt : 0;
-    const refText = String(fd.get('creditNoteRefundRef') ?? this.creditNoteRefundRef ?? '')
-      .trim()
-      .slice(0, 80);
-
-    const ncPaymentMethod: PaymentMethod = isImmediateRefund
-      ? this.creditNoteRefundMethod
-      : 'Crédito';
-
-    const summaryParts: string[] = [];
-    if (abatedFromDebt > 0) {
-      summaryParts.push(`Abatido à dívida ${originInv.number}: ${formatKzNumber(abatedFromDebt)} Kz`);
-    }
-    if (refundedNow > 0) {
-      summaryParts.push(`Reembolso ${this.creditNoteRefundMethod}: ${formatKzNumber(refundedNow)} Kz`);
-    } else if (remainderAfterDebt > 0) {
-      summaryParts.push(`Crédito cliente: ${formatKzNumber(remainderAfterDebt)} Kz`);
-    }
-
-    const ncSnapshot = buildInvoiceIssuerSnapshot(this.settings.company, {
-      companyId: this.activeCompany.id,
-      establishment: activeEst,
-      capturedAtIso: now,
-    });
-    const ncSeriesCode = reservedNcSeries?.seriesCode;
-    const prevNcSeriesInv = this.invoices.find(
-      (i) =>
-        i.companyId === this.activeCompany.id &&
-        (!ncSeriesCode || i.seriesCode === ncSeriesCode) &&
-        (i.seriesEnvironment || 'SIMULACAO') === activeEnv
-    );
-    const ncPreviousHash = prevNcSeriesInv
-      ? prevNcSeriesInv.saftHashFull ||
-        generateChainedDocumentHash(prevNcSeriesInv, prevNcSeriesInv.previousInvoiceHash || '')
-      : '';
-    const ncHashResult = computeDocumentSaftHash4(
-      {
-        issuedAtIso: now,
-        number: nextNumber,
-        grandTotal: ncTotals.grandTotal,
-      },
-      ncPreviousHash
-    );
-    const ncAtcud =
-      reservedNcSeries?.environment === 'PRODUCAO' && reservedNcSeries.agtAuthorizationCode
-        ? `${reservedNcSeries.agtAuthorizationCode.trim()}-${reservedNcSeries.sequenceNumber}`
-        : undefined;
-    const originCustObj =
-      originInv.customerId && originInv.customerId !== getDirectCustomerIdForCompany(this.activeCompany.id)
-        ? this.customers.find((c) => c.id === originInv.customerId)
-        : undefined;
-    const ncCustomerType =
-      originInv.customerType ||
-      (originCustObj
-        ? inferCustomerType(originCustObj, getDirectCustomerIdForCompany(this.activeCompany.id))
-        : inferCustomerType({
-            id: originInv.customerId,
-            name: originInv.customerName,
-            nif: originInv.customerNif,
-          }));
-    const ncCustomerCountry = originInv.customerCountryCode || originCustObj?.countryCode || 'AO';
-    const ncCustomerAddr = originInv.customerAddress || originCustObj?.address;
-    const ncCustomerPhone = originInv.customerPhone || originCustObj?.phone;
-    const ncCustomerEmail = originInv.customerEmail || originCustObj?.email;
-
-    const ncInvoice: InvoiceRecord = {
-      id: `inv_nc_${Date.now()}_${Math.random().toString(36).slice(2, 6)}`,
-      companyId: this.activeCompany.id,
-      number: nextNumber,
-      docType: 'NC',
-      issuedAtIso: now,
-      cashier: openSess?.cashier || this.cashier || '01',
-      operator: openSess?.operator || this.operator || '001',
-      ...(openSess ? { sessionId: openSess.id } : {}),
-      paymentMethod: ncPaymentMethod,
-      customerId: originInv.customerId,
-      customerName: originInv.customerName,
-      customerNif: originInv.customerNif,
-      customerType: ncCustomerType,
-      customerCountryCode: ncCustomerCountry,
-      customerLocality: originInv.customerLocality,
-      ...(ncCustomerAddr ? { customerAddress: ncCustomerAddr } : {}),
-      ...(ncCustomerPhone ? { customerPhone: ncCustomerPhone } : {}),
-      ...(ncCustomerEmail ? { customerEmail: ncCustomerEmail } : {}),
-      merchandiseTotal: ncTotals.merchandiseTotal,
-      discountTotal: ncTotals.discountTotal,
-      ...(ncTotals.globalDiscountPct > 0
-        ? {
-            globalDiscountPct: ncTotals.globalDiscountPct,
-            globalDiscountAmount: ncTotals.globalDiscountAmount,
+      let nextNumber = generateNextInvoiceNumber(
+        this.invoices.map((i) => i.number),
+        'NC',
+        this.activeCompany.baseSequence
+      );
+      let reservedNcSeries: ProximoNumeroFiscalResult | null = null;
+      try {
+        const activeNcSer = obterSerieAtiva(this.activeCompany.id, 'NC', undefined, {
+          environment: activeEnv,
+          establishmentId: activeEst.id,
+        });
+        const minNcDoc = activeNcSer
+          ? getHighestSequenceForSeriesInInvoices(this.invoices, {
+              companyId: this.activeCompany.id,
+              docType: 'NC',
+              seriesCode: activeNcSer.seriesCode,
+              environment: activeEnv,
+            })
+          : 0;
+        reservedNcSeries = reservarProximoNumeroFiscal(
+          this.activeCompany.id,
+          'NC',
+          undefined,
+          undefined,
+          {
+            environment: activeEnv,
+            establishmentId: activeEst.id,
+            minLastDocumentNumber: minNcDoc,
           }
-        : {}),
-      taxBase14: ncTotals.taxBase14,
-      taxAmount14: ncTotals.taxAmount14,
-      ...(typeof ncTotals.taxBaseIntermediate === 'number'
-        ? { taxBaseIntermediate: ncTotals.taxBaseIntermediate }
-        : {}),
-      ...(typeof ncTotals.taxAmountIntermediate === 'number'
-        ? { taxAmountIntermediate: ncTotals.taxAmountIntermediate }
-        : {}),
-      ...(typeof ncTotals.taxBaseReduced === 'number'
-        ? { taxBaseReduced: ncTotals.taxBaseReduced }
-        : {}),
-      ...(typeof ncTotals.taxAmountReduced === 'number'
-        ? { taxAmountReduced: ncTotals.taxAmountReduced }
-        : {}),
-      taxBase0: ncTotals.taxBase0,
-      taxAmount0: 0,
-      taxTotal: ncTotals.taxTotal,
-      grandTotal: ncTotals.grandTotal,
-      amountInWords: ncTotals.amountInWords,
-      issuerSnapshot: ncSnapshot,
-      establishmentId: reservedNcSeries?.establishmentId || activeEst.id,
-      establishmentCode: reservedNcSeries?.establishmentCode || activeEst.code,
-      establishmentName: activeEst.name,
-      ...(reservedNcSeries
-        ? {
-            seriesCode: reservedNcSeries.seriesCode,
-            seriesEnvironment: reservedNcSeries.environment,
-            ...(reservedNcSeries.agtAuthorizationCode
-              ? { agtAuthorizationCode: reservedNcSeries.agtAuthorizationCode }
-              : {}),
-            ...(ncAtcud ? { atcud: ncAtcud } : {}),
-          }
-        : { seriesEnvironment: activeEnv }),
-      saftHash4: ncHashResult.hash4,
-      saftHashFull: ncHashResult.fullHash,
-      ...(ncPreviousHash ? { previousInvoiceHash: ncPreviousHash } : {}),
-      amountReceived: refundedNow,
-      changeAmount: 0,
-      ...(refText ? { transferReference: refText } : {}),
-      ...(summaryParts.length > 0 ? { paymentSummary: summaryParts.join(' · ').slice(0, 160) } : {}),
-      returnOriginInvoiceId: originInv.id,
-      returnOriginNumber: originInv.number,
-      notes: reason.slice(0, 300),
-      status: 'issued',
-      lines: ncTotals.lines,
-      syncState: 'pending',
-      synced: false,
-      createdAtIso: now,
-      updatedAtIso: now,
-    };
+        );
+        nextNumber = reservedNcSeries.documentNo;
+      } catch {
+        // Mantém fallback sequencial caso série específica NC não tenha sido inicializada
+      }
 
-    await localDb.saveInvoice(ncInvoice, this.activeCompany.id);
-    this.invoices = [ncInvoice, ...this.invoices];
+      const openSess = this.getActiveOpenCashSession();
+      const now = new Date().toISOString();
+      const originDue = Math.max(0, roundKz(originInv.amountDue || 0));
+      const abatedFromDebt = Math.min(originDue, ncTotals.grandTotal);
+      const remainderAfterDebt = Math.max(0, roundKz(ncTotals.grandTotal - abatedFromDebt));
+      const isImmediateRefund =
+        this.creditNoteRefundMode === 'REFUND_NOW' && remainderAfterDebt > 0;
+      const refundedNow = isImmediateRefund ? remainderAfterDebt : 0;
+      const refText = String(fd.get('creditNoteRefundRef') ?? this.creditNoteRefundRef ?? '')
+        .trim()
+        .slice(0, 80);
 
-    // Se a fatura original tinha saldo em dívida, abate automaticamente até ao limite da NC
-    let updatedOrigin: InvoiceRecord | null = null;
-    if (abatedFromDebt > 0) {
-      const nextOriginDue = Math.max(0, roundKz(originDue - abatedFromDebt));
-      const dtShort = formatDateTimePt(now).slashDate.slice(0, 5);
-      const prevSum =
-        originInv.paymentSummary ||
-        `${originInv.paymentMethod}: ${formatKzNumber(originInv.amountReceived)} Kz`;
-      updatedOrigin = {
-        ...originInv,
-        initialAmountReceived:
-          typeof originInv.initialAmountReceived === 'number'
-            ? originInv.initialAmountReceived
-            : originInv.amountReceived,
-        initialChangeAmount:
-          typeof originInv.initialChangeAmount === 'number'
-            ? originInv.initialChangeAmount
-            : originInv.changeAmount,
-        amountDue: nextOriginDue,
-        paymentSummary: `${prevSum} + NC ${dtShort} (${nextNumber}): ${formatKzNumber(abatedFromDebt)} Kz`.slice(
-          0,
-          160
-        ),
-        syncState: 'pending',
-        synced: false,
-        updatedAtIso: now,
-      };
-      await localDb.saveInvoice(updatedOrigin, this.activeCompany.id);
-      this.invoices = this.invoices.map((x) => (x.id === updatedOrigin!.id ? updatedOrigin! : x));
-    }
+      const ncPaymentMethod: PaymentMethod = isImmediateRefund
+        ? this.creditNoteRefundMethod
+        : 'Crédito';
 
-    // Reposição automática de stock quando assinalada
-    if (this.creditNoteRestoreStock) {
-      await this.adjustCatalogStockForInvoiceLines(ncTotals.lines, 'RESTORE', {
-        type: 'DEVOLUCAO_CLIENTE',
-        reason: `Devolução por Nota de Crédito ${ncInvoice.number} (ref. ${originInv.number}): ${reason}`,
-        invoiceId: ncInvoice.id,
-        invoiceNumber: ncInvoice.number,
-        operator: this.getCurrentStockOperatorLabel(),
-      });
-    }
+      const summaryParts: string[] = [];
+      if (abatedFromDebt > 0) {
+        summaryParts.push(`Abatido à dívida ${originInv.number}: ${formatKzNumber(abatedFromDebt)} Kz`);
+      }
+      if (refundedNow > 0) {
+        summaryParts.push(`Reembolso ${this.creditNoteRefundMethod}: ${formatKzNumber(refundedNow)} Kz`);
+      } else if (remainderAfterDebt > 0) {
+        summaryParts.push(`Crédito cliente: ${formatKzNumber(remainderAfterDebt)} Kz`);
+      }
 
-    // Registo de saída financeira se houve reembolso imediato
-    if (refundedNow > 0) {
-      const useCashDrawer =
-        openSess &&
-        (this.creditNoteRefundMethod !== 'Dinheiro' || this.creditNoteAffectCashDrawer);
-      const refundMov: CashMovement = {
-        id: `cm_nc_${Date.now()}_${Math.random().toString(36).slice(2, 6)}`,
+      const ncSnapshot = buildInvoiceIssuerSnapshot(this.settings.company, {
         companyId: this.activeCompany.id,
-        sessionId: useCashDrawer && openSess ? openSess.id : 'sem_turno',
+        establishment: activeEst,
+        capturedAtIso: now,
+      });
+      const ncSeriesCode = reservedNcSeries?.seriesCode;
+      const prevNcSeriesInv = this.invoices.find(
+        (i) =>
+          i.companyId === this.activeCompany.id &&
+          (!ncSeriesCode || i.seriesCode === ncSeriesCode) &&
+          (i.seriesEnvironment || 'SIMULACAO') === activeEnv
+      );
+      const ncPreviousHash = prevNcSeriesInv
+        ? prevNcSeriesInv.saftHashFull ||
+          generateChainedDocumentHash(prevNcSeriesInv, prevNcSeriesInv.previousInvoiceHash || '')
+        : '';
+      const ncHashResult = computeDocumentSaftHash4(
+        {
+          issuedAtIso: now,
+          number: nextNumber,
+          grandTotal: ncTotals.grandTotal,
+        },
+        ncPreviousHash
+      );
+      const ncAtcud =
+        reservedNcSeries?.environment === 'PRODUCAO' && reservedNcSeries.agtAuthorizationCode
+          ? `${reservedNcSeries.agtAuthorizationCode.trim()}-${reservedNcSeries.sequenceNumber}`
+          : undefined;
+      const originCustObj =
+        originInv.customerId && originInv.customerId !== getDirectCustomerIdForCompany(this.activeCompany.id)
+          ? this.customers.find((c) => c.id === originInv.customerId)
+          : undefined;
+      const ncCustomerType =
+        originInv.customerType ||
+        (originCustObj
+          ? inferCustomerType(originCustObj, getDirectCustomerIdForCompany(this.activeCompany.id))
+          : inferCustomerType({
+              id: originInv.customerId,
+              name: originInv.customerName,
+              nif: originInv.customerNif,
+            }));
+      const ncCustomerCountry = originInv.customerCountryCode || originCustObj?.countryCode || 'AO';
+      const ncCustomerAddr = originInv.customerAddress || originCustObj?.address;
+      const ncCustomerPhone = originInv.customerPhone || originCustObj?.phone;
+      const ncCustomerEmail = originInv.customerEmail || originCustObj?.email;
+
+      const ncInvoice: InvoiceRecord = {
+        id: generateUniqueEntityId('inv_nc', this.terminalDeviceId),
+        companyId: this.activeCompany.id,
+        terminalDeviceId: this.terminalDeviceId,
+        number: nextNumber,
+        docType: 'NC',
+        issuedAtIso: now,
         cashier: openSess?.cashier || this.cashier || '01',
         operator: openSess?.operator || this.operator || '001',
-        createdByUid: this.user?.uid,
-        type: 'SAIDA',
-        entryKind: 'MOVIMENTO_CAIXA',
-        category: 'Reembolsos e Devoluções de Clientes',
-        amount: refundedNow,
-        paymentMethod: this.creditNoteRefundMethod,
-        reason: `Reembolso Nota de Crédito ${ncInvoice.number} (ref. ${originInv.number})`.slice(
-          0,
-          240
-        ),
-        ...(refText ? { reference: refText } : {}),
-        invoiceId: ncInvoice.id,
-        invoiceNumber: ncInvoice.number,
-        customerName: originInv.customerName.slice(0, 160),
+        ...(openSess ? { sessionId: openSess.id } : {}),
+        paymentMethod: ncPaymentMethod,
+        customerId: originInv.customerId,
+        customerName: originInv.customerName,
+        customerNif: originInv.customerNif,
+        customerType: ncCustomerType,
+        customerCountryCode: ncCustomerCountry,
+        customerLocality: originInv.customerLocality,
+        ...(ncCustomerAddr ? { customerAddress: ncCustomerAddr } : {}),
+        ...(ncCustomerPhone ? { customerPhone: ncCustomerPhone } : {}),
+        ...(ncCustomerEmail ? { customerEmail: ncCustomerEmail } : {}),
+        merchandiseTotal: ncTotals.merchandiseTotal,
+        discountTotal: ncTotals.discountTotal,
+        ...(ncTotals.globalDiscountPct > 0
+          ? {
+              globalDiscountPct: ncTotals.globalDiscountPct,
+              globalDiscountAmount: ncTotals.globalDiscountAmount,
+            }
+          : {}),
+        taxBase14: ncTotals.taxBase14,
+        taxAmount14: ncTotals.taxAmount14,
+        ...(typeof ncTotals.taxBaseIntermediate === 'number'
+          ? { taxBaseIntermediate: ncTotals.taxBaseIntermediate }
+          : {}),
+        ...(typeof ncTotals.taxAmountIntermediate === 'number'
+          ? { taxAmountIntermediate: ncTotals.taxAmountIntermediate }
+          : {}),
+        ...(typeof ncTotals.taxBaseReduced === 'number'
+          ? { taxBaseReduced: ncTotals.taxBaseReduced }
+          : {}),
+        ...(typeof ncTotals.taxAmountReduced === 'number'
+          ? { taxAmountReduced: ncTotals.taxAmountReduced }
+          : {}),
+        taxBase0: ncTotals.taxBase0,
+        taxAmount0: 0,
+        taxTotal: ncTotals.taxTotal,
+        grandTotal: ncTotals.grandTotal,
+        amountInWords: ncTotals.amountInWords,
+        issuerSnapshot: ncSnapshot,
+        establishmentId: reservedNcSeries?.establishmentId || activeEst.id,
+        establishmentCode: reservedNcSeries?.establishmentCode || activeEst.code,
+        establishmentName: activeEst.name,
+        ...(reservedNcSeries
+          ? {
+              seriesCode: reservedNcSeries.seriesCode,
+              seriesEnvironment: reservedNcSeries.environment,
+              ...(reservedNcSeries.agtAuthorizationCode
+                ? { agtAuthorizationCode: reservedNcSeries.agtAuthorizationCode }
+                : {}),
+              ...(ncAtcud ? { atcud: ncAtcud } : {}),
+            }
+          : { seriesEnvironment: activeEnv }),
+        saftHash4: ncHashResult.hash4,
+        saftHashFull: ncHashResult.fullHash,
+        ...(ncPreviousHash ? { previousInvoiceHash: ncPreviousHash } : {}),
+        amountReceived: refundedNow,
+        changeAmount: 0,
+        ...(refText ? { transferReference: refText } : {}),
+        ...(summaryParts.length > 0 ? { paymentSummary: summaryParts.join(' · ').slice(0, 160) } : {}),
+        returnOriginInvoiceId: originInv.id,
+        returnOriginNumber: originInv.number,
+        notes: reason.slice(0, 300),
+        status: 'issued',
+        lines: ncTotals.lines,
         syncState: 'pending',
         synced: false,
         createdAtIso: now,
+        updatedAtIso: now,
       };
-      await this.persistAndSyncCashMovement(refundMov);
-    }
 
-    this.creditNoteOriginId = null;
-    this.creditNoteError = null;
-    this.selectedHistoryId = ncInvoice.id;
-    this.historyRightTab = 'PREVIEW';
-    this.showHistoryNotice(
-      `Nota de Crédito ${ncInvoice.number} emitida (${formatKzNumber(ncInvoice.grandTotal)} Kz).`
-    );
-    this.render();
-
-    if (this.user && this.isOnline && canCompanySyncCloudData(this.activeCompany)) {
-      try {
-        await ensureCompanyRegisteredCloud(this.activeCompany);
-        await createInvoiceCloud(ncInvoice, this.activeCompany);
-        if (reservedNcSeries) {
-          const updatedNcSeries = listarSeries({ companyId: this.activeCompany.id }).find(
-            (s) => s.id === reservedNcSeries!.seriesId
-          );
-          if (updatedNcSeries) {
-            await upsertFiscalSeriesCloud(updatedNcSeries, this.activeCompany).catch(() => null);
-          }
-        }
-        await submitInvoiceAudit(ncInvoice, this.activeCompany.id).catch(() => null);
-        const syncedNc: InvoiceRecord = { ...ncInvoice, syncState: 'synced', synced: true };
-        await localDb.saveInvoice(syncedNc, this.activeCompany.id);
-        this.invoices = this.invoices.map((x) => (x.id === syncedNc.id ? syncedNc : x));
-        if (updatedOrigin) {
-          await createInvoiceCloud(updatedOrigin, this.activeCompany);
-          const syncedOrig: InvoiceRecord = {
-            ...updatedOrigin,
-            syncState: 'synced',
-            synced: true,
-          };
-          await localDb.saveInvoice(syncedOrig, this.activeCompany.id);
-          this.invoices = this.invoices.map((x) => (x.id === syncedOrig.id ? syncedOrig : x));
-        }
-        if (this.activeModule === 'HISTORY' || this.activeModule === 'SYNC') this.render();
-      } catch {
-        // Mantém pendente localmente para sincronização posterior
+      await localDb.saveInvoice(ncInvoice, this.activeCompany.id);
+      await this.enqueueSyncMutation('invoice', ncInvoice.id, 'upsert', ncInvoice.number);
+      if (reservedNcSeries) {
+        await this.enqueueSyncMutation(
+          'fiscal_series',
+          reservedNcSeries.seriesId,
+          'upsert',
+          reservedNcSeries.seriesCode
+        );
       }
-    }
+      this.invoices = [ncInvoice, ...this.invoices];
+
+      // Se a fatura original tinha saldo em dívida, abate automaticamente até ao limite da NC
+      let updatedOrigin: InvoiceRecord | null = null;
+      if (abatedFromDebt > 0) {
+        const nextOriginDue = Math.max(0, roundKz(originDue - abatedFromDebt));
+        const dtShort = formatDateTimePt(now).slashDate.slice(0, 5);
+        const prevSum =
+          originInv.paymentSummary ||
+          `${originInv.paymentMethod}: ${formatKzNumber(originInv.amountReceived)} Kz`;
+        updatedOrigin = {
+          ...originInv,
+          initialAmountReceived:
+            typeof originInv.initialAmountReceived === 'number'
+              ? originInv.initialAmountReceived
+              : originInv.amountReceived,
+          initialChangeAmount:
+            typeof originInv.initialChangeAmount === 'number'
+              ? originInv.initialChangeAmount
+              : originInv.changeAmount,
+          amountDue: nextOriginDue,
+          paymentSummary: `${prevSum} + NC ${dtShort} (${nextNumber}): ${formatKzNumber(abatedFromDebt)} Kz`.slice(
+            0,
+            160
+          ),
+          syncState: 'pending',
+          synced: false,
+          updatedAtIso: now,
+        };
+        await localDb.saveInvoice(updatedOrigin, this.activeCompany.id);
+        await this.enqueueSyncMutation('invoice', updatedOrigin.id, 'upsert', updatedOrigin.number);
+        this.invoices = this.invoices.map((x) => (x.id === updatedOrigin!.id ? updatedOrigin! : x));
+      }
+
+      // Reposição automática de stock quando assinalada
+      if (this.creditNoteRestoreStock) {
+        await this.adjustCatalogStockForInvoiceLines(ncTotals.lines, 'RESTORE', {
+          type: 'DEVOLUCAO_CLIENTE',
+          reason: `Devolução por Nota de Crédito ${ncInvoice.number} (ref. ${originInv.number}): ${reason}`,
+          invoiceId: ncInvoice.id,
+          invoiceNumber: ncInvoice.number,
+          operator: this.getCurrentStockOperatorLabel(),
+        });
+      }
+
+      // Registo de saída financeira se houve reembolso imediato
+      if (refundedNow > 0) {
+        const useCashDrawer =
+          openSess &&
+          (this.creditNoteRefundMethod !== 'Dinheiro' || this.creditNoteAffectCashDrawer);
+        const refundMov: CashMovement = {
+          id: generateUniqueEntityId('cm_nc', this.terminalDeviceId),
+          companyId: this.activeCompany.id,
+          sessionId: useCashDrawer && openSess ? openSess.id : 'sem_turno',
+          cashier: openSess?.cashier || this.cashier || '01',
+          operator: openSess?.operator || this.operator || '001',
+          createdByUid: this.user?.uid,
+          type: 'SAIDA',
+          entryKind: 'MOVIMENTO_CAIXA',
+          category: 'Reembolsos e Devoluções de Clientes',
+          amount: refundedNow,
+          paymentMethod: this.creditNoteRefundMethod,
+          reason: `Reembolso Nota de Crédito ${ncInvoice.number} (ref. ${originInv.number})`.slice(
+            0,
+            240
+          ),
+          ...(refText ? { reference: refText } : {}),
+          invoiceId: ncInvoice.id,
+          invoiceNumber: ncInvoice.number,
+          customerName: originInv.customerName.slice(0, 160),
+          syncState: 'pending',
+          synced: false,
+          createdAtIso: now,
+        };
+        await this.persistAndSyncCashMovement(refundMov);
+      }
+
+      this.creditNoteOriginId = null;
+      this.creditNoteError = null;
+      this.selectedHistoryId = ncInvoice.id;
+      this.historyRightTab = 'PREVIEW';
+      this.showHistoryNotice(
+        `Nota de Crédito ${ncInvoice.number} emitida (${formatKzNumber(ncInvoice.grandTotal)} Kz).`
+      );
+      this.render();
+
+      if (this.user && this.isOnline && canCompanySyncCloudData(this.activeCompany)) {
+        try {
+          await ensureCompanyRegisteredCloud(this.activeCompany);
+          await createInvoiceCloud(ncInvoice, this.activeCompany);
+          if (reservedNcSeries) {
+            const updatedNcSeries = listarSeries({ companyId: this.activeCompany.id }).find(
+              (s) => s.id === reservedNcSeries!.seriesId
+            );
+            if (updatedNcSeries) {
+              await upsertFiscalSeriesCloud(updatedNcSeries, this.activeCompany)
+                .then(() => this.markSyncMutationSuccess('fiscal_series', updatedNcSeries.id))
+                .catch(() => null);
+            }
+          }
+          await submitInvoiceAudit(ncInvoice, this.activeCompany.id).catch(() => null);
+          const syncedNc: InvoiceRecord = { ...ncInvoice, syncState: 'synced', synced: true };
+          await localDb.saveInvoice(syncedNc, this.activeCompany.id);
+          this.invoices = this.invoices.map((x) => (x.id === syncedNc.id ? syncedNc : x));
+          await this.markSyncMutationSuccess('invoice', syncedNc.id);
+          if (updatedOrigin) {
+            await createInvoiceCloud(updatedOrigin, this.activeCompany);
+            const syncedOrig: InvoiceRecord = {
+              ...updatedOrigin,
+              syncState: 'synced',
+              synced: true,
+            };
+            await localDb.saveInvoice(syncedOrig, this.activeCompany.id);
+            this.invoices = this.invoices.map((x) => (x.id === syncedOrig.id ? syncedOrig : x));
+            await this.markSyncMutationSuccess('invoice', syncedOrig.id);
+          }
+          if (this.activeModule === 'HISTORY' || this.activeModule === 'SYNC') this.render();
+        } catch (err) {
+          await this.markSyncMutationError(
+            'invoice',
+            ncInvoice.id,
+            err instanceof Error ? err.message : 'Erro ao sincronizar Nota de Crédito.',
+            ncInvoice.number
+          );
+        }
+      }
+    });
   }
 
   private async reprintHistoryInvoice(
@@ -22882,7 +24009,12 @@ export class SilaBillingApp {
     const pSup = !cloudSyncEntitled ? 0 : this.suppliers.filter((s) => !s.synced).length;
     const pPur = !cloudSyncEntitled ? 0 : this.purchases.filter((pr) => !pr.synced).length;
     const pSet = !cloudSyncEntitled ? 0 : this.settings.synced ? 0 : 1;
-    const totalPending = pProd + pCust + pInv + pSess + pMov + pStock + pSup + pPur + pSet;
+    const queuedDeleteCount = !cloudSyncEntitled
+      ? 0
+      : this.syncQueueEntries.filter((q) => q.operation === 'delete').length;
+    const openConflicts = !cloudSyncEntitled ? [] : this.getOpenSyncConflicts();
+    const totalPending =
+      pProd + pCust + pInv + pSess + pMov + pStock + pSup + pPur + pSet + queuedDeleteCount;
 
     const errCount = !cloudSyncEntitled
       ? 0
@@ -22895,6 +24027,9 @@ export class SilaBillingApp {
         this.suppliers.filter((s) => s.syncState === 'error').length +
         this.purchases.filter((pr) => pr.syncState === 'error').length +
         (this.settings.syncState === 'error' ? 1 : 0);
+    const outboxErrorCount = !cloudSyncEntitled
+      ? 0
+      : this.syncQueueEntries.filter((q) => q.status === 'error').length;
 
     const showCloudProtectionNudge =
       !isUnassigned &&
@@ -22911,13 +24046,20 @@ export class SilaBillingApp {
         <div class="max-w-3xl bg-white border border-slate-200/90 rounded-xl p-4 sm:p-6 sila-card-elevated space-y-6">
           <div class="flex flex-col sm:flex-row sm:items-center justify-between gap-3 pb-3 border-b border-slate-200">
             <div>
-              <h1 class="text-sm font-bold text-slate-900">Sincronização, Backend e Backup</h1>
+              <h1 class="text-sm font-bold text-slate-900">Sincronização, Integridade Offline e Backup</h1>
               <p class="text-xs text-slate-500">${
                 isUnassigned
                   ? 'Sessão multiempresa pronta · Selecione ou cadastre uma empresa para sincronizar dados.'
                   : `Persistência isolada por empresa (${escapeHtml(
                       this.settings.company.shortName
                     )} · NIF ${escapeHtml(this.settings.company.nif)}).`
+              }</p>
+              <p class="text-[11px] text-slate-500 font-mono mt-0.5">Terminal: ${escapeHtml(
+                this.terminalDeviceId
+              )} · Armazenamento: ${
+                this.storagePersisted === true
+                  ? 'Persistente (protegido contra limpeza)'
+                  : 'Padrão (IndexedDB local)'
               }</p>
             </div>
 
@@ -22972,6 +24114,134 @@ export class SilaBillingApp {
                     class="h-8 px-3 rounded-md bg-blue-600 hover:bg-blue-700 text-white text-xs font-semibold whitespace-nowrap shrink-0"
                   >Proteger na Cloud</button>
                 </div>`
+              : ''
+          }
+
+          ${
+            openConflicts.length > 0
+              ? `<section class="p-4 rounded-xl border border-red-200 bg-red-50/70 space-y-3">
+                  <div class="flex flex-col sm:flex-row sm:items-center justify-between gap-2">
+                    <div>
+                      <h2 class="text-xs font-bold text-red-900">Conflitos de Sincronização Detetados (${openConflicts.length})</h2>
+                      <p class="text-[11px] text-red-700">Estes registos ficaram bloqueados contra sobrescrita cega para evitar perda ou duplicação de vendas. Escolha a resolução abaixo.</p>
+                    </div>
+                  </div>
+                  <div class="space-y-2.5">
+                    ${openConflicts
+                      .map((c) => {
+                        const isNumCollision = c.type === 'FISCAL_NUMBER_COLLISION';
+                        const isHashFork = c.type === 'HASH_CHAIN_FORK';
+                        const hasCloud = Boolean(c.cloudSnapshotJson);
+                        const allowKeepLocal =
+                          c.entityType === 'product' ||
+                          c.entityType === 'customer' ||
+                          c.entityType === 'supplier' ||
+                          c.entityType === 'settings';
+                        return `
+                          <div class="p-3 rounded-lg border border-red-200 bg-white space-y-2 text-xs">
+                            <div class="flex flex-wrap items-center justify-between gap-2">
+                              <span class="font-bold text-slate-900">${escapeHtml(c.summary)}</span>
+                              <span class="font-mono text-[11px] text-slate-500">${escapeHtml(c.entityLabel)}</span>
+                            </div>
+                            <p class="text-[11px] text-slate-600 leading-relaxed">${escapeHtml(c.details)}</p>
+                            <div class="grid grid-cols-1 sm:grid-cols-2 gap-2 text-[11px] font-mono">
+                              <div class="p-2 rounded bg-slate-50 border border-slate-200 text-slate-800">${escapeHtml(c.localSummary)}</div>
+                              <div class="p-2 rounded bg-blue-50/60 border border-blue-200 text-blue-900">${escapeHtml(c.cloudSummary)}</div>
+                            </div>
+                            <div class="flex flex-wrap items-center gap-2 pt-1">
+                              ${
+                                isNumCollision
+                                  ? `<button
+                                      type="button"
+                                      data-action="resolve-sync-conflict"
+                                      data-id="${escapeHtml(c.id)}"
+                                      data-value="REASSIGN_LOCAL_SERIES_NUMBER"
+                                      class="h-8 px-3 rounded-md bg-blue-600 hover:bg-blue-700 text-white text-[11px] font-semibold"
+                                    >Reatribuir Próximo Nº Livre</button>`
+                                  : ''
+                              }
+                              ${
+                                hasCloud && !isNumCollision
+                                  ? `<button
+                                      type="button"
+                                      data-action="resolve-sync-conflict"
+                                      data-id="${escapeHtml(c.id)}"
+                                      data-value="USE_CLOUD"
+                                      class="h-8 px-3 rounded-md bg-slate-900 hover:bg-slate-800 text-white text-[11px] font-semibold"
+                                    >Adotar Versão da Cloud</button>`
+                                  : ''
+                              }
+                              ${
+                                allowKeepLocal && !isNumCollision && !isHashFork
+                                  ? `<button
+                                      type="button"
+                                      data-action="resolve-sync-conflict"
+                                      data-id="${escapeHtml(c.id)}"
+                                      data-value="KEEP_LOCAL"
+                                      class="h-8 px-3 rounded-md border border-slate-300 hover:bg-slate-50 text-slate-800 text-[11px] font-semibold"
+                                    >Manter Versão Local</button>`
+                                  : ''
+                              }
+                              ${
+                                isHashFork
+                                  ? `<button
+                                      type="button"
+                                      data-action="resolve-sync-conflict"
+                                      data-id="${escapeHtml(c.id)}"
+                                      data-value="ACKNOWLEDGE_AUDIT"
+                                      class="h-8 px-3 rounded-md border border-amber-300 bg-amber-50 hover:bg-amber-100 text-amber-900 text-[11px] font-semibold"
+                                    >Registar em Auditoria</button>`
+                                  : ''
+                              }
+                            </div>
+                          </div>
+                        `;
+                      })
+                      .join('')}
+                  </div>
+                  <p class="text-[11px] text-slate-600">
+                    Recomendação operacional: se vários caixas operam offline ao mesmo tempo, crie uma série fiscal dedicada por terminal (ex: CAIXA1, CAIXA2) para eliminar colisões de numeração e ramificações SAF-T.
+                  </p>
+                </section>`
+              : ''
+          }
+
+          ${
+            cloudSyncEntitled && this.syncQueueEntries.length > 0
+              ? `<section class="p-3.5 rounded-lg border border-amber-200 bg-amber-50/70 space-y-2.5 text-xs">
+                  <div class="flex flex-col sm:flex-row sm:items-center justify-between gap-2">
+                    <div>
+                      <h2 class="text-xs font-bold text-amber-900">Fila Persistente de Saída (Outbox · ${this.syncQueueEntries.length})</h2>
+                      <p class="text-[11px] text-amber-800 tabular-nums">${
+                        outboxErrorCount > 0
+                          ? `${outboxErrorCount} operação(ões) aguardam reenvio automático após falha de rede.`
+                          : 'Operações guardadas em IndexedDB prontas para envio seguro à Cloud.'
+                      }</p>
+                    </div>
+                    <button
+                      type="button"
+                      data-action="retry-sync-queue"
+                      ${!this.user || !this.isOnline || this.isSyncing ? 'disabled' : ''}
+                      class="h-8 px-3 rounded-md bg-amber-900 hover:bg-amber-800 text-white text-[11px] font-semibold disabled:opacity-40 whitespace-nowrap shrink-0"
+                    >Reenviar fila agora</button>
+                  </div>
+                  <div class="divide-y divide-amber-200/70 rounded-md border border-amber-200/80 bg-white/80">
+                    ${this.syncQueueEntries
+                      .slice(0, 6)
+                      .map((q) => {
+                        const qLabel = q.entityLabel || q.entityId;
+                        const opLabel = q.operation === 'delete' ? 'Eliminar' : 'Enviar';
+                        const statusLabel = q.status === 'error' ? `Erro (${q.retryCount || 0}x)` : 'Pendente';
+                        return `
+                          <div class="px-2.5 py-1.5 flex items-center justify-between gap-2 text-[11px]">
+                            <span class="font-medium text-slate-800 truncate">${escapeHtml(opLabel)} · ${escapeHtml(q.entityType)}: <span class="font-mono">${escapeHtml(qLabel)}</span></span>
+                            <span class="font-mono ${q.status === 'error' ? 'text-red-700' : 'text-amber-700'} shrink-0">${escapeHtml(statusLabel)}</span>
+                          </div>
+                        `;
+                      })
+                      .join('')}
+                  </div>
+                </section>`
               : ''
           }
 
@@ -23132,6 +24402,15 @@ export class SilaBillingApp {
                     </button>`
                   : ''
               }
+              <button
+                type="button"
+                data-action="export-unsynced-json"
+                ${isUnassigned || (this.syncQueueEntries.length === 0 && openConflicts.length === 0) ? 'disabled' : ''}
+                class="h-9 px-3 rounded-lg border border-amber-300 bg-amber-50 text-xs font-semibold text-amber-900 hover:bg-amber-100 disabled:opacity-40 flex items-center gap-1.5 whitespace-nowrap"
+              >
+                ${ICONS.download}
+                <span>Exportar Pendentes (JSON)</span>
+              </button>
               <button
                 type="button"
                 data-action="export-backup-local"
@@ -23334,6 +24613,7 @@ export class SilaBillingApp {
   private async persistAndSyncSupplier(sup: Supplier): Promise<void> {
     if (!this.activeCompany.id) return;
     await localDb.saveSupplier(sup, this.activeCompany.id);
+    await this.enqueueSyncMutation('supplier', sup.id, 'upsert', sup.name);
     const exists = this.suppliers.some((s) => s.id === sup.id);
     this.suppliers = exists
       ? this.suppliers.map((s) => (s.id === sup.id ? sup : s))
@@ -23347,15 +24627,24 @@ export class SilaBillingApp {
           const synced: Supplier = { ...sup, syncState: 'synced', synced: true };
           await localDb.saveSupplier(synced, this.activeCompany.id);
           this.suppliers = this.suppliers.map((s) => (s.id === synced.id ? synced : s));
+          await this.markSyncMutationSuccess('supplier', synced.id);
           if (this.activeModule === 'PURCHASES' || this.activeModule === 'SYNC') this.render();
         })
-        .catch(() => null);
+        .catch((err) => {
+          void this.markSyncMutationError(
+            'supplier',
+            sup.id,
+            err instanceof Error ? err.message : 'Erro ao sincronizar fornecedor.',
+            sup.name
+          );
+        });
     }
   }
 
   private async persistAndSyncPurchase(pur: PurchaseRecord): Promise<void> {
     if (!this.activeCompany.id) return;
     await localDb.savePurchase(pur, this.activeCompany.id);
+    await this.enqueueSyncMutation('purchase', pur.id, 'upsert', pur.number || pur.supplierName);
     const exists = this.purchases.some((p) => p.id === pur.id);
     this.purchases = exists
       ? this.purchases.map((p) => (p.id === pur.id ? pur : p))
@@ -23369,9 +24658,17 @@ export class SilaBillingApp {
           const synced: PurchaseRecord = { ...pur, syncState: 'synced', synced: true };
           await localDb.savePurchase(synced, this.activeCompany.id);
           this.purchases = this.purchases.map((p) => (p.id === synced.id ? synced : p));
+          await this.markSyncMutationSuccess('purchase', synced.id);
           if (this.activeModule === 'PURCHASES' || this.activeModule === 'SYNC') this.render();
         })
-        .catch(() => null);
+        .catch((err) => {
+          void this.markSyncMutationError(
+            'purchase',
+            pur.id,
+            err instanceof Error ? err.message : 'Erro ao sincronizar compra.',
+            pur.number || pur.supplierName
+          );
+        });
     }
   }
 
@@ -23451,7 +24748,7 @@ export class SilaBillingApp {
     const actorLabel = (this.user?.email || formatRoleLabelPt(this.getEffectiveRole())).slice(0, 120);
 
     const purchase: PurchaseRecord = {
-      id: `pur_${Date.now()}_${Math.random().toString(36).slice(2, 6)}`,
+      id: generateUniqueEntityId('pur', this.terminalDeviceId),
       companyId: this.activeCompany.id,
       number: purNumber,
       ...(supplierInvoiceRef ? { supplierInvoiceRef } : {}),
@@ -23531,11 +24828,12 @@ export class SilaBillingApp {
       };
 
       await localDb.saveProduct(updatedProd, this.activeCompany.id);
+      await this.enqueueSyncMutation('product', updatedProd.id, 'upsert', updatedProd.name);
       updatedProducts.push(updatedProd);
 
       if (updateStock) {
         const mov: StockMovement = {
-          id: `sm_pur_${Date.now()}_${Math.random().toString(36).slice(2, 6)}`,
+          id: generateUniqueEntityId('sm_pur', this.terminalDeviceId),
           companyId: this.activeCompany.id,
           productId: updatedProd.id,
           productCode: updatedProd.code,
@@ -23571,8 +24869,16 @@ export class SilaBillingApp {
               const synced: Product = { ...up, syncState: 'synced', synced: true };
               await localDb.saveProduct(synced, this.activeCompany.id);
               this.products = this.products.map((p) => (p.id === synced.id ? synced : p));
+              await this.markSyncMutationSuccess('product', synced.id);
             })
-            .catch(() => null);
+            .catch((err) => {
+              void this.markSyncMutationError(
+                'product',
+                up.id,
+                err instanceof Error ? err.message : 'Erro ao sincronizar artigo.',
+                up.name
+              );
+            });
         }
       }
     }
@@ -23595,7 +24901,7 @@ export class SilaBillingApp {
         });
       } else {
         const supMov: CashMovement = {
-          id: `cm_sup_${Date.now()}_${Math.random().toString(36).slice(2, 6)}`,
+          id: generateUniqueEntityId('cm_sup', this.terminalDeviceId),
           companyId: this.activeCompany.id,
           sessionId: 'sem_turno',
           cashier: openSess?.cashier || this.cashier || '01',
@@ -23686,7 +24992,7 @@ export class SilaBillingApp {
         });
       } else {
         const supMov: CashMovement = {
-          id: `cm_sup_${Date.now()}_${Math.random().toString(36).slice(2, 6)}`,
+          id: generateUniqueEntityId('cm_sup', this.terminalDeviceId),
           companyId: this.activeCompany.id,
           sessionId: 'sem_turno',
           cashier: openSess?.cashier || this.cashier || '01',
@@ -23796,7 +25102,7 @@ export class SilaBillingApp {
         });
       } else {
         const supMov: CashMovement = {
-          id: `cm_sup_${Date.now()}_${Math.random().toString(36).slice(2, 6)}`,
+          id: generateUniqueEntityId('cm_sup', this.terminalDeviceId),
           companyId: this.activeCompany.id,
           sessionId: 'sem_turno',
           cashier: openSess?.cashier || this.cashier || '01',
@@ -25626,7 +26932,7 @@ export class SilaBillingApp {
     } else {
       const now = new Date().toISOString();
       const mov: CashMovement = {
-        id: `cm_fin_${Date.now()}_${Math.random().toString(36).slice(2, 6)}`,
+        id: generateUniqueEntityId('cm_fin', this.terminalDeviceId),
         companyId: this.activeCompany.id,
         sessionId: 'sem_turno',
         cashier: openSess?.cashier || this.cashier || '01',
@@ -25722,6 +27028,7 @@ export class SilaBillingApp {
     };
 
     await localDb.saveProduct(updated, this.activeCompany.id);
+    await this.enqueueSyncMutation('product', updated.id, 'upsert', updated.name);
     this.products = this.products.map((p) => (p.id === updated.id ? updated : p));
     this.financeEditingProductId = null;
     this.financeEditProductError = null;
@@ -25735,6 +27042,7 @@ export class SilaBillingApp {
           const synced: Product = { ...updated, syncState: 'synced', synced: true };
           await localDb.saveProduct(synced, this.activeCompany.id);
           this.products = this.products.map((p) => (p.id === synced.id ? synced : p));
+          await this.markSyncMutationSuccess('product', synced.id);
           if (
             this.activeModule === 'FINANCE' ||
             this.activeModule === 'INDICATORS' ||
@@ -25743,7 +27051,14 @@ export class SilaBillingApp {
             this.render();
           }
         })
-        .catch(() => null);
+        .catch((err) => {
+          void this.markSyncMutationError(
+            'product',
+            updated.id,
+            err instanceof Error ? err.message : 'Erro ao sincronizar artigo.',
+            updated.name
+          );
+        });
     }
   }
 

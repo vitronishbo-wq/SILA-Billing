@@ -21,6 +21,7 @@ import {
   resolveMemberStatus,
 } from '../core/rbac';
 import { seriesStorage } from '../core/seriesManager';
+import { generateUniqueEntityId } from '../core/syncIntegrity';
 import {
   AgtOperationEnvironment,
   AngolaLegalNature,
@@ -30,6 +31,7 @@ import {
   CartDraftItem,
   CashMovement,
   CashSession,
+  CommittedCheckoutOpRecord,
   CompanyMember,
   CompanyProfile,
   CompanyRecord,
@@ -59,6 +61,8 @@ import {
   StockMovement,
   Supplier,
   SuspendedSale,
+  SyncBaselineMap,
+  SyncConflictRecord,
   SyncQueueEntry,
   validateCompanyNif,
   VITRONIS_INSTITUTIONAL,
@@ -1963,7 +1967,99 @@ export const localDb = {
   getSecurityAuditsByCompany: (companyId: string) =>
     getAllByCompanyIndex<SecurityAuditEntry>('security_audit_logs', companyId),
   enqueueSync: (entry: SyncQueueEntry) => putInStore('sync_queue', entry),
+  getSyncQueueByCompany: (companyId: string) =>
+    getAllByCompanyIndex<SyncQueueEntry>('sync_queue', companyId),
   deleteSyncEntry: (id: string) => deleteFromStore('sync_queue', id),
+  clearSyncQueueForEntity: async (
+    companyId: string,
+    entityType: SyncQueueEntry['entityType'],
+    entityId: string
+  ) => {
+    const entries = await getAllByCompanyIndex<SyncQueueEntry>('sync_queue', companyId);
+    const matchingIds = entries
+      .filter((e) => e.entityType === entityType && e.entityId === entityId)
+      .map((e) => e.id);
+    if (matchingIds.length > 0) {
+      await deleteBatchFromStore('sync_queue', matchingIds);
+    }
+  },
+  getSyncConflicts: async (companyId: string): Promise<SyncConflictRecord[]> => {
+    const resolvedId = String(companyId || '').trim();
+    if (!resolvedId) return [];
+    const entry = await getFromStore<{ key: string; value: SyncConflictRecord[] }>(
+      'meta',
+      `sync_conflicts:${resolvedId}`
+    );
+    return Array.isArray(entry?.value) ? entry.value : [];
+  },
+  saveSyncConflicts: (companyId: string, conflicts: SyncConflictRecord[]) => {
+    const resolvedId = String(companyId || '').trim();
+    if (!resolvedId) return Promise.resolve();
+    return putInStore('meta', {
+      key: `sync_conflicts:${resolvedId}`,
+      value: conflicts.slice(0, 200),
+    });
+  },
+  getSyncBaselines: async (companyId: string): Promise<SyncBaselineMap> => {
+    const resolvedId = String(companyId || '').trim();
+    if (!resolvedId) return {};
+    const entry = await getFromStore<{ key: string; value: SyncBaselineMap }>(
+      'meta',
+      `sync_baselines:${resolvedId}`
+    );
+    return entry?.value && typeof entry.value === 'object' ? entry.value : {};
+  },
+  saveSyncBaselines: (companyId: string, baselines: SyncBaselineMap) => {
+    const resolvedId = String(companyId || '').trim();
+    if (!resolvedId) return Promise.resolve();
+    return putInStore('meta', {
+      key: `sync_baselines:${resolvedId}`,
+      value: baselines,
+    });
+  },
+  getCommittedCheckoutOps: async (companyId: string): Promise<CommittedCheckoutOpRecord[]> => {
+    const resolvedId = String(companyId || '').trim();
+    if (!resolvedId) return [];
+    const entry = await getFromStore<{ key: string; value: CommittedCheckoutOpRecord[] }>(
+      'meta',
+      `committed_ops:${resolvedId}`
+    );
+    return Array.isArray(entry?.value) ? entry.value : [];
+  },
+  recordCommittedCheckoutOp: async (
+    companyId: string,
+    op: CommittedCheckoutOpRecord
+  ): Promise<CommittedCheckoutOpRecord[]> => {
+    const resolvedId = String(companyId || '').trim();
+    if (!resolvedId) return [];
+    const entry = await getFromStore<{ key: string; value: CommittedCheckoutOpRecord[] }>(
+      'meta',
+      `committed_ops:${resolvedId}`
+    );
+    const existing = Array.isArray(entry?.value) ? entry.value : [];
+    const deduped = [op, ...existing.filter((x) => x.operationId !== op.operationId)].slice(0, 150);
+    await putInStore('meta', {
+      key: `committed_ops:${resolvedId}`,
+      value: deduped,
+    });
+    return deduped;
+  },
+  requestDurableBrowserStorage: async (): Promise<boolean | null> => {
+    try {
+      if (typeof navigator !== 'undefined' && navigator.storage) {
+        if (typeof navigator.storage.persisted === 'function') {
+          const already = await navigator.storage.persisted();
+          if (already) return true;
+        }
+        if (typeof navigator.storage.persist === 'function') {
+          return await navigator.storage.persist();
+        }
+      }
+    } catch {
+      // Ignore unsupported storage persist API
+    }
+    return null;
+  },
   saveProduct: (p: Product, companyId: string) => {
     const resolvedCompanyId = String(companyId || p.companyId || '').trim();
     if (!resolvedCompanyId) {
@@ -2019,8 +2115,7 @@ export const localDb = {
     if (!resolvedCompanyId) {
       return Promise.reject(new Error('Selecione ou cadastre uma empresa antes de emitir faturas.'));
     }
-    const resolvedId =
-      String(inv.id || '').trim() || `inv_${Date.now()}_${Math.random().toString(36).slice(2, 6)}`;
+    const resolvedId = String(inv.id || '').trim() || generateUniqueEntityId('inv');
     return putInStore('invoices', { ...inv, id: resolvedId, companyId: resolvedCompanyId });
   },
   saveCashSession: (session: CashSession, companyId: string) => {

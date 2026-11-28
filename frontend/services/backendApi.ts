@@ -647,6 +647,18 @@ export async function fetchCompanyWorkspaceBackend(companyId: string): Promise<{
     if (!json.ok) return null;
 
     const now = new Date().toISOString();
+    const extractTsIso = (raw: unknown, fallback = '2025-01-01T00:00:00.000Z'): string => {
+      if (!raw) return fallback;
+      if (typeof raw === 'string') return raw;
+      if (typeof raw === 'object') {
+        const obj = raw as { _seconds?: number; seconds?: number };
+        const secs = typeof obj._seconds === 'number' ? obj._seconds : obj.seconds;
+        if (typeof secs === 'number' && Number.isFinite(secs)) {
+          return new Date(secs * 1000).toISOString();
+        }
+      }
+      return fallback;
+    };
     const normalizeRate = (raw: unknown): TaxRate => {
       const n = Number(raw);
       return n === 1 || n === 5 || n === 7 || n === 14 ? n : 0;
@@ -702,8 +714,8 @@ export async function fetchCompanyWorkspaceBackend(companyId: string): Promise<{
         ...(priceHistory.length > 0 ? { priceHistory } : {}),
         syncState: 'synced',
         synced: true,
-        createdAtIso: now,
-        updatedAtIso: now,
+        createdAtIso: extractTsIso(p.createdAt),
+        updatedAtIso: extractTsIso(p.updatedAt, extractTsIso(p.createdAt)),
       };
     });
 
@@ -739,8 +751,8 @@ export async function fetchCompanyWorkspaceBackend(companyId: string): Promise<{
       ...(Array.isArray(c.changeHistory) ? { changeHistory: c.changeHistory as Customer['changeHistory'] } : {}),
       syncState: 'synced',
       synced: true,
-      createdAtIso: now,
-      updatedAtIso: now,
+      createdAtIso: extractTsIso(c.createdAt),
+      updatedAtIso: extractTsIso(c.updatedAt, extractTsIso(c.createdAt)),
     }));
 
     const invoices: InvoiceRecord[] = (json.invoices || []).map((inv) => {
@@ -1015,7 +1027,7 @@ export async function fetchCompanyWorkspaceBackend(companyId: string): Promise<{
       active: sup.active !== false,
       syncState: 'synced',
       synced: true,
-      updatedAtIso: now,
+      updatedAtIso: extractTsIso(sup.updatedAt, extractTsIso(sup.createdAt)),
     }));
 
     const purchases: PurchaseRecord[] = (json.purchases || []).map((pur) => {
@@ -1101,7 +1113,7 @@ export async function fetchCompanyWorkspaceBackend(companyId: string): Promise<{
         allowCashierPriceEdit: Boolean(sd.allowCashierPriceEdit ?? false),
         syncState: 'synced',
         synced: true,
-        updatedAtIso: now,
+        updatedAtIso: extractTsIso(sd.updatedAt),
       };
     }
 

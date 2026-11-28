@@ -53,15 +53,30 @@ import {
   JAIMONA_COMPANY_ID,
   resolveCompanyProfileFromSnapshot,
   VITRONIS_INSTITUTIONAL,
+  type AppSettings,
   type CashMovement,
   type CashSession,
+  type CommittedCheckoutOpRecord,
   type CompanyProfile,
   type Customer,
   type InvoiceRecord,
   type Product,
+  type StockMovement,
   type Supplier,
+  type SyncConflictRecord,
   type TaxRate,
 } from './types.ts';
+import {
+  analyzePrePushSyncConflicts,
+  checkDuplicateCheckoutSubmission,
+  computeCartFingerprint,
+  computeProductFingerprint,
+  detectHashChainForks,
+  generateUniqueEntityId,
+  reassignCollidingLocalInvoice,
+  reconcileConcurrentStock,
+  withTerminalExecutionLock,
+} from './syncIntegrity.ts';
 import { normalizeCompanyMasterProfile, registerNewCompanyLocal } from '../services/localStore.ts';
 import {
   generateNextCustomerInternalCode,
@@ -4034,6 +4049,490 @@ export async function runPhase5ValidationTests(): Promise<{ passed: number; tota
         dossierHtml.includes('Dossier Contabilístico Mensal') &&
         dossierHtml.includes('Emitido por SILA-Billing'),
       'Interface do Modo Contabilista e Dossier A4 devem renderizar limpos sem undefined/NaN'
+    );
+  });
+
+  // -------------------------------------------------------------------------
+  // 11. INTEGRIDADE OFFLINE, ANTI-DUPLICAÇÃO & RESOLUÇÃO DE CONFLITOS DE SYNC
+  // -------------------------------------------------------------------------
+  await test('5.21 Integridade Offline: IDs únicos por terminal, lock de concorrência e idempotência de checkout', async () => {
+    // 1. Unicidade de IDs em geração simultânea no mesmo milissegundo
+    const generated = new Set<string>();
+    for (let i = 0; i < 60; i++) {
+      generated.add(generateUniqueEntityId('inv', 'term_alpha01'));
+    }
+    assert(generated.size === 60, 'generateUniqueEntityId deve gerar 60 IDs distintos mesmo em rajada');
+    const sampleId = [...generated][0]!;
+    assert(
+      sampleId.startsWith('inv_') && sampleId.includes('lpha01'),
+      'ID gerado deve preservar prefixo e sufixo identificador do terminal'
+    );
+
+    // 2. Serialização estrita de concorrência via withTerminalExecutionLock
+    const timeline: string[] = [];
+    await Promise.all([
+      withTerminalExecutionLock('lock_test_offline', async () => {
+        timeline.push('A_start');
+        await new Promise((r) => setTimeout(r, 15));
+        timeline.push('A_end');
+      }),
+      withTerminalExecutionLock('lock_test_offline', async () => {
+        timeline.push('B_start');
+        timeline.push('B_end');
+      }),
+    ]);
+    assert(
+      timeline.join(',') === 'A_start,A_end,B_start,B_end',
+      `withTerminalExecutionLock deve serializar execuções concorrentes (obtido: ${timeline.join(',')})`
+    );
+
+    // 3. Idempotência por clientOperationId e janela rápida de carrinho idêntico
+    const compId = 'emp_idem_1';
+    const opId = generateUniqueEntityId('op', 'term_idem');
+    const fp = computeCartFingerprint({
+      companyId: compId,
+      docType: 'FR',
+      customerId: 'cli_consumidor',
+      paymentMethod: 'Dinheiro',
+      globalDiscountPct: 0,
+      grandTotal: 11400,
+      cart: [
+        {
+          productId: 'prod_1',
+          code: 'P001',
+          description: 'Artigo Teste',
+          unit: 'un',
+          qty: 1,
+          unitPrice: 10000,
+          discountPct: 0,
+          ivaRate: 14,
+        },
+      ],
+    });
+
+    const recentOp: CommittedCheckoutOpRecord = {
+      operationId: opId,
+      invoiceId: 'inv_recorded_1',
+      invoiceNumber: 'FR A2026/000001',
+      cartFingerprint: fp,
+      grandTotal: 11400,
+      committedAtIso: '2026-11-20T10:00:00.000Z',
+    };
+
+    const byOpId = checkDuplicateCheckoutSubmission({
+      companyId: compId,
+      clientOperationId: opId,
+      cartFingerprint: fp,
+      existingInvoices: [],
+      recentCommittedOps: [recentOp],
+      nowMs: Date.parse('2026-11-20T10:05:00.000Z'),
+    });
+    assert(
+      byOpId.duplicate && byOpId.existingInvoiceNumber === 'FR A2026/000001',
+      'Deve bloquear submissão repetida com mesmo clientOperationId mesmo após minutos'
+    );
+
+    const freshOpId = generateUniqueEntityId('op', 'term_idem');
+    const byRapidDoubleClick = checkDuplicateCheckoutSubmission({
+      companyId: compId,
+      clientOperationId: freshOpId,
+      cartFingerprint: fp,
+      existingInvoices: [],
+      recentCommittedOps: [recentOp],
+      nowMs: Date.parse('2026-11-20T10:00:02.000Z'), // 2s após -> dentro da janela de 3.5s
+      rapidWindowMs: 3500,
+    });
+    assert(
+      byRapidDoubleClick.duplicate && byRapidDoubleClick.existingInvoiceId === 'inv_recorded_1',
+      'Deve bloquear duplo-clique rápido de carrinho idêntico dentro da janela de proteção'
+    );
+
+    const allowedAfterWindow = checkDuplicateCheckoutSubmission({
+      companyId: compId,
+      clientOperationId: freshOpId,
+      cartFingerprint: fp,
+      existingInvoices: [],
+      recentCommittedOps: [recentOp],
+      nowMs: Date.parse('2026-11-20T10:00:10.000Z'), // 10s após com novo clientOperationId
+      rapidWindowMs: 3500,
+    });
+    assert(
+      !allowedAfterWindow.duplicate,
+      'Nova venda deliberada com novo clientOperationId após a janela rápida deve ser permitida'
+    );
+  });
+
+  await test('5.22 Integridade Offline: cache multi-aba SeriesStorage, piso minLastDocumentNumber e reconciliação aditiva de stock', () => {
+    // 1. Simular localStorage multi-aba na memória do Node
+    const memStore = new Map<string, string>();
+    const prevWin = (globalThis as { window?: unknown }).window;
+    (globalThis as { window?: unknown }).window = {
+      localStorage: {
+        getItem: (k: string) => (memStore.has(k) ? memStore.get(k)! : null),
+        setItem: (k: string, v: string) => {
+          memStore.set(k, v);
+        },
+        removeItem: (k: string) => {
+          memStore.delete(k);
+        },
+      },
+    };
+
+    try {
+      const compId = 'emp_multitab_1';
+      seriesStorage.clearMemoryCache();
+      const s = solicitarSerie({
+        companyId: compId,
+        seriesCode: 'OFF1',
+        seriesYear: 2026,
+        documentType: 'FR',
+        firstDocumentNumber: 1,
+        environment: 'SIMULACAO',
+        operator: '001',
+      });
+      const r1 = reservarProximoNumeroFiscal(compId, 'FR', 2026, 'OFF1', { environment: 'SIMULACAO' });
+      assert(r1.documentNo === 'FR OFF1/000001', 'Primeira reserva deve ser 000001');
+
+      // Simular outra aba atualizando diretamente o localStorage para lastDocumentNumber=4
+      const storageKey = `sila_agt_series_${compId}`;
+      const rawArr = JSON.parse(memStore.get(storageKey) || '[]');
+      rawArr[0].lastDocumentNumber = 4;
+      memStore.set(storageKey, JSON.stringify(rawArr));
+
+      const r2 = reservarProximoNumeroFiscal(compId, 'FR', 2026, 'OFF1', { environment: 'SIMULACAO' });
+      assert(
+        r2.documentNo === 'FR OFF1/000005' && s.id === r2.seriesId,
+        `SeriesStorage deve invalidar cache ao detetar alteração externa no localStorage (obtido ${r2.documentNo})`
+      );
+
+      // Piso minLastDocumentNumber impede reutilização mesmo se o contador fosse inferior
+      const r3 = reservarProximoNumeroFiscal(compId, 'FR', 2026, 'OFF1', {
+        environment: 'SIMULACAO',
+        minLastDocumentNumber: 9,
+      });
+      assert(
+        r3.documentNo === 'FR OFF1/000010',
+        `minLastDocumentNumber=9 deve avançar imediatamente para 000010 (obtido ${r3.documentNo})`
+      );
+    } finally {
+      seriesStorage.clearMemoryCache();
+      if (prevWin === undefined) {
+        delete (globalThis as { window?: unknown }).window;
+      } else {
+        (globalThis as { window?: unknown }).window = prevWin;
+      }
+    }
+
+    // 2. Reconciliação automática de stock concorrente (10 inicial -> Cloud vendeu 2 = 8; Local vendeu 3 = 7 => esperado 5)
+    const baseProd: Product = {
+      id: 'prod_stk_1',
+      companyId: 'emp_stk',
+      code: 'REF-01',
+      name: 'Água Mineral 1,5L',
+      category: 'Bebidas',
+      unit: 'un',
+      price: 500,
+      ivaRate: 14,
+      exemptionReason: '',
+      active: true,
+      trackStock: true,
+      stockQty: 10,
+      createdAtIso: '2026-11-20T08:00:00.000Z',
+      updatedAtIso: '2026-11-20T08:00:00.000Z',
+    };
+    const cloudProd: Product = { ...baseProd, stockQty: 8 };
+    const localProd: Product = { ...baseProd, stockQty: 7, synced: false, syncState: 'pending' };
+
+    const localMovOut3: StockMovement = {
+      id: 'sm_loc_3',
+      companyId: 'emp_stk',
+      productId: baseProd.id,
+      productCode: baseProd.code,
+      productName: baseProd.name,
+      unit: 'un',
+      type: 'SAIDA_VENDA',
+      direction: 'OUT',
+      qty: 3,
+      previousStock: 10,
+      newStock: 7,
+      warehouseId: 'armazem_principal',
+      reason: 'Venda POS Local',
+      operator: '001',
+      synced: false,
+      createdAtIso: '2026-11-20T09:05:00.000Z',
+    };
+    const cloudMovOut2: StockMovement = {
+      id: 'sm_cloud_2',
+      companyId: 'emp_stk',
+      productId: baseProd.id,
+      productCode: baseProd.code,
+      productName: baseProd.name,
+      unit: 'un',
+      type: 'SAIDA_VENDA',
+      direction: 'OUT',
+      qty: 2,
+      previousStock: 10,
+      newStock: 8,
+      warehouseId: 'armazem_principal',
+      reason: 'Venda POS Terminal B',
+      operator: '002',
+      synced: true,
+      createdAtIso: '2026-11-20T09:03:00.000Z',
+    };
+
+    const autoReconcile = reconcileConcurrentStock({
+      localProduct: localProd,
+      cloudProduct: cloudProd,
+      localPendingMovements: [localMovOut3],
+      cloudMovementsForProduct: [cloudMovOut2],
+      localExistingMovementsIds: new Set([localMovOut3.id]),
+    });
+    assert(
+      autoReconcile.mode === 'AUTO_RECONCILED' && autoReconcile.reconciledStockQty === 5,
+      `Stock concorrente deve reconciliar automaticamente 8 + (-3) = 5 (obtido: ${autoReconcile.mode} / ${autoReconcile.reconciledStockQty})`
+    );
+
+    // Contagem física concorrente exige decisão manual
+    const manualConflict = reconcileConcurrentStock({
+      localProduct: localProd,
+      cloudProduct: cloudProd,
+      localPendingMovements: [{ ...localMovOut3, type: 'RECONCILIACAO_FISICA' }],
+      cloudMovementsForProduct: [cloudMovOut2],
+      localExistingMovementsIds: new Set([localMovOut3.id]),
+    });
+    assert(
+      manualConflict.mode === 'CONFLICT_MANUAL_REQUIRED',
+      'Contagem física (RECONCILIACAO_FISICA) concorrente deve exigir confirmação manual'
+    );
+  });
+
+  await test('5.23 Resolução de Conflitos: análise pré-push, reatribuição de numeração colidente e bifurcação SAF-T', () => {
+    const compId = 'emp_conf_1';
+    const settings: AppSettings = {
+      companyId: compId,
+      company: {
+        ...JAIMONA_COMPANY,
+        nif: '5009991112',
+        shortName: 'Loja MultiCaixa',
+        legalName: 'Loja MultiCaixa, Lda',
+      },
+      defaultCashier: '01',
+      defaultOperator: '001',
+      defaultFormat: 'POS',
+      defaultDocType: 'FR',
+      defaultNotes: '',
+      autoPrintOnEmit: false,
+      agtEnvironment: 'SIMULACAO',
+      synced: true,
+      updatedAtIso: '2026-11-21T08:00:00.000Z',
+    };
+
+    const tot = calculateInvoiceTotals([
+      { productId: 'p1', code: 'P1', description: 'Café Expresso', unit: 'un', qty: 2, unitPrice: 1500, discountPct: 0, ivaRate: 14 },
+    ]);
+
+    const cloudInvPrev: InvoiceRecord = {
+      id: 'inv_cloud_0001',
+      companyId: compId,
+      number: 'FR OFF2/000001',
+      seriesCode: 'OFF2',
+      seriesEnvironment: 'SIMULACAO',
+      docType: 'FR',
+      issuedAtIso: '2026-11-21T09:00:00.000Z',
+      createdAtIso: '2026-11-21T09:00:00.000Z',
+      updatedAtIso: '2026-11-21T09:00:00.000Z',
+      cashier: '02',
+      operator: '002',
+      paymentMethod: 'Dinheiro',
+      customerId: 'c1',
+      customerName: 'Cliente Cloud',
+      customerNif: '999999999',
+      customerLocality: 'Luanda',
+      merchandiseTotal: tot.merchandiseTotal,
+      discountTotal: 0,
+      taxBase14: tot.taxBase14,
+      taxAmount14: tot.taxAmount14,
+      taxBase0: 0,
+      taxAmount0: 0,
+      taxTotal: tot.taxTotal,
+      grandTotal: tot.grandTotal,
+      amountInWords: tot.amountInWords,
+      amountReceived: tot.grandTotal,
+      changeAmount: 0,
+      previousInvoiceHash: '',
+      saftHash4: 'ABCD',
+      saftHashFull: 'full_hash_0001',
+      notes: '',
+      status: 'issued',
+      synced: true,
+      lines: tot.lines,
+    };
+
+    // Dois terminais offline emitiram o #000002 a partir do mesmo hash anterior!
+    const cloudInv2: InvoiceRecord = {
+      ...cloudInvPrev,
+      id: 'inv_cloud_0002',
+      number: 'FR OFF2/000002',
+      issuedAtIso: '2026-11-21T10:00:00.000Z',
+      createdAtIso: '2026-11-21T10:00:00.000Z',
+      updatedAtIso: '2026-11-21T10:00:00.000Z',
+      previousInvoiceHash: 'full_hash_0001',
+      saftHash4: 'EFGH',
+      saftHashFull: 'full_hash_0002_cloud',
+    };
+
+    const localCollidingInv2: InvoiceRecord = {
+      ...cloudInvPrev,
+      id: 'inv_local_0002',
+      number: 'FR OFF2/000002',
+      cashier: '01',
+      operator: '001',
+      customerName: 'Cliente Local Offline',
+      issuedAtIso: '2026-11-21T10:05:00.000Z',
+      createdAtIso: '2026-11-21T10:05:00.000Z',
+      updatedAtIso: '2026-11-21T10:05:00.000Z',
+      previousInvoiceHash: 'full_hash_0001',
+      saftHash4: 'IJKL',
+      saftHashFull: 'full_hash_0002_local',
+      synced: false,
+      syncState: 'pending',
+    };
+
+    const sessClosedCloud: CashSession = {
+      id: 'sess_conf_1',
+      companyId: compId,
+      cashier: '01',
+      operator: '001',
+      status: 'closed',
+      openingFloat: 5000,
+      openedAtIso: '2026-11-21T08:00:00.000Z',
+      closedAtIso: '2026-11-21T18:00:00.000Z',
+      countedCash: 15000,
+      synced: true,
+      createdAtIso: '2026-11-21T08:00:00.000Z',
+      updatedAtIso: '2026-11-21T18:00:00.000Z',
+    };
+    const sessOpenLocal: CashSession = {
+      ...sessClosedCloud,
+      status: 'open',
+      closedAtIso: undefined,
+      countedCash: undefined,
+      synced: false,
+      syncState: 'pending',
+    };
+
+    const baseProd: Product = {
+      id: 'prod_conf_1',
+      companyId: compId,
+      code: 'C01',
+      name: 'Pão Francês',
+      category: 'Padaria',
+      unit: 'un',
+      price: 100,
+      ivaRate: 0,
+      exemptionReason: 'Isento Artigo 12',
+      active: true,
+      trackStock: false,
+      stockQty: 0,
+      synced: true,
+      createdAtIso: '2026-11-21T08:00:00.000Z',
+      updatedAtIso: '2026-11-21T08:00:00.000Z',
+    };
+
+    const analysis = analyzePrePushSyncConflicts({
+      companyId: compId,
+      localProducts: [{ ...baseProd, price: 120, synced: false }],
+      cloudProducts: [{ ...baseProd, price: 150, synced: true }],
+      localCustomers: [],
+      cloudCustomers: [],
+      localSuppliers: [],
+      cloudSuppliers: [],
+      localInvoices: [localCollidingInv2],
+      cloudInvoices: [cloudInvPrev, cloudInv2],
+      localCashSessions: [sessOpenLocal],
+      cloudCashSessions: [sessClosedCloud],
+      localStockMovements: [],
+      cloudStockMovements: [],
+      localSettings: settings,
+      cloudSettings: null,
+      queueEntries: [],
+      baselines: {
+        'product:prod_conf_1': computeProductFingerprint(baseProd),
+      },
+      existingConflicts: [],
+    });
+
+    assert(
+      analysis.blockedEntityKeys.has('invoice:inv_local_0002') &&
+        analysis.blockedEntityKeys.has('cash_session:sess_conf_1') &&
+        analysis.blockedEntityKeys.has('product:prod_conf_1') &&
+        analysis.conflictsToSave.some((c: SyncConflictRecord) => c.type === 'FISCAL_NUMBER_COLLISION') &&
+        analysis.conflictsToSave.some((c: SyncConflictRecord) => c.type === 'CASH_SESSION_CONFLICT') &&
+        analysis.conflictsToSave.some((c: SyncConflictRecord) => c.type === 'PRODUCT_CONFLICT'),
+      'analyzePrePushSyncConflicts deve bloquear fatura colidente, turno fechado e artigo editado concorrentemente'
+    );
+
+    // Reatribuir fatura colidente para FR OFF2/000003 mantendo integridade referencial e cadeia SAF-T
+    const linkedSm: StockMovement = {
+      id: 'sm_link_1',
+      companyId: compId,
+      productId: 'p1',
+      productCode: 'P1',
+      productName: 'Café Expresso',
+      unit: 'un',
+      type: 'SAIDA_VENDA',
+      direction: 'OUT',
+      qty: 2,
+      previousStock: 10,
+      newStock: 8,
+      warehouseId: 'armazem_principal',
+      reason: 'Venda FR OFF2/000002',
+      reference: 'FR OFF2/000002',
+      invoiceId: localCollidingInv2.id,
+      invoiceNumber: localCollidingInv2.number,
+      operator: '001',
+      createdAtIso: '2026-11-21T10:05:00.000Z',
+    };
+    const linkedCm: CashMovement = {
+      id: 'cm_link_1',
+      companyId: compId,
+      sessionId: 'sess_conf_1',
+      cashier: '01',
+      operator: '001',
+      type: 'ENTRADA',
+      amount: localCollidingInv2.grandTotal,
+      paymentMethod: 'Dinheiro',
+      reason: 'Venda POS',
+      invoiceId: localCollidingInv2.id,
+      invoiceNumber: localCollidingInv2.number,
+      createdAtIso: '2026-11-21T10:05:00.000Z',
+    };
+
+    const reassigned = reassignCollidingLocalInvoice({
+      companyId: compId,
+      collidingInvoice: localCollidingInv2,
+      allInvoices: [cloudInvPrev, cloudInv2, localCollidingInv2],
+      existingStockMovements: [linkedSm],
+      existingCashMovements: [linkedCm],
+    });
+    assert(
+      reassigned.previousNumber === 'FR OFF2/000002' &&
+        reassigned.newNumber === 'FR OFF2/000003' &&
+        reassigned.updatedInvoice.previousInvoiceHash === 'full_hash_0002_cloud' &&
+        reassigned.updatedInvoice.saftHashFull !== localCollidingInv2.saftHashFull &&
+        reassigned.updatedStockMovements[0]?.invoiceNumber === 'FR OFF2/000003' &&
+        reassigned.updatedCashMovements[0]?.invoiceNumber === 'FR OFF2/000003',
+      `Reatribuição deve gerar FR OFF2/000003 encadeada após full_hash_0002_cloud e atualizar movimentos ligados (obtido: ${reassigned.newNumber})`
+    );
+
+    // Detetor de ramificações SAF-T deve capturar bifurcação antes da resolução e limpar após reatribuição
+    const forksBefore = detectHashChainForks(compId, [cloudInvPrev, cloudInv2, localCollidingInv2]);
+    const forksAfter = detectHashChainForks(compId, [cloudInvPrev, cloudInv2, reassigned.updatedInvoice]);
+    assert(
+      forksBefore.length === 1 &&
+        forksBefore[0]?.type === 'HASH_CHAIN_FORK' &&
+        forksAfter.length === 0,
+      'detectHashChainForks deve detetar ramificação enquanto ambos apontavam ao mesmo hash e limpar após encadear 000003'
     );
   });
 
